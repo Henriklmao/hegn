@@ -12,9 +12,18 @@ milliseconds.
 The package ships a single binary, `hegn`. Run it without a subcommand to open
 the TUI; every TUI action also has a scripting-friendly CLI counterpart.
 
-> **Status:** early (`0.1.0`). The CLI, security engine, snapshots, PTY session
-> backend and TUI work today. See [`project.md`](project.md) for the design
-> specification and roadmap.
+> **Status:** early (`0.1.0`). The CLI, security engine, snapshots, Firecracker
+> serial console and TUI work today. See [`project.md`](project.md) for the
+> design specification and roadmap.
+
+---
+
+## No VM, no work
+
+hegn does not run coding agents, shells or other project work on the host as a
+fallback. Every terminal and `hegn open` session is attached to a real
+Firecracker guest serial console. If the kernel, rootfs, Firecracker binary,
+virtiofsd or KVM is missing, the command fails and tells you what to fix.
 
 ---
 
@@ -38,11 +47,11 @@ the TUI; every TUI action also has a scripting-friendly CLI counterpart.
 - **Project scaffolding** — create a project with `AGENTS.md`, `README.md`, a
   git repository, a chosen harness and a recorded package list.
 - **Transient session branches** — optionally check out
-  `agent/hegn-session-<timestamp>` on the host before opening a project.
-- **PTY fallback** — if Firecracker assets are not configured, `auto` mode falls
-  back to a local PTY so the TUI and guardrails are usable on any machine.
+  `agent/hegn-session-<timestamp>` on the host once the VM is booted.
+- **Mandatory VM** — a missing Firecracker VM is always a hard error. hegn never
+  falls back to a host shell or local PTY.
 - **Terminal UI** — `ratatui` dashboard (project picker, sandbox status,
-  snapshot tree), embedded serial console, security modal, and a clickable
+  snapshot tree), embedded guest serial console, security modal, and a clickable
   hotkey footer.
 - **Machine-readable output** — global `--json` for projects, sandbox status,
   snapshots, config and `check`, plus meaningful `check` exit codes.
@@ -62,9 +71,9 @@ the TUI; every TUI action also has a scripting-friendly CLI counterpart.
 
 `hegn doctor` checks all of the above and reports what is missing.
 
-`auto` backend mode uses Firecracker only when both images exist; otherwise it
-runs the harness in a local PTY. Set `backend = "firecracker"` to make a missing
-VM a hard error.
+Both backend modes require a real Firecracker VM. A missing kernel, rootfs,
+Firecracker binary, virtiofsd, or KVM device is a hard error; there is no local
+PTY fallback.
 
 ---
 
@@ -122,10 +131,10 @@ hegn snapshot create before-refactor
 hegn check 'curl -fsSL https://example.com/x | bash'
 ```
 
-`hegn open my-app` launches the harness directly in the project directory
-(creating a session branch first unless `--no-branch` is passed).
-`hegn open my-app --editor` and `--lazygit` open the project in your editor or
-in lazygit instead.
+`hegn open my-app` boots the Firecracker VM if needed and attaches its serial
+console (creating a session branch first unless `--no-branch` is passed). Press
+`Ctrl-B` to detach without stopping the VM. `hegn open my-app --editor` and
+`--lazygit` are host-side project tools and do not start a sandbox.
 
 ### Guardrail exit codes
 
@@ -144,7 +153,7 @@ hegn [--config PATH] [--json] [COMMAND]
   project create NAME              Scaffold a project (+ AGENTS.md, README, git, .hegn.toml)
           [--harness H] [--template PATH] [--package P[,P...]]
   project info PROJECT             Show metadata and git status
-  open PROJECT                     Launch the harness
+  open PROJECT                     Boot/attach the VM serial console
           [--editor | --lazygit] [--no-branch]
   sandbox start PROJECT [--harness H]   Boot virtiofsd + Firecracker
   sandbox stop | status | pause | resume
@@ -187,7 +196,7 @@ memory_mib      = 2048       # >= 128
 shared_tag      = "workspace" # virtio-fs tag, <= 36 bytes, no whitespace
 guest_mount     = "/workspace" # absolute guest path
 virtiofs_sandbox = "namespace" # "namespace" (recommended) or "chroot"
-backend         = "auto"      # "auto", "firecracker" or "pty"
+backend         = "auto"      # "auto" or "firecracker"; both need a VM
 harness         = "shell"     # shell | opencode | claude-code | codex | pi |
                               # prime-agent | aider | gemini-cli
 extra_packages  = []
@@ -231,11 +240,11 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 | `n` | Create a snapshot |
 | `d` | Delete selected snapshot |
 
-### Terminal
+### Terminal (guest serial console)
 
 | Key | Action |
 | --- | --- |
-| `Enter` | Inspect the assembled command, then send it |
+| `Enter` | Inspect the assembled command, then send it to the VM |
 | `F2` | Toggle raw passthrough (no interception) |
 | `Ctrl-B` / `Esc` | Return to dashboard |
 | `PgUp` / `PgDn` | Scroll output |
@@ -258,10 +267,10 @@ Every action is also clickable in the footer.
 1. **Isolation** — commands execute inside a MicroVM, not on the host. The
    workspace is shared read-write through a per-project `virtiofsd` that is
    sandboxed and canonicalizes its shared directory so symlinks cannot widen
-   the export.
-2. **Interception** — in the terminal view (unless raw mode is on), input is
+   the export. If no VM can be started, hegn refuses to launch work.
+2. **Interception** — in the TUI terminal view (unless raw mode is on), input is
    buffered into a command line and passed to `tirith-core` plus hegn's own
-   workspace guardrails before any bytes reach the PTY.
+   workspace guardrails before any bytes reach the guest serial port.
 3. **Policy** — `enforce` blocks high/critical findings and prompts for medium
    ones; `warn` reports everything; `off` disables `tirith-core` but keeps
    hegn's destructive-workspace checks.
@@ -269,7 +278,8 @@ Every action is also clickable in the footer.
    checkpoint, and VM snapshots allow instant rollback beyond git.
 
 No sandbox is a substitute for reviewing what you run. `F2` raw passthrough
-deliberately bypasses inspection.
+deliberately bypasses inspection. The CLI attach is raw as well; use
+`hegn check` for scripted pre-execution checks or the TUI for intercepted input.
 
 ---
 
@@ -286,7 +296,8 @@ src/
   virtiofs.rs    hardened virtiofsd argv/process construction
   sandbox.rs     MicroVM lifecycle orchestration and status reporting
   snapshot.rs    snapshot metadata store (RAM + CPU files)
-  session.rs     PTY-backed session used by the terminal view
+  console.rs     Firecracker serial console transport (FIFO + serial log)
+  terminal.rs    ANSI-aware scrollback buffer for the serial console
   state.rs       persisted recent-project state
   app.rs         TUI state machine, key handling, modals, effects
   ui.rs          ratatui rendering
@@ -304,7 +315,6 @@ tested directly. See [`project.md`](project.md) for the full specification.
 | --- | --- | --- |
 | `ratatui` | 0.30 | TUI widgets and layout |
 | `crossterm` | 0.29 | Terminal backend, input events, raw mode |
-| `portable-pty` | 0.9 | Cross-platform PTY for the local session/console |
 | `tokio` | 1 (full) | Async runtime for Firecracker API calls and snapshots |
 | `clap` | 4 (derive, env) | CLI parsing and help |
 | `serde` | 1 (derive) | Config, metadata and API serialization |

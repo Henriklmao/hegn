@@ -10,12 +10,13 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::config::{BackendKind, Config, Harness, SecurityMode};
+use crate::config::{Config, Harness, SecurityMode};
+use crate::console::TerminalConsole;
 use crate::project::{self, GitSummary, Project, ProjectMeta};
 use crate::security::{Decision, Inspection, SecurityEngine};
-use crate::session::{Session, TerminalBuffer, harness_command};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
 use crate::state::StateStore;
+use crate::terminal::TerminalBuffer;
 
 const TOAST_TTL: Duration = Duration::from_secs(6);
 const DOUBLE_CLICK: Duration = Duration::from_millis(450);
@@ -41,6 +42,12 @@ pub enum Effect {
     OpenLazygit(PathBuf),
     RefreshProjects,
     RestoreSnapshot(SnapshotMeta),
+    /// Boot (or attach to) a Firecracker VM. A failure is a hard error; there is
+    /// no host-process fallback.
+    StartSandbox {
+        project: PathBuf,
+        harness: Harness,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,14 +113,11 @@ pub struct SandboxStatus {
 
 impl SandboxStatus {
     pub fn from_config(config: &Config) -> Self {
-        let backend = match config.effective_backend() {
-            BackendKind::Firecracker => "firecracker",
-            BackendKind::Pty | BackendKind::Auto => "local pty",
-        };
+        let backend = "firecracker";
         let virtiofs = if config.firecracker_ready() {
             "configured"
         } else {
-            "not mounted"
+            "missing VM"
         };
         Self {
             state: SandboxState::Stopped,
@@ -297,7 +301,7 @@ pub struct App {
     pub selected_snapshot: usize,
     pub snapshot_rows: Vec<RowHit>,
     pub project_rows: Vec<RowHit>,
-    pub session: Option<Session>,
+    pub session: Option<Box<dyn TerminalConsole>>,
     pub terminal: TerminalBuffer,
     pub input: String,
     pub raw_mode: bool,
@@ -456,23 +460,14 @@ impl App {
             return;
         }
         self.viewport = (cols, rows);
-        if let Some(session) = &self.session {
-            let (cols, rows) = pty_size(cols, rows);
-            let _ = session.resize(cols, rows);
-        }
     }
 
     pub fn poll(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         let mut closed = false;
         if let Some(session) = &mut self.session {
-            for event in session.drain() {
-                match event {
-                    crate::session::SessionEvent::Output(bytes) => {
-                        self.terminal.push_bytes(&bytes);
-                    }
-                    crate::session::SessionEvent::Exited => closed = true,
-                }
+            for bytes in session.drain() {
+                self.terminal.push_bytes(&bytes);
             }
             if session.is_exited() {
                 closed = true;
@@ -765,7 +760,7 @@ impl App {
             && !session.is_exited()
         {
             active = true;
-            if let Err(err) = session.send_line(line) {
+            if let Err(err) = session.send(format!("{line}\r").as_bytes()) {
                 error = Some(err.to_string());
             }
         }
@@ -1047,7 +1042,10 @@ impl App {
         Vec::new()
     }
 
-    /// Open the selected project in the sandbox.
+    /// Open the selected project in a Firecracker VM.
+    ///
+    /// This only *requests* the VM start; the terminal loop owns the runtime and
+    /// performs the boot. A missing VM is a hard error, never a local shell.
     pub fn open_selected(&mut self) -> Vec<Effect> {
         if self.focus == Focus::Snapshots {
             return self.confirm_restore_snapshot();
@@ -1057,30 +1055,21 @@ impl App {
             return Vec::new();
         };
 
-        if let Some(session) = &mut self.session
-            && !session.is_exited()
-            && session.project() == project.path
+        if self
+            .session
+            .as_mut()
+            .is_some_and(|session| !session.is_exited())
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.project() == project.path)
         {
             self.screen = Screen::Terminal;
             return Vec::new();
         }
-        self.session = None;
-        self.terminal.clear();
-        self.scroll = 0;
-        self.input.clear();
-        self.raw_mode = false;
-        self.session_closed_reported = false;
 
         let meta = project::read_meta(&project.path);
         let harness = meta.harness.unwrap_or(self.config.harness);
-        let (program, args) = harness_command(harness);
-
-        if self.config.auto_branch && project.git.is_repo {
-            match project::create_session_branch(&project.path) {
-                Ok(branch) => self.toast(format!("session branch {branch}"), ToastLevel::Info),
-                Err(err) => self.toast(format!("branch not created: {err}"), ToastLevel::Warn),
-            }
-        }
 
         if let Err(err) = self.store.touch(&project.path) {
             self.toast(
@@ -1088,47 +1077,51 @@ impl App {
                 ToastLevel::Warn,
             );
         }
-        let (cols, rows) = self.viewport;
-        let (pty_cols, pty_rows) = pty_size(cols, rows);
-        match Session::spawn(
-            &program,
-            &args,
-            &project.path,
-            pty_cols,
-            pty_rows,
-            harness.label(),
-            &project.path,
-        ) {
-            Ok(session) => {
-                self.session = Some(session);
-                self.screen = Screen::Terminal;
-                self.sandbox.state = SandboxState::Running;
-                self.sandbox.backend = "local pty";
-                self.sandbox.started_at = Some(Instant::now());
-                self.sandbox.note =
-                    Some(format!("{} in {}", harness.label(), project.display_path()));
-                if self.config.effective_backend() == BackendKind::Firecracker {
-                    self.toast(
-                        "local PTY fallback (VM boot orchestration is not enabled yet)",
-                        ToastLevel::Warn,
-                    );
-                } else {
-                    self.toast(
-                        format!("{} started in local PTY", harness.label()),
-                        ToastLevel::Info,
-                    );
-                }
-            }
-            Err(err) => {
-                self.sandbox.state = SandboxState::Failed;
-                self.toast(
-                    format!("failed to start {}: {err}", harness.label()),
-                    ToastLevel::Error,
-                );
-            }
-        }
-        self.refresh_filter();
-        Vec::new()
+
+        self.session = None;
+        self.terminal.clear();
+        self.scroll = 0;
+        self.input.clear();
+        self.raw_mode = false;
+        self.session_closed_reported = false;
+        self.sandbox.state = SandboxState::Starting;
+        self.sandbox.started_at = None;
+        self.sandbox.note = Some(format!(
+            "booting Firecracker VM for {}",
+            project.display_path()
+        ));
+        vec![Effect::StartSandbox {
+            project: project.path.clone(),
+            harness,
+        }]
+    }
+
+    /// Install a console for a successfully started/attached VM.
+    pub fn attach_console(&mut self, console: Box<dyn TerminalConsole>) {
+        self.sandbox.state = SandboxState::Running;
+        self.sandbox.backend = "firecracker";
+        self.sandbox.note = Some(format!(
+            "{} in {}",
+            console.label(),
+            console.project().display()
+        ));
+        self.sandbox.started_at = Some(Instant::now());
+        self.sandbox.socket = Some(self.config.run_dir().join("firecracker.sock"));
+        self.session = Some(console);
+        self.screen = Screen::Terminal;
+        self.raw_mode = false;
+        self.session_closed_reported = false;
+        self.toast("attached to VM serial console", ToastLevel::Info);
+    }
+
+    /// Report a hard VM start/attach failure. No host fallback is attempted.
+    pub fn fail_start(&mut self, error: impl Into<String>) {
+        let error = error.into();
+        self.session = None;
+        self.sandbox.state = SandboxState::Failed;
+        self.sandbox.started_at = None;
+        self.sandbox.note = Some(error.clone());
+        self.toast(format!("VM start failed: {error}"), ToastLevel::Error);
     }
 
     /// Dispatch a footer click or a direct action (mouse support).
@@ -1317,17 +1310,6 @@ impl App {
     }
 }
 
-/// Size of the PTY that fits inside the terminal view's right-hand pane.
-///
-/// The layout reserves a 34-column sidebar plus the panel border, a 3-line
-/// header, a 2-line footer, the mode line and the 3-line input box.
-fn pty_size(cols: u16, rows: u16) -> (u16, u16) {
-    (
-        cols.saturating_sub(36).max(20),
-        rows.saturating_sub(11).max(5),
-    )
-}
-
 fn clamp_index(current: usize, delta: isize, max: usize) -> usize {
     if delta.is_negative() {
         current.saturating_sub(delta.unsigned_abs())
@@ -1417,12 +1399,53 @@ mod tests {
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
         config.templates_dir = dir.path().join("templates");
-        config.backend = BackendKind::Pty;
+        config.backend = crate::config::BackendKind::Auto;
         config.auto_branch = false;
         std::fs::create_dir_all(&config.projects_root).unwrap();
         std::fs::create_dir_all(&config.snapshots_dir).unwrap();
         let app = App::new(config);
         (dir, app)
+    }
+
+    struct FakeConsole {
+        project: PathBuf,
+        output: Vec<Vec<u8>>,
+        sent: Vec<u8>,
+        exited: bool,
+    }
+
+    impl FakeConsole {
+        fn new(project: impl Into<PathBuf>) -> Self {
+            Self {
+                project: project.into(),
+                output: Vec::new(),
+                sent: Vec::new(),
+                exited: false,
+            }
+        }
+    }
+
+    impl TerminalConsole for FakeConsole {
+        fn send(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+            self.sent.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn drain(&mut self) -> Vec<Vec<u8>> {
+            std::mem::take(&mut self.output)
+        }
+
+        fn is_exited(&mut self) -> bool {
+            self.exited
+        }
+
+        fn project(&self) -> &std::path::Path {
+            &self.project
+        }
+
+        fn label(&self) -> &str {
+            "fake · serial"
+        }
     }
 
     fn fake_project(name: &str) -> Project {
@@ -1766,41 +1789,61 @@ mod tests {
     fn sandbox_status_reflects_config() {
         let (_dir, app) = test_app();
         assert_eq!(app.sandbox.state, SandboxState::Stopped);
-        assert_eq!(app.sandbox.backend, "local pty");
+        assert_eq!(app.sandbox.backend, "firecracker");
         assert_eq!(app.sandbox.vcpus, app.config.vcpus);
     }
 
     #[test]
-    fn pty_size_matches_the_terminal_pane() {
-        assert_eq!(pty_size(120, 40), (84, 29));
-        assert_eq!(pty_size(10, 5), (20, 5));
+    fn missing_vm_never_falls_back_to_host_work() {
+        let (_dir, mut app) = test_app();
+        app.fail_start("missing VM assets");
+        assert!(app.session.is_none());
+        assert_eq!(app.sandbox.state, SandboxState::Failed);
+        assert!(!app.session_active());
+        assert!(app.toast.as_ref().unwrap().text.contains("VM start failed"));
     }
 
     #[test]
-    fn session_lifecycle_in_local_pty() {
-        let (dir, mut app) = test_app();
-        let project_path = app.config.projects_root.join("demo");
-        std::fs::create_dir_all(&project_path).unwrap();
+    fn open_requests_a_sandbox_and_resets_raw_mode() {
+        let (_dir, mut app) = test_app();
         let mut project = fake_project("demo");
-        project.path = project_path.clone();
-        app.set_projects(vec![project]);
+        project.path = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project.path).unwrap();
+        app.set_projects(vec![project.clone()]);
         app.raw_mode = true;
-        app.open_selected();
-        assert!(
-            !app.raw_mode,
-            "raw passthrough must not leak into a new session"
-        );
-        assert_eq!(app.screen, Screen::Terminal);
-        assert!(app.session.is_some());
-        let session = app.session.as_mut().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if session.recv_timeout(Duration::from_millis(50)).is_some() {
-                break;
+        let effects = app.open_selected();
+        assert!(!app.raw_mode, "raw mode must reset for each VM");
+        assert_eq!(app.sandbox.state, SandboxState::Starting);
+        assert!(app.session.is_none());
+        match effects.as_slice() {
+            [
+                Effect::StartSandbox {
+                    project: p,
+                    harness,
+                },
+            ] => {
+                assert_eq!(p, &project.path);
+                assert_eq!(*harness, app.config.harness);
             }
+            other => panic!("expected StartSandbox, got {other:?}"),
         }
-        app.poll();
-        app.session.as_mut().unwrap().kill();
-        let _ = dir;
+    }
+
+    #[test]
+    fn attaching_a_console_enters_the_terminal_view() {
+        let (_dir, mut app) = test_app();
+        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
+        assert_eq!(app.screen, Screen::Terminal);
+        assert_eq!(app.sandbox.state, SandboxState::Running);
+        assert!(app.session_active());
+    }
+
+    #[test]
+    fn fail_start_never_falls_back_to_a_host_shell() {
+        let (_dir, mut app) = test_app();
+        app.fail_start("boom");
+        assert!(app.session.is_none());
+        assert_eq!(app.sandbox.state, SandboxState::Failed);
+        assert!(!app.session_active());
     }
 }

@@ -13,7 +13,6 @@ use crate::config::{Config, Harness};
 use crate::project::{self, ProjectMeta};
 use crate::sandbox::{SandboxManager, SandboxReport, process_alive};
 use crate::security::{Decision, SecurityEngine};
-use crate::session::harness_command;
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
 
 #[derive(Debug, Parser)]
@@ -53,14 +52,14 @@ pub enum Commands {
         #[command(subcommand)]
         command: ProjectCommands,
     },
-    /// Launch a project harness (or editor / lazygit) from the CLI.
+    /// Boot or attach a project VM and open its serial console.
     Open {
         /// Project name (under projects_root) or path.
         project: String,
-        /// Open in $EDITOR instead of the coding harness.
+        /// Open the project in $EDITOR on the host instead of the VM.
         #[arg(long, conflicts_with = "lazygit")]
         editor: bool,
-        /// Open in lazygit instead of the coding harness.
+        /// Open the project in lazygit on the host instead of the VM.
         #[arg(long)]
         lazygit: bool,
         /// Skip creating a transient git session branch.
@@ -572,10 +571,9 @@ fn doctor(config: Config, json: bool) -> Result<i32> {
     });
     checks.push(Check {
         name: "backend".into(),
-        ok: config.effective_backend() != crate::config::BackendKind::Firecracker
-            || (config.kernel_image.is_file() && config.rootfs_image.is_file()),
+        ok: config.firecracker_ready(),
         detail: format!(
-            "{} (configured {})",
+            "{} (configured {}); a VM is mandatory",
             config.effective_backend().label(),
             config.backend.label()
         ),
@@ -658,6 +656,12 @@ fn open(
         return Ok(status.code().unwrap_or(1));
     }
 
+    let meta = project::read_meta(&path);
+    let harness = meta.harness.unwrap_or(config.harness);
+    let manager = SandboxManager::new(config.clone());
+    let console = manager.ensure_console(&path, harness)?;
+
+    // Only mutate the host repository once a VM is actually available.
     let git = project::read_git_summary(&path);
     if config.auto_branch && git.is_repo && !no_branch {
         match project::create_session_branch(&path) {
@@ -666,17 +670,8 @@ fn open(
         }
     }
 
-    let meta = project::read_meta(&path);
-    let harness = meta.harness.unwrap_or(config.harness);
-    let (program, args) = harness_command(harness);
-    let status = Command::new(&program)
-        .args(&args)
-        .current_dir(&path)
-        .env("HEGN", "1")
-        .env("HEGN_WORKSPACE", &path)
-        .status()
-        .with_context(|| format!("failed to launch harness '{}' ({program})", harness.label()))?;
-    Ok(status.code().unwrap_or(1))
+    crate::console::run_interactive(console)?;
+    Ok(0)
 }
 
 fn run_editor(path: &Path) -> Result<i32> {
@@ -820,7 +815,7 @@ mod tests {
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
         config.templates_dir = dir.path().join("templates");
-        config.backend = BackendKind::Pty;
+        config.backend = BackendKind::Auto;
         std::fs::create_dir_all(&config.projects_root).unwrap();
         (dir, config)
     }

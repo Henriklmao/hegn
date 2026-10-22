@@ -4,28 +4,27 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// Which sandbox backend to use when a project is opened.
+/// How the sandbox is selected when a project is opened.
+///
+/// Both modes require a real Firecracker VM. There is no local-shell fallback:
+/// a missing VM is always a hard error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
-    /// Use Firecracker when its assets are configured and available, otherwise
-    /// fall back to a local PTY. This keeps a fresh checkout usable.
+    /// Boot a VM on demand. Still requires all Firecracker assets and binaries.
     #[default]
     Auto,
-    /// Require a Firecracker MicroVM. Never silently fall back.
+    /// Boot a VM on demand. Present for explicitness; behaves like `auto`.
     Firecracker,
-    /// Run the harness in a local PTY. Useful for development of the TUI.
-    Pty,
 }
 
 impl BackendKind {
-    pub const ALL: [Self; 3] = [Self::Auto, Self::Firecracker, Self::Pty];
+    pub const ALL: [Self; 2] = [Self::Auto, Self::Firecracker];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::Firecracker => "firecracker",
-            Self::Pty => "pty",
         }
     }
 }
@@ -334,13 +333,23 @@ impl Config {
         self.kernel_image.is_file() && self.rootfs_image.is_file()
     }
 
-    /// Whether the configured backend can boot a VM right now.
+    /// The backend actually used for work. hegn never falls back to a host
+    /// process, so this is always Firecracker.
     pub fn effective_backend(&self) -> BackendKind {
-        match self.backend {
-            BackendKind::Auto if self.firecracker_ready() => BackendKind::Firecracker,
-            BackendKind::Auto => BackendKind::Pty,
-            other => other,
+        BackendKind::Firecracker
+    }
+
+    /// Assert that the VM assets required to do any work are present.
+    pub fn require_vm_assets(&self) -> Result<()> {
+        if !self.firecracker_ready() {
+            bail!(
+                "missing VM assets: {} and/or {} do not exist; \
+                 run `hegn doctor` and configure kernel_image/rootfs_image",
+                self.kernel_image.display(),
+                self.rootfs_image.display()
+            );
         }
+        Ok(())
     }
 }
 
@@ -392,7 +401,7 @@ mod tests {
 vcpus = 4
 memory_mib = 4096
 harness = "opencode"
-backend = "pty"
+backend = "firecracker"
 "#,
         );
         let config = Config::load_from(&path).unwrap();
@@ -400,7 +409,7 @@ backend = "pty"
         assert_eq!(config.vcpus, 4);
         assert_eq!(config.memory_mib, 4096);
         assert_eq!(config.harness, Harness::Opencode);
-        assert_eq!(config.backend, BackendKind::Pty);
+        assert_eq!(config.backend, BackendKind::Firecracker);
         assert_eq!(config.projects_root, Config::default().projects_root);
     }
 
@@ -437,13 +446,20 @@ backend = "pty"
     }
 
     #[test]
-    fn backend_auto_requires_images() {
+    fn pty_backend_is_rejected() {
+        let (_dir, path) = temp_config("backend = \"pty\"\n");
+        let err = format!("{:#}", Config::load_from(&path).unwrap_err());
+        assert!(err.contains("unknown variant"), "{err}");
+    }
+
+    #[test]
+    fn missing_vm_assets_are_a_hard_error() {
         let mut config = Config::default();
         config.kernel_image = PathBuf::from("/definitely/missing/kernel");
         config.rootfs_image = PathBuf::from("/definitely/missing/rootfs");
-        assert_eq!(config.effective_backend(), BackendKind::Pty);
-        config.backend = BackendKind::Firecracker;
         assert_eq!(config.effective_backend(), BackendKind::Firecracker);
+        assert!(!config.firecracker_ready());
+        assert!(config.require_vm_assets().is_err());
     }
 
     #[test]

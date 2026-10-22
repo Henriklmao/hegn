@@ -41,6 +41,10 @@ pub struct SandboxPaths {
     pub run_dir: PathBuf,
     pub api_socket: PathBuf,
     pub virtiofs_socket: PathBuf,
+    /// FIFO connected to Firecracker's stdin (guest serial input).
+    pub serial_in: PathBuf,
+    /// File connected to Firecracker's stdout (guest serial output).
+    pub serial_out: PathBuf,
     pub firecracker_pid: PathBuf,
     pub virtiofs_pid: PathBuf,
     pub session: PathBuf,
@@ -53,6 +57,8 @@ impl SandboxPaths {
         Self {
             api_socket: run_dir.join("firecracker.sock"),
             virtiofs_socket: run_dir.join("virtiofs.sock"),
+            serial_in: run_dir.join("serial.in"),
+            serial_out: run_dir.join("serial.out"),
             firecracker_pid: run_dir.join("firecracker.pid"),
             virtiofs_pid: run_dir.join("virtiofs.pid"),
             session: run_dir.join("session.json"),
@@ -267,6 +273,31 @@ impl SandboxManager {
                 self.config.guest_mount
             )),
         })
+    }
+
+    /// Attach the TUI/CLI terminal to the running guest serial console.
+    pub fn attach_console(&self) -> Result<crate::console::VmConsole> {
+        crate::console::VmConsole::attach(&self.config)
+    }
+
+    /// Boot a VM if needed, then attach its console.
+    pub fn ensure_console(
+        &self,
+        project: &Path,
+        harness: Harness,
+    ) -> Result<crate::console::VmConsole> {
+        if let Some(session) = self.session()
+            && session.project != project
+        {
+            bail!(
+                "a sandbox for {} is already running; stop it with `hegn sandbox stop` first",
+                session.project.display()
+            );
+        }
+        if !self.is_running() {
+            self.start(project, harness)?;
+        }
+        self.attach_console()
     }
 
     /// Stop Firecracker and virtiofsd.
@@ -598,10 +629,29 @@ fn spawn_virtiofsd(
 }
 
 fn spawn_firecracker(config: &Config, paths: &SandboxPaths) -> Result<Child> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let _ = fs::remove_file(&paths.api_socket);
+    ensure_serial_fifo(&paths.serial_in)?;
+    // Firecracker registers serial input only when stdin is a TTY or a FIFO.
+    // O_RDWR keeps both ends open so the child never sees EOF between attaches.
+    let serial_in = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&paths.serial_in)
+        .with_context(|| format!("failed to open {}", paths.serial_in.display()))?;
+    let serial_out = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&paths.serial_out)
+        .with_context(|| format!("failed to open {}", paths.serial_out.display()))?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&paths.log)
         .with_context(|| format!("failed to open {}", paths.log.display()))?;
     let stderr = log.try_clone()?;
@@ -610,8 +660,8 @@ fn spawn_firecracker(config: &Config, paths: &SandboxPaths) -> Result<Child> {
         .arg(&paths.api_socket)
         .arg("--id")
         .arg(format!("hegn-{}", std::process::id()))
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
+        .stdin(Stdio::from(serial_in))
+        .stdout(Stdio::from(serial_out))
         .stderr(Stdio::from(stderr))
         .spawn()
         .with_context(|| {
@@ -620,6 +670,22 @@ fn spawn_firecracker(config: &Config, paths: &SandboxPaths) -> Result<Child> {
                 config.firecracker_bin.display()
             )
         })
+}
+
+/// Create a private FIFO for guest serial input, replacing any stale one.
+pub(crate) fn ensure_serial_fifo(path: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let _ = fs::remove_file(path);
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("invalid FIFO path {}", path.display()))?;
+    // Safety: c_path is a valid NUL-terminated path; mkfifo does not retain it.
+    if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to create {}", path.display()));
+    }
+    Ok(())
 }
 
 async fn wait_for_api(socket: &Path, child: &mut Child, timeout: Duration) -> Result<()> {
@@ -740,6 +806,8 @@ fn cleanup_files(paths: &SandboxPaths) {
     for path in [
         &paths.api_socket,
         &paths.virtiofs_socket,
+        &paths.serial_in,
+        &paths.serial_out,
         &paths.firecracker_pid,
         &paths.virtiofs_pid,
         &paths.session,

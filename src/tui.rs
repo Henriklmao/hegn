@@ -16,7 +16,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::{App, Effect, SandboxState, ToastLevel};
+use crate::app::{App, Effect, ToastLevel};
 use crate::config::Config;
 use crate::project;
 use crate::ui;
@@ -153,15 +153,36 @@ fn handle_effects(
                     app.toast(format!("lazygit failed: {err}"), ToastLevel::Error);
                 }
             }
+            Effect::StartSandbox { project, harness } => {
+                let manager = crate::sandbox::SandboxManager::new(app.config.clone());
+                match manager.ensure_console(&project, harness) {
+                    Ok(console) => {
+                        app.attach_console(Box::new(console));
+                        if app.config.auto_branch && project::read_git_summary(&project).is_repo {
+                            match project::create_session_branch(&project) {
+                                Ok(branch) => {
+                                    app.toast(format!("session branch {branch}"), ToastLevel::Info)
+                                }
+                                Err(err) => app
+                                    .toast(format!("branch not created: {err}"), ToastLevel::Warn),
+                            }
+                        }
+                    }
+                    Err(err) => app.fail_start(err.to_string()),
+                }
+            }
             Effect::RestoreSnapshot(snapshot) => {
                 let manager = crate::sandbox::SandboxManager::new(app.config.clone());
                 match runtime.block_on(manager.restore_snapshot(&snapshot)) {
-                    Ok(()) => {
-                        app.toast(format!("restored {}", snapshot.name), ToastLevel::Info);
-                        // `resume_vm` is set, so the guest is running again.
-                        app.sandbox.state = SandboxState::Running;
-                        app.sandbox.started_at = Some(Instant::now());
-                    }
+                    Ok(()) => match manager.attach_console() {
+                        Ok(console) => {
+                            app.attach_console(Box::new(console));
+                            app.toast(format!("restored {}", snapshot.name), ToastLevel::Info);
+                        }
+                        Err(err) => app.fail_start(format!(
+                            "snapshot restored, but console attach failed: {err}"
+                        )),
+                    },
                     Err(err) => app.toast(format!("restore failed: {err}"), ToastLevel::Error),
                 }
             }

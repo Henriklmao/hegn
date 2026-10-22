@@ -9,7 +9,8 @@
 //! - [`virtiofs`] — hardened `virtiofsd` command construction
 //! - [`sandbox`] — MicroVM lifecycle orchestration
 //! - [`snapshot`] — on-disk snapshot metadata
-//! - [`session`] — PTY-backed local session used by the terminal view
+//! - [`console`] — Firecracker serial-console transport (no host fallback)
+//! - [`terminal`] — ANSI-aware scrollback buffer
 //! - [`state`] — persisted recent-project state
 //! - [`app`] — TUI application state and event handling
 //! - [`ui`] — ratatui rendering
@@ -19,13 +20,14 @@
 pub mod app;
 pub mod cli;
 pub mod config;
+pub mod console;
 pub mod firecracker;
 pub mod project;
 pub mod sandbox;
 pub mod security;
-pub mod session;
 pub mod snapshot;
 pub mod state;
+pub mod terminal;
 pub mod tui;
 pub mod ui;
 pub mod virtiofs;

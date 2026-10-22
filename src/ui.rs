@@ -1413,7 +1413,7 @@ fn truncate(text: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::app::SecurityPrompt;
-    use crate::config::{BackendKind, Config};
+    use crate::config::Config;
     use crate::project::{GitSummary, Project};
     use crate::security::SecurityEngine;
     use ratatui::Terminal;
@@ -1427,7 +1427,7 @@ mod tests {
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
         config.templates_dir = dir.path().join("templates");
-        config.backend = BackendKind::Pty;
+        config.backend = crate::config::BackendKind::Auto;
         config.auto_branch = false;
         std::fs::create_dir_all(&config.projects_root).unwrap();
         let mut app = App::new(config);
