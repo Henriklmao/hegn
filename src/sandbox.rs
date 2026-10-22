@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{BackendKind, Config, Harness};
 use crate::firecracker::{
     Action, BootSource, Drive, FirecrackerClient, InstanceInfo, MachineConfig, SnapshotCreate,
-    SnapshotLoad, VhostUserFs, VmState, is_running,
+    SnapshotLoad, VhostUserFs, VmState,
 };
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
 use crate::virtiofs::{VirtiofsConfig, VirtiofsProcess};
@@ -515,7 +515,7 @@ impl SandboxManager {
         Ok(())
     }
 
-    /// Is the VM running and answering the API?
+    /// Is the VM running or paused and answering the API?
     pub fn running(&self) -> bool {
         let paths = self.paths();
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -525,7 +525,13 @@ impl SandboxManager {
             Ok(runtime) => runtime,
             Err(_) => return false,
         };
-        runtime.block_on(is_running(&paths.api_socket))
+        runtime.block_on(async {
+            FirecrackerClient::new(&paths.api_socket)
+                .instance_info()
+                .await
+                .map(|info| matches!(info.state, VmState::Running | VmState::Paused))
+                .unwrap_or(false)
+        })
     }
 
     fn cleanup_stale(&self) {

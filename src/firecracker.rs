@@ -387,11 +387,14 @@ fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>> {
         if size == 0 {
             break;
         }
-        if data.len() < size + 2 {
+        let Some(needed) = size.checked_add(2) else {
+            return Err(Error::Protocol(format!("chunk size overflow: {size_line}")).into());
+        };
+        if data.len() < needed {
             return Err(Error::Protocol("chunk truncated".into()).into());
         }
         out.extend_from_slice(&data[..size]);
-        data = &data[size + 2..];
+        data = &data[needed..];
     }
     Ok(out)
 }
@@ -413,10 +416,11 @@ pub fn validate_socket_path(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() {
         bail!("socket path is empty");
     }
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            bail!("socket directory {} does not exist", parent.display());
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        bail!("socket directory {} does not exist", parent.display());
     }
     Ok(())
 }
@@ -625,6 +629,16 @@ mod tests {
         let parsed = parse_http_response(raw).unwrap();
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.body, b"{\"a\":1}\n");
+    }
+
+    #[test]
+    fn rejects_chunk_size_overflow() {
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            usize::MAX
+        );
+        let err = format!("{:#}", parse_http_response(raw.as_bytes()).unwrap_err());
+        assert!(err.contains("chunk size overflow"), "{err}");
     }
 
     #[test]
