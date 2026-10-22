@@ -140,11 +140,21 @@ impl SandboxManager {
             self.cleanup_stale();
         }
         paths.ensure()?;
+        // Build the runtime before spawning anything so a failure here cannot
+        // leak a running virtiofsd or Firecracker process.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build async runtime")?;
 
         // 1. virtiofsd, sandboxed to exactly this project.
         let mut virtiofs = spawn_virtiofsd(&self.config, &paths, project)?;
         let virtiofs_pid = virtiofs.pid();
-        fs::write(&paths.virtiofs_pid, virtiofs_pid.to_string())?;
+        if let Err(err) = fs::write(&paths.virtiofs_pid, virtiofs_pid.to_string()) {
+            virtiofs.kill();
+            cleanup_files(&paths);
+            return Err(err).context("failed to record the virtiofsd pid");
+        }
 
         // 2. Firecracker process. Children outlive this CLI call.
         let mut firecracker = match spawn_firecracker(&self.config, &paths) {
@@ -157,9 +167,6 @@ impl SandboxManager {
         };
         let firecracker_pid = firecracker.id();
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
         let configured = runtime.block_on(async {
             wait_for_api(&paths.api_socket, &mut firecracker, API_START_TIMEOUT).await?;
             let client = FirecrackerClient::new(&paths.api_socket);
