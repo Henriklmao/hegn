@@ -33,11 +33,12 @@ jobs:
 
       - name: Install appimagetool
         run: |
-          sudo wget https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O /usr/local/bin/appimagetool
+          sudo wget -q https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage -O /usr/local/bin/appimagetool
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  /usr/local/bin/appimagetool" | sha256sum -c -
           sudo chmod +x /usr/local/bin/appimagetool
 
       - name: Install cargo-appimage
-        run: cargo install cargo-appimage
+        run: cargo install cargo-appimage --version 2.4.0
 
       - name: Build Rust Project (MUSL)
         run: cargo build --release --target x86_64-unknown-linux-musl
