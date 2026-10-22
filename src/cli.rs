@@ -352,12 +352,20 @@ fn sandbox_command(command: SandboxCommands, config: Config, json: bool) -> Resu
         }
         SandboxCommands::Pause => {
             runtime()?.block_on(manager.pause())?;
-            println!("Sandbox paused.");
+            if json {
+                println!("{}", serde_json::json!({"paused": true}));
+            } else {
+                println!("Sandbox paused.");
+            }
             Ok(0)
         }
         SandboxCommands::Resume => {
             runtime()?.block_on(manager.resume())?;
-            println!("Sandbox resumed.");
+            if json {
+                println!("{}", serde_json::json!({"resumed": true}));
+            } else {
+                println!("Sandbox resumed.");
+            }
             Ok(0)
         }
     }
@@ -496,7 +504,11 @@ fn config_command(command: ConfigCommands, config: Config, json: bool) -> Result
             Ok(0)
         }
         ConfigCommands::Path => {
-            println!("{}", Config::config_path().display());
+            if json {
+                println!("{}", serde_json::to_string_pretty(&Config::config_path())?);
+            } else {
+                println!("{}", Config::config_path().display());
+            }
             Ok(0)
         }
         ConfigCommands::Init => {
