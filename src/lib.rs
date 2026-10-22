@@ -12,6 +12,7 @@
 //! - [`app`] — TUI application state and event handling
 //! - [`ui`] — ratatui rendering
 
+pub mod app;
 pub mod config;
 pub mod firecracker;
 pub mod project;
@@ -20,6 +21,9 @@ pub mod security;
 pub mod session;
 pub mod snapshot;
 pub mod state;
+pub mod tui;
+pub mod ui;
 pub mod virtiofs;
 
+pub use app::App;
 pub use config::{BackendKind, Config, Harness, SecurityMode};
