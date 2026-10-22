@@ -170,7 +170,7 @@ impl SecurityEngine {
             findings.extend(tirith);
         }
 
-        findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+        findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
         // Keep the highest-severity copy of each rule/title pair. Sorting by
         // severity first makes the first occurrence the one to retain.
         let mut seen = std::collections::HashSet::new();

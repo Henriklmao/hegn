@@ -51,10 +51,13 @@ virtiofsd or KVM is missing, the command fails and tells you what to fix.
 - **Mandatory VM** — a missing Firecracker VM is always a hard error. hegn never
   falls back to a host shell or local PTY.
 - **Detachable serial console** — the guest `ttyS0` is wired to a private FIFO
-  (`serial.in`) for input and a serial log (`serial.out`) for output in the
-  state run directory, so the TUI and `hegn open` can detach and re-attach
-  without restarting the VM. The log is truncated when the VM starts and removed
-  by `hegn sandbox stop`.
+  (`serial.in`) for input and a persistent serial log for output, so the TUI,
+  `hegn open` and `hegn attach` can detach and re-attach without restarting the
+  VM. `hegn attach` (alias `hegn a`) works like `tmux attach` and keeps a
+  status bar on the bottom line with the project name, harness, VM pid and log.
+- **Private session logs** — boot and session output survive `hegn sandbox
+  stop` in `state_dir/logs/` (`0700` directory, `0600` files, `O_NOFOLLOW`).
+  `hegn logs list|path|show|prune` manages them.
 - **Terminal UI** — `ratatui` dashboard (project picker, sandbox status,
   snapshot tree), embedded guest serial console, security modal, and a clickable
   hotkey footer.
@@ -131,8 +134,10 @@ hegn
 # 5. Or drive it non-interactively
 hegn projects
 hegn sandbox start my-app
+hegn attach my-app
 hegn sandbox status --json
 hegn snapshot create before-refactor
+hegn logs
 hegn check 'curl -fsSL https://example.com/x | bash'
 ```
 
@@ -142,6 +147,53 @@ console (creating a session branch first unless `--no-branch` is passed). Press
 the session metadata and shown in the status line; launch it from the guest
 shell. `hegn open my-app --editor` and
 `--lazygit` are host-side project tools and do not start a sandbox.
+
+### Re-attaching like tmux
+
+```bash
+hegn attach          # attach to the single running VM
+hegn a my-app        # attach, but only if the running VM belongs to my-app
+hegn attach --no-bar # give full-screen guest programs the whole terminal
+```
+
+`hegn attach` never boots or restarts a VM. It fails if there is no running
+session, if the recorded pid is no longer the configured Firecracker binary, or
+if the optional project argument does not match the running session. The
+bottom line is reserved for a status bar:
+
+```
+ hegn ▸ my-app · OpenCode · pid 4242 · log session-…-my-app-4242.log   INPUT DIRECT · ^B detach
+```
+
+`Ctrl-B` detaches without stopping the VM. Input is forwarded directly to the
+guest UART; the `INPUT DIRECT` marker makes that bypass of `tirith-core`
+visible. Use the TUI terminal view for intercepted line input, or `hegn check`
+in scripts. The guest console geometry cannot be changed over the Firecracker
+serial port, so the bar uses one host row and full-screen guest programs keep
+their own size; pass `--no-bar` (also accepted by `hegn open`) when a guest TUI
+needs every row.
+
+### Session logs
+
+Every VM session writes its serial output to
+`~/.local/state/hegn/logs/session-<timestamp>-<project>-<pid>.log`. The log is
+created private, and `run/serial.out` is a hard link to it, so stopping the VM
+does not erase the boot log.
+
+```bash
+hegn logs                       # list, newest first
+hegn logs path my-app           # absolute path (newest by default)
+hegn logs show --lines 120      # tail with ANSI/control sequences stripped
+hegn logs show --raw            # exact bytes; only for trusted logs
+hegn logs prune --keep 20       # only hegn's session-*.log files
+```
+
+Logs may contain secrets an agent printed. They stay `0600` in a `0700`
+directory, symlinks are rejected, and `show` sanitizes terminal control and
+bidi-override sequences unless `--raw` is explicitly requested. A session log
+is not truncated while Firecracker owns it; retention is by count (default 50)
+and `hegn logs prune` can be run at any time. Pruning always protects the log of
+the currently running session.
 
 ### Guardrail exit codes
 
@@ -161,7 +213,9 @@ hegn [--config PATH] [--json] [COMMAND]
           [--harness H] [--template PATH] [--package P[,P...]]
   project info PROJECT             Show metadata and git status
   open PROJECT                     Boot/attach the VM serial console
-          [--editor | --lazygit] [--no-branch]
+          [--editor | --lazygit] [--no-branch] [--no-bar]
+  attach [PROJECT] [--no-bar]      Attach to the running VM (alias: a), tmux-style
+  logs [list|path|show|prune]      Manage persistent serial logs (alias: log)
   sandbox start PROJECT [--harness H]   Boot virtiofsd + Firecracker
   sandbox stop | status | pause | resume
   snapshot list                    List snapshots (alias: ls)
@@ -285,8 +339,14 @@ Every action is also clickable in the footer.
    checkpoint, and VM snapshots allow instant rollback beyond git.
 
 No sandbox is a substitute for reviewing what you run. `F2` raw passthrough
-deliberately bypasses inspection. The CLI attach is raw as well; use
-`hegn check` for scripted pre-execution checks or the TUI for intercepted input.
+deliberately bypasses inspection. `hegn attach` is raw as well and marks this
+in its status bar as `INPUT DIRECT`; use `hegn check` for scripted
+pre-execution checks or the TUI for intercepted input.
+
+Persistent serial logs are treated as untrusted data. They live in a private
+directory, are opened without following symlinks, and `hegn logs show` strips
+terminal escape sequences by default. `--raw` exists for debugging and should
+only be used with logs you trust.
 
 ---
 
@@ -303,7 +363,8 @@ src/
   virtiofs.rs    hardened virtiofsd argv/process construction
   sandbox.rs     MicroVM lifecycle orchestration and status reporting
   snapshot.rs    snapshot metadata store (RAM + CPU files)
-  console.rs     Firecracker serial console transport (FIFO + serial log)
+  logs.rs        persistent serial logs, private files, tail and pruning
+  console.rs     Firecracker serial console transport + tmux-style attach bar
   terminal.rs    ANSI-aware scrollback buffer for the serial console
   state.rs       persisted recent-project state
   app.rs         TUI state machine, key handling, modals, effects

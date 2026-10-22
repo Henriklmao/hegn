@@ -304,6 +304,9 @@ impl Config {
             fs::create_dir_all(dir)
                 .with_context(|| format!("failed to create {}", dir.display()))?;
         }
+        // Logs may contain secrets printed by an agent; never rely on the
+        // process umask for this directory.
+        crate::logs::LogStore::new(self.logs_dir()).ensure()?;
         Ok(())
     }
 
@@ -326,6 +329,15 @@ impl Config {
     /// Runtime directory for API and virtiofs sockets.
     pub fn run_dir(&self) -> PathBuf {
         self.state_dir.join("run")
+    }
+
+    /// Private directory for persistent serial-console logs.
+    ///
+    /// Derived from `state_dir` so existing configurations keep working and
+    /// logs always share a filesystem with the run directory (the serial log
+    /// is hard-linked into the run directory while a VM is alive).
+    pub fn logs_dir(&self) -> PathBuf {
+        self.state_dir.join("logs")
     }
 
     /// Static assets are only usable when both images exist.
@@ -460,6 +472,25 @@ backend = "firecracker"
         assert_eq!(config.effective_backend(), BackendKind::Firecracker);
         assert!(!config.firecracker_ready());
         assert!(config.require_vm_assets().is_err());
+    }
+
+    #[test]
+    fn ensure_dirs_creates_a_private_log_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.state_dir = dir.path().join("state");
+        config.snapshots_dir = dir.path().join("snapshots");
+        config.templates_dir = dir.path().join("templates");
+        config.projects_root = dir.path().join("projects");
+        config.ensure_dirs().unwrap();
+        let mode = fs::metadata(config.logs_dir())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]

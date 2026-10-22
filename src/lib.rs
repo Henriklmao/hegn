@@ -9,6 +9,7 @@
 //! - [`virtiofs`] — hardened `virtiofsd` command construction
 //! - [`sandbox`] — MicroVM lifecycle orchestration
 //! - [`snapshot`] — on-disk snapshot metadata
+//! - [`logs`] — private, persistent serial-console logs
 //! - [`console`] — Firecracker serial-console transport (no host fallback)
 //! - [`terminal`] — ANSI-aware scrollback buffer
 //! - [`state`] — persisted recent-project state
@@ -22,6 +23,7 @@ pub mod cli;
 pub mod config;
 pub mod console;
 pub mod firecracker;
+pub mod logs;
 pub mod project;
 pub mod sandbox;
 pub mod security;

@@ -384,7 +384,7 @@ impl App {
         self.projects.retain(|p| p.path != project.path);
         self.projects.push(project);
         self.projects
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            .sort_by_key(|project| project.name.to_lowercase());
         self.loading = false;
         self.query.clear();
         self.refresh_filter();

@@ -157,7 +157,7 @@ impl SnapshotStore {
                 snapshots.push(meta);
             }
         }
-        snapshots.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        snapshots.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.created_at));
         Ok(snapshots)
     }
 

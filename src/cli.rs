@@ -1,6 +1,7 @@
 //! Non-interactive CLI. Every TUI capability has a CLI counterpart so hegn can
 //! be scripted in CI, used over SSH, or driven by an agent.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -10,10 +11,12 @@ use serde::Serialize;
 
 use crate::app::PACKAGE_CHOICES;
 use crate::config::{Config, Harness};
+use crate::logs::{self, DEFAULT_KEEP, LogStore};
 use crate::project::{self, ProjectMeta};
-use crate::sandbox::{SandboxManager, SandboxReport, process_alive};
+use crate::sandbox::{SandboxManager, SandboxReport, process_alive, process_matches, same_project};
 use crate::security::{Decision, SecurityEngine};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
+use crate::terminal::TerminalBuffer;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -65,6 +68,27 @@ pub enum Commands {
         /// Skip creating a transient git session branch.
         #[arg(long)]
         no_branch: bool,
+        /// Do not reserve a status bar line (for full-screen guest programs).
+        #[arg(long)]
+        no_bar: bool,
+    },
+    /// Attach to the serial console of the already running VM (tmux-style).
+    ///
+    /// Never boots or restarts a VM. The bottom line shows the project name,
+    /// harness, VM pid and persistent serial log; Ctrl-B detaches.
+    #[command(visible_alias = "a")]
+    Attach {
+        /// Optional project name or path; must match the running session.
+        project: Option<String>,
+        /// Do not reserve a status bar line (for full-screen guest programs).
+        #[arg(long)]
+        no_bar: bool,
+    },
+    /// List, inspect and prune persistent serial-console logs.
+    #[command(visible_alias = "log")]
+    Logs {
+        #[command(subcommand)]
+        command: Option<LogCommands>,
     },
     /// Manage the Firecracker sandbox lifecycle.
     Sandbox {
@@ -154,6 +178,34 @@ pub enum SnapshotCommands {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum LogCommands {
+    /// List stored serial logs, newest first.
+    #[command(visible_alias = "ls")]
+    List,
+    /// Print the path of a log (defaults to the newest).
+    Path { name: Option<String> },
+    /// Print the end of a log (defaults to the newest, sanitized).
+    Show {
+        name: Option<String>,
+        /// Number of trailing lines to print.
+        #[arg(long, default_value_t = 80)]
+        lines: usize,
+        /// Write the raw bytes, including guest ANSI escape sequences.
+        ///
+        /// Only use this for logs you trust: guest output can contain terminal
+        /// control sequences.
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Delete all but the newest N session logs.
+    Prune {
+        /// Number of logs to keep (at least 1).
+        #[arg(long, default_value_t = DEFAULT_KEEP)]
+        keep: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ConfigCommands {
     /// Print the effective configuration as TOML.
     Show,
@@ -220,7 +272,12 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
             editor,
             lazygit,
             no_branch,
-        } => open(project, editor, lazygit, no_branch, config),
+            no_bar,
+        } => open(project, editor, lazygit, no_branch, no_bar, config),
+        Commands::Attach { project, no_bar } => attach(project, no_bar, config),
+        Commands::Logs { command } => {
+            logs_command(command.unwrap_or(LogCommands::List), config, json)
+        }
         Commands::Sandbox { command } => sandbox_command(command, config, json),
         Commands::Snapshot { command } => snapshot_command(command, config, json),
         Commands::Check { command, cwd } => check(&command.join(" "), cwd.as_deref(), config, json),
@@ -642,6 +699,7 @@ fn open(
     editor: bool,
     lazygit: bool,
     no_branch: bool,
+    no_bar: bool,
     config: Config,
 ) -> Result<i32> {
     let path = resolve_project(&config, &project)?;
@@ -670,8 +728,132 @@ fn open(
         }
     }
 
-    crate::console::run_interactive(console)?;
+    crate::console::run_interactive(console, !no_bar)?;
     Ok(0)
+}
+
+fn attach(project: Option<String>, no_bar: bool, config: Config) -> Result<i32> {
+    let manager = SandboxManager::new(config.clone());
+    let session = manager.session().with_context(|| {
+        format!(
+            "no VM session in {}; start one with `hegn open <project>` or `hegn sandbox start <project>`",
+            manager.paths().run_dir.display()
+        )
+    })?;
+    if !process_matches(session.firecracker_pid, &config.firecracker_bin) {
+        bail!(
+            "the VM recorded in {} is not running; start it with `hegn sandbox start`",
+            manager.paths().session.display()
+        );
+    }
+    if let Some(arg) = project {
+        let path = resolve_project(&config, &arg)?;
+        if !same_project(&path, &session.project) {
+            bail!(
+                "the running VM belongs to {}; stop it with `hegn sandbox stop` before attaching {}",
+                session.project.display(),
+                path.display()
+            );
+        }
+    }
+    // VmConsole::attach re-verifies that the recorded pid is still the
+    // configured Firecracker binary and that the serial files exist.
+    let console = manager.attach_console()?;
+    crate::console::run_interactive(console, !no_bar)?;
+    Ok(0)
+}
+
+fn logs_command(command: LogCommands, config: Config, json: bool) -> Result<i32> {
+    let store = LogStore::new(config.logs_dir());
+    match command {
+        LogCommands::List => {
+            let entries = store.list()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                println!("No serial logs in {}.", store.root().display());
+            } else {
+                println!("{:<64} {:>12}  MODIFIED", "NAME", "SIZE");
+                for entry in entries {
+                    let modified = entry
+                        .modified
+                        .map(|time| time.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "-".into());
+                    println!(
+                        "{:<64} {:>12}  {}",
+                        entry.name,
+                        human_size(entry.size_bytes),
+                        modified
+                    );
+                }
+            }
+            Ok(0)
+        }
+        LogCommands::Path { name } => {
+            let path = store.resolve(name.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&path)?);
+            } else {
+                println!("{}", path.display());
+            }
+            Ok(0)
+        }
+        LogCommands::Show { name, lines, raw } => {
+            let path = store.resolve(name.as_deref())?;
+            let bytes = logs::tail_bytes(&path, lines)?;
+            let mut out = std::io::stdout();
+            if raw {
+                out.write_all(&bytes)?;
+            } else {
+                // The default path strips ANSI/control sequences from guest
+                // output so a log cannot reprogram or exploit the terminal.
+                let mut buffer = TerminalBuffer::default();
+                buffer.push_bytes(&bytes);
+                let mut lines = buffer.lines();
+                if lines.last().is_some_and(String::is_empty) {
+                    lines.pop();
+                }
+                for line in lines {
+                    // `TerminalBuffer` removed ANSI/control sequences; also
+                    // neutralize bidi overrides so logs cannot spoof prompts.
+                    writeln!(out, "{}", logs::sanitize_label(&line))?;
+                }
+            }
+            out.flush()?;
+            Ok(0)
+        }
+        LogCommands::Prune { keep } => {
+            // Never unlink the log the running VM is still writing to.
+            let protected = SandboxManager::new(config.clone())
+                .session()
+                .and_then(|session| session.serial_log);
+            let removed = store.prune_except(keep, protected.as_deref())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"removed": removed, "kept": keep.max(1)})
+                );
+            } else {
+                println!("Removed {removed} log(s); kept the newest {}.", keep.max(1));
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn run_editor(path: &Path) -> Result<i32> {
@@ -763,6 +945,9 @@ fn print_report(report: &SandboxReport, json: bool) -> Result<()> {
             "virtiofsd    pid {pid} ({})",
             if process_alive(pid) { "alive" } else { "dead" }
         );
+    }
+    if let Some(log) = &report.serial_log {
+        println!("serial log   {}", log.display());
     }
     if let Some(note) = &report.note {
         println!("note         {note}");
@@ -917,6 +1102,70 @@ mod tests {
         assert_eq!(
             snapshot_command(SnapshotCommands::List, config, true).unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn attach_alias_parses_and_accepts_an_optional_project() {
+        let cli = Cli::try_parse_from(["hegn", "a", "demo"]).unwrap();
+        match cli.command {
+            Some(Commands::Attach { project, no_bar }) => {
+                assert_eq!(project.as_deref(), Some("demo"));
+                assert!(!no_bar);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["hegn", "attach"]).unwrap();
+        match cli.command {
+            Some(Commands::Attach { project, .. }) => assert!(project.is_none()),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_without_a_session_is_a_hard_error() {
+        let (_dir, config) = config();
+        let err = attach(None, false, config).unwrap_err().to_string();
+        assert!(err.contains("no VM session"), "{err}");
+    }
+
+    #[test]
+    fn logs_defaults_to_list_and_rejects_traversal() {
+        let (_dir, config) = config();
+        let cli = Cli::try_parse_from(["hegn", "logs"]).unwrap();
+        match cli.command {
+            Some(Commands::Logs { command: None }) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let store = LogStore::new(config.logs_dir());
+        let log = store
+            .create_session(Path::new("/projects/demo"), chrono::Utc::now(), 7)
+            .unwrap();
+        assert_eq!(
+            logs_command(LogCommands::List, config.clone(), true).unwrap(),
+            0
+        );
+        assert_eq!(
+            logs_command(
+                LogCommands::Path {
+                    name: Some(log.file_name().unwrap().to_str().unwrap().to_string()),
+                },
+                config.clone(),
+                true,
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            logs_command(
+                LogCommands::Path {
+                    name: Some("../session-evil.log".into()),
+                },
+                config,
+                true,
+            )
+            .is_err()
         );
     }
 

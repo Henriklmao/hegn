@@ -37,6 +37,7 @@ use crate::firecracker::{
     Action, BootSource, Drive, FirecrackerClient, InstanceInfo, MachineConfig, SnapshotCreate,
     SnapshotLoad, VhostUserFs, VmState,
 };
+use crate::logs::{DEFAULT_KEEP, LogStore};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
 use crate::virtiofs::{VirtiofsConfig, VirtiofsProcess};
 
@@ -104,6 +105,10 @@ pub struct SessionRecord {
     pub firecracker_pid: u32,
     pub virtiofs_pid: u32,
     pub boot_args: String,
+    /// Persistent serial log for this session. Optional so session records
+    /// written by older hegn versions still deserialize.
+    #[serde(default)]
+    pub serial_log: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,6 +124,9 @@ pub struct SandboxReport {
     pub firecracker_pid: Option<u32>,
     pub virtiofs_pid: Option<u32>,
     pub started_at: Option<DateTime<Utc>>,
+    /// Persistent serial console log, if the session predates logging or the
+    /// log has been removed.
+    pub serial_log: Option<PathBuf>,
     pub note: Option<String>,
 }
 
@@ -218,21 +226,40 @@ impl SandboxManager {
             .build()
             .context("failed to build async runtime")?;
 
+        // Serial output is written to a private, persistent log and exposed in
+        // the run directory through a hard link. Create the log before any
+        // process starts so a boot log is never lost and a logging problem is
+        // a hard error rather than a silent downgrade.
+        let started_at = Utc::now();
+        let logs = LogStore::new(self.config.logs_dir());
+        if let Err(err) = logs.prune(DEFAULT_KEEP) {
+            eprintln!("warning: could not prune old serial logs: {err:#}");
+        }
+        let serial_log = logs.create_session(project, started_at, std::process::id())?;
+
         // 1. virtiofsd, sandboxed to exactly this project.
-        let mut virtiofs = spawn_virtiofsd(&self.config, &paths, project)?;
+        let mut virtiofs = match spawn_virtiofsd(&self.config, &paths, project) {
+            Ok(process) => process,
+            Err(err) => {
+                let _ = fs::remove_file(&serial_log);
+                return Err(err);
+            }
+        };
         let virtiofs_pid = virtiofs.pid();
         if let Err(err) = fs::write(&paths.virtiofs_pid, virtiofs_pid.to_string()) {
             virtiofs.kill();
             cleanup_files(&paths);
+            let _ = fs::remove_file(&serial_log);
             return Err(err).context("failed to record the virtiofsd pid");
         }
 
         // 2. Firecracker process. Children outlive this CLI call.
-        let mut firecracker = match spawn_firecracker(&self.config, &paths) {
+        let mut firecracker = match spawn_firecracker(&self.config, &paths, &serial_log) {
             Ok(child) => child,
             Err(err) => {
                 virtiofs.kill();
                 cleanup_files(&paths);
+                let _ = fs::remove_file(&serial_log);
                 return Err(err);
             }
         };
@@ -279,16 +306,18 @@ impl SandboxManager {
             let _ = firecracker.wait();
             virtiofs.kill();
             cleanup_files(&paths);
+            let _ = fs::remove_file(&serial_log);
             return Err(err).context("failed to configure Firecracker");
         }
 
         let record = SessionRecord {
             project: project.to_path_buf(),
             harness,
-            started_at: Utc::now(),
+            started_at,
             firecracker_pid,
             virtiofs_pid,
             boot_args: ROOT_BOOT_ARGS.to_string(),
+            serial_log: Some(serial_log.clone()),
         };
         let recorded = (|| -> Result<()> {
             fs::write(&paths.firecracker_pid, firecracker_pid.to_string())?;
@@ -302,6 +331,7 @@ impl SandboxManager {
             let _ = firecracker.wait();
             virtiofs.kill();
             cleanup_files(&paths);
+            let _ = fs::remove_file(&serial_log);
             return Err(err).context("failed to record the sandbox session");
         }
 
@@ -321,6 +351,7 @@ impl SandboxManager {
             firecracker_pid: Some(firecracker_pid),
             virtiofs_pid: Some(virtiofs_pid),
             started_at: Some(record.started_at),
+            serial_log: Some(serial_log),
             note: Some(format!(
                 "guest workspace mounted at {}",
                 self.config.guest_mount
@@ -461,6 +492,7 @@ impl SandboxManager {
             firecracker_pid: session.as_ref().map(|s| s.firecracker_pid),
             virtiofs_pid: session.as_ref().map(|s| s.virtiofs_pid),
             started_at: session.as_ref().map(|s| s.started_at),
+            serial_log: session.as_ref().and_then(|s| s.serial_log.clone()),
             note,
         })
     }
@@ -591,11 +623,26 @@ impl SandboxManager {
             return Err(err).context("failed to record the virtiofsd pid");
         }
 
-        let mut firecracker = match spawn_firecracker(&self.config, &paths) {
+        let started_at = Utc::now();
+        let logs = LogStore::new(self.config.logs_dir());
+        if let Err(err) = logs.prune(DEFAULT_KEEP) {
+            eprintln!("warning: could not prune old serial logs: {err:#}");
+        }
+        let serial_log = match logs.create_session(&project, started_at, std::process::id()) {
+            Ok(path) => path,
+            Err(err) => {
+                virtiofs.kill();
+                cleanup_files(&paths);
+                return Err(err);
+            }
+        };
+
+        let mut firecracker = match spawn_firecracker(&self.config, &paths, &serial_log) {
             Ok(child) => child,
             Err(err) => {
                 virtiofs.kill();
                 cleanup_files(&paths);
+                let _ = fs::remove_file(&serial_log);
                 return Err(err);
             }
         };
@@ -606,6 +653,7 @@ impl SandboxManager {
             let _ = firecracker.wait();
             virtiofs.kill();
             cleanup_files(&paths);
+            let _ = fs::remove_file(&serial_log);
             return Err(err).context("failed to load the Firecracker snapshot");
         }
 
@@ -615,13 +663,14 @@ impl SandboxManager {
                 .as_ref()
                 .map(|session| session.harness)
                 .unwrap_or(self.config.harness),
-            started_at: Utc::now(),
+            started_at,
             firecracker_pid,
             virtiofs_pid,
             boot_args: existing
                 .as_ref()
                 .map(|session| session.boot_args.clone())
                 .unwrap_or_else(|| ROOT_BOOT_ARGS.to_string()),
+            serial_log: Some(serial_log.clone()),
         };
         let recorded = (|| -> Result<()> {
             fs::write(&paths.firecracker_pid, firecracker_pid.to_string())?;
@@ -633,6 +682,7 @@ impl SandboxManager {
             let _ = firecracker.wait();
             virtiofs.kill();
             cleanup_files(&paths);
+            let _ = fs::remove_file(&serial_log);
             return Err(err).context("failed to record the restored sandbox session");
         }
 
@@ -692,9 +742,10 @@ fn spawn_virtiofsd(
     Ok(process)
 }
 
-fn spawn_firecracker(config: &Config, paths: &SandboxPaths) -> Result<Child> {
+fn spawn_firecracker(config: &Config, paths: &SandboxPaths, serial_log: &Path) -> Result<Child> {
     let _ = fs::remove_file(&paths.api_socket);
     ensure_serial_fifo(&paths.serial_in)?;
+    prepare_serial_output(paths, serial_log)?;
     // Firecracker registers serial input only when stdin is a TTY or a FIFO.
     // O_RDWR keeps both ends open so the child never sees EOF between attaches.
     let serial_in = OpenOptions::new()
@@ -703,13 +754,13 @@ fn spawn_firecracker(config: &Config, paths: &SandboxPaths) -> Result<Child> {
         .custom_flags(libc::O_NONBLOCK)
         .open(&paths.serial_in)
         .with_context(|| format!("failed to open {}", paths.serial_in.display()))?;
+    // Open the persistent log itself (not the hard link) with O_NOFOLLOW so the
+    // guest serial output can never be redirected through a planted symlink.
     let serial_out = OpenOptions::new()
-        .create(true)
         .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&paths.serial_out)
-        .with_context(|| format!("failed to open {}", paths.serial_out.display()))?;
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(serial_log)
+        .with_context(|| format!("failed to open serial log {}", serial_log.display()))?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -732,6 +783,40 @@ fn spawn_firecracker(config: &Config, paths: &SandboxPaths) -> Result<Child> {
                 config.firecracker_bin.display()
             )
         })
+}
+
+/// Expose the persistent serial log at `<run>/serial.out` without copying it.
+///
+/// Firecracker writes once to the log file; console attach reads the same
+/// inode through `serial.out`. Stopping the VM removes only the run-directory
+/// link, so the session log survives.
+fn prepare_serial_output(paths: &SandboxPaths, serial_log: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(serial_log)
+        .with_context(|| format!("serial log {} is missing", serial_log.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to use symlinked serial log {}",
+            serial_log.display()
+        );
+    }
+    if !metadata.file_type().is_file() {
+        bail!("serial log {} is not a regular file", serial_log.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(serial_log, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to secure {}", serial_log.display()))?;
+    }
+    let _ = fs::remove_file(&paths.serial_out);
+    fs::hard_link(serial_log, &paths.serial_out).with_context(|| {
+        format!(
+            "failed to link serial log {} to {}",
+            serial_log.display(),
+            paths.serial_out.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// Create a private FIFO for guest serial input, replacing any stale one.
@@ -995,6 +1080,7 @@ mod tests {
             firecracker_pid: pid,
             virtiofs_pid: pid,
             boot_args: ROOT_BOOT_ARGS.into(),
+            serial_log: None,
         };
         std::fs::write(
             manager.paths().session,
@@ -1090,7 +1176,10 @@ mod tests {
     #[test]
     fn start_reports_missing_virtiofsd() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = SandboxManager::new(config_with_assets(dir.path()));
+        let mut config = config_with_assets(dir.path());
+        // Make the Firecracker preflight pass so this test reaches virtiofsd.
+        config.firecracker_bin = std::env::current_exe().unwrap();
+        let manager = SandboxManager::new(config);
         let project = dir.path().join("projects/demo");
         std::fs::create_dir_all(&project).unwrap();
         let err = manager
@@ -1134,6 +1223,7 @@ mod tests {
             firecracker_pid: 1234,
             virtiofs_pid: 4321,
             boot_args: ROOT_BOOT_ARGS.into(),
+            serial_log: None,
         };
         std::fs::write(
             manager.paths().session,
@@ -1255,6 +1345,66 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("firecracker binary"), "{err}");
+    }
+
+    #[test]
+    fn serial_output_is_hard_linked_to_the_private_log() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SandboxManager::new(config_with_assets(dir.path()));
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        let log = dir.path().join("session-test.log");
+        std::fs::write(&log, b"boot\n").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        prepare_serial_output(&paths, &log).unwrap();
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().ino(),
+            std::fs::metadata(&paths.serial_out).unwrap().ino(),
+            "serial.out must expose the same inode as the persistent log"
+        );
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::write(&paths.serial_out, b"guest output\n").unwrap();
+        assert_eq!(std::fs::read(&log).unwrap(), b"guest output\n");
+    }
+
+    #[test]
+    fn serial_output_refuses_a_symlinked_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SandboxManager::new(config_with_assets(dir.path()));
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"secret").unwrap();
+        let link = dir.path().join("session-link.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = prepare_serial_output(&paths, &link)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlinked serial log"), "{err}");
+        assert!(!paths.serial_out.exists());
+    }
+
+    #[test]
+    fn old_session_records_without_a_log_still_parse() {
+        let raw = r#"{
+            "project": "/projects/demo",
+            "harness": "shell",
+            "started_at": "2026-01-01T00:00:00Z",
+            "firecracker_pid": 1,
+            "virtiofs_pid": 2,
+            "boot_args": ""
+        }"#;
+        let record: SessionRecord = serde_json::from_str(raw).unwrap();
+        assert!(record.serial_log.is_none());
+        assert_eq!(record.project, PathBuf::from("/projects/demo"));
     }
 
     #[test]

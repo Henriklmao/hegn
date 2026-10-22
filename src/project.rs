@@ -105,7 +105,7 @@ pub fn discover(root: &Path) -> io::Result<Vec<Project>> {
         }
         projects.push(Project::load(path));
     }
-    projects.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    projects.sort_by_key(|project| project.name.to_lowercase());
     Ok(projects)
 }
 
