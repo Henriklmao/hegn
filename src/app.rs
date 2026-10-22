@@ -149,6 +149,7 @@ pub enum ActionId {
     Quit,
     Back,
     ToggleRaw,
+    ScrollUp,
     NewSnapshot,
     DeleteSnapshot,
     Restore,
@@ -364,14 +365,13 @@ impl App {
         self.loading = false;
         self.refresh_filter();
         let preferred = previous.or_else(|| self.store.state().last_project.clone());
-        if let Some(path) = preferred {
-            if let Some(index) = self
+        if let Some(path) = preferred
+            && let Some(index) = self
                 .visible
                 .iter()
                 .position(|&i| self.projects[i].path == path)
-            {
-                self.selected = index;
-            }
+        {
+            self.selected = index;
         }
     }
 
@@ -763,12 +763,12 @@ impl App {
     fn write_line(&mut self, line: &str) {
         let mut error = None;
         let mut active = false;
-        if let Some(session) = self.session.as_mut() {
-            if !session.is_exited() {
-                active = true;
-                if let Err(err) = session.send_line(line) {
-                    error = Some(err.to_string());
-                }
+        if let Some(session) = self.session.as_mut()
+            && !session.is_exited()
+        {
+            active = true;
+            if let Err(err) = session.send_line(line) {
+                error = Some(err.to_string());
             }
         }
         if let Some(error) = error {
@@ -783,12 +783,12 @@ impl App {
     fn write_bytes(&mut self, bytes: &[u8]) {
         let mut error = None;
         let mut active = false;
-        if let Some(session) = self.session.as_mut() {
-            if !session.is_exited() {
-                active = true;
-                if let Err(err) = session.send(bytes) {
-                    error = Some(err.to_string());
-                }
+        if let Some(session) = self.session.as_mut()
+            && !session.is_exited()
+        {
+            active = true;
+            if let Err(err) = session.send(bytes) {
+                error = Some(err.to_string());
             }
         }
         if let Some(error) = error {
@@ -1051,11 +1051,12 @@ impl App {
             return Vec::new();
         };
 
-        if let Some(session) = &mut self.session {
-            if !session.is_exited() && session.project() == project.path {
-                self.screen = Screen::Terminal;
-                return Vec::new();
-            }
+        if let Some(session) = &mut self.session
+            && !session.is_exited()
+            && session.project() == project.path
+        {
+            self.screen = Screen::Terminal;
+            return Vec::new();
         }
         self.session = None;
         self.terminal.clear();
@@ -1178,6 +1179,12 @@ impl App {
             }
             ActionId::ToggleRaw => {
                 self.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            }
+            ActionId::ScrollUp => {
+                if self.screen == Screen::Terminal {
+                    self.scroll = self.scroll.saturating_add(5).min(self.terminal.len());
+                }
+                Vec::new()
             }
             ActionId::Restore => self.confirm_restore_snapshot(),
             ActionId::DeleteSnapshot => self.confirm_delete_snapshot(),
@@ -1328,6 +1335,10 @@ pub fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
                 } else {
                     return None;
                 }
+            } else if key.modifiers.contains(KeyModifiers::ALT) {
+                let mut bytes = vec![0x1b];
+                bytes.extend(c.to_string().into_bytes());
+                bytes
             } else {
                 c.to_string().into_bytes()
             }
@@ -1617,6 +1628,16 @@ mod tests {
     }
 
     #[test]
+    fn terminal_scroll_footer_action_scrolls_instead_of_opening() {
+        let (_dir, mut app) = test_app();
+        app.screen = Screen::Terminal;
+        app.terminal.push_bytes(b"one\ntwo\n");
+        app.handle_action(ActionId::ScrollUp);
+        assert!(app.scroll > 0);
+        assert_eq!(app.screen, Screen::Terminal);
+    }
+
+    #[test]
     fn terminal_input_collects_and_clears_on_empty_submit() {
         let (_dir, mut app) = test_app();
         app.screen = Screen::Terminal;
@@ -1698,6 +1719,8 @@ mod tests {
         assert_eq!(encode_key(ctrl_c), Some(vec![0x03]));
         assert_eq!(encode_key(key(KeyCode::Up)), Some(b"\x1b[A".to_vec()));
         assert_eq!(encode_key(key(KeyCode::F(2))), Some(b"\x1bOQ".to_vec()));
+        let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
+        assert_eq!(encode_key(alt_b), Some(vec![0x1b, b'b']));
     }
 
     #[test]

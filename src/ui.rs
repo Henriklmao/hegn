@@ -835,7 +835,7 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
             FooterDef {
                 key: "PgUp",
                 label: "Scroll",
-                action: ActionId::Open,
+                action: ActionId::ScrollUp,
             },
             FooterDef {
                 key: "?",
