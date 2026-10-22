@@ -1055,15 +1055,11 @@ impl App {
             return Vec::new();
         };
 
-        if self
+        let attached_to_project = self
             .session
-            .as_mut()
-            .is_some_and(|session| !session.is_exited())
-            && self
-                .session
-                .as_ref()
-                .is_some_and(|session| session.project() == project.path)
-        {
+            .as_ref()
+            .is_some_and(|session| crate::sandbox::same_project(session.project(), &project.path));
+        if attached_to_project && self.session_active() {
             self.screen = Screen::Terminal;
             return Vec::new();
         }
@@ -1836,6 +1832,23 @@ mod tests {
         assert_eq!(app.screen, Screen::Terminal);
         assert_eq!(app.sandbox.state, SandboxState::Running);
         assert!(app.session_active());
+    }
+
+    #[test]
+    fn reopening_the_same_project_through_a_symlink_reuses_the_console() {
+        let (dir, mut app) = test_app();
+        let real = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("demo-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut project = fake_project("demo");
+        project.path = link;
+        app.set_projects(vec![project]);
+
+        app.attach_console(Box::new(FakeConsole::new(&real)));
+        let effects = app.open_selected();
+        assert!(effects.is_empty(), "must not boot a second VM");
+        assert_eq!(app.screen, Screen::Terminal);
     }
 
     #[test]
