@@ -21,7 +21,7 @@ enum AnsiState {
 pub struct TerminalBuffer {
     lines: VecDeque<String>,
     partial: String,
-    /// Bytes of a UTF-8 sequence split across PTY reads.
+    /// Bytes of a UTF-8 sequence split across serial reads.
     pending: Vec<u8>,
     state: AnsiState,
     max_lines: usize,

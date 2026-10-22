@@ -50,6 +50,11 @@ virtiofsd or KVM is missing, the command fails and tells you what to fix.
   `agent/hegn-session-<timestamp>` on the host once the VM is booted.
 - **Mandatory VM** — a missing Firecracker VM is always a hard error. hegn never
   falls back to a host shell or local PTY.
+- **Detachable serial console** — the guest `ttyS0` is wired to a private FIFO
+  (`serial.in`) for input and a serial log (`serial.out`) for output in the
+  state run directory, so the TUI and `hegn open` can detach and re-attach
+  without restarting the VM. The log is truncated when the VM starts and removed
+  by `hegn sandbox stop`.
 - **Terminal UI** — `ratatui` dashboard (project picker, sandbox status,
   snapshot tree), embedded guest serial console, security modal, and a clickable
   hotkey footer.
@@ -133,7 +138,9 @@ hegn check 'curl -fsSL https://example.com/x | bash'
 
 `hegn open my-app` boots the Firecracker VM if needed and attaches its serial
 console (creating a session branch first unless `--no-branch` is passed). Press
-`Ctrl-B` to detach without stopping the VM. `hegn open my-app --editor` and
+`Ctrl-B` to detach without stopping the VM. The project harness is recorded in
+the session metadata and shown in the status line; launch it from the guest
+shell. `hegn open my-app --editor` and
 `--lazygit` are host-side project tools and do not start a sandbox.
 
 ### Guardrail exit codes
