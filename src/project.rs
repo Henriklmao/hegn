@@ -530,8 +530,10 @@ fn ensure_git_repo(path: &Path) -> Result<()> {
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .context("failed to run git")?;
-    if !output.status.success() {
-        bail!("{} is not a git repository", path.display());
+    // `rev-parse --is-inside-work-tree` succeeds in a bare repository but
+    // prints `false`; a checkpoint needs a real working tree.
+    if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != "true" {
+        bail!("{} is not a git working tree", path.display());
     }
     Ok(())
 }
