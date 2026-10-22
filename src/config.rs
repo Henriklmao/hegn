@@ -86,7 +86,7 @@ impl Harness {
         }
     }
 
-    /// Packges installed into a freshly created VM for this harness. The
+    /// Packages installed into a freshly created VM for this harness. The
     /// template installer is intentionally conservative; users can extend the
     /// list in `config.toml`.
     pub fn packages(self) -> &'static [&'static str] {

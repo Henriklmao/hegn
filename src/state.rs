@@ -16,7 +16,7 @@ pub struct RecentEntry {
     pub opened_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedState {
     #[serde(default = "state_version")]
     pub version: u32,
@@ -24,6 +24,16 @@ pub struct PersistedState {
     pub recent: Vec<RecentEntry>,
     #[serde(default)]
     pub last_project: Option<PathBuf>,
+}
+
+impl Default for PersistedState {
+    fn default() -> Self {
+        Self {
+            version: state_version(),
+            recent: Vec::new(),
+            last_project: None,
+        }
+    }
 }
 
 fn state_version() -> u32 {
@@ -65,10 +75,7 @@ impl StateStore {
         let state = fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_else(|| PersistedState {
-                version: state_version(),
-                ..PersistedState::default()
-            });
+            .unwrap_or_default();
         Self { path, state }
     }
 
@@ -138,6 +145,14 @@ mod tests {
         fs::write(&path, "{oops").unwrap();
         let store = StateStore::load(&path);
         assert!(store.state().recent.is_empty());
+    }
+
+    #[test]
+    fn default_state_uses_current_version() {
+        assert_eq!(PersistedState::default().version, state_version());
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::load(dir.path().join("state.json"));
+        assert_eq!(store.state().version, state_version());
     }
 
     #[test]

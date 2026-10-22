@@ -7,10 +7,14 @@
 //! - [`security`] — `tirith-core` integration and workspace guardrails
 //! - [`firecracker`] — typed Firecracker REST client over a Unix socket
 //! - [`virtiofs`] — hardened `virtiofsd` command construction
+//! - [`sandbox`] — MicroVM lifecycle orchestration
 //! - [`snapshot`] — on-disk snapshot metadata
 //! - [`session`] — PTY-backed local session used by the terminal view
+//! - [`state`] — persisted recent-project state
 //! - [`app`] — TUI application state and event handling
 //! - [`ui`] — ratatui rendering
+//! - [`tui`] — terminal lifecycle and event loop
+//! - [`cli`] — non-interactive command surface
 
 pub mod app;
 pub mod cli;

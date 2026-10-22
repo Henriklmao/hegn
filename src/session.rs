@@ -256,6 +256,8 @@ enum AnsiState {
 pub struct TerminalBuffer {
     lines: VecDeque<String>,
     partial: String,
+    /// Bytes of a UTF-8 sequence split across PTY reads.
+    pending: Vec<u8>,
     state: AnsiState,
     max_lines: usize,
 }
@@ -271,13 +273,39 @@ impl TerminalBuffer {
         Self {
             lines: VecDeque::new(),
             partial: String::new(),
+            pending: Vec::new(),
             state: AnsiState::Ground,
             max_lines: max_lines.max(1),
         }
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) {
-        let text = String::from_utf8_lossy(bytes);
+        self.pending.extend_from_slice(bytes);
+        let decoded = {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => Ok(text.to_string()),
+                Err(err) => Err((err.valid_up_to(), err.error_len().is_none())),
+            }
+        };
+        let text = match decoded {
+            Ok(text) => {
+                self.pending.clear();
+                text
+            }
+            Err((valid, true)) => {
+                // Incomplete sequence at the end: keep it for the next read.
+                let text = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
+                self.pending.drain(..valid);
+                text
+            }
+            Err((_, false)) => {
+                // Invalid bytes: render replacement characters rather than
+                // stalling forever on them.
+                let text = String::from_utf8_lossy(&self.pending).into_owned();
+                self.pending.clear();
+                text
+            }
+        };
         for ch in text.chars() {
             self.push_char(ch);
         }
@@ -368,6 +396,7 @@ impl TerminalBuffer {
     pub fn clear(&mut self) {
         self.lines.clear();
         self.partial.clear();
+        self.pending.clear();
         self.state = AnsiState::Ground;
     }
 
@@ -403,6 +432,23 @@ mod tests {
         let mut buf = TerminalBuffer::default();
         buf.push_bytes(b"ab\x08c\tX\n");
         assert_eq!(buf.lines()[0], "ac  X");
+    }
+
+    #[test]
+    fn buffer_reassembles_utf8_split_across_reads() {
+        let mut buf = TerminalBuffer::default();
+        for byte in "héllo ✓".as_bytes() {
+            // One byte per read splits every multi-byte character.
+            buf.push_bytes(&[*byte]);
+        }
+        assert_eq!(buf.lines()[0], "héllo ✓");
+    }
+
+    #[test]
+    fn buffer_replaces_invalid_utf8() {
+        let mut buf = TerminalBuffer::default();
+        buf.push_bytes(b"ok \xff\n");
+        assert_eq!(buf.lines()[0], "ok �");
     }
 
     #[test]
