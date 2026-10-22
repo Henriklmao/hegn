@@ -58,10 +58,11 @@ impl VirtiofsConfig {
         if self.socket_path.as_os_str().is_empty() {
             bail!("virtiofsd socket path is empty");
         }
-        if let Some(parent) = self.socket_path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                bail!("socket directory {} does not exist", parent.display());
-            }
+        if let Some(parent) = self.socket_path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            bail!("socket directory {} does not exist", parent.display());
         }
 
         let mut args: Vec<OsString> = vec![

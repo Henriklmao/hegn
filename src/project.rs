@@ -75,10 +75,10 @@ impl Project {
 
     pub fn display_path(&self) -> String {
         let home = dirs::home_dir();
-        if let Some(home) = home {
-            if let Ok(rest) = self.path.strip_prefix(&home) {
-                return format!("~/{}", rest.display());
-            }
+        if let Some(home) = home
+            && let Ok(rest) = self.path.strip_prefix(&home)
+        {
+            return format!("~/{}", rest.display());
         }
         self.path.display().to_string()
     }
