@@ -1,0 +1,48 @@
+name: aur-publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  aur-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Generate PKGBUILD
+        run: bash ./generate-pkgbuild.bash "${{ github.ref_name }}"
+
+      - name: Publish AUR package
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+        with:
+          pkgname: display-tui
+          pkgbuild: ./PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: Update AUR package to ${{ github.ref_name }}
+          ssh_keyscan_types: rsa,ecdsa,ed25519
+
+  aur-publish-bin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Generate PKGBUILD for pre-built binary
+        run: bash ./generate-pkgbuild-bin.bash "${{ github.ref_name }}"
+
+      - name: Publish AUR package (bin)
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+        with:
+          pkgname: display-tui-bin
+          pkgbuild: ./PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: Update AUR package to ${{ github.ref_name }}
+          ssh_keyscan_types: rsa,ecdsa,ed25519
