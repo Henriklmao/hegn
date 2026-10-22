@@ -83,6 +83,10 @@ impl VirtiofsConfig {
     }
 
     /// Spawn the daemon with stdout/stderr detached from the TUI.
+    ///
+    /// Both streams go to the null device: inheriting them would corrupt the
+    /// alternate screen, and a piped stream that nobody drains fills up and
+    /// blocks virtiofsd mid-session.
     pub fn spawn(&self) -> Result<VirtiofsProcess> {
         let args = self.build_args()?;
         // The socket may be left over from a crashed session.
@@ -93,7 +97,7 @@ impl VirtiofsConfig {
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .with_context(|| {
                 format!(
@@ -238,6 +242,28 @@ mod tests {
             "/definitely/missing/dir/fs.sock",
         );
         assert!(cfg.build_args().is_err());
+    }
+
+    #[test]
+    fn spawn_does_not_block_on_noisy_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (project, run) = setup();
+        let socket = run.path().join("fs.sock");
+        let binary = run.path().join("fake-virtiofsd");
+        let script = format!(
+            "#!/bin/sh\n# More than a pipe buffer: must be discarded, not left unread.\nhead -c 262144 /dev/zero >&2\ntouch '{}'\n",
+            socket.display()
+        );
+        fs::write(&binary, script).unwrap();
+        fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg = VirtiofsConfig::new(&binary, project.path(), &socket);
+        let mut process = cfg.spawn().unwrap();
+        process
+            .wait_for_socket(Duration::from_secs(5))
+            .expect("noisy virtiofsd should still create its socket");
+        process.kill();
     }
 
     #[test]

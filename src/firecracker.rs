@@ -15,6 +15,9 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Firecracker responses are tiny; bound reads so a stuck or malicious socket
+/// peer cannot make hegn buffer unbounded data in memory.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -34,6 +37,7 @@ pub enum Error {
 #[serde(rename_all = "PascalCase")]
 pub enum VmState {
     #[default]
+    #[serde(alias = "Not started")]
     NotStarted,
     Starting,
     Running,
@@ -273,7 +277,15 @@ impl FirecrackerClient {
         stream.flush().await?;
 
         let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).await?;
+        stream
+            .take(MAX_RESPONSE_BYTES as u64 + 1)
+            .read_to_end(&mut raw)
+            .await?;
+        if raw.len() > MAX_RESPONSE_BYTES {
+            return Err(
+                Error::Protocol(format!("response exceeds {MAX_RESPONSE_BYTES} bytes")).into(),
+            );
+        }
         parse_http_response(&raw)
     }
 }
@@ -285,6 +297,9 @@ struct HttpResponse {
 }
 
 fn parse_http_response(raw: &[u8]) -> Result<HttpResponse> {
+    if raw.len() > MAX_RESPONSE_BYTES {
+        return Err(Error::Protocol(format!("response exceeds {MAX_RESPONSE_BYTES} bytes")).into());
+    }
     let header_end = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -517,6 +532,28 @@ mod tests {
         assert_eq!(info.state, VmState::Running);
         assert_eq!(info.vmm_version, "1.9.0");
         assert_eq!(handle.await.unwrap()[0].method, "GET");
+    }
+
+    #[tokio::test]
+    async fn reads_stopped_instance_state() {
+        // Firecracker spells the state with a space, unlike the PascalCase
+        // variant name.
+        let (_dir, path, handle) = spawn_mock(vec![(
+            200,
+            r#"{"id":"hegn","state":"Not started","vmm_version":"1.9.0","app_name":"Firecracker"}"#
+                .into(),
+        )]);
+        let info = FirecrackerClient::new(&path).instance_info().await.unwrap();
+        assert_eq!(info.state, VmState::NotStarted);
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn rejects_oversized_responses() {
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n".to_vec();
+        raw.resize(MAX_RESPONSE_BYTES + 1, b'x');
+        let err = format!("{:#}", parse_http_response(&raw).unwrap_err());
+        assert!(err.contains("exceeds"), "{err}");
     }
 
     #[tokio::test]

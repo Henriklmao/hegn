@@ -115,7 +115,7 @@ impl SandboxManager {
 
     pub fn is_running(&self) -> bool {
         self.session()
-            .map(|session| process_alive(session.firecracker_pid))
+            .map(|session| process_matches(session.firecracker_pid, &self.config.firecracker_bin))
             .unwrap_or(false)
     }
 
@@ -221,8 +221,20 @@ impl SandboxManager {
             virtiofs_pid,
             boot_args: ROOT_BOOT_ARGS.to_string(),
         };
-        fs::write(&paths.firecracker_pid, firecracker_pid.to_string())?;
-        fs::write(&paths.session, serde_json::to_string_pretty(&record)?)?;
+        let recorded = (|| -> Result<()> {
+            fs::write(&paths.firecracker_pid, firecracker_pid.to_string())?;
+            fs::write(&paths.session, serde_json::to_string_pretty(&record)?)?;
+            Ok(())
+        })();
+        if let Err(err) = recorded {
+            // Without the session record a later `stop` cannot find the VM, so
+            // tear everything down instead of leaking a running Firecracker.
+            let _ = firecracker.kill();
+            let _ = firecracker.wait();
+            virtiofs.kill();
+            cleanup_files(&paths);
+            return Err(err).context("failed to record the sandbox session");
+        }
 
         // Do not kill the children on drop.
         std::mem::forget(firecracker);
@@ -264,8 +276,11 @@ impl SandboxManager {
             bail!("no sandbox session found in {}", paths.run_dir.display());
         }
 
-        for pid in [firecracker_pid, virtiofs_pid].into_iter().flatten() {
-            terminate(pid);
+        if let Some(pid) = firecracker_pid {
+            terminate(pid, &self.config.firecracker_bin);
+        }
+        if let Some(pid) = virtiofs_pid {
+            terminate(pid, &self.config.virtiofsd_bin);
         }
         cleanup_files(&paths);
         Ok(())
@@ -301,7 +316,7 @@ impl SandboxManager {
         let session = self.session();
         let virtiofs_running = session
             .as_ref()
-            .map(|s| process_alive(s.virtiofs_pid))
+            .map(|s| process_matches(s.virtiofs_pid, &self.config.virtiofsd_bin))
             .unwrap_or(false);
         let api_socket_exists = paths.api_socket.exists();
         let mut state = if api_socket_exists {
@@ -356,8 +371,9 @@ impl SandboxManager {
     pub async fn create_snapshot(&self, project: &Path, name: &str) -> Result<SnapshotMeta> {
         let paths = self.paths();
         ensure_socket(&paths.api_socket)?;
+        let name = crate::snapshot::sanitize_name(name)?;
         let store = SnapshotStore::new(&self.config.snapshots_dir);
-        let prepared = store.prepare(name)?;
+        let prepared = store.prepare(&name)?;
         let snapshot_path = prepared.snapshot_path;
         let mem_file_path = prepared.mem_file_path;
         let snap_dir = prepared.dir;
@@ -424,11 +440,11 @@ impl SandboxManager {
     fn cleanup_stale(&self) {
         let paths = self.paths();
         if let Some(session) = self.session() {
-            if process_alive(session.firecracker_pid) {
+            if process_matches(session.firecracker_pid, &self.config.firecracker_bin) {
                 return;
             }
-            terminate(session.firecracker_pid);
-            terminate(session.virtiofs_pid);
+            terminate(session.firecracker_pid, &self.config.firecracker_bin);
+            terminate(session.virtiofs_pid, &self.config.virtiofsd_bin);
         }
         cleanup_files(&paths);
     }
@@ -492,15 +508,42 @@ fn read_pid(path: &Path) -> Option<u32> {
 }
 
 pub fn process_alive(pid: u32) -> bool {
+    // `kill(0, ...)` and `kill(-pgrp, ...)` target hegn's own process group or
+    // an arbitrary group, so only real positive PIDs are considered.
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
     // Safety: kill(2) with signal 0 only probes for existence.
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
-fn terminate(pid: u32) {
+/// Whether `pid` is alive *and* still runs the expected executable.
+///
+/// PID files and `session.json` outlive crashes and reboots. Without this check
+/// a recycled PID could make hegn report a stale VM as running, or worse, send
+/// SIGKILL to an unrelated process.
+pub fn process_matches(pid: u32, binary: &Path) -> bool {
     if !process_alive(pid) {
+        return false;
+    }
+    let Some(expected) = binary.file_name() else {
+        return false;
+    };
+    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let argv0 = cmdline.split(|byte| *byte == 0).next().unwrap_or(&[]);
+    let argv0 = String::from_utf8_lossy(argv0);
+    Path::new(argv0.as_ref())
+        .file_name()
+        .is_some_and(|actual| actual == expected)
+}
+
+fn terminate(pid: u32, binary: &Path) {
+    if !process_matches(pid, binary) {
         return;
     }
-    // Safety: the pid came from our own pid files/session record.
+    // Safety: the pid was verified to belong to the expected executable.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGTERM);
     }
@@ -511,6 +554,7 @@ fn terminate(pid: u32) {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+    // Safety: same process as above; escalate to SIGKILL after the grace period.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGKILL);
     }
@@ -643,6 +687,26 @@ mod tests {
     fn process_alive_detects_self() {
         assert!(process_alive(std::process::id()));
         assert!(!process_alive(4_000_000_000));
+    }
+
+    #[test]
+    fn process_alive_rejects_pid_zero_and_out_of_range() {
+        // `kill(0, 0)` probes hegn's own process group and would otherwise
+        // report true (and allow terminate(0) to signal our own group).
+        assert!(!process_alive(0));
+        assert!(!process_alive(u32::MAX));
+        assert!(!process_alive(i32::MAX as u32 + 1));
+    }
+
+    #[test]
+    fn process_matches_verifies_the_executable() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(process_matches(std::process::id(), &exe));
+        assert!(!process_matches(
+            std::process::id(),
+            Path::new("/definitely/not/this-binary")
+        ));
+        assert!(!process_matches(0, &exe));
     }
 
     #[test]
