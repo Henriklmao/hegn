@@ -445,7 +445,6 @@ impl SandboxManager {
                 snapshot.mem_file_path.display()
             );
         }
-
         let existing = self.session();
         let project = snapshot
             .project
@@ -454,6 +453,20 @@ impl SandboxManager {
             .context("snapshot has no project; cannot start the shared filesystem")?;
         if !project.is_dir() {
             bail!("snapshot project {} no longer exists", project.display());
+        }
+        // Preflight the binaries before stopping a running VM, so a typo in
+        // the configuration does not cost the user their current sandbox.
+        if !command_available(&self.config.firecracker_bin) {
+            bail!(
+                "firecracker binary {} was not found",
+                self.config.firecracker_bin.display()
+            );
+        }
+        if !command_available(&self.config.virtiofsd_bin) {
+            bail!(
+                "virtiofsd binary {} was not found",
+                self.config.virtiofsd_bin.display()
+            );
         }
 
         // Stop the old VM and its filesystem daemon. Both sockets are freed
@@ -655,6 +668,15 @@ fn ensure_socket(path: &Path) -> Result<()> {
 
 fn read_pid(path: &Path) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Is `binary` either an existing path or a command found on `PATH`?
+fn command_available(binary: &Path) -> bool {
+    if binary.components().count() > 1 {
+        return binary.is_file();
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(binary).is_file()))
 }
 
 pub fn process_alive(pid: u32) -> bool {
@@ -932,6 +954,38 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no project"), "{err}");
+    }
+
+    #[test]
+    fn restore_preflights_binaries_before_stopping_a_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.firecracker_bin = PathBuf::from("/definitely/missing/firecracker");
+        config.virtiofsd_bin = PathBuf::from("/definitely/missing/virtiofsd");
+        let manager = SandboxManager::new(config);
+        let snap = dir.path().join("vm.snap");
+        let mem = dir.path().join("vm.mem");
+        std::fs::write(&snap, b"state").unwrap();
+        std::fs::write(&mem, b"memory").unwrap();
+        let snapshot = SnapshotMeta {
+            name: "demo".into(),
+            created_at: Utc::now(),
+            vm_state: "Paused".into(),
+            snapshot_path: snap,
+            mem_file_path: mem,
+            project: Some(dir.path().join("projects")),
+            size_bytes: 0,
+            note: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(manager.restore_snapshot(&snapshot))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("firecracker binary"), "{err}");
     }
 
     #[test]
