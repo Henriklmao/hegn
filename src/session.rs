@@ -208,6 +208,7 @@ impl Session {
 
     pub fn kill(&mut self) {
         let _ = self.child.kill();
+        let _ = self.child.wait();
         self.exited = true;
     }
 }
@@ -227,6 +228,8 @@ impl std::fmt::Debug for Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        // Reap the child so repeated sessions cannot accumulate zombies.
+        let _ = self.child.wait();
     }
 }
 
