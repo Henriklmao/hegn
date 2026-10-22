@@ -376,7 +376,9 @@ fn destructive_rm_risk(command: &str) -> Option<(&'static str, &'static str)> {
                 if target == "~"
                     || target.starts_with("~/")
                     || target == "$home"
+                    || target.starts_with("$home/")
                     || target == "${home}"
+                    || target.starts_with("${home}/")
                 {
                     return Some((
                         "recursive delete of the home directory",
@@ -423,6 +425,10 @@ fn git_force_push_risk(command: &str) -> Option<(&'static str, &'static str)> {
             token,
             "--force" | "--force-with-lease" | "--force-if-includes"
         ) {
+            return true;
+        }
+        if token.starts_with('+') && token.len() > 1 {
+            // A leading `+` in a refspec forces the update.
             return true;
         }
         let Some(flags) = token.strip_prefix('-') else {
@@ -528,6 +534,7 @@ mod tests {
             "rm -fr /workspace",
             "sudo rm -r -f /",
             "rm -rf \"$HOME\"",
+            "rm -rf \"$HOME/\"",
             "git clean -fd",
             "git clean --force -d",
         ] {
@@ -539,7 +546,11 @@ mod tests {
                 "{command} should not be flagged"
             );
         }
-        for command in ["git push -f origin main", "git push --force-with-lease"] {
+        for command in [
+            "git push -f origin main",
+            "git push --force-with-lease",
+            "git push origin +main",
+        ] {
             assert!(detect_workspace_risk(command).is_some(), "{command}");
         }
         assert!(detect_workspace_risk("git push origin main").is_none());
