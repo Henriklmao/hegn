@@ -135,7 +135,9 @@ impl VirtiofsProcess {
 
     /// Wait until virtiofsd has created its socket.
     pub fn wait_for_socket(&mut self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .context("socket wait timeout is too large")?;
         while Instant::now() < deadline {
             if self.socket_path.exists() {
                 return Ok(());
