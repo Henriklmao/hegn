@@ -13,9 +13,13 @@
 //! - [`ui`] — ratatui rendering
 
 pub mod config;
+pub mod firecracker;
 pub mod project;
+pub mod sandbox;
 pub mod security;
 pub mod session;
+pub mod snapshot;
 pub mod state;
+pub mod virtiofs;
 
 pub use config::{BackendKind, Config, Harness, SecurityMode};
