@@ -170,7 +170,10 @@ impl SecurityEngine {
         }
 
         findings.sort_by(|a, b| b.severity.cmp(&a.severity));
-        findings.dedup_by(|a, b| a.rule == b.rule && a.title == b.title);
+        // Keep the highest-severity copy of each rule/title pair. Sorting by
+        // severity first makes the first occurrence the one to retain.
+        let mut seen = std::collections::HashSet::new();
+        findings.retain(|finding| seen.insert((finding.rule.clone(), finding.title.clone())));
 
         if findings.is_empty() {
             return Inspection::allowed();
@@ -275,27 +278,14 @@ pub fn detect_workspace_risk(command: &str) -> Option<WorkspaceRisk> {
     let normalized = command.to_lowercase();
     let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
 
+    if let Some((title, description)) = destructive_rm_risk(&collapsed) {
+        return Some(WorkspaceRisk { title, description });
+    }
+    if let Some((title, description)) = git_clean_risk(&collapsed) {
+        return Some(WorkspaceRisk { title, description });
+    }
+
     let destructive = [
-        (
-            "rm -rf /workspace",
-            "recursive delete of the workspace",
-            "Deleting /workspace destroys every uncommitted change in the shared project.",
-        ),
-        (
-            "rm -rf /",
-            "recursive delete of the filesystem root",
-            "This command would delete the guest root filesystem.",
-        ),
-        (
-            "rm -rf ~",
-            "recursive delete of the home directory",
-            "Deleting the home directory destroys agent state and credentials.",
-        ),
-        (
-            "git clean -fdx",
-            "git clean of ignored and untracked files",
-            "This removes untracked files, including local configuration and secrets.",
-        ),
         (
             "git reset --hard",
             "hard git reset",
@@ -344,6 +334,86 @@ pub fn detect_workspace_risk(command: &str) -> Option<WorkspaceRisk> {
     }
 
     None
+}
+
+/// Detect `rm` invocations that combine recursive and force flags and target
+/// the workspace, the home directory or the filesystem root, regardless of the
+/// flag order.
+fn destructive_rm_risk(command: &str) -> Option<(&'static str, &'static str)> {
+    for segment in command.split(['\n', ';', '&', '|']) {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        for (index, token) in tokens.iter().enumerate() {
+            if *token != "rm" && !token.ends_with("/rm") {
+                continue;
+            }
+            let mut recursive = false;
+            let mut force = false;
+            let mut targets = Vec::new();
+            for arg in &tokens[index + 1..] {
+                if let Some(long) = arg.strip_prefix("--") {
+                    match long {
+                        "recursive" => recursive = true,
+                        "force" => force = true,
+                        _ => {}
+                    }
+                } else if arg.starts_with('-') && *arg != "-" {
+                    let flags = &arg[1..];
+                    recursive |= flags.contains('r') || flags.contains('R');
+                    force |= flags.contains('f');
+                } else {
+                    targets.push(*arg);
+                }
+            }
+            if !(recursive && force) {
+                continue;
+            }
+            for target in targets {
+                let target = target.trim_matches(|c| c == '\'' || c == '"');
+                if target == "/" || target == "/*" {
+                    return Some((
+                        "recursive delete of the filesystem root",
+                        "This command would delete the guest root filesystem.",
+                    ));
+                }
+                if target == "~"
+                    || target.starts_with("~/")
+                    || target == "$home"
+                    || target == "${home}"
+                {
+                    return Some((
+                        "recursive delete of the home directory",
+                        "Deleting the home directory destroys agent state and credentials.",
+                    ));
+                }
+                if target == "/workspace" || target.starts_with("/workspace/") {
+                    return Some((
+                        "recursive delete of the workspace",
+                        "Deleting /workspace destroys every uncommitted change in the shared project.",
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `git clean` with a force flag removes untracked files, even without `-x`.
+fn git_clean_risk(command: &str) -> Option<(&'static str, &'static str)> {
+    let rest = command.split("git clean").nth(1)?;
+    let segment = rest.split(['\n', ';', '&', '|']).next().unwrap_or("");
+    let forced = segment.split_whitespace().any(|token| {
+        if token == "--force" {
+            return true;
+        }
+        let Some(flags) = token.strip_prefix('-') else {
+            return false;
+        };
+        !flags.starts_with('-') && flags.contains('f')
+    });
+    forced.then_some((
+        "git clean of untracked files",
+        "This removes untracked files, including local configuration and secrets.",
+    ))
 }
 
 #[cfg(test)]
@@ -433,6 +503,25 @@ mod tests {
         let destructive = engine.inspect("rm -rf /workspace", None);
         assert_eq!(destructive.decision, Decision::Allow);
         assert!(destructive.destructive);
+    }
+
+    #[test]
+    fn destructive_rm_flag_order_and_git_clean_variants_are_detected() {
+        for command in [
+            "rm -fr /workspace",
+            "sudo rm -r -f /",
+            "rm -rf \"$HOME\"",
+            "git clean -fd",
+            "git clean --force -d",
+        ] {
+            assert!(detect_workspace_risk(command).is_some(), "{command}");
+        }
+        for command in ["git clean -n", "rm -rf ./build", "rm -rf /workspace2"] {
+            assert!(
+                detect_workspace_risk(command).is_none(),
+                "{command} should not be flagged"
+            );
+        }
     }
 
     #[test]
