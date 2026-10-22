@@ -54,9 +54,11 @@ jobs:
         run: cargo appimage
 
       - name: Rename AppImage with Tag
+        env:
+          HEGN_TAG: ${{ github.ref_name }}
         run: |
           cd target/appimage
-          mv hegn.AppImage hegn-${{ github.ref_name }}.AppImage
+          mv hegn.AppImage "hegn-${HEGN_TAG}.AppImage"
 
       - name: Create Release and Upload AppImage
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3

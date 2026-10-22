@@ -59,9 +59,11 @@ jobs:
         echo "name=$name" >> "$GITHUB_OUTPUT"
 
     - name: Package release binary
+      env:
+        BUILD_NAME: ${{ steps.build.outputs.name }}
       run: |
         mkdir -p dist
-        cp target/release/hegn "dist/hegn-${{ steps.build.outputs.name }}-x86_64-linux-gnu"
+        cp target/release/hegn "dist/hegn-${BUILD_NAME}-x86_64-linux-gnu"
 
     - name: Upload build artifact
       uses: actions/upload-artifact@v7

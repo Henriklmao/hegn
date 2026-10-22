@@ -13,7 +13,7 @@ fi
 # The tag is embedded in the generated PKGBUILD, which downstream users build.
 # Restrict it to a version-like token so quotes, '$' or backticks cannot break
 # out of the PKGBUILD strings.
-if [[ ! "$tag" =~ ^v?[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.]+)?$ ]]; then
+if [[ ! "$tag" =~ ^v?[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
     echo "refusing to generate a PKGBUILD for unexpected tag '$tag'" >&2
     exit 1
 fi
