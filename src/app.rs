@@ -1329,11 +1329,18 @@ pub fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
     let bytes = match key.code {
         KeyCode::Char(c) => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
-                let upper = c.to_ascii_uppercase() as u8;
-                if upper.is_ascii_uppercase() {
-                    vec![upper - 0x40]
+                if c.is_ascii_alphabetic() {
+                    vec![c.to_ascii_uppercase() as u8 - 0x40]
                 } else {
-                    return None;
+                    match c {
+                        ' ' | '@' => vec![0x00],
+                        '[' => vec![0x1b],
+                        '\\' => vec![0x1c],
+                        ']' => vec![0x1d],
+                        '^' => vec![0x1e],
+                        '_' => vec![0x1f],
+                        _ => return None,
+                    }
                 }
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 let mut bytes = vec![0x1b];
@@ -1721,6 +1728,11 @@ mod tests {
         assert_eq!(encode_key(key(KeyCode::F(2))), Some(b"\x1bOQ".to_vec()));
         let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
         assert_eq!(encode_key(alt_b), Some(vec![0x1b, b'b']));
+        // A non-ASCII char must not be truncated into an ASCII control code.
+        let ctrl_non_ascii = KeyEvent::new(KeyCode::Char('Ń'), KeyModifiers::CONTROL);
+        assert_eq!(encode_key(ctrl_non_ascii), None);
+        let ctrl_bracket = KeyEvent::new(KeyCode::Char('['), KeyModifiers::CONTROL);
+        assert_eq!(encode_key(ctrl_bracket), Some(vec![0x1b]));
     }
 
     #[test]
