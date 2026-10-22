@@ -20,7 +20,7 @@ jobs:
       - name: Publish AUR package
         uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
-          pkgname: display-tui
+          pkgname: hegn
           pkgbuild: ./PKGBUILD
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
@@ -39,7 +39,7 @@ jobs:
       - name: Publish AUR package (bin)
         uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
-          pkgname: display-tui-bin
+          pkgname: hegn-bin
           pkgbuild: ./PKGBUILD
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}

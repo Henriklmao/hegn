@@ -61,13 +61,13 @@ jobs:
     - name: Package release binary
       run: |
         mkdir -p dist
-        cp target/release/display-tui "dist/display-tui-${{ steps.build.outputs.name }}-x86_64-linux-gnu"
+        cp target/release/hegn "dist/hegn-${{ steps.build.outputs.name }}-x86_64-linux-gnu"
 
     - name: Upload build artifact
       uses: actions/upload-artifact@v7
       with:
-        name: display-tui-${{ steps.build.outputs.name }}-x86_64-linux-gnu
-        path: dist/display-tui-*-x86_64-linux-gnu
+        name: hegn-${{ steps.build.outputs.name }}-x86_64-linux-gnu
+        path: dist/hegn-*-x86_64-linux-gnu
         if-no-files-found: error
 
   release:
@@ -82,14 +82,14 @@ jobs:
     - name: Download the built binary
       uses: actions/download-artifact@v8
       with:
-        pattern: display-tui-*
+        pattern: hegn-*
         merge-multiple: true
         path: dist
 
     - name: Upload binary to GitHub Release
       uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
       with:
-        files: "dist/display-tui-*-x86_64-linux-gnu"
+        files: "dist/hegn-*-x86_64-linux-gnu"
         # download-artifact@v8 has no if-no-artifact-found input and the release
         # action ignores unmatched globs by default, so a re-run without
         # artifacts would publish a binary-less release and still pass.
