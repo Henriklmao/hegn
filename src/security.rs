@@ -284,17 +284,15 @@ pub fn detect_workspace_risk(command: &str) -> Option<WorkspaceRisk> {
     if let Some((title, description)) = git_clean_risk(&collapsed) {
         return Some(WorkspaceRisk { title, description });
     }
+    if let Some((title, description)) = git_force_push_risk(&collapsed) {
+        return Some(WorkspaceRisk { title, description });
+    }
 
     let destructive = [
         (
             "git reset --hard",
             "hard git reset",
             "Uncommitted changes will be lost. Create a checkpoint first.",
-        ),
-        (
-            "git push --force",
-            "force push",
-            "Force-pushing can overwrite remote history.",
         ),
         (
             "mkfs",
@@ -416,6 +414,25 @@ fn git_clean_risk(command: &str) -> Option<(&'static str, &'static str)> {
     ))
 }
 
+/// `git push --force` and its short/long variants rewrite remote history.
+fn git_force_push_risk(command: &str) -> Option<(&'static str, &'static str)> {
+    let rest = command.split("git push").nth(1)?;
+    let segment = rest.split(['\n', ';', '&', '|']).next().unwrap_or("");
+    let forced = segment.split_whitespace().any(|token| {
+        if matches!(
+            token,
+            "--force" | "--force-with-lease" | "--force-if-includes"
+        ) {
+            return true;
+        }
+        let Some(flags) = token.strip_prefix('-') else {
+            return false;
+        };
+        !flags.starts_with('-') && flags.contains('f')
+    });
+    forced.then_some(("force push", "Force-pushing can overwrite remote history."))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +539,10 @@ mod tests {
                 "{command} should not be flagged"
             );
         }
+        for command in ["git push -f origin main", "git push --force-with-lease"] {
+            assert!(detect_workspace_risk(command).is_some(), "{command}");
+        }
+        assert!(detect_workspace_risk("git push origin main").is_none());
     }
 
     #[test]
