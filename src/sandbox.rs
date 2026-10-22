@@ -62,6 +62,18 @@ impl SandboxPaths {
     }
 
     pub fn ensure(&self) -> Result<()> {
+        // The API and virtiofs sockets live here; a private directory keeps
+        // other local users from driving the microVM.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder
+                .create(&self.run_dir)
+                .with_context(|| format!("failed to create {}", self.run_dir.display()))?;
+        }
+        #[cfg(not(unix))]
         fs::create_dir_all(&self.run_dir)
             .with_context(|| format!("failed to create {}", self.run_dir.display()))?;
         Ok(())
@@ -741,6 +753,23 @@ mod tests {
         assert_eq!(paths.run_dir, config.state_dir.join("run"));
         assert_eq!(paths.api_socket.file_name().unwrap(), "firecracker.sock");
         assert_eq!(paths.virtiofs_socket.file_name().unwrap(), "virtiofs.sock");
+    }
+
+    #[test]
+    fn run_directory_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SandboxManager::new(config_with_assets(dir.path()));
+        manager.paths().ensure().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&manager.paths().run_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+        }
     }
 
     #[test]
