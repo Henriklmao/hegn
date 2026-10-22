@@ -377,8 +377,13 @@ pub fn create_project(
     Ok(path)
 }
 
-/// Create a transient safety branch without switching to it. Used before
-/// destructive commands.
+/// Create a transient safety branch that snapshots the *working tree*.
+///
+/// A plain `git branch` only points at `HEAD`, so uncommitted changes would not
+/// survive a destructive command even though the UI promised a checkpoint. We
+/// instead build a commit object from an isolated temporary index, which
+/// captures staged, unstaged and untracked files without touching the user's
+/// index, `HEAD` or working tree.
 pub fn create_checkpoint(path: &Path, label: &str) -> Result<String> {
     ensure_git_repo(path)?;
     let slug: String = label
@@ -397,10 +402,11 @@ pub fn create_checkpoint(path: &Path, label: &str) -> Result<String> {
         Utc::now().format("%Y%m%d-%H%M%S"),
         if slug.is_empty() { "manual" } else { slug }
     );
+    let commit = snapshot_worktree(path, label)?;
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
-        .args(["branch", &branch])
+        .args(["branch", &branch, &commit])
         .output()
         .context("failed to run git branch")?;
     if !output.status.success() {
@@ -410,6 +416,83 @@ pub fn create_checkpoint(path: &Path, label: &str) -> Result<String> {
         );
     }
     Ok(branch)
+}
+
+/// Commit the current working tree into a dangling commit object.
+fn snapshot_worktree(path: &Path, label: &str) -> Result<String> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let index = std::env::temp_dir().join(format!(
+        "hegn-checkpoint-{}-{unique}.index",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&index);
+
+    let result = (|| -> Result<String> {
+        git_stdout(path, &["add", "-A"], Some(&index))?;
+        let tree = git_stdout(path, &["write-tree"], Some(&index))?;
+        let message = format!(
+            "hegn checkpoint: {}",
+            if label.trim().is_empty() {
+                "manual"
+            } else {
+                label
+            }
+        );
+        // `commit-tree` needs an identity even when the repository has none
+        // configured; use a synthetic one so the safety net always works.
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(path)
+            .args(["-c", "user.name=hegn", "-c", "user.email=hegn@localhost"])
+            .args(["commit-tree", tree.trim(), "-m", &message]);
+        if has_head(path) {
+            command.args(["-p", "HEAD"]);
+        }
+        let output = command.output().context("failed to run git commit-tree")?;
+        if !output.status.success() {
+            bail!(
+                "git commit-tree failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    })();
+
+    let _ = fs::remove_file(&index);
+    result
+}
+
+fn git_stdout(path: &Path, args: &[&str], index: Option<&Path>) -> Result<String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path).args(args);
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn has_head(path: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 /// Create and check out `agent/hegn-session-<timestamp>`.
@@ -605,6 +688,57 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), branch);
+    }
+
+    #[test]
+    fn checkpoint_captures_uncommitted_and_untracked_files() {
+        let repo = git_repo();
+        std::fs::write(repo.path().join("tracked.txt"), "original").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "init", "--quiet"]] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(repo.path().join("tracked.txt"), "modified").unwrap();
+        std::fs::write(repo.path().join("untracked.txt"), "new file").unwrap();
+
+        let branch = create_checkpoint(repo.path(), "before rm -rf").unwrap();
+
+        let tracked = git_stdout(
+            repo.path(),
+            &["show", &format!("{branch}:tracked.txt")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(tracked.trim(), "modified");
+        let untracked = git_stdout(
+            repo.path(),
+            &["show", &format!("{branch}:untracked.txt")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(untracked.trim(), "new file");
+
+        // The checkpoint must not commit or stage anything in the real repo.
+        let status = git_stdout(repo.path(), &["status", "--porcelain"], None).unwrap();
+        assert!(status.contains("M tracked.txt"), "{status}");
+        assert!(status.contains("?? untracked.txt"), "{status}");
+    }
+
+    #[test]
+    fn checkpoint_works_in_a_repository_without_commits() {
+        let repo = git_repo();
+        std::fs::write(repo.path().join("first.txt"), "hello").unwrap();
+        let branch = create_checkpoint(repo.path(), "before first commit").unwrap();
+        let content =
+            git_stdout(repo.path(), &["show", &format!("{branch}:first.txt")], None).unwrap();
+        assert_eq!(content.trim(), "hello");
     }
 
     #[test]
