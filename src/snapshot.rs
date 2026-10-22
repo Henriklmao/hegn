@@ -81,13 +81,16 @@ impl SnapshotStore {
     }
 
     /// Reserve a directory and return the paths Firecracker should write to.
+    ///
+    /// Snapshot memory can contain credentials, so the per-snapshot directory
+    /// is created with mode 0700 instead of inheriting the process umask.
     pub fn prepare(&self, name: &str) -> Result<SnapshotPaths> {
         let name = sanitize_name(name)?;
         let dir = self.root.join(&name);
         if dir.exists() {
             bail!("snapshot '{name}' already exists");
         }
-        fs::create_dir_all(&dir)
+        create_private_dir(&dir)
             .with_context(|| format!("failed to create snapshot directory {}", dir.display()))?;
         let dir = dir
             .canonicalize()
@@ -108,6 +111,13 @@ impl SnapshotStore {
         let path = dir.join("snapshot.json");
         let raw = serde_json::to_string_pretty(meta)?;
         fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+        // The containing directory is private; keep the metadata private too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("failed to secure {}", path.display()))?;
+        }
         Ok(())
     }
 
@@ -158,6 +168,20 @@ impl SnapshotStore {
         fs::remove_dir_all(&dir)
             .with_context(|| format!("failed to delete snapshot {}", dir.display()))?;
         Ok(())
+    }
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
     }
 }
 
@@ -237,6 +261,22 @@ mod tests {
         let list = store.list().unwrap();
         assert_eq!(list[0].name, "new");
         assert_eq!(list[1].name, "old");
+    }
+
+    #[test]
+    fn snapshot_directories_and_metadata_are_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let paths = store.prepare("private").unwrap();
+        store.save_meta(&meta("private", &paths)).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&paths.dir), 0o700);
+            assert_eq!(mode(&paths.meta_path), 0o600);
+        }
     }
 
     #[test]
