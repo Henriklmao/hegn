@@ -1062,6 +1062,7 @@ impl App {
         self.terminal.clear();
         self.scroll = 0;
         self.input.clear();
+        self.raw_mode = false;
         self.session_closed_reported = false;
 
         let meta = project::read_meta(&project.path);
@@ -1751,7 +1752,12 @@ mod tests {
         let mut project = fake_project("demo");
         project.path = project_path.clone();
         app.set_projects(vec![project]);
+        app.raw_mode = true;
         app.open_selected();
+        assert!(
+            !app.raw_mode,
+            "raw passthrough must not leak into a new session"
+        );
         assert_eq!(app.screen, Screen::Terminal);
         assert!(app.session.is_some());
         let session = app.session.as_mut().unwrap();
