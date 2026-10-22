@@ -239,10 +239,18 @@ fn project_command(command: ProjectCommands, config: Config, json: bool) -> Resu
             packages,
         } => {
             let harness = harness.unwrap_or(config.harness);
-            let template = template.or_else(|| {
-                let path = config.templates_dir.join("AGENTS.md");
-                path.is_file().then_some(path)
-            });
+            let template = match template {
+                Some(path) => {
+                    if !path.is_file() {
+                        bail!("template {} does not exist", path.display());
+                    }
+                    Some(path)
+                }
+                None => {
+                    let path = config.templates_dir.join("AGENTS.md");
+                    path.is_file().then_some(path)
+                }
+            };
             let path = project::create_project(
                 &config.projects_root,
                 &name,
@@ -882,6 +890,23 @@ mod tests {
         let meta = project::read_meta(&config.projects_root.join("demo"));
         assert_eq!(meta.harness, Some(Harness::Codex));
         assert_eq!(meta.packages, vec!["git", "python3"]);
+    }
+
+    #[test]
+    fn project_create_rejects_a_missing_template() {
+        let config = config();
+        let err = project_command(
+            ProjectCommands::Create {
+                name: "demo".into(),
+                harness: None,
+                template: Some(PathBuf::from("/definitely/missing/AGENTS.md")),
+                packages: Vec::new(),
+            },
+            config,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
     }
 
     #[test]
