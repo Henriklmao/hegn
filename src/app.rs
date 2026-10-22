@@ -760,7 +760,7 @@ impl App {
         Vec::new()
     }
 
-    fn write_line(&mut self, line: &str) {
+    fn write_line(&mut self, line: &str) -> bool {
         let mut error = None;
         let mut active = false;
         if let Some(session) = self.session.as_mut()
@@ -773,10 +773,13 @@ impl App {
         }
         if let Some(error) = error {
             self.toast(format!("write failed: {error}"), ToastLevel::Error);
+            false
         } else if active {
             self.scroll = 0;
+            true
         } else {
             self.toast("no active session", ToastLevel::Warn);
+            false
         }
     }
 
@@ -976,18 +979,27 @@ impl App {
     fn handle_security_key(&mut self, key: KeyEvent, prompt: SecurityPrompt) -> Vec<Effect> {
         match key.code {
             KeyCode::Char('a') | KeyCode::Enter => {
-                self.write_line(&prompt.command);
-                self.toast("command approved once", ToastLevel::Warn);
+                if self.write_line(&prompt.command) {
+                    self.toast("command approved once", ToastLevel::Warn);
+                }
                 Vec::new()
             }
             KeyCode::Char('c') => {
                 match project::create_checkpoint(&prompt.project, "before flagged command") {
                     Ok(branch) => {
-                        self.write_line(&prompt.command);
-                        self.toast(
-                            format!("checkpoint {branch}; command approved"),
-                            ToastLevel::Info,
-                        );
+                        if self.write_line(&prompt.command) {
+                            self.toast(
+                                format!("checkpoint {branch}; command approved"),
+                                ToastLevel::Info,
+                            );
+                        } else {
+                            self.toast(
+                                format!(
+                                    "checkpoint {branch} created, but the command was not sent"
+                                ),
+                                ToastLevel::Warn,
+                            );
+                        }
                     }
                     Err(err) => {
                         let mut prompt = prompt;
@@ -1536,7 +1548,12 @@ mod tests {
         }));
         app.handle_key(key(KeyCode::Char('a')));
         assert!(app.modal.is_none());
-        assert!(app.toast.is_some());
+        let toast = app.toast.as_ref().expect("a warning toast");
+        assert!(
+            toast.text.contains("no active session"),
+            "approval must not hide the write failure: {}",
+            toast.text
+        );
     }
 
     #[test]
