@@ -6,17 +6,24 @@
 //! <state>/run/
 //!   firecracker.sock
 //!   virtiofs.sock
+//!   serial.in        (FIFO: guest serial input)
+//!   serial.out       (serial log: guest serial output)
 //!   firecracker.pid
 //!   virtiofs.pid
 //!   session.json
 //!   firecracker.log
+//!   hegn.lock
 //! ```
 //!
 //! `start` boots virtiofsd followed by Firecracker, configures the API and
 //! issues `InstanceStart`. The child processes deliberately outlive the CLI
-//! process; `stop` terminates them.
+//! process; `stop` terminates them. VM lifecycle operations hold an exclusive
+//! lock on `hegn.lock` so two concurrent `hegn open` calls cannot boot
+//! Firecracker on the same sockets and serial FIFO.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -25,7 +32,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{BackendKind, Config, Harness};
+use crate::config::{Config, Harness};
 use crate::firecracker::{
     Action, BootSource, Drive, FirecrackerClient, InstanceInfo, MachineConfig, SnapshotCreate,
     SnapshotLoad, VhostUserFs, VmState,
@@ -49,6 +56,8 @@ pub struct SandboxPaths {
     pub virtiofs_pid: PathBuf,
     pub session: PathBuf,
     pub log: PathBuf,
+    /// Exclusive lock serializing VM lifecycle operations.
+    pub lock: PathBuf,
 }
 
 impl SandboxPaths {
@@ -63,6 +72,7 @@ impl SandboxPaths {
             virtiofs_pid: run_dir.join("virtiofs.pid"),
             session: run_dir.join("session.json"),
             log: run_dir.join("firecracker.log"),
+            lock: run_dir.join("hegn.lock"),
             run_dir,
         }
     }
@@ -117,6 +127,14 @@ pub struct SandboxManager {
     config: Config,
 }
 
+/// Exclusive lock held for the duration of a VM lifecycle operation.
+///
+/// Dropping it (including on an error path) releases the lock.
+#[derive(Debug)]
+struct RunLock {
+    _file: File,
+}
+
 impl SandboxManager {
     pub fn new(config: Config) -> Self {
         Self { config }
@@ -137,20 +155,55 @@ impl SandboxManager {
             .unwrap_or(false)
     }
 
+    /// Take the exclusive VM lifecycle lock.
+    ///
+    /// A second `hegn open`/`sandbox start` must not recreate `serial.in` or the
+    /// API socket underneath a VM that is already booting.
+    fn lock(&self, paths: &SandboxPaths) -> Result<RunLock> {
+        paths.ensure()?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&paths.lock)
+            .with_context(|| format!("failed to open {}", paths.lock.display()))?;
+        // Safety: `file` is a valid, open descriptor for the lock file.
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if locked != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                bail!("another hegn VM operation is in progress; retry when it finishes");
+            }
+            return Err(err).with_context(|| format!("failed to lock {}", paths.lock.display()));
+        }
+        Ok(RunLock { _file: file })
+    }
+
     /// Boot virtiofsd + Firecracker and start the guest.
     pub fn start(&self, project: &Path, harness: Harness) -> Result<SandboxReport> {
         let paths = self.paths();
-        if self.config.effective_backend() != BackendKind::Firecracker
-            || !self.config.firecracker_ready()
-        {
-            bail!(
-                "firecracker backend is not ready: set kernel_image and rootfs_image in {}",
-                Config::config_path().display()
-            );
-        }
+        // A missing VM is always a hard error: there is no host-process fallback.
+        self.config.require_vm_assets()?;
         if !project.is_dir() {
             bail!("project {} does not exist", project.display());
         }
+        // Preflight both binaries before spawning anything, so a typo in the
+        // configuration cannot leave a stray virtiofsd (or a VM without a
+        // console) behind.
+        if !command_available(&self.config.firecracker_bin) {
+            bail!(
+                "firecracker binary {} was not found; run `hegn doctor`",
+                self.config.firecracker_bin.display()
+            );
+        }
+        if !command_available(&self.config.virtiofsd_bin) {
+            bail!(
+                "virtiofsd binary {} was not found; run `hegn doctor`",
+                self.config.virtiofsd_bin.display()
+            );
+        }
+        let _lock = self.lock(&paths)?;
         if self.is_running() {
             bail!("a sandbox is already running (use `hegn sandbox stop` first)");
         }
@@ -286,8 +339,12 @@ impl SandboxManager {
         project: &Path,
         harness: Harness,
     ) -> Result<crate::console::VmConsole> {
+        // Only a *running* sandbox for another project is a conflict. A stale
+        // session record (crash, reboot) must not block opening a project; the
+        // start path cleans it up.
         if let Some(session) = self.session()
-            && session.project != project
+            && !same_project(&session.project, project)
+            && process_matches(session.firecracker_pid, &self.config.firecracker_bin)
         {
             bail!(
                 "a sandbox for {} is already running; stop it with `hegn sandbox stop` first",
@@ -303,6 +360,10 @@ impl SandboxManager {
     /// Stop Firecracker and virtiofsd.
     pub fn stop(&self) -> Result<()> {
         let paths = self.paths();
+        if !paths.run_dir.is_dir() {
+            bail!("no sandbox session found in {}", paths.run_dir.display());
+        }
+        let _lock = self.lock(&paths)?;
         let session = self.session();
         let firecracker_pid = session
             .as_ref()
@@ -499,6 +560,9 @@ impl SandboxManager {
                 self.config.virtiofsd_bin.display()
             );
         }
+        // Serialize with start/stop so another hegn process cannot recreate the
+        // sockets and serial FIFO while the snapshot boot is in flight.
+        let _lock = self.lock(&paths)?;
 
         // Stop the old VM and its filesystem daemon. Both sockets are freed
         // and recreated below with the same paths the snapshot expects.
@@ -629,8 +693,6 @@ fn spawn_virtiofsd(
 }
 
 fn spawn_firecracker(config: &Config, paths: &SandboxPaths) -> Result<Child> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     let _ = fs::remove_file(&paths.api_socket);
     ensure_serial_fifo(&paths.serial_in)?;
     // Firecracker registers serial input only when stdin is a TTY or a FIFO.
@@ -745,6 +807,21 @@ fn command_available(binary: &Path) -> bool {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(binary).is_file()))
 }
 
+/// Whether two project paths refer to the same directory.
+///
+/// The TUI discovers projects as `<projects_root>/<name>` while the CLI
+/// canonicalizes them, so a symlinked projects root would otherwise look like a
+/// different project (and trigger a bogus "sandbox already running" error).
+pub fn same_project(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 pub fn process_alive(pid: u32) -> bool {
     // `kill(0, ...)` and `kill(-pgrp, ...)` target hegn's own process group or
     // an arbitrary group, so only real positive PIDs are considered.
@@ -820,6 +897,7 @@ fn cleanup_files(paths: &SandboxPaths) {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+    use crate::config::BackendKind;
 
     fn config_with_assets(dir: &Path) -> Config {
         let mut config = Config::default();
@@ -872,7 +950,130 @@ mod tests {
             .start(dir.path(), Harness::Shell)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not ready"), "{err}");
+        assert!(err.contains("missing VM assets"), "{err}");
+    }
+
+    #[test]
+    fn start_preflights_binaries_before_spawning_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.firecracker_bin = PathBuf::from("/definitely/missing/firecracker");
+        let manager = SandboxManager::new(config);
+        let project = dir.path().join("projects/demo");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let err = manager
+            .start(&project, Harness::Shell)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("firecracker binary"), "{err}");
+        assert!(!manager.paths().virtiofs_pid.exists());
+        assert!(!manager.paths().api_socket.exists());
+    }
+
+    #[test]
+    fn lifecycle_lock_is_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SandboxManager::new(config_with_assets(dir.path()));
+        let paths = manager.paths();
+        let held = manager.lock(&paths).unwrap();
+        let err = manager.lock(&paths).unwrap_err().to_string();
+        assert!(err.contains("in progress"), "{err}");
+        drop(held);
+        assert!(
+            manager.lock(&paths).is_ok(),
+            "lock must be released on drop"
+        );
+    }
+
+    fn write_session(manager: &SandboxManager, project: &Path, pid: u32) {
+        manager.paths().ensure().unwrap();
+        let record = SessionRecord {
+            project: project.to_path_buf(),
+            harness: Harness::Shell,
+            started_at: Utc::now(),
+            firecracker_pid: pid,
+            virtiofs_pid: pid,
+            boot_args: ROOT_BOOT_ARGS.into(),
+        };
+        std::fs::write(
+            manager.paths().session,
+            serde_json::to_string(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ensure_console_ignores_a_stale_session_for_another_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.firecracker_bin = PathBuf::from("/definitely/missing/firecracker");
+        let manager = SandboxManager::new(config);
+        let other = dir.path().join("projects/other");
+        std::fs::create_dir_all(&other).unwrap();
+        // Pid 4_000_000_000 cannot exist, so this session is stale.
+        write_session(&manager, &dir.path().join("projects/gone"), 4_000_000_000);
+
+        let err = manager
+            .ensure_console(&other, Harness::Shell)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("already running"),
+            "a stale session must not block another project: {err}"
+        );
+        assert!(err.contains("firecracker binary"), "{err}");
+    }
+
+    #[test]
+    fn ensure_console_rejects_a_running_session_for_another_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.firecracker_bin = std::env::current_exe().unwrap();
+        let manager = SandboxManager::new(config);
+        let running = dir.path().join("projects/running");
+        let other = dir.path().join("projects/other");
+        std::fs::create_dir_all(&running).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        write_session(&manager, &running, std::process::id());
+
+        let err = manager
+            .ensure_console(&other, Harness::Shell)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already running"), "{err}");
+    }
+
+    #[test]
+    fn ensure_console_matches_a_symlinked_project_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.firecracker_bin = std::env::current_exe().unwrap();
+        let manager = SandboxManager::new(config);
+        let real = dir.path().join("projects/real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("projects/link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_session(&manager, &real, std::process::id());
+
+        // Same VM, same project through a symlink: the conflict check passes
+        // and only the missing serial files are reported.
+        let err = manager
+            .ensure_console(&link, Harness::Shell)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("serial console files"), "{err}");
+    }
+
+    #[test]
+    fn same_project_compares_canonical_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(same_project(&real, &link));
+        assert!(!same_project(&real, &dir.path().join("missing")));
     }
 
     #[test]

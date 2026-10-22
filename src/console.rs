@@ -91,7 +91,13 @@ impl VmConsole {
                 Ok(0) => break,
                 Ok(n) => chunks.push(buf[..n].to_vec()),
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                // An unreadable serial log is unusable: stop the console rather
+                // than silently dropping guest output for the rest of the
+                // session.
+                Err(_) => {
+                    self.exited = true;
+                    break;
+                }
             }
         }
         chunks
@@ -146,6 +152,37 @@ impl TerminalConsole for VmConsole {
     }
 }
 
+/// Attaches the process terminal to the console and restores it on drop,
+/// including when the console loop unwinds with a panic.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        use crossterm::execute;
+        use crossterm::terminal::{EnterAlternateScreen, disable_raw_mode, enable_raw_mode};
+
+        enable_raw_mode().context("failed to enable raw mode")?;
+        let mut out = std::io::stdout();
+        if let Err(err) = execute!(out, EnterAlternateScreen) {
+            disable_raw_mode().ok();
+            return Err(err).context("failed to enter the serial console");
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        use crossterm::cursor::Show;
+        use crossterm::execute;
+        use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
+
+        disable_raw_mode().ok();
+        let mut out = std::io::stdout();
+        let _ = execute!(out, LeaveAlternateScreen, Show);
+    }
+}
+
 /// Attach an interactive terminal to a VM serial console.
 ///
 /// This is the CLI equivalent of the TUI terminal view. Input is passed
@@ -154,19 +191,11 @@ impl TerminalConsole for VmConsole {
 /// the VM.
 pub fn run_interactive(mut console: VmConsole) -> Result<()> {
     use crossterm::event::{self, Event, KeyEventKind};
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
-    use crossterm::{cursor::Show, execute};
 
-    let mut out = std::io::stdout();
-    enable_raw_mode().context("failed to enable raw mode")?;
-    if let Err(err) = execute!(out, EnterAlternateScreen) {
-        disable_raw_mode().ok();
-        return Err(err).context("failed to enter the serial console");
-    }
+    let _guard = TerminalGuard::enter()?;
 
-    let result = (|| -> Result<()> {
+    (|| -> Result<()> {
+        let mut out = std::io::stdout();
         loop {
             for chunk in console.drain() {
                 out.write_all(&chunk)?;
@@ -192,11 +221,7 @@ pub fn run_interactive(mut console: VmConsole) -> Result<()> {
             }
         }
         Ok(())
-    })();
-
-    disable_raw_mode().ok();
-    execute!(out, LeaveAlternateScreen, Show).ok();
-    result
+    })()
 }
 
 #[cfg(test)]
@@ -276,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_requires_a_running_vm_and_serial_files() {
+    fn attach_requires_serial_files() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
         let paths = SandboxPaths::from_config(&config);
@@ -292,5 +317,28 @@ mod tests {
         std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
         let err = VmConsole::attach(&config).unwrap_err().to_string();
         assert!(err.contains("serial console files are missing"), "{err}");
+    }
+
+    #[test]
+    fn attach_rejects_a_dead_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let paths = SandboxPaths::from_config(&config);
+        paths.ensure().unwrap();
+        crate::sandbox::ensure_serial_fifo(&paths.serial_in).unwrap();
+        std::fs::write(&paths.serial_out, b"").unwrap();
+        let record = crate::sandbox::SessionRecord {
+            project: dir.path().to_path_buf(),
+            harness: crate::config::Harness::Shell,
+            started_at: Utc::now(),
+            // Out of pid_t range: cannot be running, even after pid reuse.
+            firecracker_pid: 4_000_000_000,
+            virtiofs_pid: 4_000_000_000,
+            boot_args: String::new(),
+        };
+        std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
+
+        let err = VmConsole::attach(&config).unwrap_err().to_string();
+        assert!(err.contains("not running"), "{err}");
     }
 }
