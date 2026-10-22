@@ -1,3 +1,3 @@
 fn main() {
-    println!("Hello, world!");
+    println!("hegn — Firecracker sandbox manager for coding agents");
 }
