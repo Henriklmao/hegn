@@ -107,7 +107,7 @@ impl SnapshotStore {
     pub fn save_meta(&self, meta: &SnapshotMeta) -> Result<()> {
         let name = sanitize_name(&meta.name)?;
         let dir = self.root.join(name);
-        fs::create_dir_all(&dir)?;
+        create_private_dir(&dir)?;
         let path = dir.join("snapshot.json");
         let raw = serde_json::to_string_pretty(meta)?;
         fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
