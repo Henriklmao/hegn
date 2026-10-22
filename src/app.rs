@@ -926,11 +926,7 @@ impl App {
                 let meta = ProjectMeta {
                     harness: Some(form.harness),
                     packages: form.selected_packages(),
-                    template: Some(if template.is_some() {
-                        "custom".to_string()
-                    } else {
-                        "default".to_string()
-                    }),
+                    template: template.map(|path| path.display().to_string()),
                 };
                 if let Err(err) = project::write_meta(&path, &meta) {
                     self.toast(
@@ -1506,6 +1502,9 @@ mod tests {
         let path = app.config.projects_root.join("demo-app");
         assert!(path.join("AGENTS.md").is_file());
         assert!(app.projects.iter().any(|p| p.path == path));
+        let meta = project::read_meta(&path);
+        assert_eq!(meta.harness, Some(Harness::Shell));
+        assert!(meta.template.is_none());
     }
 
     #[test]
