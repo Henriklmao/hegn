@@ -146,7 +146,7 @@ pub enum SnapshotCommands {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Load a snapshot (requires a running Firecracker API socket).
+    /// Load a snapshot (boots a fresh Firecracker process).
     Restore { name: String },
     /// Delete a snapshot directory.
     Delete { name: String },
@@ -286,13 +286,14 @@ fn project_command(command: ProjectCommands, config: Config, json: bool) -> Resu
             let path = resolve_project(&config, &project)?;
             let info = project::Project::load(path.clone());
             let meta = project::read_meta(&path);
+            let harness = meta.harness.unwrap_or(config.harness);
             if json {
                 #[derive(Serialize)]
                 struct Info<'a> {
                     name: &'a str,
                     path: &'a Path,
                     git: &'a project::GitSummary,
-                    harness: Option<Harness>,
+                    harness: Harness,
                     packages: &'a [String],
                 }
                 println!(
@@ -301,7 +302,7 @@ fn project_command(command: ProjectCommands, config: Config, json: bool) -> Resu
                         name: &info.name,
                         path: &info.path,
                         git: &info.git,
-                        harness: meta.harness,
+                        harness,
                         packages: &meta.packages,
                     })?
                 );
@@ -312,10 +313,7 @@ fn project_command(command: ProjectCommands, config: Config, json: bool) -> Resu
                 if let Some(err) = &info.git.error {
                     println!("  git note {err}");
                 }
-                println!(
-                    "  harness  {}",
-                    meta.harness.unwrap_or(config.harness).label()
-                );
+                println!("  harness  {}", harness.label());
                 if !meta.packages.is_empty() {
                     println!("  packages {}", meta.packages.join(", "));
                 }
@@ -418,9 +416,6 @@ fn snapshot_command(command: SnapshotCommands, config: Config, json: bool) -> Re
         }
         SnapshotCommands::Restore { name } => {
             let meta = store.load(&name)?;
-            if !manager.running() {
-                bail!("the sandbox is not running; boot Firecracker before loading a snapshot");
-            }
             runtime()?.block_on(manager.restore_snapshot(&meta))?;
             if json {
                 println!("{}", serde_json::json!({"restored": meta.name}));

@@ -31,7 +31,7 @@ use crate::firecracker::{
     SnapshotLoad, VhostUserFs, VmState, is_running,
 };
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
-use crate::virtiofs::VirtiofsConfig;
+use crate::virtiofs::{VirtiofsConfig, VirtiofsProcess};
 
 const API_START_TIMEOUT: Duration = Duration::from_secs(5);
 const ROOT_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw";
@@ -142,16 +142,7 @@ impl SandboxManager {
         paths.ensure()?;
 
         // 1. virtiofsd, sandboxed to exactly this project.
-        let fs_config = VirtiofsConfig::new(
-            self.config.virtiofsd_bin.clone(),
-            project,
-            paths.virtiofs_socket.clone(),
-        );
-        let mut virtiofs = fs_config.spawn().context("failed to start virtiofsd")?;
-        if let Err(err) = virtiofs.wait_for_socket(Duration::from_secs(5)) {
-            virtiofs.kill();
-            return Err(err);
-        }
+        let mut virtiofs = spawn_virtiofsd(&self.config, &paths, project)?;
         let virtiofs_pid = virtiofs.pid();
         fs::write(&paths.virtiofs_pid, virtiofs_pid.to_string())?;
 
@@ -290,17 +281,13 @@ impl SandboxManager {
     pub async fn pause(&self) -> Result<()> {
         let paths = self.paths();
         ensure_socket(&paths.api_socket)?;
-        FirecrackerClient::new(&paths.api_socket)
-            .action(Action::Pause)
-            .await
+        FirecrackerClient::new(&paths.api_socket).pause().await
     }
 
     pub async fn resume(&self) -> Result<()> {
         let paths = self.paths();
         ensure_socket(&paths.api_socket)?;
-        FirecrackerClient::new(&paths.api_socket)
-            .action(Action::Resume)
-            .await
+        FirecrackerClient::new(&paths.api_socket).resume().await
     }
 
     pub async fn instance_info(&self) -> Result<InstanceInfo> {
@@ -379,17 +366,17 @@ impl SandboxManager {
         let snap_dir = prepared.dir;
         let client = FirecrackerClient::new(&paths.api_socket);
 
-        client.action(Action::Pause).await?;
-        let result = client
+        client.pause().await?;
+        if let Err(err) = client
             .create_snapshot(&SnapshotCreate {
                 snapshot_path: snapshot_path.display().to_string(),
                 mem_file_path: mem_file_path.display().to_string(),
                 snapshot_type: Some("Full".into()),
             })
-            .await;
-        // Always try to resume, even if snapshot creation failed.
-        let _ = client.action(Action::Resume).await;
-        if let Err(err) = result {
+            .await
+        {
+            // Always try to resume, even if snapshot creation failed.
+            let _ = client.resume().await;
             let _ = fs::remove_dir_all(&snap_dir);
             return Err(err);
         }
@@ -406,21 +393,125 @@ impl SandboxManager {
             size_bytes: size,
             note: None,
         };
-        store.save_meta(&meta)?;
+        if let Err(err) = store.save_meta(&meta) {
+            let _ = client.resume().await;
+            return Err(err);
+        }
+        client
+            .resume()
+            .await
+            .context("snapshot saved, but the VM could not be resumed")?;
         Ok(meta)
     }
 
+    /// Restore a snapshot into a brand new Firecracker process.
+    ///
+    /// Firecracker only accepts `/snapshot/load` before the microVM is booted,
+    /// so the running process is replaced first. A fresh process also keeps a
+    /// failed load (Firecracker terminates itself on failure) from taking down
+    /// an existing VM. virtiofsd is restarted for the snapshot's project so the
+    /// restored guest finds a healthy backend on the same socket path.
     pub async fn restore_snapshot(&self, snapshot: &SnapshotMeta) -> Result<()> {
         let paths = self.paths();
-        ensure_socket(&paths.api_socket)?;
-        FirecrackerClient::new(&paths.api_socket)
-            .load_snapshot(&SnapshotLoad {
-                snapshot_path: snapshot.snapshot_path.display().to_string(),
-                mem_file_path: snapshot.mem_file_path.display().to_string(),
-                enable_diff_snapshots: None,
-                resume_vm: Some(true),
-            })
-            .await?;
+        paths.ensure()?;
+        if !snapshot.snapshot_path.is_file() {
+            bail!(
+                "snapshot state file {} is missing",
+                snapshot.snapshot_path.display()
+            );
+        }
+        if !snapshot.mem_file_path.is_file() {
+            bail!(
+                "snapshot memory file {} is missing",
+                snapshot.mem_file_path.display()
+            );
+        }
+
+        let existing = self.session();
+        let project = snapshot
+            .project
+            .clone()
+            .or_else(|| existing.as_ref().map(|session| session.project.clone()))
+            .context("snapshot has no project; cannot start the shared filesystem")?;
+        if !project.is_dir() {
+            bail!("snapshot project {} no longer exists", project.display());
+        }
+
+        // Stop the old VM and its filesystem daemon. Both sockets are freed
+        // and recreated below with the same paths the snapshot expects.
+        if let Some(session) = &existing {
+            terminate(session.firecracker_pid, &self.config.firecracker_bin);
+            terminate(session.virtiofs_pid, &self.config.virtiofsd_bin);
+        }
+        if let Some(pid) = read_pid(&paths.firecracker_pid) {
+            terminate(pid, &self.config.firecracker_bin);
+        }
+        if let Some(pid) = read_pid(&paths.virtiofs_pid) {
+            terminate(pid, &self.config.virtiofsd_bin);
+        }
+
+        let mut virtiofs = match spawn_virtiofsd(&self.config, &paths, &project) {
+            Ok(process) => process,
+            Err(err) => {
+                cleanup_files(&paths);
+                return Err(err);
+            }
+        };
+        let virtiofs_pid = virtiofs.pid();
+        if let Err(err) = fs::write(&paths.virtiofs_pid, virtiofs_pid.to_string()) {
+            virtiofs.kill();
+            cleanup_files(&paths);
+            return Err(err).context("failed to record the virtiofsd pid");
+        }
+
+        let mut firecracker = match spawn_firecracker(&self.config, &paths) {
+            Ok(child) => child,
+            Err(err) => {
+                virtiofs.kill();
+                cleanup_files(&paths);
+                return Err(err);
+            }
+        };
+        let firecracker_pid = firecracker.id();
+
+        if let Err(err) = load_snapshot_into(&paths, &mut firecracker, snapshot).await {
+            let _ = firecracker.kill();
+            let _ = firecracker.wait();
+            virtiofs.kill();
+            cleanup_files(&paths);
+            return Err(err).context("failed to load the Firecracker snapshot");
+        }
+
+        let record = SessionRecord {
+            project,
+            harness: existing
+                .as_ref()
+                .map(|session| session.harness)
+                .unwrap_or(self.config.harness),
+            started_at: Utc::now(),
+            firecracker_pid,
+            virtiofs_pid,
+            boot_args: existing
+                .as_ref()
+                .map(|session| session.boot_args.clone())
+                .unwrap_or_else(|| ROOT_BOOT_ARGS.to_string()),
+        };
+        let recorded = (|| -> Result<()> {
+            fs::write(&paths.firecracker_pid, firecracker_pid.to_string())?;
+            fs::write(&paths.session, serde_json::to_string_pretty(&record)?)?;
+            Ok(())
+        })();
+        if let Err(err) = recorded {
+            let _ = firecracker.kill();
+            let _ = firecracker.wait();
+            virtiofs.kill();
+            cleanup_files(&paths);
+            return Err(err).context("failed to record the restored sandbox session");
+        }
+
+        // The restored VM runs for the rest of the hegn session.
+        std::mem::forget(firecracker);
+        std::mem::forget(virtiofs);
         Ok(())
     }
 
@@ -448,6 +539,24 @@ impl SandboxManager {
         }
         cleanup_files(&paths);
     }
+}
+
+fn spawn_virtiofsd(
+    config: &Config,
+    paths: &SandboxPaths,
+    project: &Path,
+) -> Result<VirtiofsProcess> {
+    let virtiofs = VirtiofsConfig::new(
+        config.virtiofsd_bin.clone(),
+        project,
+        paths.virtiofs_socket.clone(),
+    );
+    let mut process = virtiofs.spawn().context("failed to start virtiofsd")?;
+    if let Err(err) = process.wait_for_socket(Duration::from_secs(5)) {
+        process.kill();
+        return Err(err);
+    }
+    Ok(process)
 }
 
 fn spawn_firecracker(config: &Config, paths: &SandboxPaths) -> Result<Child> {
@@ -491,6 +600,22 @@ async fn wait_for_api(socket: &Path, child: &mut Child, timeout: Duration) -> Re
         "timed out after {timeout:?} waiting for Firecracker API at {}",
         socket.display()
     )
+}
+
+async fn load_snapshot_into(
+    paths: &SandboxPaths,
+    child: &mut Child,
+    snapshot: &SnapshotMeta,
+) -> Result<()> {
+    wait_for_api(&paths.api_socket, child, API_START_TIMEOUT).await?;
+    FirecrackerClient::new(&paths.api_socket)
+        .load_snapshot(&SnapshotLoad {
+            snapshot_path: snapshot.snapshot_path.display().to_string(),
+            mem_file_path: snapshot.mem_file_path.display().to_string(),
+            track_dirty_pages: Some(true),
+            resume_vm: Some(true),
+        })
+        .await
 }
 
 fn ensure_socket(path: &Path) -> Result<()> {
@@ -549,12 +674,16 @@ fn terminate(pid: u32, binary: &Path) {
     }
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if !process_alive(pid) {
+        if !process_matches(pid, binary) {
+            // Exited, or the PID was recycled by an unrelated process.
             return;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    // Safety: same process as above; escalate to SIGKILL after the grace period.
+    if !process_matches(pid, binary) {
+        return;
+    }
+    // Safety: same verified process as above; escalate after the grace period.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGKILL);
     }
@@ -707,6 +836,60 @@ mod tests {
             Path::new("/definitely/not/this-binary")
         ));
         assert!(!process_matches(0, &exe));
+    }
+
+    #[test]
+    fn restore_rejects_missing_snapshot_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SandboxManager::new(config_with_assets(dir.path()));
+        let snapshot = SnapshotMeta {
+            name: "missing".into(),
+            created_at: Utc::now(),
+            vm_state: "Paused".into(),
+            snapshot_path: dir.path().join("missing.snap"),
+            mem_file_path: dir.path().join("missing.mem"),
+            project: Some(dir.path().join("projects")),
+            size_bytes: 0,
+            note: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(manager.restore_snapshot(&snapshot))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn restore_requires_a_project_without_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SandboxManager::new(config_with_assets(dir.path()));
+        let snap = dir.path().join("vm.snap");
+        let mem = dir.path().join("vm.mem");
+        std::fs::write(&snap, b"state").unwrap();
+        std::fs::write(&mem, b"memory").unwrap();
+        let snapshot = SnapshotMeta {
+            name: "orphan".into(),
+            created_at: Utc::now(),
+            vm_state: "Paused".into(),
+            snapshot_path: snap,
+            mem_file_path: mem,
+            project: None,
+            size_bytes: 0,
+            note: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(manager.restore_snapshot(&snapshot))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no project"), "{err}");
     }
 
     #[test]

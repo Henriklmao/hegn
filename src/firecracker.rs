@@ -106,7 +106,7 @@ pub struct SnapshotLoad {
     pub snapshot_path: String,
     pub mem_file_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_diff_snapshots: Option<bool>,
+    pub track_dirty_pages: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_vm: Option<bool>,
 }
@@ -126,8 +126,6 @@ pub struct InstanceInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     InstanceStart,
-    Pause,
-    Resume,
     SendCtrlAltDel,
 }
 
@@ -135,8 +133,6 @@ impl Action {
     fn as_str(self) -> &'static str {
         match self {
             Self::InstanceStart => "InstanceStart",
-            Self::Pause => "Pause",
-            Self::Resume => "Resume",
             Self::SendCtrlAltDel => "SendCtrlAltDel",
         }
     }
@@ -194,6 +190,24 @@ impl FirecrackerClient {
         .await
     }
 
+    /// `PATCH /vm` with `{"state": "Paused"}`.
+    pub async fn pause(&self) -> Result<()> {
+        self.set_vm_state("Paused").await
+    }
+
+    /// `PATCH /vm` with `{"state": "Resumed"}`.
+    pub async fn resume(&self) -> Result<()> {
+        self.set_vm_state("Resumed").await
+    }
+
+    async fn set_vm_state(&self, state: &str) -> Result<()> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            state: &'a str,
+        }
+        self.patch("/vm", &Body { state }).await
+    }
+
     pub async fn instance_info(&self) -> Result<InstanceInfo> {
         self.get("/").await
     }
@@ -209,8 +223,16 @@ impl FirecrackerClient {
     }
 
     async fn put<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        self.send_json("PUT", path, body).await
+    }
+
+    async fn patch<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        self.send_json("PATCH", path, body).await
+    }
+
+    async fn send_json<B: Serialize>(&self, method: &str, path: &str, body: &B) -> Result<()> {
         let bytes = serde_json::to_vec(body)?;
-        let response = self.request("PUT", path, Some(bytes)).await?;
+        let response = self.request(method, path, Some(bytes)).await?;
         if !(200..300).contains(&response.status) {
             return Err(Error::Status {
                 status: response.status,
@@ -522,6 +544,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pauses_and_resumes_via_patch_vm() {
+        let (_dir, path, handle) = spawn_mock(vec![(204, String::new()), (204, String::new())]);
+        let client = FirecrackerClient::new(&path);
+        client.pause().await.unwrap();
+        client.resume().await.unwrap();
+
+        let requests = handle.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "PATCH");
+        assert_eq!(requests[0].path, "/vm");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["state"], "Paused");
+        assert_eq!(requests[1].method, "PATCH");
+        assert_eq!(requests[1].path, "/vm");
+        let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(body["state"], "Resumed");
+    }
+
+    #[tokio::test]
     async fn reads_instance_info() {
         let (_dir, path, handle) = spawn_mock(vec![(
             200,
@@ -604,11 +645,11 @@ mod tests {
         let load = SnapshotLoad {
             snapshot_path: "/snap/vm.snap".into(),
             mem_file_path: "/snap/vm.mem".into(),
-            enable_diff_snapshots: None,
+            track_dirty_pages: None,
             resume_vm: Some(true),
         };
         let json = serde_json::to_value(&load).unwrap();
-        assert!(json.get("enable_diff_snapshots").is_none());
+        assert!(json.get("track_dirty_pages").is_none());
         assert_eq!(json["resume_vm"], true);
     }
 }

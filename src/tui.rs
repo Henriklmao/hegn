@@ -1,7 +1,7 @@
 //! Terminal lifecycle and the blocking TUI event loop.
 
 use std::io::{Stdout, stdout};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -18,7 +18,6 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::app::{App, Effect, SandboxState, ToastLevel};
 use crate::config::Config;
-use crate::firecracker::{FirecrackerClient, SnapshotLoad};
 use crate::project;
 use crate::ui;
 
@@ -35,11 +34,13 @@ pub fn run(config: Config) -> Result<()> {
     let (scan_tx, scan_rx) = mpsc::channel();
     spawn_scan(app.config.clone(), scan_tx.clone());
 
-    let mut terminal = setup_terminal()?;
+    // Build the runtime before taking over the terminal so a failure cannot
+    // leave the user in raw mode on the alternate screen.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("failed to build async runtime")?;
+    let mut terminal = setup_terminal()?;
 
     let result = run_loop(&mut terminal, &mut app, &scan_tx, &scan_rx, &runtime);
     restore_terminal(&mut terminal)?;
@@ -108,17 +109,22 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
 }
 
 fn spawn_scan(config: Config, tx: mpsc::Sender<ScanMessage>) {
-    std::thread::Builder::new()
+    let thread_tx = tx.clone();
+    let spawned = std::thread::Builder::new()
         .name("hegn-project-scan".into())
         .spawn(move || match project::discover(&config.projects_root) {
             Ok(projects) => {
-                let _ = tx.send(ScanMessage::Projects(projects));
+                let _ = thread_tx.send(ScanMessage::Projects(projects));
             }
             Err(err) => {
-                let _ = tx.send(ScanMessage::Error(err.to_string()));
+                let _ = thread_tx.send(ScanMessage::Error(err.to_string()));
             }
-        })
-        .ok();
+        });
+    if let Err(err) = spawned {
+        let _ = tx.send(ScanMessage::Error(format!(
+            "could not start project scanner: {err}"
+        )));
+    }
 }
 
 fn handle_effects(
@@ -148,7 +154,8 @@ fn handle_effects(
                 }
             }
             Effect::RestoreSnapshot(snapshot) => {
-                match runtime.block_on(restore_snapshot(&app.config, &snapshot)) {
+                let manager = crate::sandbox::SandboxManager::new(app.config.clone());
+                match runtime.block_on(manager.restore_snapshot(&snapshot)) {
                     Ok(()) => {
                         app.toast(format!("restored {}", snapshot.name), ToastLevel::Info);
                         // `resume_vm` is set, so the guest is running again.
@@ -236,27 +243,4 @@ fn open_lazygit(path: &Path) -> Result<()> {
         anyhow::bail!("lazygit exited with {status}");
     }
     Ok(())
-}
-
-async fn restore_snapshot(config: &Config, snapshot: &crate::snapshot::SnapshotMeta) -> Result<()> {
-    let socket = firecracker_socket(config);
-    if !socket.exists() {
-        anyhow::bail!(
-            "no Firecracker API socket at {} (start a VM first)",
-            socket.display()
-        );
-    }
-    FirecrackerClient::new(&socket)
-        .load_snapshot(&SnapshotLoad {
-            snapshot_path: snapshot.snapshot_path.display().to_string(),
-            mem_file_path: snapshot.mem_file_path.display().to_string(),
-            enable_diff_snapshots: None,
-            resume_vm: Some(true),
-        })
-        .await?;
-    Ok(())
-}
-
-pub fn firecracker_socket(config: &Config) -> PathBuf {
-    config.run_dir().join("firecracker.sock")
 }
