@@ -132,7 +132,7 @@ hegn project create my-app --harness opencode --package git --package nodejs
 hegn
 
 # 5. Or drive it non-interactively
-hegn projects
+hegn ls # alternatively `hegn projects`
 hegn sandbox start my-app
 hegn attach my-app
 hegn sandbox status --json

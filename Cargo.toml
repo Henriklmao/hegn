@@ -3,7 +3,7 @@ name = "hegn"
 version = "0.1.0"
 edition = "2024"
 description = "Firecracker MicroVM sandbox manager and TUI for agentic coding"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-or-later"
 rust-version = "1.88"
 
 [dependencies]
@@ -11,15 +11,15 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.29"
-dirs = "6"
-libc = "0.2"
-ratatui = "0.30"
+dirs = "7.0.0"
+libc = "0.2.191"
+ratatui = "0.30.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tirith-core = "0.4.2"
 tokio = { version = "1", features = ["full"] }
-toml = "0.9"
+toml = "1.1.8+spec-1.1.0"
 unicode-width = "0.2"
 
 [dev-dependencies]
