@@ -1013,7 +1013,7 @@ impl App {
             self.modal = Some(Modal::Confirm(ConfirmPrompt {
                 title: "Delete snapshot".into(),
                 message: format!(
-                    "Delete '{}' ({} )?\nThis cannot be undone.",
+                    "Delete '{}' ({})?\nThis cannot be undone.",
                     snapshot.name,
                     snapshot.size_label()
                 ),

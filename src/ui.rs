@@ -1169,9 +1169,10 @@ fn render_create_form(
             style,
         )));
     }
+    pkg_lines.push(Line::default());
     pkg_lines.push(Line::from(Span::styled(
         format!(
-            "\n template: {}",
+            " template: {}",
             if app.config.templates_dir.join("AGENTS.md").is_file() {
                 app.config
                     .templates_dir
@@ -1390,12 +1391,19 @@ fn truncate(text: &str, max: usize) -> String {
     if text.width() <= max {
         return text.to_string();
     }
+    if max == 0 {
+        return String::new();
+    }
     let mut out = String::new();
+    let mut width = 0;
     for ch in text.chars() {
-        if out.width() + 1 >= max {
+        let char_width = ch.width().unwrap_or(0);
+        // Reserve one column for the ellipsis.
+        if width + char_width + 1 > max {
             break;
         }
         out.push(ch);
+        width += char_width;
     }
     out.push('…');
     out
@@ -1530,6 +1538,17 @@ mod tests {
         let (text, _) = render(&app);
         assert!(text.contains("no projects found"));
         assert!(text.contains("press c to create one"));
+    }
+
+    #[test]
+    fn truncate_respects_display_width() {
+        assert_eq!(truncate("abc", 3), "abc");
+        assert_eq!(truncate("abc", 0), "");
+        let wide = truncate("日本語", 4);
+        assert!(wide.ends_with('…'), "{wide}");
+        assert!(wide.width() <= 4, "{wide:?} has width {}", wide.width());
+        let narrow = truncate("abcdef", 4);
+        assert_eq!(narrow, "abc…");
     }
 
     #[test]
