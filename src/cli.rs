@@ -813,7 +813,7 @@ mod tests {
     use super::*;
     use crate::config::BackendKind;
 
-    fn config() -> Config {
+    fn config() -> (tempfile::TempDir, Config) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.projects_root = dir.path().join("projects");
@@ -822,7 +822,7 @@ mod tests {
         config.templates_dir = dir.path().join("templates");
         config.backend = BackendKind::Pty;
         std::fs::create_dir_all(&config.projects_root).unwrap();
-        config
+        (dir, config)
     }
 
     #[test]
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn resolves_project_by_name_and_path() {
-        let config = config();
+        let (_dir, config) = config();
         let path = config.projects_root.join("demo");
         std::fs::create_dir_all(&path).unwrap();
         assert_eq!(
@@ -864,7 +864,7 @@ mod tests {
 
     #[test]
     fn check_returns_tirith_exit_codes() {
-        let config = config();
+        let (_dir, config) = config();
         assert_eq!(check_command_for_test(&config, "ls -la").unwrap(), 0);
         assert_eq!(
             check_command_for_test(&config, "rm -rf /workspace").unwrap(),
@@ -874,7 +874,7 @@ mod tests {
 
     #[test]
     fn project_create_writes_metadata() {
-        let config = config();
+        let (_dir, config) = config();
         let code = project_command(
             ProjectCommands::Create {
                 name: "demo".into(),
@@ -894,7 +894,7 @@ mod tests {
 
     #[test]
     fn project_create_rejects_a_missing_template() {
-        let config = config();
+        let (_dir, config) = config();
         let err = project_command(
             ProjectCommands::Create {
                 name: "demo".into(),
@@ -911,14 +911,14 @@ mod tests {
 
     #[test]
     fn sandbox_status_json_works_without_vm() {
-        let config = config();
+        let (_dir, config) = config();
         let code = sandbox_command(SandboxCommands::Status, config, true).unwrap();
         assert_eq!(code, 0);
     }
 
     #[test]
     fn snapshot_list_empty() {
-        let config = config();
+        let (_dir, config) = config();
         assert_eq!(
             snapshot_command(SnapshotCommands::List, config, true).unwrap(),
             0
@@ -927,7 +927,6 @@ mod tests {
 
     #[test]
     fn config_init_is_idempotent() {
-        let _ = config();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hegn/config.toml");
         // write_default_if_missing uses Config::config_path; just test the
