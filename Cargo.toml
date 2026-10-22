@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Firecracker MicroVM sandbox manager and TUI for agentic coding"
 license = "MIT OR Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [dependencies]
 anyhow = "1"
