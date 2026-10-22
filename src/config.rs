@@ -281,6 +281,13 @@ impl Config {
         if self.shared_tag.is_empty() || self.shared_tag.contains(char::is_whitespace) {
             bail!("shared_tag must be a non-empty token without whitespace");
         }
+        // virtio-fs tags are limited to 36 bytes including the terminator.
+        if self.shared_tag.len() > 36 {
+            bail!(
+                "shared_tag must be at most 36 bytes (got {})",
+                self.shared_tag.len()
+            );
+        }
         if !self.guest_mount.starts_with('/') {
             bail!("guest_mount must be an absolute guest path");
         }
@@ -414,6 +421,9 @@ backend = "pty"
         assert!(config.validate().is_err());
         config.memory_mib = 1024;
         config.guest_mount = "workspace".into();
+        assert!(config.validate().is_err());
+        config.guest_mount = "/workspace".into();
+        config.shared_tag = "x".repeat(37);
         assert!(config.validate().is_err());
     }
 
