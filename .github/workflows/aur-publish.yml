@@ -8,17 +8,25 @@ on:
 permissions:
   contents: read
 
+# Serialise tag runs; never cancel a publish half-way.
+concurrency:
+  group: aur-publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   aur-publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
       - name: Generate PKGBUILD
-        run: bash ./generate-pkgbuild.bash "${{ github.ref_name }}"
+        env:
+          HEGN_TAG: ${{ github.ref_name }}
+        run: bash ./generate-pkgbuild.bash "$HEGN_TAG"
 
       - name: Publish AUR package
-        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
         with:
           pkgname: hegn
           pkgbuild: ./PKGBUILD
@@ -30,14 +38,17 @@ jobs:
 
   aur-publish-bin:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
       - name: Generate PKGBUILD for pre-built binary
-        run: bash ./generate-pkgbuild-bin.bash "${{ github.ref_name }}"
+        env:
+          HEGN_TAG: ${{ github.ref_name }}
+        run: bash ./generate-pkgbuild-bin.bash "$HEGN_TAG"
 
       - name: Publish AUR package (bin)
-        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
         with:
           pkgname: hegn-bin
           pkgbuild: ./PKGBUILD
