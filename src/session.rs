@@ -381,11 +381,30 @@ impl TerminalBuffer {
         lines
     }
 
+    /// Clone only the half-open range `start..end` of the combined view.
+    ///
+    /// The renderer calls this for every frame; cloning the full scrollback
+    /// there would be needlessly expensive.
+    pub fn range(&self, start: usize, end: usize) -> Vec<String> {
+        let total = self.len();
+        let start = start.min(total);
+        let end = end.min(total);
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
+        for index in start..end {
+            if index < self.lines.len() {
+                out.push(self.lines[index].clone());
+            } else if index == self.lines.len() {
+                out.push(self.partial.clone());
+            }
+        }
+        out
+    }
+
     /// Last `height` lines, newest at the bottom.
     pub fn tail(&self, height: usize) -> Vec<String> {
-        let lines = self.lines();
-        let start = lines.len().saturating_sub(height.max(1));
-        lines[start..].to_vec()
+        let total = self.len();
+        let start = total.saturating_sub(height.max(1));
+        self.range(start, total)
     }
 
     pub fn len(&self) -> usize {
@@ -469,6 +488,15 @@ mod tests {
         buf.push_bytes(b"only\n");
         assert_eq!(buf.tail(5), vec!["only", ""]);
         assert_eq!(buf.tail(1), vec![""]);
+    }
+
+    #[test]
+    fn range_returns_only_the_requested_window() {
+        let mut buf = TerminalBuffer::default();
+        buf.push_bytes(b"a\nb\nc");
+        assert_eq!(buf.range(1, 3), vec!["b", "c"]);
+        assert_eq!(buf.range(0, 1), vec!["a"]);
+        assert!(buf.range(10, 20).is_empty());
     }
 
     #[test]

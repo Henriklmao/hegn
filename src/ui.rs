@@ -631,18 +631,17 @@ fn render_terminal(frame: &mut Frame, app: &App, area: Rect) -> (Vec<RowHit>, Ve
     let out = block.inner(right[1]);
     frame.render_widget(block, right[1]);
     let available = out.height.max(1) as usize;
-    let all = app.terminal.lines();
-    let total = all.len();
+    let total = app.terminal.len();
     let scroll = app.scroll.min(total.saturating_sub(available));
     let end = total.saturating_sub(scroll);
     let start = end.saturating_sub(available);
-    let visible: Vec<Line> = all[start..end]
-        .iter()
+    let visible: Vec<Line> = app
+        .terminal
+        .range(start, end)
+        .into_iter()
         .map(|line| {
-            Line::from(Span::styled(
-                line.clone(),
-                Style::default().fg(if line.starts_with("$ ") { GREEN } else { TEXT }),
-            ))
+            let color = if line.starts_with("$ ") { GREEN } else { TEXT };
+            Line::from(Span::styled(line, Style::default().fg(color)))
         })
         .collect();
     frame.render_widget(
