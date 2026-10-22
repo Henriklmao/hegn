@@ -249,14 +249,17 @@ fn project_command(command: ProjectCommands, config: Config, json: bool) -> Resu
                 template.as_deref(),
                 harness,
             )?;
-            let packages: Vec<String> = if packages.is_empty() {
-                harness.packages().iter().map(|p| p.to_string()).collect()
-            } else {
+            let explicit_packages = !packages.is_empty();
+            let packages: Vec<String> = if explicit_packages {
                 packages
+            } else {
+                harness.packages().iter().map(|p| p.to_string()).collect()
             };
-            for package in &packages {
-                if !PACKAGE_CHOICES.contains(&package.as_str()) {
-                    eprintln!("note: '{package}' is not a built-in template package");
+            if explicit_packages {
+                for package in &packages {
+                    if !PACKAGE_CHOICES.contains(&package.as_str()) {
+                        eprintln!("note: '{package}' is not a built-in template package");
+                    }
                 }
             }
             let meta = ProjectMeta {
