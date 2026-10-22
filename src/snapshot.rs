@@ -77,6 +77,9 @@ impl SnapshotStore {
     /// Generate a timestamped name such as `hegn-20261022-141500`.
     pub fn suggested_name(prefix: &str) -> String {
         let prefix = sanitize_name(prefix).unwrap_or_else(|_| "snapshot".to_string());
+        // Leave room for the dash and the 15-character timestamp so the result
+        // still passes `sanitize_name`.
+        let prefix = &prefix[..prefix.len().min(80)];
         format!("{prefix}-{}", Utc::now().format("%Y%m%d-%H%M%S"))
     }
 
@@ -297,6 +300,15 @@ mod tests {
         fs::create_dir(dir.path().join("broken")).unwrap();
         fs::write(dir.path().join("broken/snapshot.json"), "{not json").unwrap();
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn suggested_names_fit_the_name_limit() {
+        let long = "a".repeat(120);
+        let name = SnapshotStore::suggested_name(&long);
+        assert!(name.len() <= 100, "{}", name.len());
+        sanitize_name(&name).unwrap();
+        assert!(SnapshotStore::suggested_name("demo").starts_with("demo-"));
     }
 
     #[test]
