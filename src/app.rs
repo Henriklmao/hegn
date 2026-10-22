@@ -457,10 +457,8 @@ impl App {
         }
         self.viewport = (cols, rows);
         if let Some(session) = &self.session {
-            let _ = session.resize(
-                cols.saturating_sub(4).max(20),
-                rows.saturating_sub(8).max(5),
-            );
+            let (cols, rows) = pty_size(cols, rows);
+            let _ = session.resize(cols, rows);
         }
     }
 
@@ -1091,12 +1089,13 @@ impl App {
             );
         }
         let (cols, rows) = self.viewport;
+        let (pty_cols, pty_rows) = pty_size(cols, rows);
         match Session::spawn(
             &program,
             &args,
             &project.path,
-            cols.saturating_sub(36).max(20),
-            rows.saturating_sub(8).max(5),
+            pty_cols,
+            pty_rows,
             harness.label(),
             &project.path,
         ) {
@@ -1316,6 +1315,17 @@ impl App {
     pub fn project_git(&self) -> Option<&GitSummary> {
         self.selected_project().map(|p| &p.git)
     }
+}
+
+/// Size of the PTY that fits inside the terminal view's right-hand pane.
+///
+/// The layout reserves a 34-column sidebar plus the panel border, a 3-line
+/// header, a 2-line footer, the mode line and the 3-line input box.
+fn pty_size(cols: u16, rows: u16) -> (u16, u16) {
+    (
+        cols.saturating_sub(36).max(20),
+        rows.saturating_sub(11).max(5),
+    )
 }
 
 fn clamp_index(current: usize, delta: isize, max: usize) -> usize {
@@ -1758,6 +1768,12 @@ mod tests {
         assert_eq!(app.sandbox.state, SandboxState::Stopped);
         assert_eq!(app.sandbox.backend, "local pty");
         assert_eq!(app.sandbox.vcpus, app.config.vcpus);
+    }
+
+    #[test]
+    fn pty_size_matches_the_terminal_pane() {
+        assert_eq!(pty_size(120, 40), (84, 29));
+        assert_eq!(pty_size(10, 5), (20, 5));
     }
 
     #[test]
