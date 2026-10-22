@@ -6,7 +6,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     ActionId, App, CreateFocus, Focus, FooterHit, Modal, RowHit, SandboxState, Screen, ToastLevel,
@@ -670,10 +670,20 @@ fn render_terminal(frame: &mut Frame, app: &App, area: Rect) -> (Vec<RowHit>, Ve
         );
     } else {
         let prompt = Span::styled("❯ ", Style::default().fg(ACCENT));
-        let shown = if app.input.width() as u16 > input_inner.width.saturating_sub(3) {
-            let skip =
-                (app.input.width() as u16).saturating_sub(input_inner.width.saturating_sub(3));
-            app.input.chars().skip(skip as usize).collect::<String>()
+        let available = input_inner.width.saturating_sub(3) as usize;
+        let shown = if app.input.width() > available {
+            // Scroll by characters, not by display columns: skipping `width`
+            // characters would cut wide (CJK) input in the wrong place.
+            let mut width = app.input.width();
+            let mut skip = 0;
+            for ch in app.input.chars() {
+                if width <= available {
+                    break;
+                }
+                width -= ch.width().unwrap_or(0);
+                skip += 1;
+            }
+            app.input.chars().skip(skip).collect::<String>()
         } else {
             app.input.clone()
         };
@@ -779,12 +789,12 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
             FooterDef {
                 key: "Tab",
                 label: "Next field",
-                action: ActionId::Create,
+                action: ActionId::NextField,
             },
             FooterDef {
                 key: "Enter",
                 label: "Create",
-                action: ActionId::Create,
+                action: ActionId::SubmitCreate,
             },
             FooterDef {
                 key: "Esc",
@@ -796,12 +806,12 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
             FooterDef {
                 key: "y",
                 label: "Confirm",
-                action: ActionId::Open,
+                action: ActionId::Confirm,
             },
             FooterDef {
                 key: "n",
                 label: "Cancel",
-                action: ActionId::Close,
+                action: ActionId::Cancel,
             },
         ],
         Some(Modal::Help | Modal::Error { .. }) => {

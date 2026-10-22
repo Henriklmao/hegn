@@ -138,6 +138,10 @@ impl SandboxStatus {
 pub enum ActionId {
     Open,
     Create,
+    Confirm,
+    Cancel,
+    NextField,
+    SubmitCreate,
     Edit,
     Lazygit,
     Refresh,
@@ -448,6 +452,9 @@ impl App {
     }
 
     pub fn set_viewport(&mut self, cols: u16, rows: u16) {
+        if self.viewport == (cols, rows) {
+            return;
+        }
         self.viewport = (cols, rows);
         if let Some(session) = &self.session {
             let _ = session.resize(
@@ -465,9 +472,6 @@ impl App {
                 match event {
                     crate::session::SessionEvent::Output(bytes) => {
                         self.terminal.push_bytes(&bytes);
-                        if self.scroll == 0 {
-                            // follow output
-                        }
                     }
                     crate::session::SessionEvent::Exited => closed = true,
                 }
@@ -603,6 +607,9 @@ impl App {
                 } else {
                     Vec::new()
                 }
+            }
+            KeyCode::Char('n') if self.focus == Focus::Snapshots => {
+                self.handle_action(ActionId::NewSnapshot)
             }
             KeyCode::Char('s') => {
                 self.focus = Focus::Snapshots;
@@ -1067,7 +1074,12 @@ impl App {
             }
         }
 
-        let _ = self.store.touch(&project.path);
+        if let Err(err) = self.store.touch(&project.path) {
+            self.toast(
+                format!("could not save recent projects: {err}"),
+                ToastLevel::Warn,
+            );
+        }
         let (cols, rows) = self.viewport;
         match Session::spawn(
             &program,
@@ -1120,6 +1132,35 @@ impl App {
                 )));
                 Vec::new()
             }
+            ActionId::Confirm => {
+                if matches!(self.modal, Some(Modal::Confirm(_))) {
+                    self.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+                } else {
+                    Vec::new()
+                }
+            }
+            ActionId::Cancel => {
+                if matches!(self.modal, Some(Modal::Confirm(_))) {
+                    self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                } else {
+                    Vec::new()
+                }
+            }
+            ActionId::NextField => {
+                if matches!(self.modal, Some(Modal::CreateProject(_))) {
+                    self.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+                } else {
+                    Vec::new()
+                }
+            }
+            ActionId::SubmitCreate => match self.modal.take() {
+                Some(Modal::CreateProject(form)) => self.submit_create_project(form),
+                Some(other) => {
+                    self.modal = Some(other);
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
             ActionId::Edit => self.effect_for_selected(Effect::OpenEditor),
             ActionId::Lazygit => self.effect_for_selected(Effect::OpenLazygit),
             ActionId::Refresh => vec![Effect::RefreshProjects],
@@ -1520,6 +1561,59 @@ mod tests {
         app.handle_key(key(KeyCode::Char('y')));
         assert!(app.snapshots.is_empty());
         assert!(!app.config.snapshots_dir.join("old").exists());
+    }
+
+    #[test]
+    fn footer_confirm_action_deletes_instead_of_opening_project() {
+        let (_dir, mut app) = test_app();
+        let paths = SnapshotStore::new(&app.config.snapshots_dir)
+            .prepare("old")
+            .unwrap();
+        SnapshotStore::new(&app.config.snapshots_dir)
+            .save_meta(&SnapshotMeta {
+                name: "old".into(),
+                created_at: chrono::Utc::now(),
+                vm_state: "Paused".into(),
+                snapshot_path: paths.snapshot_path,
+                mem_file_path: paths.mem_file_path,
+                project: None,
+                size_bytes: 0,
+                note: None,
+            })
+            .unwrap();
+        app.refresh_snapshots();
+        app.focus = Focus::Snapshots;
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(app.modal, Some(Modal::Confirm(_))));
+        app.handle_action(ActionId::Confirm);
+        assert!(app.modal.is_none());
+        assert!(app.snapshots.is_empty());
+        assert!(!app.config.snapshots_dir.join("old").exists());
+    }
+
+    #[test]
+    fn footer_create_action_submits_without_discarding_input() {
+        let (_dir, mut app) = test_app();
+        app.handle_key(key(KeyCode::Char('c')));
+        for c in "from-footer".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_action(ActionId::SubmitCreate);
+        assert!(app.modal.is_none(), "{:?}", app.modal);
+        assert!(app.config.projects_root.join("from-footer").is_dir());
+    }
+
+    #[test]
+    fn snapshot_focus_supports_documented_new_shortcut() {
+        let (_dir, mut app) = test_app();
+        app.focus = Focus::Snapshots;
+        app.handle_key(key(KeyCode::Char('n')));
+        let toast = app.toast.as_ref().unwrap();
+        assert!(
+            toast.text.contains("hegn snapshot create"),
+            "{}",
+            toast.text
+        );
     }
 
     #[test]

@@ -132,21 +132,28 @@ fn handle_effects(
         match effect {
             Effect::Quit => app.should_quit = true,
             Effect::RefreshProjects => {
+                app.loading = true;
                 app.toast("refreshing projects…", ToastLevel::Info);
                 spawn_scan(app.config.clone(), scan_tx.clone());
             }
             Effect::OpenEditor(path) => {
-                with_suspended_terminal(terminal, || open_editor(&path))?;
-                app.toast("returned from editor", ToastLevel::Info);
+                match with_suspended_terminal(terminal, || open_editor(&path)) {
+                    Ok(()) => app.toast("returned from editor", ToastLevel::Info),
+                    Err(err) => app.toast(format!("editor failed: {err}"), ToastLevel::Error),
+                }
             }
             Effect::OpenLazygit(path) => {
-                with_suspended_terminal(terminal, || open_lazygit(&path))?;
+                if let Err(err) = with_suspended_terminal(terminal, || open_lazygit(&path)) {
+                    app.toast(format!("lazygit failed: {err}"), ToastLevel::Error);
+                }
             }
             Effect::RestoreSnapshot(snapshot) => {
                 match runtime.block_on(restore_snapshot(&app.config, &snapshot)) {
                     Ok(()) => {
                         app.toast(format!("restored {}", snapshot.name), ToastLevel::Info);
-                        app.sandbox.state = SandboxState::Paused;
+                        // `resume_vm` is set, so the guest is running again.
+                        app.sandbox.state = SandboxState::Running;
+                        app.sandbox.started_at = Some(Instant::now());
                     }
                     Err(err) => app.toast(format!("restore failed: {err}"), ToastLevel::Error),
                 }
@@ -159,10 +166,19 @@ fn handle_effects(
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)
-        .context("failed to enter alternate screen")?;
-    let backend = CrosstermBackend::new(out);
-    Terminal::new(backend).context("failed to create terminal")
+    if let Err(err) = execute!(out, EnterAlternateScreen, EnableMouseCapture) {
+        disable_raw_mode().ok();
+        return Err(err).context("failed to enter alternate screen");
+    }
+    match Terminal::new(CrosstermBackend::new(out)) {
+        Ok(terminal) => Ok(terminal),
+        Err(err) => {
+            disable_raw_mode().ok();
+            let mut out = stdout();
+            let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture, Show);
+            Err(err).context("failed to create terminal")
+        }
+    }
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
