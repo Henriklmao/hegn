@@ -18,7 +18,7 @@ use crate::config::Harness;
 
 /// Maximum number of scrollback lines retained in memory.
 const DEFAULT_SCROLLBACK: usize = 10_000;
-const MAX_LINE_CHARS: usize = 8_192;
+const MAX_LINE_BYTES: usize = 8_192;
 
 #[derive(Debug)]
 pub enum SessionEvent {
@@ -331,7 +331,7 @@ impl TerminalBuffer {
                 }
                 c if c.is_control() => {}
                 c => {
-                    if self.partial.chars().count() < MAX_LINE_CHARS {
+                    if self.partial.len() < MAX_LINE_BYTES {
                         self.partial.push(c);
                     }
                 }
@@ -497,6 +497,14 @@ mod tests {
         assert_eq!(buf.range(1, 3), vec!["b", "c"]);
         assert_eq!(buf.range(0, 1), vec!["a"]);
         assert!(buf.range(10, 20).is_empty());
+    }
+
+    #[test]
+    fn buffer_caps_very_long_lines() {
+        let mut buf = TerminalBuffer::default();
+        buf.push_bytes(&vec![b'a'; MAX_LINE_BYTES * 2]);
+        buf.push_bytes(b"\n");
+        assert_eq!(buf.lines()[0].len(), MAX_LINE_BYTES);
     }
 
     #[test]
