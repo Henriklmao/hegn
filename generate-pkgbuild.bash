@@ -23,7 +23,7 @@ url='${url}'
 license=('MIT' 'Apache-2.0')
 # cloud-hypervisor-bin provides 'cloud-hypervisor', so either AUR package
 # satisfies this dependency.
-depends=('gcc-libs' 'cloud-hypervisor')
+depends=('gcc-libs' 'cloud-hypervisor' 'virtiofsd')
 conflicts=('hegn-bin' 'hegn-git')
 makedepends=('git' 'rust')
 source=("\$pkgname::git+${url}.git#tag=${tag}")

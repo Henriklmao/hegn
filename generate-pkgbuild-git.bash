@@ -31,10 +31,10 @@ pkgdesc='${aur_description} (git version)'
 arch=('x86_64' 'aarch64')
 url='${url}'
 license=('MIT' 'Apache-2.0')
-depends=('gcc-libs' 'git')
+# cloud-hypervisor-bin provides 'cloud-hypervisor', so either AUR package
+# satisfies this dependency. hegn cannot start without the VMM or virtiofsd.
+depends=('gcc-libs' 'git' 'cloud-hypervisor' 'virtiofsd')
 optdepends=(
-  'cloud-hypervisor: boot MicroVMs (available as cloud-hypervisor or cloud-hypervisor-bin in the AUR)'
-  'virtiofsd: share the project directory into the guest'
   'lazygit: open projects with the g shortcut'
 )
 provides=('hegn')
