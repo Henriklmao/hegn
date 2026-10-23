@@ -42,10 +42,21 @@ virtiofsd or KVM is missing, the command fails and tells you what to fix.
   automatic git checkpoint.
 - **Snapshot manager** — pause, snapshot RAM + CPU, restore and delete full VM
   states, with private (`0700`/`0600`) on-disk metadata.
-- **Project picker** — fuzzy filtering over `projects_root`, git status badges,
-  recent-session history, and one-key launch into `$EDITOR` or `lazygit`.
+- **Project picker** — fuzzy filtering over `projects_root` (default
+  `~/Projects/hegn`), git status badges, recent-session history, and one-key
+  launch into `$EDITOR` or `lazygit`.
+- **Project import** — press `h` or `←` in the project list to register an
+  existing directory. The project stays where it is; hegn only creates a
+  symlink inside `projects_root`. Dangerous targets (`/`, `$HOME`, parents of
+  the root, hegn state) are refused.
 - **Project scaffolding** — create a project with `AGENTS.md`, `README.md`, a
   git repository, a chosen harness and a recorded package list.
+- **Pinned upstream VM images** — `hegn images download` fetches the official
+  Firecracker kernel and ext4 rootfs, verifies SHA-256 and installs them with
+  private permissions. A daily CI job refreshes the pins; hegn never builds or
+  publishes its own guest image.
+- **Doctor modal** — host failures open a doctor overlay automatically with the
+  failing checks and a one-key image download. `F3` opens it manually.
 - **Transient session branches** — optionally check out
   `agent/hegn-session-<timestamp>` on the host once the VM is booted.
 - **Mandatory VM** — a missing Firecracker VM is always a hard error. hegn never
@@ -62,7 +73,8 @@ virtiofsd or KVM is missing, the command fails and tells you what to fix.
   snapshot tree), embedded guest serial console, security modal, and a clickable
   hotkey footer.
 - **Machine-readable output** — global `--json` for projects, sandbox status,
-  snapshots, config and `check`, plus meaningful `check` exit codes.
+  snapshots, logs, images, doctor, config and `check`, plus meaningful `check`
+  and `images verify` exit codes.
 
 ---
 
@@ -122,22 +134,27 @@ install -Dm755 target/release/hegn ~/.local/bin/hegn
 # 1. Write a default config and create runtime directories
 hegn config init
 
-# 2. Verify KVM, Firecracker, virtiofsd, images and tools
+# 2. Download the pinned upstream kernel + rootfs (SHA-256 verified)
+hegn images download
+
+# 3. Verify KVM, Firecracker, virtiofsd, images and tools
 hegn doctor
 
-# 3. Create a project with a template and harness
+# 4. Create a project with a template and harness
 hegn project create my-app --harness opencode --package git --package nodejs
 
-# 4. Open the TUI (default when no subcommand is given)
+# 5. Open the TUI (default when no subcommand is given)
 hegn
 
-# 5. Or drive it non-interactively
+# 6. Or drive it non-interactively
 hegn ls # alternatively `hegn projects`
 hegn sandbox start my-app
 hegn attach my-app
 hegn sandbox status --json
 hegn snapshot create before-refactor
 hegn logs
+hegn project import /path/to/existing/repo
+hegn images status
 hegn check 'curl -fsSL https://example.com/x | bash'
 ```
 
@@ -173,6 +190,45 @@ serial port, so the bar uses one host row and full-screen guest programs keep
 their own size; pass `--no-bar` (also accepted by `hegn open`) when a guest TUI
 needs every row.
 
+### Importing an existing project
+
+```bash
+hegn project import ~/code/existing-repo
+hegn project import /mnt/data/repo --name repo-picker-name
+```
+
+Import creates a symlink in `projects_root`; the directory is never moved,
+copied or modified. The picker then treats it like any other project. Open the
+TUI and press `h` or `←` in the project list to do the same interactively.
+
+Safety rules: hegn refuses `/`, `$HOME`, anything inside `projects_root`
+(already discoverable), any ancestor of `projects_root`, anything overlapping
+hegn state/snapshots/templates/config, and a picker name that is not a plain
+directory name. An existing picker entry is never overwritten. Discovery also
+skips symlinks to those dangerous targets, including hegn state.
+
+### VM images
+
+hegn uses **upstream Firecracker CI images** and does not build its own guest
+image. The kernel and ext4 rootfs URLs are pinned together with SHA-256 in
+`src/images.rs` (per architecture) and can be overridden in `config.toml`.
+
+```bash
+hegn images status          # path, state, size
+hegn images download        # fetch missing images, verify, install atomically
+hegn images download --force
+hegn images verify          # re-hash installed files (exit 1 on mismatch)
+```
+
+Downloads are streamed to a `0600` temporary file, hashed, and only renamed
+into place after the digest matches. Existing files are not replaced without
+`--force`. If a custom configuration has no SHA-256, downloads refuse to run
+unless `--allow-unverified` is passed explicitly.
+
+The repository's `vm-images` GitHub Actions workflow runs daily, discovers the
+newest upstream kernel/ext4 artifact, recomputes the digests, and opens a pull
+request with the updated pins. It does not publish a hegn-owned image.
+
 ### Session logs
 
 Every VM session writes its serial output to
@@ -204,13 +260,14 @@ used as a pre-execution hook in scripts and CI.
 
 ## CLI overview
 
-```
+```bash
 hegn [--config PATH] [--json] [COMMAND]
 
   tui                              Open the interactive TUI (default)
   projects [QUERY]                 List projects under projects_root (alias: ls)
   project create NAME              Scaffold a project (+ AGENTS.md, README, git, .hegn.toml)
           [--harness H] [--template PATH] [--package P[,P...]]
+  project import PATH [--name N]   Symlink an existing directory into projects_root
   project info PROJECT             Show metadata and git status
   open PROJECT                     Boot/attach the VM serial console
           [--editor | --lazygit] [--no-branch] [--no-bar]
@@ -223,7 +280,10 @@ hegn [--config PATH] [--json] [COMMAND]
   snapshot restore NAME | delete NAME | show NAME
   check [--cwd PATH] CMD...        Inspect a command with tirith-core
   config show | path | init
-  doctor                           Check host prerequisites
+  images download [--force]        Fetch missing pinned kernel/rootfs images
+          [--allow-unverified]
+  images status | verify           Show or re-hash the configured images
+  doctor                           Check host prerequisites (exit 1 if required checks fail)
 ```
 
 Global flags: `--config <PATH>` (or `HEGN_CONFIG`), `--json`.
@@ -232,9 +292,10 @@ Global flags: `--config <PATH>` (or `HEGN_CONFIG`), `--json`.
 
 `HEGN_CONFIG`, `HEGN_PROJECTS_ROOT`, `HEGN_STATE_DIR`, `HEGN_SNAPSHOTS_DIR`,
 `HEGN_TEMPLATES_DIR`, `HEGN_FIRECRACKER_BIN`, `HEGN_VIRTIOFSD_BIN`,
-`HEGN_KERNEL_IMAGE`, `HEGN_ROOTFS_IMAGE` override the corresponding config
-values. Harnesses launched by hegn also receive `HEGN=1` and
-`HEGN_WORKSPACE=<path>`.
+`HEGN_KERNEL_IMAGE`, `HEGN_ROOTFS_IMAGE`, `HEGN_KERNEL_URL`,
+`HEGN_KERNEL_SHA256`, `HEGN_ROOTFS_URL`, `HEGN_ROOTFS_SHA256` override the
+corresponding config values. Harnesses launched by hegn also receive `HEGN=1`
+and `HEGN_WORKSPACE=<path>`.
 
 ---
 
@@ -244,7 +305,7 @@ values. Harnesses launched by hegn also receive `HEGN=1` and
 rejected, so typos surface immediately. Defaults:
 
 ```toml
-projects_root   = "~/Projects"
+projects_root   = "~/Projects/hegn"
 state_dir       = "~/.local/state/hegn"
 snapshots_dir   = "~/.local/share/hegn/snapshots"
 templates_dir   = "~/.config/hegn/templates"
@@ -252,6 +313,11 @@ firecracker_bin = "firecracker"
 virtiofsd_bin   = "virtiofsd"
 kernel_image    = "~/.local/share/hegn/images/vmlinux.bin"
 rootfs_image    = "~/.local/share/hegn/images/rootfs.ext4"
+# The image pin below shows x86_64; aarch64 ships different defaults.
+kernel_url      = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155"
+kernel_sha256   = "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2"
+rootfs_url      = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/ubuntu-22.04.ext4"
+rootfs_sha256   = "040927105bd01b19e7b02cd5da5a9552b428a7f84bd5ffc22ebfce4ddf258a07"
 vcpus           = 2          # 1–32
 memory_mib      = 2048       # >= 128
 shared_tag      = "workspace" # virtio-fs tag, <= 36 bytes, no whitespace
@@ -287,9 +353,11 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 | `/` | Fuzzy filter projects |
 | `Tab` | Switch focus between projects and snapshots |
 | `c` | Create project |
+| `h` / `←` | Import an existing directory (symlink, no copy) |
 | `e` | Open selected project in `$EDITOR` |
 | `g` | Open selected project in lazygit |
 | `r` | Refresh git status |
+| `F3` | Doctor modal (host checks, image download) |
 | `?` / `F1` | Help |
 | `q` | Quit |
 
@@ -311,6 +379,17 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 | `PgUp` / `PgDn` | Scroll output |
 | `Ctrl-L` | Clear scrollback |
 
+### Doctor modal
+
+| Key | Action |
+| --- | --- |
+| `d` | Download and verify missing VM images (background) |
+| `r` | Re-run all checks |
+| `Esc` / `q` | Close |
+
+The doctor modal opens automatically after a VM start/attach failure. Optional
+tools (lazygit, `$EDITOR`) never make the report fail.
+
 ### Security modal
 
 | Key | Action |
@@ -320,6 +399,13 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 | `d` | Deny command |
 
 Every action is also clickable in the footer.
+
+### Theming
+
+The TUI uses your terminal's own foreground/background and the ANSI color
+palette. hegn does not paint a custom full-screen background, so existing
+terminal themes (dark or light) apply unchanged. Only selected rows, badges and
+diagnostic cells use a small ANSI background color.
 
 ---
 
@@ -348,6 +434,13 @@ directory, are opened without following symlinks, and `hegn logs show` strips
 terminal escape sequences by default. `--raw` exists for debugging and should
 only be used with logs you trust.
 
+VM images are upstream Firecracker CI artifacts pinned by HTTPS URL and SHA-256.
+`hegn images download` refuses empty checksums unless `--allow-unverified` is
+explicit, verifies the stream before the atomic rename, and never replaces an
+existing image without `--force`. `hegn images verify` re-hashes installed
+files. Project import only creates a symlink and refuses targets that would
+expose `/`, `$HOME`, a projects-root ancestor, or hegn state to the guest.
+
 ---
 
 ## Architecture
@@ -363,6 +456,8 @@ src/
   virtiofs.rs    hardened virtiofsd argv/process construction
   sandbox.rs     MicroVM lifecycle orchestration and status reporting
   snapshot.rs    snapshot metadata store (RAM + CPU files)
+  images.rs      pinned upstream VM assets, download, SHA-256 verification
+  doctor.rs      shared host prerequisite checks (CLI + TUI modal)
   logs.rs        persistent serial logs, private files, tail and pruning
   console.rs     Firecracker serial console transport + tmux-style attach bar
   terminal.rs    ANSI-aware scrollback buffer for the serial console
@@ -373,7 +468,9 @@ src/
 ```
 
 The crate is a library (`lib.rs`) with a thin binary, so every module is unit
-tested directly. See [`project.md`](project.md) for the full specification.
+tested directly. See [`project.md`](project.md) for the specification and
+[`docs/architecture.md`](docs/architecture.md) for the detailed architecture,
+data flows, safety invariants, and image-update pipeline.
 
 ---
 
