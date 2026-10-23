@@ -175,9 +175,11 @@ fn session_cost(config: &Config, notes: &mut Vec<String>) -> Option<SessionCost>
                 continue;
             }
         };
-        if process_alive(session.vm_pid) && cmdline_contains(session.vm_pid, "cloud-hypervisor") {
+        if process_alive(session.vm_pid)
+            && matches_binary(session.vm_pid, &config.vm_binary(), "cloud-hypervisor")
+        {
             let (vcpus, memory_mib) = sandbox_limits(&path, config);
-            return Some(build_session(&session, vcpus, memory_mib, notes));
+            return Some(build_session(&session, config, vcpus, memory_mib, notes));
         }
         stale.get_or_insert((session, path));
     }
@@ -189,25 +191,42 @@ fn session_cost(config: &Config, notes: &mut Vec<String>) -> Option<SessionCost>
         session.vm_pid
     ));
     let (vcpus, memory_mib) = sandbox_limits(&path, config);
-    Some(build_session(&session, vcpus, memory_mib, notes))
+    Some(build_session(&session, config, vcpus, memory_mib, notes))
 }
 
 fn build_session(
     session: &SessionFile,
+    config: &Config,
     vcpus: u8,
     memory_mib: u32,
     notes: &mut Vec<String>,
 ) -> SessionCost {
+    let vm = config.vm_binary();
+    let virtiofsd = config.virtiofsd_bin.clone();
     let mut processes = Vec::new();
-    for (role, pid, needle) in [
-        ("cloud-hypervisor", session.vm_pid, "cloud-hypervisor"),
-        ("virtiofsd", session.virtiofs_pid, "virtiofsd"),
-        ("console-relay", session.relay_pid, "__console-relay"),
+    for (role, pid, binary, fallback) in [
+        (
+            "cloud-hypervisor",
+            session.vm_pid,
+            Some(&vm),
+            "cloud-hypervisor",
+        ),
+        (
+            "virtiofsd",
+            session.virtiofs_pid,
+            Some(&virtiofsd),
+            "virtiofsd",
+        ),
+        ("console-relay", session.relay_pid, None, "__console-relay"),
     ] {
         if pid == 0 {
             continue;
         }
-        if !cmdline_contains(pid, needle) {
+        let matches = match binary {
+            Some(binary) => matches_binary(pid, binary, fallback),
+            None => cmdline_contains(pid, fallback),
+        };
+        if !matches {
             notes.push(format!(
                 "pid {pid} recorded as {role} no longer belongs to that process"
             ));
@@ -472,6 +491,19 @@ fn cmdline_contains(pid: u32, needle: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the process runs `binary`, or at least a binary with its file name.
+///
+/// The configured path may be renamed (`cloud_hypervisor_bin = "/opt/ch"`), so
+/// both the configured name and the conventional one are accepted.
+fn matches_binary(pid: u32, binary: &Path, fallback: &str) -> bool {
+    let configured = binary
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .filter(|name| !name.is_empty())
+        .is_some_and(|name| cmdline_contains(pid, &name));
+    configured || cmdline_contains(pid, fallback)
+}
+
 /// Render bytes with binary units and one decimal place.
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -644,6 +676,18 @@ mod tests {
         assert!(cmdline_contains(pid, &name));
         assert!(!cmdline_contains(pid, "definitely-not-on-this-cmdline"));
         assert!(!cmdline_contains(u32::MAX - 1, "hegn"));
+    }
+
+    #[test]
+    fn matches_binary_accepts_the_configured_path() {
+        let pid = std::process::id();
+        let exe = std::env::current_exe().expect("current exe");
+        assert!(matches_binary(pid, &exe, "no-such-fallback"));
+        assert!(!matches_binary(
+            pid,
+            Path::new("/opt/not-running"),
+            "no-such-fallback"
+        ));
     }
 
     #[test]
