@@ -1,9 +1,9 @@
 name: aur-publish-git
 
 on:
-  push:
-    branches:
-      - main
+  schedule:
+    # Daily at 03:17 UTC; GitHub Actions cron is always UTC.
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
