@@ -124,8 +124,14 @@ pub enum Commands {
     },
     /// Check host prerequisites (KVM, Cloud Hypervisor, virtiofsd, assets, tools).
     Doctor,
-    /// Measure the host cost of the running sandbox and the on-disk usage.
-    Benchmark,
+    /// Measure the host cost of a sandbox; boots one on demand.
+    Benchmark {
+        /// Project name or path to boot and measure.
+        project: Option<String>,
+        /// Create a throwaway project, measure it, then remove it again.
+        #[arg(long, conflicts_with = "project")]
+        clean: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -324,7 +330,9 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
         Commands::Config { command } => config_command(command, config, json),
         Commands::Images { command } => image_command(command, config, json),
         Commands::Doctor => doctor(config, json),
-        Commands::Benchmark => benchmark::run(&config, json),
+        Commands::Benchmark { project, clean } => {
+            benchmark::run(&config, project.as_deref(), clean, json)
+        }
     }
 }
 

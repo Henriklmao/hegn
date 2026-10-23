@@ -385,7 +385,7 @@ hegn [--config PATH] [--json] [COMMAND]
           [--allow-unverified]
   images status | verify           Show or re-hash the configured images
   doctor                           Check host prerequisites (exit 1 if required checks fail)
-  benchmark                        Measure host RAM/disk cost of the running sandbox
+  benchmark [PROJECT] [--clean]    Measure host cost; boots a VM on demand
 ```
 
 Global flags: `--config <PATH>` (or `HEGN_CONFIG`), `--json`.

@@ -135,13 +135,25 @@ around every command and snapshot-based rollback.
 
 ## Measure on your machine
 
-`hegn benchmark` performs the measurements this document is based on. It is
-read-only: no VM is started, paused or stopped.
+`hegn benchmark` performs the measurements this document is based on:
 
 ```bash
-hegn benchmark          # human-readable report
-hegn benchmark --json   # same data for scripts
+hegn benchmark               # running sandbox; offers to boot one when idle
+hegn benchmark my-project    # boot (or reuse) that project's sandbox
+hegn benchmark --clean       # throwaway project + VM, measured, then removed
+hegn benchmark --json        # machine-readable report
 ```
+
+Without arguments and without a running sandbox, the command asks on an
+interactive terminal whether it should create a temporary test project. It
+never prompts when stdin is not a terminal or `--json` is set, so scripts and
+agents get the passive report instead.
+
+`--clean` creates `<projects_root>/hegn-benchmark-<timestamp>`, boots it,
+measures it, stops the sandbox and deletes the directory again; the report
+records the cleanup and refuses to delete anything that is not one of its own
+projects. `hegn benchmark <project>` leaves the sandbox running so you can
+attach to it afterwards.
 
 ```text
 hegn benchmark

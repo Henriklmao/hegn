@@ -3,22 +3,35 @@
 //! The report answers the questions behind `docs/resources.md`: how much RAM
 //! the VMM, `virtiofsd` and the console relay actually use, how much disk the
 //! images, snapshots and logs occupy, and what the configured guest would cost
-//! at most. Everything here is read-only: no VM is started, paused or stopped.
+//! at most.
+//!
+//! Three modes:
+//!
+//! - no argument: measure the running sandbox (read-only), or ask whether to
+//!   boot a throwaway one when nothing is running;
+//! - `benchmark <project>`: boot that project's sandbox and measure it;
+//! - `benchmark --clean`: create a temporary project, boot it, measure it, stop
+//!   it and delete the project again.
 //!
 //! Process numbers come from `/proc/<pid>/status`, disk numbers from
 //! `st_blocks` (allocated) and `st_size` (apparent), so sparse files such as
 //! the cloud-init seed and the qcow2 image are reported honestly.
 
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::config::{Config, Harness};
+use crate::project;
+use crate::sandbox::SandboxManager;
 
 const MIB: u64 = 1024 * 1024;
+/// Prefix for throwaway projects created by `benchmark --clean`.
+const TEMP_PREFIX: &str = "hegn-benchmark-";
 
 /// One host process that belongs to a running session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -66,12 +79,24 @@ pub struct BenchmarkReport {
     pub guest_memory_bytes: u64,
     /// Resident memory of the session processes observed right now.
     pub process_rss_bytes: u64,
+    /// Whether this invocation booted a sandbox.
+    pub started: bool,
+    /// Present for `--clean`: what happened to the throwaway project.
+    pub cleanup: Option<Cleanup>,
     pub snapshots: u64,
     /// `snapshots * memory_mib`; disk contents are not part of a snapshot.
     pub snapshot_estimate_bytes: u64,
     pub disk: Vec<DiskCost>,
     pub disk_allocated_bytes: u64,
     pub notes: Vec<String>,
+}
+
+/// Outcome of removing a `--clean` project after measuring it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Cleanup {
+    pub project: PathBuf,
+    pub sandbox_stopped: bool,
+    pub removed: bool,
 }
 
 /// `session.json` written by `hegn sandbox start`.
@@ -99,17 +124,210 @@ struct SessionFile {
 
 /// Measure the current host cost and print or emit the report.
 ///
-/// Always exits `0`: a machine without a running sandbox still gets its disk
-/// usage reported. Unreadable session records are reported as notes instead of
-/// failing the command.
-pub fn run(config: &Config, json: bool) -> Result<i32> {
-    let report = collect(config);
+/// - no project and no `--clean`: measure the running sandbox; if nothing runs
+///   and the terminal is interactive, offer to boot a throwaway one;
+/// - `project`: boot that project (or measure it when it is already running);
+/// - `clean`: create a temporary project, boot it, measure it, stop and remove
+///   it again.
+pub fn run(config: &Config, project: Option<&str>, clean: bool, json: bool) -> Result<i32> {
+    if let Some(project) = project {
+        return measure_project(config, project, json);
+    }
+    if clean {
+        return measure_temporary(config, json);
+    }
+    if running_session(config).is_some() {
+        return emit(collect(config), json);
+    }
+    if !json && io::stdin().is_terminal() {
+        let question = "No sandbox is running. Create a temporary benchmark project, boot a \
+                        VM and remove both afterwards?";
+        if confirm(question)? {
+            return measure_temporary(config, json);
+        }
+    }
+
+    let mut report = collect(config);
+    report.notes.push(
+        "no sandbox running; pass a project name to boot one, or --clean for a throwaway \
+         project"
+            .to_string(),
+    );
+    emit(report, json)
+}
+
+fn emit(report: BenchmarkReport, json: bool) -> Result<i32> {
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_report(&report);
     }
     Ok(0)
+}
+
+fn confirm(question: &str) -> Result<bool> {
+    print!("{question} [y/N] ");
+    io::stdout().flush().context("failed to write the prompt")?;
+    let mut answer = String::new();
+    if io::stdin()
+        .read_line(&mut answer)
+        .context("failed to read the answer")?
+        == 0
+    {
+        return Ok(false);
+    }
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Boot (or reuse) the sandbox of an existing project and measure it.
+fn measure_project(config: &Config, project: &str, json: bool) -> Result<i32> {
+    let path = crate::cli::resolve_project(config, project)?;
+    if let Some((session, session_path)) = running_session(config) {
+        let matches_project = session
+            .project
+            .as_ref()
+            .is_some_and(|running| same_path(running, &path));
+        if !matches_project {
+            bail!(
+                "a sandbox is already running for {}; stop it with `hegn sandbox stop` first",
+                session
+                    .project
+                    .as_ref()
+                    .map(|running| running.display().to_string())
+                    .unwrap_or_else(|| session_path.display().to_string())
+            );
+        }
+        let mut report = collect(config);
+        report
+            .notes
+            .push("the sandbox was already running; nothing was started".to_string());
+        return emit(report, json);
+    }
+
+    let harness = project::read_meta(&path).harness.unwrap_or(config.harness);
+    SandboxManager::new(config.clone()).start(&path, harness)?;
+
+    let mut report = collect(config);
+    report.started = true;
+    report.notes.push(format!(
+        "sandbox started for {}; attach with `hegn attach`, stop it with `hegn sandbox stop`",
+        path.display()
+    ));
+    emit(report, json)
+}
+
+/// Create a throwaway project, boot it, measure it and clean up again.
+fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
+    if let Some((session, _)) = running_session(config) {
+        bail!(
+            "a sandbox is already running for {}; stop it with `hegn sandbox stop` first",
+            session
+                .project
+                .as_ref()
+                .map(|running| running.display().to_string())
+                .unwrap_or_else(|| "an unknown project".to_string())
+        );
+    }
+
+    let name = format!("{TEMP_PREFIX}{}", Utc::now().timestamp_millis());
+    let template = config.templates_dir.join("AGENTS.md");
+    let template = template.is_file().then_some(template);
+    let path = project::create_project(
+        &config.projects_root,
+        &name,
+        template.as_deref(),
+        config.harness,
+    )?;
+    let meta = project::ProjectMeta {
+        harness: Some(config.harness),
+        packages: packages_for(config.harness),
+        template: template.map(|path| path.display().to_string()),
+    };
+    project::write_meta(&path, &meta)?;
+
+    let started = (|| -> Result<BenchmarkReport> {
+        SandboxManager::new(config.clone()).start(&path, config.harness)?;
+        let mut report = collect(config);
+        report.started = true;
+        Ok(report)
+    })();
+
+    let stopped = SandboxManager::new(config.clone()).stop().is_ok();
+    let removed = match remove_temp_project(config, &path) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("warning: could not remove {}: {err}", path.display());
+            false
+        }
+    };
+
+    match started {
+        Ok(mut report) => {
+            report.cleanup = Some(Cleanup {
+                project: path.clone(),
+                sandbox_stopped: stopped,
+                removed,
+            });
+            if !stopped {
+                report
+                    .notes
+                    .push("the temporary sandbox could not be stopped".to_string());
+            }
+            if !removed {
+                report.notes.push(format!(
+                    "could not remove the temporary project {}; remove it manually",
+                    path.display()
+                ));
+            }
+            emit(report, json)
+        }
+        Err(err) => {
+            if removed {
+                Err(err)
+            } else {
+                Err(err.context(format!(
+                    "the temporary project {} could not be removed; remove it manually",
+                    path.display()
+                )))
+            }
+        }
+    }
+}
+
+fn packages_for(harness: Harness) -> Vec<String> {
+    harness.packages().iter().map(|p| p.to_string()).collect()
+}
+
+/// Remove a throwaway project, refusing anything that is not one of ours.
+fn remove_temp_project(config: &Config, path: &Path) -> Result<()> {
+    let in_projects_root = path.parent() == Some(config.projects_root.as_path());
+    let prefixed = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(TEMP_PREFIX));
+    if !in_projects_root || !prefixed {
+        bail!(
+            "refusing to remove {}: not a benchmark project under {}",
+            path.display(),
+            config.projects_root.display()
+        );
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!("refusing to remove {}: not a directory", path.display());
+    }
+    fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 /// Build the report without printing anything.
@@ -149,12 +367,32 @@ pub fn collect(config: &Config) -> BenchmarkReport {
         vcpus,
         guest_memory_bytes,
         process_rss_bytes,
+        started: false,
+        cleanup: None,
         snapshots,
         snapshot_estimate_bytes,
         disk,
         disk_allocated_bytes,
         notes,
     }
+}
+
+/// The session that is alive right now, if any.
+fn running_session(config: &Config) -> Option<(SessionFile, PathBuf)> {
+    for path in session_candidates(config) {
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(session) = serde_json::from_str::<SessionFile>(&raw) else {
+            continue;
+        };
+        if process_alive(session.vm_pid)
+            && matches_binary(session.vm_pid, &config.vm_binary(), "cloud-hypervisor")
+        {
+            return Some((session, path));
+        }
+    }
+    None
 }
 
 /// Locate the session that is actually running and read its process costs.
@@ -580,6 +818,18 @@ fn print_report(report: &BenchmarkReport) {
         }
     }
 
+    if report.started {
+        println!("\nStarted   a sandbox for this measurement");
+    }
+    if let Some(cleanup) = &report.cleanup {
+        println!(
+            "\nCleanup   {} (sandbox stopped: {}, project removed: {})",
+            cleanup.project.display(),
+            cleanup.sandbox_stopped,
+            cleanup.removed
+        );
+    }
+
     println!(
         "\n{:<12} {:>11} {:>11} {:>7}  PATH",
         "DISK", "ALLOCATED", "APPARENT", "FILES"
@@ -823,6 +1073,8 @@ mod tests {
             vcpus: 2,
             guest_memory_bytes: 2048 * MIB,
             process_rss_bytes: 0,
+            started: false,
+            cleanup: None,
             snapshots: 0,
             snapshot_estimate_bytes: 0,
             disk: Vec::new(),
@@ -831,6 +1083,64 @@ mod tests {
         };
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["guest_memory_bytes"], 2048 * MIB);
+        assert_eq!(json["started"], false);
+        assert!(json["cleanup"].is_null());
         assert!(json["session"].is_null());
+    }
+
+    #[test]
+    fn remove_temp_project_only_deletes_its_own_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            projects_root: dir.path().join("projects"),
+            ..Config::default()
+        };
+        let temp = config.projects_root.join("hegn-benchmark-1");
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("README.md"), b"x").unwrap();
+
+        remove_temp_project(&config, &temp).unwrap();
+        assert!(!temp.exists());
+
+        let foreign = config.projects_root.join("my-project");
+        fs::create_dir_all(&foreign).unwrap();
+        let err = remove_temp_project(&config, &foreign).unwrap_err();
+        assert!(err.to_string().contains("refusing to remove"), "{err}");
+        assert!(foreign.exists());
+
+        let outside = dir.path().join("hegn-benchmark-outside");
+        fs::create_dir_all(&outside).unwrap();
+        let err = remove_temp_project(&config, &outside).unwrap_err();
+        assert!(err.to_string().contains("refusing to remove"), "{err}");
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn running_session_ignores_a_recycled_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            state_dir: dir.path().join("state"),
+            snapshots_dir: dir.path().join("data/snapshots"),
+            ..Config::default()
+        };
+        fs::create_dir_all(config.state_dir.join("run")).unwrap();
+        let session = serde_json::json!({
+            "project": dir.path().join("project"),
+            "harness": "shell",
+            "started_at": "2026-01-01T00:00:00Z",
+            "vm_pid": std::process::id(),
+            "virtiofs_pid": 0,
+            "relay_pid": 0,
+        });
+        fs::write(
+            config.state_dir.join("run/session.json"),
+            serde_json::to_vec(&session).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            running_session(&config).is_none(),
+            "the test process is not a Cloud Hypervisor"
+        );
     }
 }
