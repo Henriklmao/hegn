@@ -4,10 +4,11 @@ on:
   push:
   pull_request:
 
-# A newer push/PR supersedes the previous run for the same ref.
+# One run per ref at a time. A newer push/PR queues behind the running check
+# instead of cancelling it, so every started run finishes.
 concurrency:
-  group: rust-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 # Read-only by default; only the release job widens it.
 permissions:
