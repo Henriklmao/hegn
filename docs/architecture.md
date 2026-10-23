@@ -58,6 +58,16 @@ The guest sees exactly one host directory through virtiofsd. The host sees
 control sockets, logs and metadata. There is no network port, no shared
 namespace and no second mount by default.
 
+### 2.1 Firecracker build requirement
+
+Firecracker upstream does not implement virtio-fs (the host filesystem-sharing
+feature is a long-standing open request). hegn therefore requires a
+**virtio-fs-enabled Firecracker build** that exposes the `PUT /vhost-user-fs`
+API. Current startup tries `/vhost-user-fs/{id}` first and falls back to the
+collection form `/vhost-user-fs` for forks that use that shape. If neither
+exists, the error explicitly says the build lacks virtio-fs; hegn does not
+substitute a host shell, a copied workspace, or a different VMM.
+
 ---
 
 ## 3. Runtime topology
@@ -140,7 +150,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `config.rs` | Schema, defaults, env overrides, validation, XDG paths, tool lookup | Unknown keys rejected; SHA-256 and HTTPS URL validation; log dir `0700`; `virtiofsd` resolved via `PATH` then distribution dirs |
 | `project.rs` | Discovery, fuzzy filter, git summaries, create, import, checkpoints | Import only creates a symlink; dangerous targets rejected; discovery skips links to `/`, `$HOME` and root ancestors |
 | `security.rs` | `tirith-core` integration and hegn workspace rules | Empty commands allowed; off mode still keeps destructive-operation guard |
-| `firecracker.rs` | Typed REST client over the API socket | Bounded request/response sizes; errors preserve context |
+| `firecracker.rs` | Typed REST client over the API socket | Frames responses by `Content-Length`/chunked encoding (Firecracker may keep the socket open), accepts bodyless `204`, validates resource IDs, bounded response sizes, path-form and collection-form virtio-fs endpoints |
 | `virtiofs.rs` | virtiofsd argv/process construction | Shared dir canonicalized; always sandboxed; sockets scoped to run dir |
 | `sandbox.rs` | VM lifecycle, lock, session record, status, snapshots | Exclusive flock for start/stop/restore; preflight before spawn; cleanup on every error path |
 | `snapshot.rs` | Snapshot metadata store | Sanitized names; private dirs/files; atomic-ish metadata writes |
@@ -392,7 +402,15 @@ artifacts are not used by the current boot configuration.
 
 Modals: create project, import project, doctor, security prompt, confirm,
 help and error. Every footer button has an `ActionId` and is clicked through the
-same `handle_action` path as its keybinding.
+same `handle_action` path as its keybinding. Footer buttons invert their colors
+while `MouseEventKind::Moved` reports the pointer inside their rectangle.
+
+VM starts run on a named worker thread (`hegn-start-vm`) and report through the
+same channel as project scans. The UI therefore keeps drawing an animated
+`STARTING` spinner, the sandbox note and a toast immediately after Enter;
+`ensure_console`, virtiofsd/Firecracker boot, and the optional session branch do
+not block the event loop. Snapshot restore is still on the runtime path and is
+the next candidate for the same treatment.
 
 ### 8.1 Theming
 
@@ -446,6 +464,9 @@ needs to recover or audit has a CLI form.
 | Missing kernel/rootfs | Hard error before spawn; doctor modal/CLI report; `hegn images download` offered |
 | Missing Firecracker/virtiofsd | Hard error before any child is spawned |
 | Missing `/dev/kvm` | Hard error; doctor reports it |
+| Firecracker build lacks virtio-fs | Explicit hard error naming the missing API/build requirement; no host or copy-based fallback |
+| Firecracker keeps the API socket open | Client frames by `Content-Length`/chunked encoding and returns as soon as the response is complete; bodyless `204` ends at the headers |
+| VM boot is slow | Worker thread; UI shows an animated `STARTING` spinner and remains responsive |
 | Bad download/checksum | Temporary file removed; no final image written |
 | Empty checksum | Refused unless `--allow-unverified` |
 | Existing image | Refused unless `--force` |

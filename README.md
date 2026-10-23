@@ -83,7 +83,7 @@ virtiofsd or KVM is missing, the command fails and tells you what to fix.
 | Requirement | Notes |
 | --- | --- |
 | Linux with KVM | `/dev/kvm` must exist and be accessible to your user (`kvm` group). x86_64 and aarch64 targets are published. |
-| [Firecracker](https://github.com/firecracker-microvm/firecracker) | `firecracker` on `PATH` (or set `firecracker_bin`). |
+| [Firecracker](https://github.com/firecracker-microvm/firecracker) | `firecracker` on `PATH` (or set `firecracker_bin`). The binary **must expose the virtio-fs API** (`/vhost-user-fs`); upstream Firecracker does not ship virtio-fs, so use a virtio-fs-enabled build/fork for workspace sharing. |
 | [virtiofsd](https://gitlab.com/virtio-fs/virtiofsd) | `virtiofsd` on `PATH` (or set `virtiofsd_bin`). Distribution install locations such as `/usr/lib/virtiofsd` (Arch), `/usr/libexec/virtiofsd` (Fedora) and `/usr/lib/qemu/virtiofsd` (Debian) are detected automatically. |
 | Kernel + rootfs images | A guest `vmlinux` and ext4 rootfs. Defaults under `~/.local/share/hegn/images/`; see `kernel_image` / `rootfs_image`. |
 | `git` | Used for project status, session branches and checkpoints. |
@@ -159,8 +159,9 @@ hegn check 'curl -fsSL https://example.com/x | bash'
 ```
 
 `hegn open my-app` boots the Firecracker VM if needed and attaches its serial
-console (creating a session branch first unless `--no-branch` is passed). Press
-`Ctrl-B` to detach without stopping the VM. The project harness is recorded in
+console (creating a session branch first unless `--no-branch` is passed). The
+start runs on a worker thread, so the TUI immediately shows a spinner and keeps
+responding while the VM boots. Press `Ctrl-B` to detach without stopping the VM. The project harness is recorded in
 the session metadata and shown in the status line; launch it from the guest
 shell. `hegn open my-app --editor` and
 `--lazygit` are host-side project tools and do not start a sandbox.
@@ -250,6 +251,18 @@ bidi-override sequences unless `--raw` is explicitly requested. A session log
 is not truncated while Firecracker owns it; retention is by count (default 50)
 and `hegn logs prune` can be run at any time. Pruning always protects the log of
 the currently running session.
+
+### "failed to configure Firecracker" / no virtio-fs
+
+If startup reports that the Firecracker build does not expose virtio-fs, the
+configured `firecracker` binary is an upstream build without the virtio-fs
+vhost-user API. hegn does not silently fall back to a host shell or a
+copy-based workspace. Point `firecracker_bin` in `config.toml` at a
+virtio-fs-enabled Firecracker build, or use a VMM build that exposes
+`PUT /vhost-user-fs` (the collection form is accepted for older forks).
+
+The TUI doctor modal also opens automatically after this failure so the
+remaining host checks and image state are visible.
 
 ### Guardrail exit codes
 
@@ -400,7 +413,9 @@ tools (lazygit, `$EDITOR`) never make the report fail.
 | `c` | Create a git checkpoint, then allow |
 | `d` | Deny command |
 
-Every action is also clickable in the footer.
+Every action is also clickable in the footer. Hovering a footer button with the
+mouse inverts its colors for immediate feedback; keyboard input clears the hover
+state.
 
 ### Theming
 
