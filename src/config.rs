@@ -136,6 +136,27 @@ pub const VIRTIOFSD_FALLBACKS: &[&str] = &[
     "/usr/libexec/qemu/virtiofsd",
 ];
 
+/// The AUR package `cloud-hypervisor-bin` installs only the static binary.
+pub const CLOUD_HYPERVISOR_STATIC: &str = "cloud-hypervisor-static";
+
+/// Common install locations for Cloud Hypervisor.
+pub const CLOUD_HYPERVISOR_FALLBACKS: &[&str] = &[
+    "/usr/bin/cloud-hypervisor",
+    "/usr/bin/cloud-hypervisor-static",
+    "/usr/lib/cloud-hypervisor/cloud-hypervisor",
+];
+
+/// Map `cloud-hypervisor` to its static AUR variant and back.
+fn alternate_cloud_hypervisor_name(binary: &Path) -> Option<&'static str> {
+    if binary == Path::new("cloud-hypervisor") {
+        Some(CLOUD_HYPERVISOR_STATIC)
+    } else if binary == Path::new(CLOUD_HYPERVISOR_STATIC) {
+        Some("cloud-hypervisor")
+    } else {
+        None
+    }
+}
+
 /// Resolve a configured tool to an executable file.
 ///
 /// A configured path (anything with a directory component) is used verbatim so
@@ -389,11 +410,8 @@ impl Config {
         if self.memory_mib < 128 {
             bail!("memory_mib must be at least 128 (got {})", self.memory_mib);
         }
-        if self.shared_tag.is_empty()
-            || self.shared_tag.contains(char::is_whitespace)
-            || self.shared_tag.contains(',')
-        {
-            bail!("shared_tag must be a non-empty token without whitespace or commas");
+        if !crate::cloud_init::safe_token(&self.shared_tag) {
+            bail!("shared_tag may only contain ASCII letters, digits, '-', '_' and '.'");
         }
         // virtio-fs tags are limited to 36 bytes including the terminator.
         if self.shared_tag.len() > 36 {
@@ -402,8 +420,10 @@ impl Config {
                 self.shared_tag.len()
             );
         }
-        if !self.guest_mount.starts_with('/') {
-            bail!("guest_mount must be an absolute guest path");
+        if !crate::cloud_init::safe_mount(&self.guest_mount) {
+            bail!(
+                "guest_mount must be an absolute path with simple components                  (letters, digits, '/', '-', '_' and '.')"
+            );
         }
         if !self.root_device.starts_with("/dev/") || self.root_device.contains(',') {
             bail!("root_device must be a guest device path such as /dev/vda1");
@@ -529,6 +549,29 @@ impl Config {
     /// outside `PATH`. Returns `None` when no candidate exists.
     pub fn resolved_virtiofsd(&self) -> Option<PathBuf> {
         resolve_binary(&self.virtiofsd_bin, VIRTIOFSD_FALLBACKS)
+    }
+
+    /// Locate the Cloud Hypervisor executable.
+    ///
+    /// Besides the configured name/path this accepts the static binary shipped
+    /// by AUR's `cloud-hypervisor-bin` package, which does not install a
+    /// `cloud-hypervisor` symlink. An explicit path is still used verbatim.
+    pub fn resolved_cloud_hypervisor(&self) -> Option<PathBuf> {
+        if let Some(found) = resolve_binary(&self.cloud_hypervisor_bin, CLOUD_HYPERVISOR_FALLBACKS)
+        {
+            return Some(found);
+        }
+        let alternate = alternate_cloud_hypervisor_name(&self.cloud_hypervisor_bin)?;
+        resolve_binary(Path::new(alternate), CLOUD_HYPERVISOR_FALLBACKS)
+    }
+
+    /// The binary used for process matching and termination.
+    ///
+    /// Falls back to the configured path when discovery fails, so a VM started
+    /// before the binary disappeared can still be identified and stopped.
+    pub fn vm_binary(&self) -> PathBuf {
+        self.resolved_cloud_hypervisor()
+            .unwrap_or_else(|| self.cloud_hypervisor_bin.clone())
     }
 
     /// Static assets are only usable when both images are real files.
@@ -671,7 +714,12 @@ root_device = "/dev/vda"
         config.root_device = "/dev/vda1".into();
         config.shared_tag = "x".repeat(37);
         assert!(config.validate().is_err());
+        config.shared_tag = "work space".into();
+        assert!(config.validate().is_err());
         config.shared_tag = "workspace".into();
+        config.guest_mount = "/work space".into();
+        assert!(config.validate().is_err());
+        config.guest_mount = "/workspace".into();
         config.kernel_image = PathBuf::from("/images/vmlinux,broken");
         assert!(config.validate().is_err());
     }
@@ -690,6 +738,22 @@ root_device = "/dev/vda"
         let (_dir, path) = temp_config("backend = \"pty\"\n");
         let err = format!("{:#}", Config::load_from(&path).unwrap_err());
         assert!(err.contains("unknown variant"), "{err}");
+    }
+
+    #[test]
+    fn cloud_hypervisor_static_is_an_accepted_alias() {
+        assert_eq!(
+            alternate_cloud_hypervisor_name(Path::new("cloud-hypervisor")),
+            Some("cloud-hypervisor-static")
+        );
+        assert_eq!(
+            alternate_cloud_hypervisor_name(Path::new("cloud-hypervisor-static")),
+            Some("cloud-hypervisor")
+        );
+        assert_eq!(
+            alternate_cloud_hypervisor_name(Path::new("/opt/custom/ch")),
+            None
+        );
     }
 
     #[test]

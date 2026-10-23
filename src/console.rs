@@ -66,7 +66,7 @@ impl VmConsole {
                 paths.run_dir.display()
             ),
         };
-        if !process_matches(session.vm_pid, &config.cloud_hypervisor_bin) {
+        if !process_matches(session.vm_pid, &config.vm_binary()) {
             bail!(
                 "the VM recorded in {} is not running; start a VM before attaching",
                 paths.session.display()
@@ -98,7 +98,7 @@ impl VmConsole {
 
         Ok(Self {
             stream,
-            cloud_hypervisor_bin: config.cloud_hypervisor_bin.clone(),
+            cloud_hypervisor_bin: config.vm_binary(),
             vm_pid: session.vm_pid,
             relay_pid: session.relay_pid,
             project: session.project.clone(),

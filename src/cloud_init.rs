@@ -19,7 +19,11 @@ use fatfs::{FileSystem, FormatVolumeOptions, FsOptions};
 /// 4 MiB is enough for the two tiny files and keeps the seed cheap.
 const SEED_BYTES: u64 = 4 * 1024 * 1024;
 
-const USER_DATA: &str = r#"#cloud-config
+const META_DATA: &str = "instance-id: hegn-sandbox\nlocal-hostname: hegn\n";
+
+fn user_data(shared_tag: &str, guest_mount: &str) -> String {
+    format!(
+        r#"#cloud-config
 users:
   - default
   - name: hegn
@@ -42,17 +46,44 @@ write_files:
       ExecStart=-/sbin/agetty --autologin root --keep-baud 115200,38400,9600 %I $TERM
 runcmd:
   - systemctl daemon-reload || true
-  - systemctl enable --now serial-getty@ttyS0.service || true
-  - systemctl enable --now serial-getty@ttyAMA0.service || true
-"#;
+  - systemctl enable serial-getty@ttyS0.service || true
+  - systemctl restart serial-getty@ttyS0.service || true
+  - systemctl enable serial-getty@ttyAMA0.service || true
+  - systemctl restart serial-getty@ttyAMA0.service || true
+  - mkdir -p '{guest_mount}' || true
+  - mount -t virtiofs '{shared_tag}' '{guest_mount}' || true
+"#
+    )
+}
 
-const META_DATA: &str = "instance-id: hegn-sandbox\nlocal-hostname: hegn\n";
+/// Reject values that could break out of the cloud-init shell command.
+pub(crate) fn safe_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+pub(crate) fn safe_mount(value: &str) -> bool {
+    value.starts_with('/')
+        && value.len() > 1
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+}
 
 /// Write (or replace) the NoCloud seed at `path`.
 ///
 /// The image is created with mode `0600` and `O_NOFOLLOW`; a planted symlink
 /// cannot redirect the write.
-pub fn write_seed(path: &Path) -> Result<()> {
+pub fn write_seed(path: &Path, shared_tag: &str, guest_mount: &str) -> Result<()> {
+    if !safe_token(shared_tag) {
+        anyhow::bail!("unsafe virtio-fs tag for the cloud-init seed: {shared_tag:?}");
+    }
+    if !safe_mount(guest_mount) {
+        anyhow::bail!("unsafe guest mount path for the cloud-init seed: {guest_mount:?}");
+    }
+    let user_data = user_data(shared_tag, guest_mount);
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -76,7 +107,7 @@ pub fn write_seed(path: &Path) -> Result<()> {
         let fs = FileSystem::new(&mut file, FsOptions::new())
             .with_context(|| format!("failed to open cloud-init seed {}", path.display()))?;
         let root = fs.root_dir();
-        write_file(&root, "user-data", USER_DATA)?;
+        write_file(&root, "user-data", &user_data)?;
         write_file(&root, "meta-data", META_DATA)?;
     }
     file.sync_all()?;
@@ -113,7 +144,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cloud-init.img");
-        write_seed(&path).unwrap();
+        write_seed(&path, "workspace", "/workspace").unwrap();
 
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -130,6 +161,10 @@ mod tests {
             .read_to_string(&mut user_data)
             .unwrap();
         assert!(user_data.contains("autologin root"), "{user_data}");
+        assert!(
+            user_data.contains("mount -t virtiofs 'workspace' '/workspace'"),
+            "{user_data}"
+        );
         let mut meta_data = String::new();
         root.open_file("meta-data")
             .unwrap()
@@ -149,8 +184,18 @@ mod tests {
         let link = dir.path().join("cloud-init.img");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        assert!(write_seed(&link).is_err());
+        assert!(write_seed(&link, "workspace", "/workspace").is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
+    }
+
+    #[test]
+    fn rejects_values_that_could_break_the_cloud_init_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud-init.img");
+        assert!(write_seed(&path, "bad tag", "/workspace").is_err());
+        assert!(write_seed(&path, "workspace", "/work space").is_err());
+        assert!(write_seed(&path, "workspace;reboot", "/workspace").is_err());
+        assert!(write_seed(&path, "workspace", "/workspace;reboot").is_err());
     }
 
     #[test]
@@ -158,7 +203,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cloud-init.img");
         std::fs::write(&path, vec![0u8; 1024]).unwrap();
-        write_seed(&path).unwrap();
+        write_seed(&path, "workspace", "/workspace").unwrap();
         assert!(std::fs::metadata(&path).unwrap().len() >= SEED_BYTES);
     }
 }

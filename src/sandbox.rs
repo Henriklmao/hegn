@@ -212,8 +212,9 @@ impl SandboxManager {
     }
 
     pub fn is_running(&self) -> bool {
+        let binary = self.config.vm_binary();
         self.session()
-            .map(|session| process_matches(session.vm_pid, &self.config.cloud_hypervisor_bin))
+            .map(|session| process_matches(session.vm_pid, &binary))
             .unwrap_or(false)
     }
 
@@ -279,12 +280,13 @@ impl SandboxManager {
         // Preflight every binary before spawning anything, so a typo in the
         // configuration cannot leave a stray virtiofsd (or a VM without a
         // console) behind.
-        if !command_available(&self.config.cloud_hypervisor_bin) {
-            bail!(
-                "cloud-hypervisor binary {} was not found; run `hegn doctor`",
-                self.config.cloud_hypervisor_bin.display()
-            );
-        }
+        let vm_binary = self.config.resolved_cloud_hypervisor().with_context(|| {
+            format!(
+                "cloud-hypervisor binary {} was not found (also tried `{}`); run `hegn doctor`",
+                self.config.cloud_hypervisor_bin.display(),
+                crate::config::CLOUD_HYPERVISOR_STATIC
+            )
+        })?;
         if self.config.resolved_virtiofsd().is_none() {
             bail!(
                 "virtiofsd binary {} was not found on PATH or in {}; install virtiofsd or set \
@@ -335,7 +337,11 @@ impl SandboxManager {
         // 2. Optional NoCloud seed for the official cloud images. It contains
         // no secrets and only enables a serial root login.
         if self.config.cloud_init
-            && let Err(err) = cloud_init::write_seed(&paths.cloud_init)
+            && let Err(err) = cloud_init::write_seed(
+                &paths.cloud_init,
+                &self.config.shared_tag,
+                &self.config.guest_mount,
+            )
         {
             virtiofs.kill();
             cleanup_files(&paths);
@@ -343,7 +349,7 @@ impl SandboxManager {
         }
 
         // 3. Cloud Hypervisor. Children outlive this CLI call.
-        let mut vm = match spawn_cloud_hypervisor(&self.config, &paths, None) {
+        let mut vm = match spawn_cloud_hypervisor(&self.config, &paths, &vm_binary, None) {
             Ok(child) => child,
             Err(err) => {
                 virtiofs.kill();
@@ -446,9 +452,10 @@ impl SandboxManager {
         // Only a *running* sandbox for another project is a conflict. A stale
         // session record (crash, reboot) must not block opening a project; the
         // start path cleans it up.
+        let binary = self.config.vm_binary();
         if let Some(session) = self.session()
             && !same_project(&session.project, project)
-            && process_matches(session.vm_pid, &self.config.cloud_hypervisor_bin)
+            && process_matches(session.vm_pid, &binary)
         {
             bail!(
                 "a sandbox for {} is already running; stop it with `hegn sandbox stop` first",
@@ -496,7 +503,7 @@ impl SandboxManager {
         }
 
         if let Some(pid) = vm_pid {
-            terminate(pid, &self.config.cloud_hypervisor_bin);
+            terminate(pid, &self.config.vm_binary());
         }
         if let Some(pid) = relay_pid {
             terminate_relay(pid, &hegn);
@@ -712,12 +719,13 @@ impl SandboxManager {
         }
         // Preflight the binaries before stopping a running VM, so a typo in
         // the configuration does not cost the user their current sandbox.
-        if !command_available(&self.config.cloud_hypervisor_bin) {
-            bail!(
-                "cloud-hypervisor binary {} was not found",
-                self.config.cloud_hypervisor_bin.display()
-            );
-        }
+        let vm_binary = self.config.resolved_cloud_hypervisor().with_context(|| {
+            format!(
+                "cloud-hypervisor binary {} was not found (also tried `{}`)",
+                self.config.cloud_hypervisor_bin.display(),
+                crate::config::CLOUD_HYPERVISOR_STATIC
+            )
+        })?;
         if self.config.resolved_virtiofsd().is_none() {
             bail!(
                 "virtiofsd binary {} was not found on PATH or in {}; install virtiofsd or set \
@@ -741,12 +749,12 @@ impl SandboxManager {
         // Stop the old VM, relay and filesystem daemon. The sockets are freed
         // and recreated below with the same paths the snapshot expects.
         if let Some(session) = &existing {
-            terminate(session.vm_pid, &self.config.cloud_hypervisor_bin);
+            terminate(session.vm_pid, &self.config.vm_binary());
             terminate_relay(session.relay_pid, &hegn);
             terminate(session.virtiofs_pid, &self.config.virtiofsd_bin);
         }
         if let Some(pid) = read_pid(&paths.vm_pid) {
-            terminate(pid, &self.config.cloud_hypervisor_bin);
+            terminate(pid, &self.config.vm_binary());
         }
         if let Some(pid) = read_pid(&paths.relay_pid) {
             terminate_relay(pid, &hegn);
@@ -771,7 +779,11 @@ impl SandboxManager {
         }
 
         if self.config.cloud_init
-            && let Err(err) = cloud_init::write_seed(&paths.cloud_init)
+            && let Err(err) = cloud_init::write_seed(
+                &paths.cloud_init,
+                &self.config.shared_tag,
+                &self.config.guest_mount,
+            )
         {
             virtiofs.kill();
             cleanup_files(&paths);
@@ -792,7 +804,8 @@ impl SandboxManager {
             }
         };
 
-        let mut vm = match spawn_cloud_hypervisor(&self.config, &paths, Some(snapshot)) {
+        let mut vm = match spawn_cloud_hypervisor(&self.config, &paths, &vm_binary, Some(snapshot))
+        {
             Ok(child) => child,
             Err(err) => {
                 virtiofs.kill();
@@ -877,10 +890,11 @@ impl SandboxManager {
     fn cleanup_stale(&self) {
         let paths = self.paths();
         if let Some(session) = self.session() {
-            if process_matches(session.vm_pid, &self.config.cloud_hypervisor_bin) {
+            let binary = self.config.vm_binary();
+            if process_matches(session.vm_pid, &binary) {
                 return;
             }
-            terminate(session.vm_pid, &self.config.cloud_hypervisor_bin);
+            terminate(session.vm_pid, &binary);
             if let Ok(binary) = hegn_binary() {
                 terminate_relay(session.relay_pid, &binary);
             }
@@ -996,6 +1010,7 @@ fn common_args(config: &Config, paths: &SandboxPaths, landlock: bool) -> Vec<OsS
 fn spawn_cloud_hypervisor(
     config: &Config,
     paths: &SandboxPaths,
+    binary: &Path,
     restore: Option<&SnapshotMeta>,
 ) -> Result<Child> {
     // Cloud Hypervisor must create the API and serial listeners itself.
@@ -1013,7 +1028,7 @@ fn spawn_cloud_hypervisor(
         Some(snapshot) => restore_args(config, paths, snapshot),
         None => cloud_hypervisor_args(config, paths),
     };
-    Command::new(&config.cloud_hypervisor_bin)
+    Command::new(binary)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1022,7 +1037,7 @@ fn spawn_cloud_hypervisor(
         .with_context(|| {
             format!(
                 "failed to spawn {} (is Cloud Hypervisor installed?)",
-                config.cloud_hypervisor_bin.display()
+                binary.display()
             )
         })
 }
@@ -1185,15 +1200,6 @@ fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()>
 
 fn read_pid(path: &Path) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
-/// Is `binary` either an existing path or a command found on `PATH`?
-fn command_available(binary: &Path) -> bool {
-    if binary.components().count() > 1 {
-        return binary.is_file();
-    }
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(binary).is_file()))
 }
 
 /// Whether two project paths refer to the same directory.

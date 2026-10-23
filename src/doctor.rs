@@ -62,12 +62,19 @@ impl DoctorReport {
 /// handful of version commands.
 pub fn run(config: &Config) -> DoctorReport {
     let mut checks = Vec::new();
-    checks.push(check_tool(
-        "cloud-hypervisor",
-        &config.cloud_hypervisor_bin,
-        &["--version"],
-        true,
-    ));
+    checks.push(match config.resolved_cloud_hypervisor() {
+        Some(binary) => check_tool("cloud-hypervisor", &binary, &["--version"], true),
+        None => Check::new(
+            "cloud-hypervisor",
+            false,
+            true,
+            format!(
+                "{} not found on PATH or as `cloud-hypervisor-static`; install \
+                 cloud-hypervisor-bin or set `cloud_hypervisor_bin`",
+                config.cloud_hypervisor_bin.display()
+            ),
+        ),
+    });
     checks.push(match config.resolved_virtiofsd() {
         Some(binary) => check_tool("virtiofsd", &binary, &["--version"], true),
         None => Check::new(

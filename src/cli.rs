@@ -799,7 +799,7 @@ fn attach(project: Option<String>, no_bar: bool, config: Config) -> Result<i32> 
             manager.paths().run_dir.display()
         )
     })?;
-    if !process_matches(session.vm_pid, &config.cloud_hypervisor_bin) {
+    if !process_matches(session.vm_pid, &config.vm_binary()) {
         bail!(
             "the VM recorded in {} is not running; start it with `hegn sandbox start`",
             manager.paths().session.display()

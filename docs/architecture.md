@@ -193,7 +193,9 @@ All state paths can be overridden in `config.toml` or by environment variables
 5. Create the session log (`LogStore::create_session`); prune old logs
    best-effort.
 6. Spawn `virtiofsd` with the canonical project path and wait for its socket.
-7. Write the NoCloud seed when `cloud_init = true`.
+7. Write the NoCloud seed when `cloud_init = true`. It enables serial root
+   autologin and mounts the virtio-fs tag at `guest_mount` (`/workspace` by
+   default).
 8. Spawn Cloud Hypervisor with an explicit, hardened argv: `--api-socket`,
    `--kernel`, `--disk` (rootfs + optional seed), `--cpus`, `--memory ...
    shared=on`, `--fs`, `--serial socket=...`, `--console off`, `--seccomp` and
@@ -306,6 +308,12 @@ A bare `virtiofsd_bin` is resolved through `PATH` and then the distribution
 install directories in `config::VIRTIOFSD_FALLBACKS`; the report names the
 resolved path next to the version. An explicit `virtiofsd_bin` path is always
 used verbatim.
+
+A bare `cloud_hypervisor_bin` accepts both `cloud-hypervisor` and
+`cloud-hypervisor-static` (the AUR `cloud-hypervisor-bin` package installs only
+the static name), then the absolute fallbacks in
+`config::CLOUD_HYPERVISOR_FALLBACKS`. The resolved path is used for spawning and
+for `/proc/<pid>/cmdline` verification.
 
 The TUI opens the doctor modal automatically from `App::fail_start` (VM
 start/attach failure). `F3` opens it manually. `d` triggers a background

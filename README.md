@@ -35,6 +35,8 @@ fix.
   command line and controlled over its REST API on a Unix socket.
 - **Native virtio-fs** — Cloud Hypervisor implements the virtio-fs device
   directly, so no patched hypervisor build is needed for workspace sharing.
+  The generated cloud-init seed mounts the tag at `/workspace` (configurable via
+  `guest_mount`).
 - **Defence in depth** — Cloud Hypervisor runs with seccomp filters and
   Landlock filesystem sandboxing; `virtiofsd` always runs with
   `--sandbox=namespace` (or `chroot`).
@@ -89,7 +91,7 @@ fix.
 | Requirement | Notes |
 | --- | --- |
 | Linux with KVM | `/dev/kvm` must exist and be accessible to your user (`kvm` group). x86_64 and aarch64 targets are published. |
-| [Cloud Hypervisor](https://www.cloudhypervisor.org/) | `cloud-hypervisor` on `PATH` (or set `cloud_hypervisor_bin`). Native virtio-fs support is required; hegn enables seccomp and Landlock. |
+| [Cloud Hypervisor](https://www.cloudhypervisor.org/) | `cloud-hypervisor` **or** `cloud-hypervisor-static` on `PATH` (AUR's `cloud-hypervisor-bin` installs the static name), or set `cloud_hypervisor_bin`. Native virtio-fs support is required; hegn enables seccomp and Landlock. |
 | Landlock | A host kernel with Landlock ABI v3 (Linux 6.2 or newer). `hegn doctor` probes it; set `landlock = false` only if you accept the reduced isolation. |
 | [virtiofsd](https://gitlab.com/virtio-fs/virtiofsd) | `virtiofsd` on `PATH` (or set `virtiofsd_bin`). Distribution install locations such as `/usr/lib/virtiofsd` (Arch), `/usr/libexec/virtiofsd` (Fedora) and `/usr/lib/qemu/virtiofsd` (Debian) are detected automatically. |
 | Kernel + rootfs images | A guest kernel and qcow2/raw root filesystem. Defaults under `~/.local/share/hegn/images/`; see `kernel_image`, `rootfs_image`, `rootfs_format` and `root_device`. |
@@ -132,6 +134,7 @@ any VM started by an older version and remove its `state_dir/run/` directory.
 Then update `config.toml`:
 
 - replace the old VMM binary key with `cloud_hypervisor_bin = "cloud-hypervisor"`
+  (the static AUR binary `cloud-hypervisor-static` is detected automatically)
 - set `rootfs_format` (`raw` or `qcow2`) and `root_device` (`/dev/vda1` for the
   official cloud image, `/dev/vda` for a whole-disk ext4 image)
 - `landlock`, `seccomp` and `cloud_init` default to `true`
@@ -382,7 +385,8 @@ state_dir       = "~/.local/state/hegn"
 snapshots_dir   = "~/.local/share/hegn/snapshots"
 templates_dir   = "~/.config/hegn/templates"
 cloud_hypervisor_bin = "cloud-hypervisor"
-# Bare names are resolved via PATH, then /usr/lib/virtiofsd (Arch),
+# Bare names are resolved via PATH. cloud-hypervisor-static (AUR) is accepted
+# automatically. virtiofsd falls back to /usr/lib/virtiofsd (Arch),
 # /usr/libexec/virtiofsd (Fedora) and /usr/lib/qemu/virtiofsd (Debian).
 virtiofsd_bin   = "virtiofsd"
 kernel_image    = "~/.local/share/hegn/images/vmlinux-x86_64"
@@ -596,7 +600,8 @@ data flows, safety invariants, and image-update pipeline.
 
 Dev-dependencies: `tempfile` (3) for isolated config/state/snapshot fixtures.
 
-Runtime tools (not Rust dependencies): `cloud-hypervisor`, `virtiofsd`, `git`,
+Runtime tools (not Rust dependencies): `cloud-hypervisor` or
+`cloud-hypervisor-static`, `virtiofsd`, `git`,
 and optionally `lazygit` and `$EDITOR`.
 
 ---
