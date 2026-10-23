@@ -100,6 +100,7 @@ error before that point it kills both children and removes the run files.
   virtiofs.pid       last known virtiofsd pid
   session.json       SessionRecord
   firecracker.log    VMM stderr
+  hegn.log           lifecycle/start diagnostics (timestamped, mode 0600)
   hegn.lock          flock for lifecycle operations
 ```
 
@@ -187,9 +188,12 @@ All state paths can be overridden in `config.toml` or by environment variables
    single-writer design.
 10. Release the lock. The children keep running.
 
-On any failure the VMM and daemon are killed, run files and the half-created
-log are removed, and the error is returned. A failure to record the session
-tears the VM down instead of leaking an unmanageable process.
+On any failure the VMM and daemon are killed and run links are removed, but the
+session serial log is kept and `run/hegn.log` receives a timestamped diagnostic
+line. The CLI error repeats the `hegn.log` path. A failure to record the session
+tears the VM down instead of leaking an unmanageable process. Keeping the failed
+serial log is intentional: Firecracker writes API request/error lines there, not
+to stderr.
 
 ### 5.2 Attach (`hegn attach`, `hegn a`, `hegn open`)
 
@@ -467,6 +471,7 @@ needs to recover or audit has a CLI form.
 | Firecracker build lacks virtio-fs | Explicit hard error naming the missing API/build requirement; no host or copy-based fallback |
 | Firecracker keeps the API socket open | Client frames by `Content-Length`/chunked encoding and returns as soon as the response is complete; bodyless `204` ends at the headers |
 | VM boot is slow | Worker thread; UI shows an animated `STARTING` spinner and remains responsive |
+| Start fails before guest boot | `run/hegn.log` gets the error; the serial log is preserved and `hegn logs show` exposes Firecracker API messages |
 | Bad download/checksum | Temporary file removed; no final image written |
 | Empty checksum | Refused unless `--allow-unverified` |
 | Existing image | Refused unless `--force` |

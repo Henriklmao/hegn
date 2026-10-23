@@ -230,6 +230,21 @@ The repository's `vm-images` GitHub Actions workflow runs daily, discovers the
 newest upstream kernel/ext4 artifact, recomputes the digests, and opens a pull
 request with the updated pins. It does not publish a hegn-owned image.
 
+### Start diagnostics
+
+A failed start leaves diagnostics in the run directory:
+
+```bash
+cat ~/.local/state/hegn/run/hegn.log         # lifecycle + start errors
+cat ~/.local/state/hegn/run/firecracker.log  # VMM stderr
+hegn logs list                               # serial logs, including failed starts
+hegn logs show <name>                        # Firecracker API/guest output
+```
+
+The CLI error includes the `hegn.log` path, and failed-start serial logs are no
+longer deleted, so the Firecracker API messages that caused the failure remain
+available.
+
 ### Session logs
 
 Every VM session writes its serial output to

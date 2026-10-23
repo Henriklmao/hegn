@@ -57,6 +57,8 @@ pub struct SandboxPaths {
     pub virtiofs_pid: PathBuf,
     pub session: PathBuf,
     pub log: PathBuf,
+    /// hegn lifecycle/start errors, kept in the run directory for post-mortems.
+    pub event_log: PathBuf,
     /// Exclusive lock serializing VM lifecycle operations.
     pub lock: PathBuf,
 }
@@ -73,6 +75,7 @@ impl SandboxPaths {
             virtiofs_pid: run_dir.join("virtiofs.pid"),
             session: run_dir.join("session.json"),
             log: run_dir.join("firecracker.log"),
+            event_log: run_dir.join("hegn.log"),
             lock: run_dir.join("hegn.lock"),
             run_dir,
         }
@@ -189,7 +192,28 @@ impl SandboxManager {
     }
 
     /// Boot virtiofsd + Firecracker and start the guest.
+    ///
+    /// Lifecycle errors are appended to `run/hegn.log` so a failed start can
+    /// be diagnosed even when Firecracker never reached the guest.
     pub fn start(&self, project: &Path, harness: Harness) -> Result<SandboxReport> {
+        let result = self.start_inner(project, harness);
+        let paths = self.paths();
+        // `start_inner` may fail before it creates the run directory.
+        let _ = paths.ensure();
+        let message = match &result {
+            Ok(report) => format!(
+                "started project={} harness={} firecracker_pid={}",
+                project.display(),
+                harness.label(),
+                report.firecracker_pid.unwrap_or(0)
+            ),
+            Err(err) => format!("start failed project={}: {err:#}", project.display()),
+        };
+        append_event_log(&paths.event_log, &message);
+        result.map_err(|err| anyhow::anyhow!("{err:#} (VM log: {})", paths.event_log.display()))
+    }
+
+    fn start_inner(&self, project: &Path, harness: Harness) -> Result<SandboxReport> {
         let paths = self.paths();
         // A missing VM is always a hard error: there is no host-process fallback.
         self.config.require_vm_assets()?;
@@ -243,7 +267,6 @@ impl SandboxManager {
         let mut virtiofs = match spawn_virtiofsd(&self.config, &paths, project) {
             Ok(process) => process,
             Err(err) => {
-                let _ = fs::remove_file(&serial_log);
                 return Err(err);
             }
         };
@@ -251,7 +274,6 @@ impl SandboxManager {
         if let Err(err) = write_private(&paths.virtiofs_pid, virtiofs_pid.to_string()) {
             virtiofs.kill();
             cleanup_files(&paths);
-            let _ = fs::remove_file(&serial_log);
             return Err(err).context("failed to record the virtiofsd pid");
         }
 
@@ -261,7 +283,6 @@ impl SandboxManager {
             Err(err) => {
                 virtiofs.kill();
                 cleanup_files(&paths);
-                let _ = fs::remove_file(&serial_log);
                 return Err(err);
             }
         };
@@ -308,7 +329,6 @@ impl SandboxManager {
             let _ = firecracker.wait();
             virtiofs.kill();
             cleanup_files(&paths);
-            let _ = fs::remove_file(&serial_log);
             return Err(err).context("failed to configure Firecracker");
         }
 
@@ -333,7 +353,6 @@ impl SandboxManager {
             let _ = firecracker.wait();
             virtiofs.kill();
             cleanup_files(&paths);
-            let _ = fs::remove_file(&serial_log);
             return Err(err).context("failed to record the sandbox session");
         }
 
@@ -646,7 +665,6 @@ impl SandboxManager {
             Err(err) => {
                 virtiofs.kill();
                 cleanup_files(&paths);
-                let _ = fs::remove_file(&serial_log);
                 return Err(err);
             }
         };
@@ -657,7 +675,6 @@ impl SandboxManager {
             let _ = firecracker.wait();
             virtiofs.kill();
             cleanup_files(&paths);
-            let _ = fs::remove_file(&serial_log);
             return Err(err).context("failed to load the Firecracker snapshot");
         }
 
@@ -686,7 +703,6 @@ impl SandboxManager {
             let _ = firecracker.wait();
             virtiofs.kill();
             cleanup_files(&paths);
-            let _ = fs::remove_file(&serial_log);
             return Err(err).context("failed to record the restored sandbox session");
         }
 
@@ -885,6 +901,24 @@ fn ensure_socket(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Append a timestamped lifecycle line to `run/hegn.log`.
+///
+/// Best effort: a logging failure must never mask the VM start result.
+fn append_event_log(path: &Path, message: &str) {
+    use std::io::Write;
+
+    let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        let _ = writeln!(file, "{timestamp} hegn: {message}");
+    }
 }
 
 /// Write a runtime metadata file with mode `0600`.
@@ -1260,6 +1294,28 @@ mod tests {
         let loaded = manager.session().unwrap();
         assert_eq!(loaded.harness, Harness::Codex);
         assert_eq!(loaded.firecracker_pid, 1234);
+    }
+
+    #[test]
+    fn failed_start_leaves_a_private_lifecycle_log() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.kernel_image = dir.path().join("missing-kernel");
+        let manager = SandboxManager::new(config);
+        let err = manager
+            .start(&dir.path().join("projects/demo"), Harness::Shell)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VM log:"), "{err}");
+        let log = manager.paths().event_log;
+        let text = fs::read_to_string(&log).unwrap();
+        assert!(text.contains("start failed"), "{text}");
+        assert_eq!(
+            fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
