@@ -1175,7 +1175,9 @@ mod tests {
 
     #[test]
     fn image_status_and_missing_verify() {
-        let (_dir, config) = config();
+        let (dir, mut config) = config();
+        config.kernel_image = dir.path().join("missing-kernel");
+        config.rootfs_image = dir.path().join("missing-rootfs");
         assert_eq!(
             image_command(ImageCommands::Status, config.clone(), true).unwrap(),
             0

@@ -2099,7 +2099,9 @@ mod tests {
 
     #[test]
     fn failures_open_the_doctor_modal_and_d_requests_a_download() {
-        let (_dir, mut app) = test_app();
+        let (dir, mut app) = test_app();
+        app.config.kernel_image = dir.path().join("missing-kernel");
+        app.config.rootfs_image = dir.path().join("missing-rootfs");
         app.fail_start("missing VM assets");
         match &app.modal {
             Some(Modal::Doctor(modal)) => {
