@@ -323,6 +323,8 @@ pub struct ConfirmPrompt {
 pub struct DoctorModal {
     pub report: DoctorReport,
     pub downloading: bool,
+    /// The failure that opened the modal, if any.
+    pub error: Option<String>,
 }
 
 impl DoctorModal {
@@ -330,6 +332,15 @@ impl DoctorModal {
         Self {
             report,
             downloading: false,
+            error: None,
+        }
+    }
+
+    pub fn with_error(report: DoctorReport, error: impl Into<String>) -> Self {
+        Self {
+            report,
+            downloading: false,
+            error: Some(error.into()),
         }
     }
 }
@@ -1293,9 +1304,10 @@ impl App {
         self.sandbox.started_at = None;
         self.sandbox.note = Some(error.clone());
         self.toast(format!("VM start failed: {error}"), ToastLevel::Error);
-        self.modal = Some(Modal::Doctor(DoctorModal::new(crate::doctor::run(
-            &self.config,
-        ))));
+        self.modal = Some(Modal::Doctor(DoctorModal::with_error(
+            crate::doctor::run(&self.config),
+            error,
+        )));
     }
 
     /// Install a fresh doctor report, e.g. after a background image download.
@@ -2165,6 +2177,12 @@ mod tests {
             Some(Modal::Doctor(modal)) => {
                 assert!(!modal.report.ok);
                 assert!(modal.report.can_download());
+                assert!(
+                    modal
+                        .error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("missing VM"))
+                );
             }
             other => panic!("expected doctor modal, got {other:?}"),
         }

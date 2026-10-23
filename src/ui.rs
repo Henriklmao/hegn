@@ -1401,6 +1401,13 @@ fn render_doctor(frame: &mut Frame, modal: &crate::app::DoctorModal, area: Rect)
     frame.render_widget(block, rect);
 
     let mut lines = Vec::new();
+    if let Some(error) = &modal.error {
+        lines.push(Line::from(Span::styled(
+            format!(" failure: {error}"),
+            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::default());
+    }
     for check in &modal.report.checks {
         let color = if check.ok {
             GREEN
