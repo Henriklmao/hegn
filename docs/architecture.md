@@ -137,7 +137,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | Module | Responsibility | Notable invariants |
 | --- | --- | --- |
 | `cli.rs` | Clap command surface, JSON/text output, exit codes | Every TUI operation has a CLI counterpart; no fallback paths |
-| `config.rs` | Schema, defaults, env overrides, validation, XDG paths | Unknown keys rejected; SHA-256 and HTTPS URL validation; log dir `0700` |
+| `config.rs` | Schema, defaults, env overrides, validation, XDG paths, tool lookup | Unknown keys rejected; SHA-256 and HTTPS URL validation; log dir `0700`; `virtiofsd` resolved via `PATH` then distribution dirs |
 | `project.rs` | Discovery, fuzzy filter, git summaries, create, import, checkpoints | Import only creates a symlink; dangerous targets rejected; discovery skips links to `/`, `$HOME` and root ancestors |
 | `security.rs` | `tirith-core` integration and hegn workspace rules | Empty commands allowed; off mode still keeps destructive-operation guard |
 | `firecracker.rs` | Typed REST client over the API socket | Bounded request/response sizes; errors preserve context |
@@ -265,6 +265,11 @@ mismatch. `hegn images status` shows path, presence and size.
 `doctor::run(&config)` performs cheap blocking checks: Firecracker, virtiofsd,
 git, lazygit (optional), `/dev/kvm`, kernel image, rootfs image, projects root,
 logs dir (optional), backend, editor (optional), plus `images::status`.
+
+A bare `virtiofsd_bin` is resolved through `PATH` and then the distribution
+install directories in `config::VIRTIOFSD_FALLBACKS`; the report names the
+resolved path next to the version. An explicit `virtiofsd_bin` path is always
+used verbatim.
 
 The TUI opens the doctor modal automatically from `App::fail_start` (VM
 start/attach failure). `F3` opens it manually. `d` triggers a background
@@ -504,6 +509,9 @@ or press `h`/`←` in the project list. The original directory is untouched.
 1. Read the doctor modal (opens automatically) or run `hegn doctor`.
 2. If images are missing: `hegn images download`.
 3. If virtiofsd/Firecracker is missing: install it or set the binary path.
+   Distribution packages put `virtiofsd` in `/usr/lib/virtiofsd` (Arch),
+   `/usr/libexec/virtiofsd` (Fedora), `/usr/lib/qemu/virtiofsd` (Debian) or
+   `/usr/libexec/qemu/virtiofsd` (openSUSE); hegn searches those after `PATH`.
 4. If `/dev/kvm` is missing: enable KVM and add your user to the `kvm` group.
 5. If the config is wrong: `hegn config show`, `hegn doctor --json`.
 

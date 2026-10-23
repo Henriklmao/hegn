@@ -32,7 +32,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, Harness};
+use crate::config::{Config, Harness, VIRTIOFSD_FALLBACKS};
 use crate::firecracker::{
     Action, BootSource, Drive, FirecrackerClient, InstanceInfo, MachineConfig, SnapshotCreate,
     SnapshotLoad, VhostUserFs, VmState,
@@ -205,10 +205,12 @@ impl SandboxManager {
                 self.config.firecracker_bin.display()
             );
         }
-        if !command_available(&self.config.virtiofsd_bin) {
+        if self.config.resolved_virtiofsd().is_none() {
             bail!(
-                "virtiofsd binary {} was not found; run `hegn doctor`",
-                self.config.virtiofsd_bin.display()
+                "virtiofsd binary {} was not found on PATH or in {}; install virtiofsd or set \
+                 `virtiofsd_bin` (run `hegn doctor`)",
+                self.config.virtiofsd_bin.display(),
+                VIRTIOFSD_FALLBACKS.join(", ")
             );
         }
         let _lock = self.lock(&paths)?;
@@ -586,10 +588,12 @@ impl SandboxManager {
                 self.config.firecracker_bin.display()
             );
         }
-        if !command_available(&self.config.virtiofsd_bin) {
+        if self.config.resolved_virtiofsd().is_none() {
             bail!(
-                "virtiofsd binary {} was not found",
-                self.config.virtiofsd_bin.display()
+                "virtiofsd binary {} was not found on PATH or in {}; install virtiofsd or set \
+                 `virtiofsd_bin`",
+                self.config.virtiofsd_bin.display(),
+                VIRTIOFSD_FALLBACKS.join(", ")
             );
         }
         // Serialize with start/stop so another hegn process cannot recreate the
@@ -729,11 +733,15 @@ fn spawn_virtiofsd(
     paths: &SandboxPaths,
     project: &Path,
 ) -> Result<VirtiofsProcess> {
-    let virtiofs = VirtiofsConfig::new(
-        config.virtiofsd_bin.clone(),
-        project,
-        paths.virtiofs_socket.clone(),
-    );
+    let binary = config.resolved_virtiofsd().with_context(|| {
+        format!(
+            "virtiofsd binary {} was not found on PATH or in {}; install virtiofsd or set \
+             `virtiofsd_bin`",
+            config.virtiofsd_bin.display(),
+            VIRTIOFSD_FALLBACKS.join(", ")
+        )
+    })?;
+    let virtiofs = VirtiofsConfig::new(binary, project, paths.virtiofs_socket.clone());
     let mut process = virtiofs.spawn().context("failed to start virtiofsd")?;
     if let Err(err) = process.wait_for_socket(Duration::from_secs(5)) {
         process.kill();

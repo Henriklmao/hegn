@@ -5,7 +5,7 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::config::{Config, VIRTIOFSD_FALLBACKS};
 use crate::images::{self, AssetStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -68,12 +68,19 @@ pub fn run(config: &Config) -> DoctorReport {
         &["--version"],
         true,
     ));
-    checks.push(check_tool(
-        "virtiofsd",
-        &config.virtiofsd_bin,
-        &["--version"],
-        true,
-    ));
+    checks.push(match config.resolved_virtiofsd() {
+        Some(binary) => check_tool("virtiofsd", &binary, &["--version"], true),
+        None => Check::new(
+            "virtiofsd",
+            false,
+            true,
+            format!(
+                "{} not found on PATH or in {}; install virtiofsd or set `virtiofsd_bin`",
+                config.virtiofsd_bin.display(),
+                VIRTIOFSD_FALLBACKS.join(", ")
+            ),
+        ),
+    });
     checks.push(check_tool("git", Path::new("git"), &["--version"], true));
     checks.push(check_tool(
         "lazygit",
@@ -168,10 +175,10 @@ fn check_tool(name: &str, binary: &Path, args: &[&str], required: bool) -> Check
                 name,
                 true,
                 required,
-                if version.is_empty() {
-                    output.status.to_string()
-                } else {
-                    version.to_string()
+                match (version.is_empty(), binary.components().count() > 1) {
+                    (false, true) => format!("{version} ({})", binary.display()),
+                    (false, false) => version.to_string(),
+                    (true, _) => output.status.to_string(),
                 },
             )
         }
@@ -204,6 +211,11 @@ mod tests {
         assert!(!report.ok);
         assert!(report.failures().any(|check| check.name == "kernel image"));
         assert!(report.failures().any(|check| check.name == "rootfs image"));
+        assert!(
+            report.failures().any(
+                |check| check.name == "virtiofsd" && check.detail.contains("not found on PATH")
+            )
+        );
         assert!(report.missing_assets().count() >= 2);
         assert!(report.can_download());
     }

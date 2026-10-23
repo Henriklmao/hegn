@@ -84,7 +84,7 @@ virtiofsd or KVM is missing, the command fails and tells you what to fix.
 | --- | --- |
 | Linux with KVM | `/dev/kvm` must exist and be accessible to your user (`kvm` group). x86_64 and aarch64 targets are published. |
 | [Firecracker](https://github.com/firecracker-microvm/firecracker) | `firecracker` on `PATH` (or set `firecracker_bin`). |
-| [virtiofsd](https://gitlab.com/virtio-fs/virtiofsd) | `virtiofsd` on `PATH` (or set `virtiofsd_bin`). |
+| [virtiofsd](https://gitlab.com/virtio-fs/virtiofsd) | `virtiofsd` on `PATH` (or set `virtiofsd_bin`). Distribution install locations such as `/usr/lib/virtiofsd` (Arch), `/usr/libexec/virtiofsd` (Fedora) and `/usr/lib/qemu/virtiofsd` (Debian) are detected automatically. |
 | Kernel + rootfs images | A guest `vmlinux` and ext4 rootfs. Defaults under `~/.local/share/hegn/images/`; see `kernel_image` / `rootfs_image`. |
 | `git` | Used for project status, session branches and checkpoints. |
 | `lazygit`, `$EDITOR` | Optional, for the `g` and `e` shortcuts. |
@@ -310,6 +310,8 @@ state_dir       = "~/.local/state/hegn"
 snapshots_dir   = "~/.local/share/hegn/snapshots"
 templates_dir   = "~/.config/hegn/templates"
 firecracker_bin = "firecracker"
+# Bare names are resolved via PATH, then /usr/lib/virtiofsd (Arch),
+# /usr/libexec/virtiofsd (Fedora) and /usr/lib/qemu/virtiofsd (Debian).
 virtiofsd_bin   = "virtiofsd"
 kernel_image    = "~/.local/share/hegn/images/vmlinux.bin"
 rootfs_image    = "~/.local/share/hegn/images/rootfs.ext4"
