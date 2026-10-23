@@ -23,7 +23,9 @@ pkgdesc='${aur_description} (pre-built binary)'
 arch=('x86_64')
 url='${url}'
 license=('MIT' 'Apache-2.0')
-depends=('gcc-libs')
+# cloud-hypervisor-bin provides 'cloud-hypervisor', so either AUR package
+# satisfies this dependency.
+depends=('gcc-libs' 'cloud-hypervisor')
 provides=('hegn')
 conflicts=('hegn' 'hegn-git')
 source=("\$pkgname-\$pkgver::${url}/releases/download/${tag}/${asset}")
