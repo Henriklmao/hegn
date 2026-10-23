@@ -6,8 +6,8 @@ companion to [`../project.md`](../project.md) (specification) and
 [`../README.md`](../README.md) (user documentation).
 
 `hegn` is a Linux-only Rust application that runs coding agents inside
-Firecracker MicroVMs. The host process never runs project work itself. Every
-terminal, shell and agent session is attached to a real Firecracker guest
+Cloud Hypervisor VMs. The host process never runs project work itself. Every
+terminal, shell and agent session is attached to a real Cloud Hypervisor guest
 serial console.
 
 ---
@@ -40,17 +40,19 @@ serial console.
 │    ├── security.rs ── tirith-core (in-memory inspection)                  │
 │    ├── project.rs  ── ~/Projects/hegn (picker + import symlinks)          │
 │    ├── sandbox.rs  ── lifecycle, lock, session record                     │
-│    │     ├── firecracker.rs ── REST over unix socket                      │
+│    │     ├── cloud_hypervisor.rs ── REST over unix socket                 │
 │    │     ├── virtiofs.rs    ── virtiofsd argv/process                     │
-│    │     ├── console.rs     ── serial FIFO + persistent serial log        │
+│    │     ├── relay.rs       ── detached serial relay + persistent log     │
+│    │     ├── cloud_init.rs  ── NoCloud seed for official images           │
+│    │     ├── console.rs     ── relay socket + attach bar                  │
 │    │     ├── snapshot.rs    ── snapshot metadata                          │
-│    │     └── logs.rs        ── private logs, hard link, pruning           │
+│    │     └── logs.rs        ── private logs, tail and pruning             │
 │    ├── images.rs ── upstream kernel/rootfs download + SHA-256             │
 │    └── doctor.rs ── shared prerequisite checks                            │
 │                                                                            │
 │  virtiofsd (sandboxed, one project) ◄──── shared project directory         │
-│  Firecracker VMM ── /dev/kvm, API unix socket, serial FIFO/log             │
-│        └── guest ttyS0 ── agent / shell                                   │
+│  Cloud Hypervisor ── /dev/kvm, API/serial sockets, seccomp + Landlock     │
+│        └── guest serial console ── agent / shell                          │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -58,15 +60,19 @@ The guest sees exactly one host directory through virtiofsd. The host sees
 control sockets, logs and metadata. There is no network port, no shared
 namespace and no second mount by default.
 
-### 2.1 Firecracker build requirement
+### 2.1 Native virtio-fs and VMM hardening
 
-Firecracker upstream does not implement virtio-fs (the host filesystem-sharing
-feature is a long-standing open request). hegn therefore requires a
-**virtio-fs-enabled Firecracker build** that exposes the `PUT /vhost-user-fs`
-API. Current startup tries `/vhost-user-fs/{id}` first and falls back to the
-collection form `/vhost-user-fs` for forks that use that shape. If neither
-exists, the error explicitly says the build lacks virtio-fs; hegn does not
-substitute a host shell, a copied workspace, or a different VMM.
+Cloud Hypervisor implements virtio-fs natively. hegn passes the workspace as
+`--fs tag=<tag>,socket=<virtiofsd socket>` together with
+`--memory size=<MiB>M,shared=on`; no patched VMM build is required.
+
+The VMM is launched with seccomp filters and, unless explicitly disabled,
+Landlock. Landlock restricts the VMM's filesystem view to the kernel, the
+disks, the serial socket, the virtio-fs socket and a dedicated snapshot
+staging directory. `virtiofsd` independently runs with `--sandbox=namespace`
+(or `chroot`) and `--cache=never`. A finished snapshot is moved out of the
+staging directory and its files are tightened to `0600`, so the VMM never gets
+write access to completed checkpoints.
 
 ---
 
@@ -80,11 +86,13 @@ A running session consists of:
 | --- | --- | --- |
 | `hegn` CLI/TUI | UI, orchestration, guardrails, API calls | Foreground; may exit while VM continues |
 | `virtiofsd` | Exports exactly `session.project` under `--sandbox=namespace` (or `chroot`) | Until `sandbox stop` / restore |
-| `firecracker` | KVM MicroVM | Until `sandbox stop` / restore / guest exit |
+| `cloud-hypervisor` | KVM VMM | Until `sandbox stop` / restore / guest exit |
+| `hegn __console-relay` | Serial socket client, persistent log, attach socket | Until the VMM exits or `sandbox stop` |
 
-The CLI deliberately lets `virtiofsd` and Firecracker outlive itself. It
-forgets the `Child` handles only after the session record is written; on any
-error before that point it kills both children and removes the run files.
+The CLI deliberately lets `virtiofsd`, Cloud Hypervisor and the console relay
+outlive itself. It forgets the `Child` handles only after the session record is
+written; on any error before that point it kills the children and removes the
+run files.
 
 ### 3.2 Run directory
 
@@ -92,20 +100,23 @@ error before that point it kills both children and removes the run files.
 
 ```text
 <state>/run/
-  firecracker.sock   Firecracker REST API socket
-  virtiofs.sock      virtiofsd vhost-user socket
-  serial.in          FIFO: host input -> guest ttyS0
-  serial.out         hard link to the session log (read side)
-  firecracker.pid    last known VMM pid
-  virtiofs.pid       last known virtiofsd pid
-  session.json       SessionRecord
-  firecracker.log    VMM stderr
-  hegn.log           lifecycle/start diagnostics (timestamped, mode 0600)
-  hegn.lock          flock for lifecycle operations
+  cloud-hypervisor.sock  Cloud Hypervisor REST API socket
+  serial.sock            Cloud Hypervisor guest serial socket
+  console.sock           relay socket used by the TUI / hegn attach
+  virtiofs.sock          virtiofsd vhost-user socket
+  cloud-hypervisor.pid   last known VMM pid
+  console-relay.pid      last known relay pid
+  virtiofs.pid           last known virtiofsd pid
+  session.json           SessionRecord
+  cloud-hypervisor.log   VMM log
+  hegn.log               lifecycle/start diagnostics (timestamped, mode 0600)
+  hegn.lock              flock for lifecycle operations
+  cloud-init.img         generated NoCloud seed (no secrets)
 ```
 
-`run/` is created with mode `0700`. `serial.in` is a FIFO with mode `0600`.
-`serial.out` is a hard link to the persistent log, not a copy.
+`run/` is created with mode `0700`. All sockets live inside it; the relay
+socket is additionally `0600`. The cloud-init seed is `0600` and contains only
+public boot configuration.
 
 ### 3.3 Persistent log
 
@@ -114,11 +125,11 @@ error before that point it kills both children and removes the run files.
   session-<timestamp>-<project>-<pid>.log
 ```
 
-The log is created before Firecracker starts, mode `0600`, with
-`O_NOFOLLOW | O_CREAT | O_EXCL`. Firecracker's stdout is the log file itself.
-The run directory exposes the same inode as `serial.out`, so attaches can read
-the current output from offset 0. `sandbox stop` removes only the run link;
-the log survives for `hegn logs`.
+The log is created before Cloud Hypervisor starts, mode `0600`, with
+`O_NOFOLLOW | O_CREAT | O_EXCL`. The detached relay is the only client of the
+VMM serial socket and appends every byte to this file. On attach it replays the
+tail of the log and then streams live output, so `sandbox stop` leaves a
+complete log for `hegn logs`.
 
 Logs may contain secrets printed by an agent. They are never uploaded, and
 `hegn logs show` strips terminal control and bidi-override characters unless
@@ -131,10 +142,11 @@ never the log of the running session.
 | --- | --- | --- |
 | `~/.config/hegn/config.toml` | User config | user default |
 | `~/.config/hegn/templates/` | `AGENTS.md` templates | user default |
-| `~/.local/state/hegn/run/` | Sockets, FIFOs, session record, lock | `0700` |
+| `~/.local/state/hegn/run/` | Sockets, cloud-init seed, session record, lock | `0700` |
 | `~/.local/state/hegn/logs/` | Persistent serial logs | `0700`, files `0600` |
 | `~/.local/state/hegn/state.json` | Recent projects / last project | user default |
-| `~/.local/share/hegn/snapshots/` | Snapshot metadata + memory/state files | `0700`, files `0600` |
+| `~/.local/share/hegn/snapshots/` | Completed snapshots (`config.json`, `state.json`, `memory-ranges`, `snapshot.json`) | `0700`, files `0600` |
+| `~/.local/share/hegn/snapshots/.staging/` | The only snapshot path the VMM may write | `0700` |
 | `~/.local/share/hegn/images/` | Kernel and rootfs | files `0600` |
 | `~/Projects/hegn/` | Projects and import symlinks | user default |
 
@@ -151,13 +163,15 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `config.rs` | Schema, defaults, env overrides, validation, XDG paths, tool lookup | Unknown keys rejected; SHA-256 and HTTPS URL validation; log dir `0700`; `virtiofsd` resolved via `PATH` then distribution dirs |
 | `project.rs` | Discovery, fuzzy filter, git summaries, create, import, checkpoints | Import only creates a symlink; dangerous targets rejected; discovery skips links to `/`, `$HOME` and root ancestors |
 | `security.rs` | `tirith-core` integration and hegn workspace rules | Empty commands allowed; off mode still keeps destructive-operation guard |
-| `firecracker.rs` | Typed REST client over the API socket | Frames responses by `Content-Length`/chunked encoding (Firecracker may keep the socket open), accepts bodyless `204`, validates resource IDs, bounded response sizes, path-form and collection-form virtio-fs endpoints |
-| `virtiofs.rs` | virtiofsd argv/process construction | Shared dir canonicalized; always sandboxed; sockets scoped to run dir |
-| `sandbox.rs` | VM lifecycle, lock, session record, status, snapshots | Exclusive flock for start/stop/restore; preflight before spawn; cleanup on every error path |
+| `cloud_hypervisor.rs` | Typed REST client over `/api/v1` | Frames responses by `Content-Length`/chunked encoding, accepts bodyless `204`, bounded response sizes, pause/resume/info/snapshot only |
+| `cloud_init.rs` | NoCloud seed generation | FAT volume labelled `CIDATA`; serial root autologin; no secrets; `0600` and `O_NOFOLLOW` |
+| `relay.rs` | Detached serial relay | Sole VMM serial client; append-only log; replays the log tail on attach; bounded buffers; refuses to replace non-socket paths |
+| `virtiofs.rs` | virtiofsd argv/process construction | Shared dir canonicalized; always sandboxed; `--cache=never` by default; sockets scoped to run dir |
+| `sandbox.rs` | VM lifecycle, lock, session record, status, snapshots | Exclusive flock for start/stop/restore; preflight before spawn; hardened VMM argv; cleanup on every error path |
 | `snapshot.rs` | Snapshot metadata store | Sanitized names; private dirs/files; atomic-ish metadata writes |
 | `images.rs` | Upstream asset pins, streaming download, SHA-256 install/verify | HTTPS only by config validation; checksum before rename; no overwrite without `--force` |
 | `doctor.rs` | Shared host checks for CLI and TUI | Required vs optional checks; missing images are downloadable |
-| `console.rs` | Serial transport, tmux-style attach, status bar | Never pretends a VM exists; bar content sanitized; `--no-bar` for full-screen guests |
+| `console.rs` | Serial transport over the relay socket, tmux-style attach, status bar | Never pretends a VM exists; verifies VMM and relay; bar content sanitized; `--no-bar` for full-screen guests |
 | `logs.rs` | Log naming, listing, resolve, tail, prune | `O_NOFOLLOW`, regular files only, no foreign files deleted, active log protected |
 | `terminal.rs` | ANSI-aware scrollback | Strips CSI/OSC; caps line bytes and scrollback |
 | `state.rs` | Recent-project persistence | Atomic tmp+rename |
@@ -172,39 +186,42 @@ All state paths can be overridden in `config.toml` or by environment variables
 ### 5.1 Boot (`hegn open`, `hegn sandbox start`, TUI open)
 
 1. Load and validate config.
-2. Preflight: project exists, kernel/rootfs exist, Firecracker and virtiofsd
-   binaries resolve, KVM available.
+2. Preflight: project exists, kernel/rootfs exist, Cloud Hypervisor and
+   virtiofsd binaries resolve, KVM and Landlock available.
 3. Take the exclusive `hegn.lock`. A second lifecycle operation fails fast.
 4. If a stale session exists, clean up its run files and any verified children.
 5. Create the session log (`LogStore::create_session`); prune old logs
    best-effort.
 6. Spawn `virtiofsd` with the canonical project path and wait for its socket.
-7. Create the serial FIFO, link `serial.out` to the log, spawn Firecracker with
-   the FIFO as stdin, the log as stdout and `firecracker.log` as stderr.
-8. Wait for the API socket, then `PUT /machine-config`, `/boot-source`,
-   `/drives`, `/vhost-user-fs`, and finally `POST /actions` with
-   `InstanceStart`.
-9. Write `firecracker.pid` and `session.json` atomically enough for this
-   single-writer design.
-10. Release the lock. The children keep running.
+7. Write the NoCloud seed when `cloud_init = true`.
+8. Spawn Cloud Hypervisor with an explicit, hardened argv: `--api-socket`,
+   `--kernel`, `--disk` (rootfs + optional seed), `--cpus`, `--memory ...
+   shared=on`, `--fs`, `--serial socket=...`, `--console off`, `--seccomp` and
+   `--landlock`.
+9. Spawn the detached relay; it connects to the serial socket and appends to
+   the session log.
+10. Wait until `/api/v1/vm.info` reports `Running`.
+11. Write the pid files and `session.json`; release the lock. The children keep
+    running.
 
-On any failure the VMM and daemon are killed and run links are removed, but the
-session serial log is kept and `run/hegn.log` receives a timestamped diagnostic
-line. The CLI error repeats the `hegn.log` path. A failure to record the session
-tears the VM down instead of leaking an unmanageable process. Keeping the failed
-serial log is intentional: Firecracker writes API request/error lines there, not
-to stderr.
+On any failure the VMM, relay and daemon are killed and run links are removed,
+but the session serial log is kept and `run/hegn.log` receives a timestamped
+diagnostic line. The CLI error repeats the `hegn.log` path. A failure to record
+the session tears the VM down instead of leaking an unmanageable process.
+Keeping the failed serial log is intentional: early boot and VMM diagnostics
+remain available.
 
 ### 5.2 Attach (`hegn attach`, `hegn a`, `hegn open`)
 
 1. Read `session.json`; fail if missing.
-2. Verify the recorded pid is alive **and** still runs the configured
-   Firecracker binary (`/proc/<pid>/cmdline`).
-3. If a project argument was given, resolve it and compare canonical paths.
-4. Open `serial.in` write-only/non-blocking and `serial.out` read-only.
-5. Enter the alternate screen, reserve the bottom line with DECSTBM, replay the
-   log and forward input.
-6. `Ctrl-B` detaches; the VM keeps running. `--no-bar` uses the full terminal
+2. Verify the recorded VMM pid is alive **and** still runs the configured
+   Cloud Hypervisor binary (`/proc/<pid>/cmdline`).
+3. Verify the recorded relay pid still runs the internal relay command.
+4. If a project argument was given, resolve it and compare canonical paths.
+5. Connect to `console.sock`. The relay replays the log tail, then forwards
+   input and live output.
+6. Enter the alternate screen, reserve the bottom line with DECSTBM, and
+   forward input. `Ctrl-B` detaches; the VM keeps running. `--no-bar` uses the full terminal
    for full-screen guest programs.
 
 Attach never boots, restarts or repairs a VM.
@@ -212,9 +229,9 @@ Attach never boots, restarts or repairs a VM.
 ### 5.3 Stop
 
 1. Take `hegn.lock`.
-2. Resolve pids from `session.json` / pid files.
-3. Send `SIGTERM` only when the pid still matches the expected binary, wait up
-   to two seconds, then `SIGKILL` under the same check.
+2. Resolve VMM, relay and virtiofsd pids from `session.json` / pid files.
+3. Send `SIGTERM` only when the pid still matches the expected binary/relay
+   command, wait up to two seconds, then `SIGKILL` under the same check.
 4. Remove run files. The session log stays.
 
 ### 5.4 Snapshot create / restore
@@ -223,20 +240,24 @@ Create:
 
 1. Require a running VM and an API socket.
 2. Pause the guest.
-3. `PUT /snapshot/create` with a full snapshot.
-4. Record metadata with `SnapshotStore`.
+3. `PUT /api/v1/vm.snapshot` with a `file://` destination inside
+   `snapshots_dir/.staging/<name>`.
+4. Tighten the files, atomically rename the directory into `snapshots_dir`, and
+   record metadata with `SnapshotStore` (the directory holds `config.json`,
+   `state.json` and `memory-ranges`).
 5. Always attempt to resume; if saving metadata fails, remove the snapshot
    directory and resume.
 
 Restore:
 
-1. Validate snapshot state/memory files and project.
-2. Preflight Firecracker/virtiofsd before stopping the current VM.
-3. Take `hegn.lock`; terminate the old VM/daemon.
-4. Start a fresh virtiofsd and Firecracker, create a new session log, then
-   `PUT /snapshot/load`.
-5. Write the new session record; on failure kill both children and remove the
-   new log.
+1. Validate the snapshot directory and its `config.json`, `state.json` and
+   `memory-ranges` files, plus the project.
+2. Preflight Cloud Hypervisor/virtiofsd before stopping the current VM.
+3. Take `hegn.lock`; terminate the old VMM, relay and daemon.
+4. Start a fresh virtiofsd, regenerate the seed, create a new session log, then
+   start Cloud Hypervisor with `--restore source_url=file://<dir>,resume=true`.
+5. Start the relay, wait for the API, write the new session record; on failure
+   kill the children and remove the new log.
 
 ### 5.5 Project create / import
 
@@ -276,9 +297,10 @@ mismatch. `hegn images status` shows path, presence and size.
 
 ### 5.7 Doctor
 
-`doctor::run(&config)` performs cheap blocking checks: Firecracker, virtiofsd,
-git, lazygit (optional), `/dev/kvm`, kernel image, rootfs image, projects root,
-logs dir (optional), backend, editor (optional), plus `images::status`.
+`doctor::run(&config)` performs cheap blocking checks: Cloud Hypervisor,
+virtiofsd, git, lazygit (optional), `/dev/kvm`, Landlock (required when
+enabled), kernel image, rootfs image, projects root, logs dir (optional),
+backend, editor (optional), plus `images::status`.
 
 A bare `virtiofsd_bin` is resolved through `PATH` and then the distribution
 install directories in `config::VIRTIOFSD_FALLBACKS`; the report names the
@@ -299,15 +321,15 @@ These are product requirements, not implementation details.
 1. **No host work, ever.** No fallback shell, local PTY, container or host
    command execution for project work. `hegn doctor` and `hegn logs` inspect the
    host, but do not run project code.
-2. **Preflight and cleanup.** Do not spawn `virtiofsd` or Firecracker until
-   assets and binaries are known good. On mid-start failure, kill children and
-   remove run files and the half-created log.
+2. **Preflight and cleanup.** Do not spawn `virtiofsd`, Cloud Hypervisor or the
+   relay until assets and binaries are known good. On mid-start failure, kill
+   children and remove run files; the session serial log is kept for diagnosis.
 3. **Single lifecycle writer.** `start`, `stop` and snapshot restore hold an
    exclusive `flock` on `run/hegn.lock`.
 4. **One project per VM.** Only `session.project` is exported. virtiofsd
    canonicalizes the shared directory and always uses a sandbox mode.
-5. **Attach is read/verify, not recovery.** It checks the recorded pid and
-   binary and refuses no-session/dead/mismatched cases.
+5. **Attach is read/verify, not recovery.** It checks the recorded VMM pid,
+   binary and relay and refuses no-session/dead/mismatched cases.
 6. **Least privilege on disk.** Run/log dirs `0700`; locks, logs, sessions,
    snapshots and images `0600`; `O_NOFOLLOW` where untrusted names are opened.
 7. **Untrusted output stays untrusted.** Project names, log names and log
@@ -323,8 +345,8 @@ These are product requirements, not implementation details.
     replace; temporary files never become visible as final images.
 11. **Import never widens the export accidentally.** Symlink only, dangerous
     ancestors/state paths refused, discovery filters dangerous links.
-12. **No own guest image.** Kernel and rootfs come from upstream Firecracker CI;
-    CI only refreshes pins and opens a reviewable PR.
+12. **No own guest image.** Kernel and rootfs come from upstream Cloud
+    Hypervisor releases; CI only refreshes pins and opens a reviewable PR.
 
 ### 6.1 Threat notes
 
@@ -342,7 +364,7 @@ These are product requirements, not implementation details.
 
 ---
 
-## 7. Image pinning and the daily CI job
+## 7. Image pinning and the weekly CI job
 
 hegn intentionally does **not** build, sign or publish its own guest image.
 That would add a second supply chain, a package-rebuild cadence and a large
@@ -351,17 +373,17 @@ release artifact. Instead:
 - `src/images.rs` contains per-architecture constants:
   `KERNEL_VERSION`, `KERNEL_ARTIFACT`, `KERNEL_URL`, `KERNEL_SHA256`,
   `ROOTFS_VERSION`, `ROOTFS_ARTIFACT`, `ROOTFS_URL`, `ROOTFS_SHA256`.
-- Defaults currently use the newest upstream Firecracker CI `vmlinux-6.1.*`
-  kernel and the newest upstream `ubuntu-*.ext4` rootfs. The two may come from
-  different Firecracker CI versions; the pins make that explicit.
+- Defaults use the official Cloud Hypervisor Linux kernel release and the
+  newest official Cloud Hypervisor cloud image (qcow2 on x86_64, raw on
+  aarch64). The pins make the exact artifacts explicit.
 - `config.toml` can override URLs and digests (for a mirror), but URLs must be
   `https://` and non-empty digests must be 64 hex characters.
-- `.github/workflows/vm-images.yml` runs **daily** (`17 4 * * *`) and on
+- `.github/workflows/vm-images.yml` runs **weekly** (`17 4 * * 1`) and on
   `workflow_dispatch`.
-- `scripts/update_vm_images.py --arch <arch>` lists the S3 bucket, selects the
-  newest kernel and the newest ext4 rootfs, downloads both, computes SHA-256
-  from the actual bytes, and rewrites only the matching architecture block in
-  `src/images.rs`.
+- `scripts/update_vm_images.py --arch <arch>` queries the Cloud Hypervisor
+  Linux release and the upstream `test_assets.yaml`, selects the kernel and
+  cloud image, downloads both, computes SHA-256 from the actual bytes, and
+  rewrites only the matching architecture block in `src/images.rs`.
 - If the file changed, the workflow force-pushes a `chore/vm-images` branch and
   creates or updates a pull request. A human reviews the new artifacts before
   merging; the normal Rust CI then re-runs tests and clippy.
@@ -371,8 +393,8 @@ release artifact. Instead:
 The workflow needs `contents: write` and `pull-requests: write`; it uses the
 repository `GITHUB_TOKEN` and `gh`, not a third-party PR action. It does not
 publish releases or cache a hegn-owned image. Because the job downloads the
-artifacts to hash them, it needs roughly 350 MiB of temporary network transfer
-per architecture; no file is written outside the process.
+artifacts to hash them, it needs several GiB of temporary network transfer and
+disk per architecture; no file is written outside the process.
 
 ### 7.1 Updating pins manually
 
@@ -384,8 +406,8 @@ hegn images verify
 ```
 
 Review the URL/version movement, especially when the rootfs and kernel versions
-diverge. The rootfs must remain an ext4 image; Firecracker CI's newer squashfs
-artifacts are not used by the current boot configuration.
+diverge. The pinned root filesystem must stay compatible with `rootfs_format`
+and `root_device`; the official qcow2 image uses `/dev/vda1`.
 
 ---
 
@@ -412,8 +434,8 @@ while `MouseEventKind::Moved` reports the pointer inside their rectangle.
 VM starts run on a named worker thread (`hegn-start-vm`) and report through the
 same channel as project scans. The UI therefore keeps drawing an animated
 `STARTING` spinner, the sandbox note and a toast immediately after Enter;
-`ensure_console`, virtiofsd/Firecracker boot, and the optional session branch do
-not block the event loop. Snapshot restore is still on the runtime path and is
+`ensure_console`, virtiofsd/Cloud Hypervisor boot, and the optional session
+branch do not block the event loop. Snapshot restore is still on the runtime path and is
 the next candidate for the same treatment.
 
 ### 8.1 Theming
@@ -466,12 +488,12 @@ needs to recover or audit has a CLI form.
 | Failure | Behaviour |
 | --- | --- |
 | Missing kernel/rootfs | Hard error before spawn; doctor modal/CLI report; `hegn images download` offered |
-| Missing Firecracker/virtiofsd | Hard error before any child is spawned |
+| Missing Cloud Hypervisor/virtiofsd | Hard error before any child is spawned |
 | Missing `/dev/kvm` | Hard error; doctor reports it |
-| Firecracker build lacks virtio-fs | Explicit hard error naming the missing API/build requirement; no host or copy-based fallback |
-| Firecracker keeps the API socket open | Client frames by `Content-Length`/chunked encoding and returns as soon as the response is complete; bodyless `204` ends at the headers |
+| Landlock unavailable | Hard error when `landlock = true`; doctor names the missing LSM |
+| VMM keeps the API socket open | Client frames by `Content-Length`/chunked encoding and returns as soon as the response is complete; bodyless `204` ends at the headers |
 | VM boot is slow | Worker thread; UI shows an animated `STARTING` spinner and remains responsive |
-| Start fails before guest boot | `run/hegn.log` gets the error; the serial log is preserved and `hegn logs show` exposes Firecracker API messages |
+| Start fails before guest boot | `run/hegn.log` gets the error; the serial log is preserved and `hegn logs show` exposes VMM messages |
 | Bad download/checksum | Temporary file removed; no final image written |
 | Empty checksum | Refused unless `--allow-unverified` |
 | Existing image | Refused unless `--force` |
@@ -481,7 +503,7 @@ needs to recover or audit has a CLI form.
 | Two lifecycle calls | Second fails on `flock` with a retry hint |
 | Import target unsafe | Form/CLI error; no symlink created |
 | Log symlink | Listing skips it; resolution/reads refuse it |
-| Snapshot load fails | New Firecracker process dies; cleanup; old VM already stopped by design (preflight prevents config errors) |
+| Snapshot restore fails | New Cloud Hypervisor process dies; cleanup; old VM already stopped by design (preflight prevents config errors) |
 | Terminal too small for attach bar | Refuse to attach before raw mode; suggest `--no-bar`/resize |
 
 ---
@@ -489,9 +511,12 @@ needs to recover or audit has a CLI form.
 ## 11. Testing strategy
 
 - All modules are unit-tested from the library crate (`src/*.rs` `#[cfg(test)]`).
-- Firecracker API tests use a local Unix socket server; no `/dev/kvm` needed.
-- Console tests use a FIFO and a regular serial file with a fake session record
-  whose pid belongs to the test binary.
+- Cloud Hypervisor API tests use a local Unix socket server; no `/dev/kvm`
+  needed.
+- Console and relay tests use Unix socket pairs with a fake session record whose
+  pid belongs to the test binary.
+- Cloud-init seed tests open the generated FAT image and verify its label and
+  files without a VM.
 - Lifecycle tests assert preflight ordering and cleanup using missing binaries.
 - Log tests cover naming, permissions, symlink refusal, tail semantics, prune
   protection and foreign-file preservation.
@@ -503,9 +528,9 @@ needs to recover or audit has a CLI form.
 - CI runs `cargo fmt --check`, clippy with warnings denied, the full test suite,
   and a release build on Rust 1.99.1.
 
-The daily image workflow is the only job that performs network downloads; it
+The weekly image workflow is the only job that performs network downloads; it
 does not run the test suite. The normal CI must stay offline/reproducible and
-must not depend on S3 availability.
+must not depend on upstream hosting availability.
 
 ---
 
@@ -534,7 +559,7 @@ or press `h`/`←` in the project list. The original directory is untouched.
 
 1. Read the doctor modal (opens automatically) or run `hegn doctor`.
 2. If images are missing: `hegn images download`.
-3. If virtiofsd/Firecracker is missing: install it or set the binary path.
+3. If virtiofsd/Cloud Hypervisor is missing: install it or set the binary path.
    Distribution packages put `virtiofsd` in `/usr/lib/virtiofsd` (Arch),
    `/usr/libexec/virtiofsd` (Fedora), `/usr/lib/qemu/virtiofsd` (Debian) or
    `/usr/libexec/qemu/virtiofsd` (openSUSE); hegn searches those after `PATH`.
@@ -576,8 +601,8 @@ python3 scripts/update_vm_images.py --arch x86_64 --check
 
 ### ADR-001: No hegn-owned guest image
 
-**Decision:** consume upstream Firecracker CI artifacts; pin URL + SHA-256;
-refresh pins daily via CI PR.
+**Decision:** consume upstream Cloud Hypervisor CI artifacts; pin URL + SHA-256;
+refresh pins weekly via CI PR.
 
 **Why:** avoids maintaining a rootfs build/signing pipeline and a large release
 artifact, while still making updates reviewable. Users who need extra packages
@@ -609,24 +634,25 @@ unrelated directories in `~/Projects`.
 who want the new default must update `projects_root` or rerun `hegn config init`
 after moving the file.
 
-### ADR-004: Persistent log via hard link
+### ADR-004: Persistent log via a detached relay
 
-**Decision:** Firecracker writes to `state/logs/session-*.log`; `run/serial.out`
-is a hard link to the same inode.
+**Decision:** a detached relay reads Cloud Hypervisor's serial socket and
+appends to `state/logs/session-*.log`; attach clients connect to a second relay
+socket.
 
-**Why:** the boot log survives `stop` with no logger process, no copy and no
-second writer. Attach sees the full log from offset 0.
+**Why:** Cloud Hypervisor's serial socket accepts a single client. The relay
+keeps the log complete while detached and replays its tail to the next attach
+without a second writer.
 
-**Consequence:** logs and run directory must be on the same filesystem. They are
-both derived from `state_dir`, so this is normally true; a hard-link failure is
-a hard error.
+**Consequence:** one small hegn process per VM. It has no project access, no
+network and only the two socket paths plus the log.
 
 ### ADR-005: Attach bar is an overlay, not a terminal emulator
 
 **Decision:** reserve one host row with DECSTBM and paint the status line.
 
 **Why:** implementing a complete VT emulator plus a guest-side resize protocol
-is disproportionate; Firecracker's serial console cannot transmit window-size
+is disproportionate; the legacy serial console cannot transmit window-size
 changes to the guest tty anyway.
 
 **Consequence:** full-screen guests see one fewer usable row (or can be attached
@@ -638,15 +664,21 @@ The TUI remains the line-intercepted view.
 ## 14. Known limitations and future work
 
 - No guest network management; configure it outside hegn.
-- No guest tty resize channel over the Firecracker serial port.
+- No guest tty resize channel over the legacy serial port.
 - Attach input bypasses `tirith-core` by design and is labelled; a guarded raw
   proxy would require a full terminal emulator.
-- Per-session logs are not truncated while Firecracker owns the file; retention
+- Per-session logs are not truncated while the relay owns the file; retention
   is by count and explicit `logs prune`.
 - Snapshot restore intentionally stops the current VM after preflight; there is
   no live migration.
+- Cloud Hypervisor snapshots embed absolute device and socket paths (rootfs,
+  serial, virtio-fs and Landlock rules). Restore assumes the same
+  `state_dir`/`snapshots_dir`; moving them fails closed.
 - The upstream rootfs is generic; harness-specific package installation is
   recorded but not baked into the downloaded image.
+- The default rootfs is writable and reused between sessions; guest changes
+  persist. Use a per-session copy or overlay image when an ephemeral root is
+  required.
 - CI image refresh opens a PR rather than auto-merging, so updates still need a
   human review.
 
@@ -662,13 +694,15 @@ src/
   config.rs      schema, defaults, env overrides, validation
   project.rs     discovery, import, templates, git helpers
   security.rs    tirith-core + hegn workspace guardrails
-  firecracker.rs typed REST client
+  cloud_hypervisor.rs typed REST client
+  cloud_init.rs   NoCloud seed generation
+  relay.rs        detached serial relay
   virtiofs.rs    hardened virtiofsd process construction
   sandbox.rs     MicroVM lifecycle, lock, session, report
   snapshot.rs    snapshot metadata store
   images.rs      upstream image pins, downloads, SHA-256
   doctor.rs      shared host checks
-  console.rs     serial transport, attach bar
+  console.rs     serial transport over the relay, attach bar
   logs.rs        persistent logs, tail, prune
   terminal.rs    ANSI-aware scrollback
   state.rs       recent-project state
@@ -679,7 +713,7 @@ scripts/
   update_vm_images.py  refresh upstream pins (CI)
 .github/workflows/
   rust.yml          fmt, clippy, tests, release build
-  vm-images.yml     daily upstream pin refresh PR
+  vm-images.yml     weekly upstream pin refresh PR
   release.yml       tagged AppImage release
   aur-publish.yml   tagged AUR publish
 docs/

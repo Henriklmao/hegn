@@ -1,12 +1,12 @@
 name: VM images
 
-# hegn uses upstream Firecracker CI images; it never builds its own guest
+# hegn uses upstream Cloud Hypervisor images; it never builds its own guest
 # image. This scheduled job refreshes the pinned URLs/SHA-256 and opens a PR so
 # a human can review the new kernel/rootfs before it becomes the default.
 on:
   schedule:
-    # Daily, 04:17 UTC (off the top of the hour).
-    - cron: "17 4 * * *"
+    # Weekly, Monday 04:17 UTC (off the top of the hour).
+    - cron: "17 4 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -49,11 +49,11 @@ jobs:
           git config user.email "hegn-vm-images@users.noreply.github.com"
           git checkout -B "$branch"
           git add src/images.rs
-          git commit -m "chore(images): refresh pinned Firecracker VM assets"
+          git commit -m "chore(images): refresh pinned Cloud Hypervisor VM assets"
           git push --force origin "$branch"
 
           body=$(cat <<'EOF'
-          Weekly automated refresh of the upstream Firecracker CI VM assets.
+          Weekly automated refresh of the upstream Cloud Hypervisor VM assets.
 
           The update script downloads the selected kernel and ext4 rootfs,
           computes SHA-256 from the actual bytes, and rewrites the architecture
@@ -64,12 +64,12 @@ jobs:
 
           if gh pr view "$branch" --json number >/dev/null 2>&1; then
             gh pr edit "$branch" \
-              --title "chore(images): refresh pinned Firecracker VM assets" \
+              --title "chore(images): refresh pinned Cloud Hypervisor VM assets" \
               --body "$body"
           else
             gh pr create \
               --base main \
               --head "$branch" \
-              --title "chore(images): refresh pinned Firecracker VM assets" \
+              --title "chore(images): refresh pinned Cloud Hypervisor VM assets" \
               --body "$body"
           fi

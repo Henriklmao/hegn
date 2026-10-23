@@ -44,8 +44,8 @@ pub enum Effect {
     RefreshProjects,
     RestoreSnapshot(SnapshotMeta),
     DownloadImages,
-    /// Boot (or attach to) a Firecracker VM. A failure is a hard error; there is
-    /// no host-process fallback.
+    /// Boot (or attach to) a Cloud Hypervisor VM. A failure is a hard error;
+    /// there is no host-process fallback.
     StartSandbox {
         project: PathBuf,
         harness: Harness,
@@ -115,8 +115,8 @@ pub struct SandboxStatus {
 
 impl SandboxStatus {
     pub fn from_config(config: &Config) -> Self {
-        let backend = "firecracker";
-        let virtiofs = if config.firecracker_ready() {
+        let backend = "cloud-hypervisor";
+        let virtiofs = if config.vm_assets_ready() {
             "configured"
         } else {
             "missing VM"
@@ -1221,7 +1221,7 @@ impl App {
         Vec::new()
     }
 
-    /// Open the selected project in a Firecracker VM.
+    /// Open the selected project in a Cloud Hypervisor VM.
     ///
     /// This only *requests* the VM start; the terminal loop owns the runtime and
     /// performs the boot. A missing VM is a hard error, never a local shell.
@@ -1266,7 +1266,7 @@ impl App {
         self.sandbox.state = SandboxState::Starting;
         self.sandbox.started_at = None;
         self.sandbox.note = Some(format!(
-            "booting Firecracker VM for {}",
+            "booting Cloud Hypervisor VM for {}",
             project.display_path()
         ));
         vec![Effect::StartSandbox {
@@ -1278,14 +1278,14 @@ impl App {
     /// Install a console for a successfully started/attached VM.
     pub fn attach_console(&mut self, console: Box<dyn TerminalConsole>) {
         self.sandbox.state = SandboxState::Running;
-        self.sandbox.backend = "firecracker";
+        self.sandbox.backend = "cloud-hypervisor";
         self.sandbox.note = Some(format!(
             "{} in {}",
             console.label(),
             console.project().display()
         ));
         self.sandbox.started_at = Some(Instant::now());
-        self.sandbox.socket = Some(self.config.run_dir().join("firecracker.sock"));
+        self.sandbox.socket = Some(self.config.run_dir().join("cloud-hypervisor.sock"));
         self.session = Some(console);
         self.screen = Screen::Terminal;
         self.raw_mode = false;
@@ -1856,8 +1856,7 @@ mod tests {
                 name: "old".into(),
                 created_at: chrono::Utc::now(),
                 vm_state: "Paused".into(),
-                snapshot_path: paths.snapshot_path,
-                mem_file_path: paths.mem_file_path,
+                dir: paths.dir,
                 project: None,
                 size_bytes: 0,
                 note: None,
@@ -1883,8 +1882,7 @@ mod tests {
                 name: "old".into(),
                 created_at: chrono::Utc::now(),
                 vm_state: "Paused".into(),
-                snapshot_path: paths.snapshot_path,
-                mem_file_path: paths.mem_file_path,
+                dir: paths.dir,
                 project: None,
                 size_bytes: 0,
                 note: None,
@@ -2058,7 +2056,7 @@ mod tests {
     fn sandbox_status_reflects_config() {
         let (_dir, app) = test_app();
         assert_eq!(app.sandbox.state, SandboxState::Stopped);
-        assert_eq!(app.sandbox.backend, "firecracker");
+        assert_eq!(app.sandbox.backend, "cloud-hypervisor");
         assert_eq!(app.sandbox.vcpus, app.config.vcpus);
     }
 

@@ -1,28 +1,36 @@
-//! Firecracker lifecycle orchestration.
+//! Cloud Hypervisor lifecycle orchestration.
 //!
 //! One hegn state directory manages one VM at a time:
 //!
 //! ```text
 //! <state>/run/
-//!   firecracker.sock
-//!   virtiofs.sock
-//!   serial.in        (FIFO: guest serial input)
-//!   serial.out       (serial log: guest serial output)
-//!   firecracker.pid
+//!   cloud-hypervisor.sock   REST API socket
+//!   serial.sock             guest serial socket (Cloud Hypervisor listener)
+//!   console.sock            relay socket used by `hegn attach`
+//!   virtiofs.sock           virtiofsd vhost-user socket
+//!   cloud-hypervisor.pid
+//!   console-relay.pid
 //!   virtiofs.pid
 //!   session.json
-//!   firecracker.log
-//!   hegn.lock
+//!   cloud-hypervisor.log    VMM log
+//!   hegn.log                lifecycle/start diagnostics
+//!   hegn.lock               lifecycle flock
+//!   cloud-init.img          NoCloud seed for the official cloud images
 //! ```
 //!
-//! `start` boots virtiofsd followed by Firecracker, configures the API and
-//! issues `InstanceStart`. The child processes deliberately outlive the CLI
-//! process; `stop` terminates them. VM lifecycle operations hold an exclusive
-//! lock on `hegn.lock` so two concurrent `hegn open` calls cannot boot
-//! Firecracker on the same sockets and serial FIFO.
+//! `start` boots virtiofsd, Cloud Hypervisor and the detached serial relay. The
+//! child processes deliberately outlive the CLI process; `stop` terminates
+//! them. VM lifecycle operations hold an exclusive lock on `hegn.lock` so two
+//! concurrent `hegn open` calls cannot boot a VMM on the same sockets.
+//!
+//! Cloud Hypervisor supports virtio-fs natively, so no special fork or
+//! patched build is required. The VMM runs with seccomp filters and, when
+//! enabled, Landlock restricting its filesystem view to the kernel, disks and
+//! serial/fs sockets.
 
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -32,28 +40,38 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::cloud_hypervisor::{CloudHypervisorClient, SnapshotConfig, VmInfo, VmState};
+use crate::cloud_init;
 use crate::config::{Config, Harness, VIRTIOFSD_FALLBACKS};
-use crate::firecracker::{
-    Action, BootSource, Drive, FirecrackerClient, InstanceInfo, MachineConfig, SnapshotCreate,
-    SnapshotLoad, VhostUserFs, VmState,
-};
 use crate::logs::{DEFAULT_KEEP, LogStore};
+use crate::relay::{self, RelayArgs};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
 use crate::virtiofs::{VirtiofsConfig, VirtiofsProcess};
 
-const API_START_TIMEOUT: Duration = Duration::from_secs(5);
-const ROOT_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw";
+const API_START_TIMEOUT: Duration = Duration::from_secs(15);
+const RELAY_START_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(target_arch = "x86_64")]
+const SERIAL_CONSOLE: &str = "ttyS0";
+#[cfg(target_arch = "aarch64")]
+const SERIAL_CONSOLE: &str = "ttyAMA0";
+
+fn boot_args(root_device: &str) -> String {
+    format!("console={SERIAL_CONSOLE} reboot=k panic=1 root={root_device} rw")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPaths {
     pub run_dir: PathBuf,
+    /// Cloud Hypervisor REST API.
     pub api_socket: PathBuf,
+    /// Guest serial socket created by Cloud Hypervisor.
+    pub serial_socket: PathBuf,
+    /// Relay socket consumed by the TUI and `hegn attach`.
+    pub console_socket: PathBuf,
     pub virtiofs_socket: PathBuf,
-    /// FIFO connected to Firecracker's stdin (guest serial input).
-    pub serial_in: PathBuf,
-    /// File connected to Firecracker's stdout (guest serial output).
-    pub serial_out: PathBuf,
-    pub firecracker_pid: PathBuf,
+    pub vm_pid: PathBuf,
+    pub relay_pid: PathBuf,
     pub virtiofs_pid: PathBuf,
     pub session: PathBuf,
     pub log: PathBuf,
@@ -61,37 +79,56 @@ pub struct SandboxPaths {
     pub event_log: PathBuf,
     /// Exclusive lock serializing VM lifecycle operations.
     pub lock: PathBuf,
+    /// Generated NoCloud seed disk.
+    pub cloud_init: PathBuf,
 }
 
 impl SandboxPaths {
     pub fn from_config(config: &Config) -> Self {
         let run_dir = config.run_dir();
         Self {
-            api_socket: run_dir.join("firecracker.sock"),
+            api_socket: run_dir.join("cloud-hypervisor.sock"),
+            serial_socket: run_dir.join("serial.sock"),
+            console_socket: run_dir.join("console.sock"),
             virtiofs_socket: run_dir.join("virtiofs.sock"),
-            serial_in: run_dir.join("serial.in"),
-            serial_out: run_dir.join("serial.out"),
-            firecracker_pid: run_dir.join("firecracker.pid"),
+            vm_pid: run_dir.join("cloud-hypervisor.pid"),
+            relay_pid: run_dir.join("console-relay.pid"),
             virtiofs_pid: run_dir.join("virtiofs.pid"),
             session: run_dir.join("session.json"),
-            log: run_dir.join("firecracker.log"),
+            log: run_dir.join("cloud-hypervisor.log"),
             event_log: run_dir.join("hegn.log"),
             lock: run_dir.join("hegn.lock"),
+            cloud_init: run_dir.join("cloud-init.img"),
             run_dir,
         }
     }
 
     pub fn ensure(&self) -> Result<()> {
-        // The API and virtiofs sockets live here; a private directory keeps
-        // other local users from driving the microVM.
+        // The API, serial, relay and virtiofs sockets live here; a private
+        // directory keeps other local users from driving the microVM.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::DirBuilderExt;
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            // A symlinked run directory could redirect the VMM/console sockets
+            // outside the private state tree. Refuse instead of following it.
+            if let Ok(metadata) = fs::symlink_metadata(&self.run_dir)
+                && metadata.file_type().is_symlink()
+            {
+                bail!(
+                    "refusing symlinked run directory {}",
+                    self.run_dir.display()
+                );
+            }
             let mut builder = fs::DirBuilder::new();
             builder.recursive(true).mode(0o700);
             builder
                 .create(&self.run_dir)
                 .with_context(|| format!("failed to create {}", self.run_dir.display()))?;
+            // The directory may already exist with wider permissions. Sockets
+            // for the VMM and the console relay live here, so tightening it is
+            // mandatory, not best effort.
+            fs::set_permissions(&self.run_dir, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("failed to secure {}", self.run_dir.display()))?;
         }
         #[cfg(not(unix))]
         fs::create_dir_all(&self.run_dir)
@@ -105,7 +142,9 @@ pub struct SessionRecord {
     pub project: PathBuf,
     pub harness: Harness,
     pub started_at: DateTime<Utc>,
-    pub firecracker_pid: u32,
+    pub vm_pid: u32,
+    #[serde(default)]
+    pub relay_pid: u32,
     pub virtiofs_pid: u32,
     pub boot_args: String,
     /// Persistent serial log for this session. Optional so session records
@@ -122,9 +161,13 @@ pub struct SandboxReport {
     pub vcpus: u8,
     pub memory_mib: u32,
     pub api_socket: PathBuf,
+    pub serial_socket: PathBuf,
+    pub console_socket: PathBuf,
     pub virtiofs_socket: PathBuf,
     pub virtiofs_running: bool,
-    pub firecracker_pid: Option<u32>,
+    pub relay_running: bool,
+    pub vm_pid: Option<u32>,
+    pub relay_pid: Option<u32>,
     pub virtiofs_pid: Option<u32>,
     pub started_at: Option<DateTime<Utc>>,
     /// Persistent serial console log, if the session predates logging or the
@@ -160,16 +203,24 @@ impl SandboxManager {
         serde_json::from_str(&raw).ok()
     }
 
+    /// A session file that exists but cannot be parsed is a migration hazard:
+    /// an old VMM may still be running, but hegn no longer knows its pid.
+    /// Refuse to overwrite that state instead of leaking an unmanaged VM.
+    fn unreadable_session(&self) -> bool {
+        let path = self.paths().session;
+        path.exists() && self.session().is_none()
+    }
+
     pub fn is_running(&self) -> bool {
         self.session()
-            .map(|session| process_matches(session.firecracker_pid, &self.config.firecracker_bin))
+            .map(|session| process_matches(session.vm_pid, &self.config.cloud_hypervisor_bin))
             .unwrap_or(false)
     }
 
     /// Take the exclusive VM lifecycle lock.
     ///
-    /// A second `hegn open`/`sandbox start` must not recreate `serial.in` or the
-    /// API socket underneath a VM that is already booting.
+    /// A second `hegn open`/`sandbox start` must not recreate the API or serial
+    /// socket underneath a VM that is already booting.
     fn lock(&self, paths: &SandboxPaths) -> Result<RunLock> {
         paths.ensure()?;
         let file = OpenOptions::new()
@@ -191,10 +242,10 @@ impl SandboxManager {
         Ok(RunLock { _file: file })
     }
 
-    /// Boot virtiofsd + Firecracker and start the guest.
+    /// Boot virtiofsd, Cloud Hypervisor and the console relay.
     ///
     /// Lifecycle errors are appended to `run/hegn.log` so a failed start can
-    /// be diagnosed even when Firecracker never reached the guest.
+    /// be diagnosed even when the guest never reached userspace.
     pub fn start(&self, project: &Path, harness: Harness) -> Result<SandboxReport> {
         let result = self.start_inner(project, harness);
         let paths = self.paths();
@@ -202,10 +253,10 @@ impl SandboxManager {
         let _ = paths.ensure();
         let message = match &result {
             Ok(report) => format!(
-                "started project={} harness={} firecracker_pid={}",
+                "started project={} harness={} vm_pid={}",
                 project.display(),
                 harness.label(),
-                report.firecracker_pid.unwrap_or(0)
+                report.vm_pid.unwrap_or(0)
             ),
             Err(err) => format!("start failed project={}: {err:#}", project.display()),
         };
@@ -217,16 +268,21 @@ impl SandboxManager {
         let paths = self.paths();
         // A missing VM is always a hard error: there is no host-process fallback.
         self.config.require_vm_assets()?;
+        // The snapshot staging directory must exist before Cloud Hypervisor
+        // starts: it is a Landlock rule, and Landlock rules are validated at
+        // create time.
+        self.config.ensure_dirs()?;
+        SnapshotStore::new(&self.config.snapshots_dir).ensure_staging()?;
         if !project.is_dir() {
             bail!("project {} does not exist", project.display());
         }
-        // Preflight both binaries before spawning anything, so a typo in the
+        // Preflight every binary before spawning anything, so a typo in the
         // configuration cannot leave a stray virtiofsd (or a VM without a
         // console) behind.
-        if !command_available(&self.config.firecracker_bin) {
+        if !command_available(&self.config.cloud_hypervisor_bin) {
             bail!(
-                "firecracker binary {} was not found; run `hegn doctor`",
-                self.config.firecracker_bin.display()
+                "cloud-hypervisor binary {} was not found; run `hegn doctor`",
+                self.config.cloud_hypervisor_bin.display()
             );
         }
         if self.config.resolved_virtiofsd().is_none() {
@@ -237,7 +293,15 @@ impl SandboxManager {
                 VIRTIOFSD_FALLBACKS.join(", ")
             );
         }
+        let hegn = hegn_binary()?;
         let _lock = self.lock(&paths)?;
+        if self.unreadable_session() {
+            bail!(
+                "session metadata in {} is unreadable or from an older hegn version; \
+                 stop the old VM manually and remove that directory before starting",
+                paths.run_dir.display()
+            );
+        }
         if self.is_running() {
             bail!("a sandbox is already running (use `hegn sandbox stop` first)");
         }
@@ -246,16 +310,12 @@ impl SandboxManager {
         }
         paths.ensure()?;
         // Build the runtime before spawning anything so a failure here cannot
-        // leak a running virtiofsd or Firecracker process.
+        // leak a running virtiofsd or VMM process.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("failed to build async runtime")?;
 
-        // Serial output is written to a private, persistent log and exposed in
-        // the run directory through a hard link. Create the log before any
-        // process starts so a boot log is never lost and a logging problem is
-        // a hard error rather than a silent downgrade.
         let started_at = Utc::now();
         let logs = LogStore::new(self.config.logs_dir());
         if let Err(err) = logs.prune(DEFAULT_KEEP) {
@@ -264,12 +324,7 @@ impl SandboxManager {
         let serial_log = logs.create_session(project, started_at, std::process::id())?;
 
         // 1. virtiofsd, sandboxed to exactly this project.
-        let mut virtiofs = match spawn_virtiofsd(&self.config, &paths, project) {
-            Ok(process) => process,
-            Err(err) => {
-                return Err(err);
-            }
-        };
+        let mut virtiofs = spawn_virtiofsd(&self.config, &paths, project)?;
         let virtiofs_pid = virtiofs.pid();
         if let Err(err) = write_private(&paths.virtiofs_pid, virtiofs_pid.to_string()) {
             virtiofs.kill();
@@ -277,8 +332,18 @@ impl SandboxManager {
             return Err(err).context("failed to record the virtiofsd pid");
         }
 
-        // 2. Firecracker process. Children outlive this CLI call.
-        let mut firecracker = match spawn_firecracker(&self.config, &paths, &serial_log) {
+        // 2. Optional NoCloud seed for the official cloud images. It contains
+        // no secrets and only enables a serial root login.
+        if self.config.cloud_init
+            && let Err(err) = cloud_init::write_seed(&paths.cloud_init)
+        {
+            virtiofs.kill();
+            cleanup_files(&paths);
+            return Err(err);
+        }
+
+        // 3. Cloud Hypervisor. Children outlive this CLI call.
+        let mut vm = match spawn_cloud_hypervisor(&self.config, &paths, None) {
             Ok(child) => child,
             Err(err) => {
                 virtiofs.kill();
@@ -286,90 +351,77 @@ impl SandboxManager {
                 return Err(err);
             }
         };
-        let firecracker_pid = firecracker.id();
+        let vm_pid = vm.id();
 
-        let configured = runtime.block_on(async {
-            wait_for_api(&paths.api_socket, &mut firecracker, API_START_TIMEOUT).await?;
-            let client = FirecrackerClient::new(&paths.api_socket);
-            client
-                .put_machine_config(&MachineConfig {
-                    vcpu_count: self.config.vcpus,
-                    mem_size_mib: self.config.memory_mib,
-                    smt: Some(false),
-                    track_dirty_pages: Some(true),
-                })
-                .await?;
-            client
-                .put_boot_source(&BootSource {
-                    kernel_image_path: self.config.kernel_image.display().to_string(),
-                    boot_args: ROOT_BOOT_ARGS.to_string(),
-                })
-                .await?;
-            client
-                .put_drive(&Drive {
-                    drive_id: "rootfs".into(),
-                    path_on_host: self.config.rootfs_image.display().to_string(),
-                    is_root_device: true,
-                    is_read_only: false,
-                })
-                .await?;
-            client
-                .put_vhost_user_fs(&VhostUserFs {
-                    fs_id: "workspace".into(),
-                    socket: paths.virtiofs_socket.display().to_string(),
-                    tag: self.config.shared_tag.clone(),
-                })
-                .await?;
-            client.action(Action::InstanceStart).await?;
-            Ok::<_, anyhow::Error>(())
-        });
+        // 4. The relay is Cloud Hypervisor's only serial client. Start it
+        // before waiting for the API so the earliest boot output is captured.
+        let relay_pid = match start_relay(&paths, &serial_log) {
+            Ok(pid) => pid,
+            Err(err) => {
+                let _ = vm.kill();
+                let _ = vm.wait();
+                virtiofs.kill();
+                cleanup_files(&paths);
+                return Err(err);
+            }
+        };
 
-        if let Err(err) = configured {
-            let _ = firecracker.kill();
-            let _ = firecracker.wait();
+        if let Err(err) =
+            runtime.block_on(wait_for_vm(&paths.api_socket, &mut vm, API_START_TIMEOUT))
+        {
+            let _ = vm.kill();
+            let _ = vm.wait();
+            terminate_relay(relay_pid, &hegn);
             virtiofs.kill();
             cleanup_files(&paths);
-            return Err(err).context("failed to configure Firecracker");
+            return Err(err).context("failed to boot Cloud Hypervisor");
         }
 
         let record = SessionRecord {
             project: project.to_path_buf(),
             harness,
             started_at,
-            firecracker_pid,
+            vm_pid,
+            relay_pid,
             virtiofs_pid,
-            boot_args: ROOT_BOOT_ARGS.to_string(),
+            boot_args: boot_args(&self.config.root_device),
             serial_log: Some(serial_log.clone()),
         };
         let recorded = (|| -> Result<()> {
-            write_private(&paths.firecracker_pid, firecracker_pid.to_string())?;
+            write_private(&paths.vm_pid, vm_pid.to_string())?;
+            write_private(&paths.relay_pid, relay_pid.to_string())?;
             write_private(&paths.session, serde_json::to_string_pretty(&record)?)?;
             Ok(())
         })();
         if let Err(err) = recorded {
             // Without the session record a later `stop` cannot find the VM, so
-            // tear everything down instead of leaking a running Firecracker.
-            let _ = firecracker.kill();
-            let _ = firecracker.wait();
+            // tear everything down instead of leaking a running VMM.
+            let _ = vm.kill();
+            let _ = vm.wait();
+            terminate_relay(relay_pid, &hegn);
             virtiofs.kill();
             cleanup_files(&paths);
             return Err(err).context("failed to record the sandbox session");
         }
 
         // Do not kill the children on drop.
-        std::mem::forget(firecracker);
+        std::mem::forget(vm);
         std::mem::forget(virtiofs);
 
         Ok(SandboxReport {
             state: "running".into(),
-            backend: "firecracker".into(),
+            backend: "cloud-hypervisor".into(),
             project: Some(project.to_path_buf()),
             vcpus: self.config.vcpus,
             memory_mib: self.config.memory_mib,
             api_socket: paths.api_socket,
+            serial_socket: paths.serial_socket,
+            console_socket: paths.console_socket,
             virtiofs_socket: paths.virtiofs_socket,
             virtiofs_running: true,
-            firecracker_pid: Some(firecracker_pid),
+            relay_running: true,
+            vm_pid: Some(vm_pid),
+            relay_pid: Some(relay_pid),
             virtiofs_pid: Some(virtiofs_pid),
             started_at: Some(record.started_at),
             serial_log: Some(serial_log),
@@ -396,7 +448,7 @@ impl SandboxManager {
         // start path cleans it up.
         if let Some(session) = self.session()
             && !same_project(&session.project, project)
-            && process_matches(session.firecracker_pid, &self.config.firecracker_bin)
+            && process_matches(session.vm_pid, &self.config.cloud_hypervisor_bin)
         {
             bail!(
                 "a sandbox for {} is already running; stop it with `hegn sandbox stop` first",
@@ -409,29 +461,45 @@ impl SandboxManager {
         self.attach_console()
     }
 
-    /// Stop Firecracker and virtiofsd.
+    /// Stop Cloud Hypervisor, the console relay and virtiofsd.
     pub fn stop(&self) -> Result<()> {
         let paths = self.paths();
         if !paths.run_dir.is_dir() {
             bail!("no sandbox session found in {}", paths.run_dir.display());
         }
         let _lock = self.lock(&paths)?;
+        let hegn = hegn_binary()?;
+        if self.unreadable_session() {
+            bail!(
+                "session metadata in {} is unreadable or from an older hegn version; \
+                 find and stop the recorded VMM manually, then remove that directory",
+                paths.run_dir.display()
+            );
+        }
         let session = self.session();
-        let firecracker_pid = session
+        let vm_pid = session
             .as_ref()
-            .map(|s| s.firecracker_pid)
-            .or_else(|| read_pid(&paths.firecracker_pid));
+            .map(|s| s.vm_pid)
+            .or_else(|| read_pid(&paths.vm_pid));
+        let relay_pid = session
+            .as_ref()
+            .map(|s| s.relay_pid)
+            .filter(|pid| *pid != 0)
+            .or_else(|| read_pid(&paths.relay_pid));
         let virtiofs_pid = session
             .as_ref()
             .map(|s| s.virtiofs_pid)
             .or_else(|| read_pid(&paths.virtiofs_pid));
 
-        if firecracker_pid.is_none() && virtiofs_pid.is_none() {
+        if vm_pid.is_none() && relay_pid.is_none() && virtiofs_pid.is_none() {
             bail!("no sandbox session found in {}", paths.run_dir.display());
         }
 
-        if let Some(pid) = firecracker_pid {
-            terminate(pid, &self.config.firecracker_bin);
+        if let Some(pid) = vm_pid {
+            terminate(pid, &self.config.cloud_hypervisor_bin);
+        }
+        if let Some(pid) = relay_pid {
+            terminate_relay(pid, &hegn);
         }
         if let Some(pid) = virtiofs_pid {
             terminate(pid, &self.config.virtiofsd_bin);
@@ -444,21 +512,19 @@ impl SandboxManager {
     pub async fn pause(&self) -> Result<()> {
         let paths = self.paths();
         ensure_socket(&paths.api_socket)?;
-        FirecrackerClient::new(&paths.api_socket).pause().await
+        CloudHypervisorClient::new(&paths.api_socket).pause().await
     }
 
     pub async fn resume(&self) -> Result<()> {
         let paths = self.paths();
         ensure_socket(&paths.api_socket)?;
-        FirecrackerClient::new(&paths.api_socket).resume().await
+        CloudHypervisorClient::new(&paths.api_socket).resume().await
     }
 
-    pub async fn instance_info(&self) -> Result<InstanceInfo> {
+    pub async fn instance_info(&self) -> Result<VmInfo> {
         let paths = self.paths();
         ensure_socket(&paths.api_socket)?;
-        FirecrackerClient::new(&paths.api_socket)
-            .instance_info()
-            .await
+        CloudHypervisorClient::new(&paths.api_socket).info().await
     }
 
     pub fn status(&self) -> Result<SandboxReport> {
@@ -467,6 +533,15 @@ impl SandboxManager {
         let virtiofs_running = session
             .as_ref()
             .map(|s| process_matches(s.virtiofs_pid, &self.config.virtiofsd_bin))
+            .unwrap_or(false);
+        let hegn = hegn_binary().ok();
+        let relay_running = session
+            .as_ref()
+            .filter(|s| s.relay_pid != 0)
+            .map(|s| {
+                hegn.as_deref()
+                    .is_some_and(|binary| relay::process_matches_relay(s.relay_pid, binary))
+            })
             .unwrap_or(false);
         let api_socket_exists = paths.api_socket.exists();
         let mut state = if api_socket_exists {
@@ -481,13 +556,13 @@ impl SandboxManager {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            match runtime.block_on(FirecrackerClient::new(&paths.api_socket).instance_info()) {
+            match runtime.block_on(CloudHypervisorClient::new(&paths.api_socket).info()) {
                 Ok(info) => {
                     state = match info.state {
                         VmState::Running => "running",
-                        VmState::Paused => "paused",
-                        VmState::Starting => "starting",
-                        VmState::NotStarted => "stopped",
+                        VmState::Paused | VmState::BreakPoint => "paused",
+                        VmState::Created => "created",
+                        VmState::Shutdown => "stopped",
                     }
                     .to_string();
                 }
@@ -500,17 +575,29 @@ impl SandboxManager {
             state = "stopped".into();
             note = Some("session metadata exists but the API socket is gone".into());
         }
+        if self.unreadable_session() {
+            state = "failed".into();
+            note = Some(
+                "session metadata is unreadable or from an older hegn version; stop the old VM \
+                 and remove the run directory"
+                    .into(),
+            );
+        }
 
         Ok(SandboxReport {
             state,
-            backend: "firecracker".into(),
+            backend: "cloud-hypervisor".into(),
             project: session.as_ref().map(|s| s.project.clone()),
             vcpus: self.config.vcpus,
             memory_mib: self.config.memory_mib,
             api_socket: paths.api_socket,
+            serial_socket: paths.serial_socket,
+            console_socket: paths.console_socket,
             virtiofs_socket: paths.virtiofs_socket,
             virtiofs_running,
-            firecracker_pid: session.as_ref().map(|s| s.firecracker_pid),
+            relay_running,
+            vm_pid: session.as_ref().map(|s| s.vm_pid),
+            relay_pid: session.as_ref().map(|s| s.relay_pid),
             virtiofs_pid: session.as_ref().map(|s| s.virtiofs_pid),
             started_at: session.as_ref().map(|s| s.started_at),
             serial_log: session.as_ref().and_then(|s| s.serial_log.clone()),
@@ -522,43 +609,65 @@ impl SandboxManager {
     pub async fn create_snapshot(&self, project: &Path, name: &str) -> Result<SnapshotMeta> {
         let paths = self.paths();
         ensure_socket(&paths.api_socket)?;
+        // Serialize with start/stop/restore so the VM cannot be torn down
+        // between pause and resume.
+        let _lock = self.lock(&paths)?;
+        if let Some(session) = self.session()
+            && !same_project(&session.project, project)
+        {
+            bail!(
+                "the running VM belongs to {}; snapshots must use the session project",
+                session.project.display()
+            );
+        }
         let name = crate::snapshot::sanitize_name(name)?;
         let store = SnapshotStore::new(&self.config.snapshots_dir);
-        let prepared = store.prepare(&name)?;
-        let snapshot_path = prepared.snapshot_path;
-        let mem_file_path = prepared.mem_file_path;
-        let snap_dir = prepared.dir;
-        let client = FirecrackerClient::new(&paths.api_socket);
+        let prepared = store.prepare_staged(&name)?;
+        let client = CloudHypervisorClient::new(&paths.api_socket);
 
-        client.pause().await?;
+        if let Err(err) = client.pause().await {
+            let _ = fs::remove_dir_all(&prepared.dir);
+            return Err(err);
+        }
         if let Err(err) = client
-            .create_snapshot(&SnapshotCreate {
-                snapshot_path: snapshot_path.display().to_string(),
-                mem_file_path: mem_file_path.display().to_string(),
-                snapshot_type: Some("Full".into()),
+            .snapshot(&SnapshotConfig {
+                destination_url: format!("file://{}", prepared.dir.display()),
             })
             .await
         {
             // Always try to resume, even if snapshot creation failed.
             let _ = client.resume().await;
-            let _ = fs::remove_dir_all(&snap_dir);
+            let _ = fs::remove_dir_all(&prepared.dir);
             return Err(err);
         }
 
-        let size = fs::metadata(&snapshot_path).map(|m| m.len()).unwrap_or(0)
-            + fs::metadata(&mem_file_path).map(|m| m.len()).unwrap_or(0);
+        if let Err(err) = secure_snapshot_dir(&prepared.dir) {
+            // Snapshot memory can contain credentials; do not keep a snapshot
+            // whose permissions we could not tighten.
+            let _ = client.resume().await;
+            let _ = fs::remove_dir_all(&prepared.dir);
+            return Err(err);
+        }
+        // Move the finished snapshot out of the VMM's Landlock view before it
+        // becomes a durable checkpoint.
+        if let Err(err) = store.finalize(&prepared) {
+            let _ = client.resume().await;
+            let _ = fs::remove_dir_all(&prepared.dir);
+            return Err(err);
+        }
+        let size = dir_size(&prepared.final_dir);
         let meta = SnapshotMeta {
             name: name.to_string(),
             created_at: Utc::now(),
             vm_state: "Paused".into(),
-            snapshot_path,
-            mem_file_path,
+            dir: prepared.final_dir.clone(),
             project: Some(project.to_path_buf()),
             size_bytes: size,
             note: None,
         };
         if let Err(err) = store.save_meta(&meta) {
             let _ = client.resume().await;
+            let _ = fs::remove_dir_all(&prepared.final_dir);
             return Err(err);
         }
         client
@@ -568,27 +677,29 @@ impl SandboxManager {
         Ok(meta)
     }
 
-    /// Restore a snapshot into a brand new Firecracker process.
+    /// Restore a snapshot into a brand new Cloud Hypervisor process.
     ///
-    /// Firecracker only accepts `/snapshot/load` before the microVM is booted,
-    /// so the running process is replaced first. A fresh process also keeps a
-    /// failed load (Firecracker terminates itself on failure) from taking down
-    /// an existing VM. virtiofsd is restarted for the snapshot's project so the
-    /// restored guest finds a healthy backend on the same socket path.
+    /// The running VMM and relay are replaced first. A fresh process keeps a
+    /// failed restore (Cloud Hypervisor exits on some restore errors) from
+    /// taking down an existing VM. virtiofsd is restarted for the snapshot's
+    /// project so the restored guest finds a healthy backend on the same
+    /// socket path.
     pub async fn restore_snapshot(&self, snapshot: &SnapshotMeta) -> Result<()> {
         let paths = self.paths();
         paths.ensure()?;
-        if !snapshot.snapshot_path.is_file() {
-            bail!(
-                "snapshot state file {} is missing",
-                snapshot.snapshot_path.display()
-            );
+        self.config.ensure_dirs()?;
+        SnapshotStore::new(&self.config.snapshots_dir).ensure_staging()?;
+        if !snapshot.dir.is_dir() {
+            bail!("snapshot directory {} is missing", snapshot.dir.display());
         }
-        if !snapshot.mem_file_path.is_file() {
-            bail!(
-                "snapshot memory file {} is missing",
-                snapshot.mem_file_path.display()
-            );
+        for required in ["config.json", "state.json", "memory-ranges"] {
+            if !snapshot.dir.join(required).is_file() {
+                bail!(
+                    "snapshot {} is not restorable: missing {}",
+                    snapshot.name,
+                    snapshot.dir.join(required).display()
+                );
+            }
         }
         let existing = self.session();
         let project = snapshot
@@ -601,10 +712,10 @@ impl SandboxManager {
         }
         // Preflight the binaries before stopping a running VM, so a typo in
         // the configuration does not cost the user their current sandbox.
-        if !command_available(&self.config.firecracker_bin) {
+        if !command_available(&self.config.cloud_hypervisor_bin) {
             bail!(
-                "firecracker binary {} was not found",
-                self.config.firecracker_bin.display()
+                "cloud-hypervisor binary {} was not found",
+                self.config.cloud_hypervisor_bin.display()
             );
         }
         if self.config.resolved_virtiofsd().is_none() {
@@ -615,22 +726,35 @@ impl SandboxManager {
                 VIRTIOFSD_FALLBACKS.join(", ")
             );
         }
+        let hegn = hegn_binary()?;
         // Serialize with start/stop so another hegn process cannot recreate the
-        // sockets and serial FIFO while the snapshot boot is in flight.
+        // sockets while the snapshot boot is in flight.
         let _lock = self.lock(&paths)?;
+        if self.unreadable_session() {
+            bail!(
+                "session metadata in {} is unreadable or from an older hegn version; \
+                 stop the old VM manually and remove that directory before restoring",
+                paths.run_dir.display()
+            );
+        }
 
-        // Stop the old VM and its filesystem daemon. Both sockets are freed
+        // Stop the old VM, relay and filesystem daemon. The sockets are freed
         // and recreated below with the same paths the snapshot expects.
         if let Some(session) = &existing {
-            terminate(session.firecracker_pid, &self.config.firecracker_bin);
+            terminate(session.vm_pid, &self.config.cloud_hypervisor_bin);
+            terminate_relay(session.relay_pid, &hegn);
             terminate(session.virtiofs_pid, &self.config.virtiofsd_bin);
         }
-        if let Some(pid) = read_pid(&paths.firecracker_pid) {
-            terminate(pid, &self.config.firecracker_bin);
+        if let Some(pid) = read_pid(&paths.vm_pid) {
+            terminate(pid, &self.config.cloud_hypervisor_bin);
+        }
+        if let Some(pid) = read_pid(&paths.relay_pid) {
+            terminate_relay(pid, &hegn);
         }
         if let Some(pid) = read_pid(&paths.virtiofs_pid) {
             terminate(pid, &self.config.virtiofsd_bin);
         }
+        cleanup_files(&paths);
 
         let mut virtiofs = match spawn_virtiofsd(&self.config, &paths, &project) {
             Ok(process) => process,
@@ -644,6 +768,14 @@ impl SandboxManager {
             virtiofs.kill();
             cleanup_files(&paths);
             return Err(err).context("failed to record the virtiofsd pid");
+        }
+
+        if self.config.cloud_init
+            && let Err(err) = cloud_init::write_seed(&paths.cloud_init)
+        {
+            virtiofs.kill();
+            cleanup_files(&paths);
+            return Err(err);
         }
 
         let started_at = Utc::now();
@@ -660,7 +792,7 @@ impl SandboxManager {
             }
         };
 
-        let mut firecracker = match spawn_firecracker(&self.config, &paths, &serial_log) {
+        let mut vm = match spawn_cloud_hypervisor(&self.config, &paths, Some(snapshot)) {
             Ok(child) => child,
             Err(err) => {
                 virtiofs.kill();
@@ -668,14 +800,25 @@ impl SandboxManager {
                 return Err(err);
             }
         };
-        let firecracker_pid = firecracker.id();
+        let vm_pid = vm.id();
+        let relay_pid = match start_relay(&paths, &serial_log) {
+            Ok(pid) => pid,
+            Err(err) => {
+                let _ = vm.kill();
+                let _ = vm.wait();
+                virtiofs.kill();
+                cleanup_files(&paths);
+                return Err(err);
+            }
+        };
 
-        if let Err(err) = load_snapshot_into(&paths, &mut firecracker, snapshot).await {
-            let _ = firecracker.kill();
-            let _ = firecracker.wait();
+        if let Err(err) = wait_for_vm(&paths.api_socket, &mut vm, API_START_TIMEOUT).await {
+            let _ = vm.kill();
+            let _ = vm.wait();
+            terminate_relay(relay_pid, &hegn);
             virtiofs.kill();
             cleanup_files(&paths);
-            return Err(err).context("failed to load the Firecracker snapshot");
+            return Err(err).context("failed to restore the Cloud Hypervisor snapshot");
         }
 
         let record = SessionRecord {
@@ -685,29 +828,29 @@ impl SandboxManager {
                 .map(|session| session.harness)
                 .unwrap_or(self.config.harness),
             started_at,
-            firecracker_pid,
+            vm_pid,
+            relay_pid,
             virtiofs_pid,
-            boot_args: existing
-                .as_ref()
-                .map(|session| session.boot_args.clone())
-                .unwrap_or_else(|| ROOT_BOOT_ARGS.to_string()),
-            serial_log: Some(serial_log.clone()),
+            boot_args: boot_args(&self.config.root_device),
+            serial_log: Some(serial_log),
         };
         let recorded = (|| -> Result<()> {
-            write_private(&paths.firecracker_pid, firecracker_pid.to_string())?;
+            write_private(&paths.vm_pid, vm_pid.to_string())?;
+            write_private(&paths.relay_pid, relay_pid.to_string())?;
             write_private(&paths.session, serde_json::to_string_pretty(&record)?)?;
             Ok(())
         })();
         if let Err(err) = recorded {
-            let _ = firecracker.kill();
-            let _ = firecracker.wait();
+            let _ = vm.kill();
+            let _ = vm.wait();
+            terminate_relay(relay_pid, &hegn);
             virtiofs.kill();
             cleanup_files(&paths);
             return Err(err).context("failed to record the restored sandbox session");
         }
 
         // The restored VM runs for the rest of the hegn session.
-        std::mem::forget(firecracker);
+        std::mem::forget(vm);
         std::mem::forget(virtiofs);
         Ok(())
     }
@@ -723,10 +866,10 @@ impl SandboxManager {
             Err(_) => return false,
         };
         runtime.block_on(async {
-            FirecrackerClient::new(&paths.api_socket)
-                .instance_info()
+            CloudHypervisorClient::new(&paths.api_socket)
+                .info()
                 .await
-                .map(|info| matches!(info.state, VmState::Running | VmState::Paused))
+                .map(|info| info.state.is_alive())
                 .unwrap_or(false)
         })
     }
@@ -734,21 +877,24 @@ impl SandboxManager {
     fn cleanup_stale(&self) {
         let paths = self.paths();
         if let Some(session) = self.session() {
-            if process_matches(session.firecracker_pid, &self.config.firecracker_bin) {
+            if process_matches(session.vm_pid, &self.config.cloud_hypervisor_bin) {
                 return;
             }
-            terminate(session.firecracker_pid, &self.config.firecracker_bin);
+            terminate(session.vm_pid, &self.config.cloud_hypervisor_bin);
+            if let Ok(binary) = hegn_binary() {
+                terminate_relay(session.relay_pid, &binary);
+            }
             terminate(session.virtiofs_pid, &self.config.virtiofsd_bin);
         }
         cleanup_files(&paths);
     }
 }
 
-fn spawn_virtiofsd(
+fn virtiofs_config(
     config: &Config,
     paths: &SandboxPaths,
     project: &Path,
-) -> Result<VirtiofsProcess> {
+) -> Result<VirtiofsConfig> {
     let binary = config.resolved_virtiofsd().with_context(|| {
         format!(
             "virtiofsd binary {} was not found on PATH or in {}; install virtiofsd or set \
@@ -757,7 +903,19 @@ fn spawn_virtiofsd(
             VIRTIOFSD_FALLBACKS.join(", ")
         )
     })?;
-    let virtiofs = VirtiofsConfig::new(binary, project, paths.virtiofs_socket.clone());
+    let mut virtiofs = VirtiofsConfig::new(binary, project, paths.virtiofs_socket.clone());
+    // Honour the configured sandbox mode. The default is namespace; chroot is
+    // available for hosts where user namespaces are restricted.
+    virtiofs.sandbox = config.virtiofs_sandbox;
+    Ok(virtiofs)
+}
+
+fn spawn_virtiofsd(
+    config: &Config,
+    paths: &SandboxPaths,
+    project: &Path,
+) -> Result<VirtiofsProcess> {
+    let virtiofs = virtiofs_config(config, paths, project)?;
     let mut process = virtiofs.spawn().context("failed to start virtiofsd")?;
     if let Err(err) = process.wait_for_socket(Duration::from_secs(5)) {
         process.kill();
@@ -766,141 +924,226 @@ fn spawn_virtiofsd(
     Ok(process)
 }
 
-fn spawn_firecracker(config: &Config, paths: &SandboxPaths, serial_log: &Path) -> Result<Child> {
-    let _ = fs::remove_file(&paths.api_socket);
-    ensure_serial_fifo(&paths.serial_in)?;
-    prepare_serial_output(paths, serial_log)?;
-    // Firecracker registers serial input only when stdin is a TTY or a FIFO.
-    // O_RDWR keeps both ends open so the child never sees EOF between attaches.
-    let serial_in = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(&paths.serial_in)
-        .with_context(|| format!("failed to open {}", paths.serial_in.display()))?;
-    // Open the persistent log itself (not the hard link) with O_NOFOLLOW so the
-    // guest serial output can never be redirected through a planted symlink.
-    let serial_out = OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(serial_log)
-        .with_context(|| format!("failed to open serial log {}", serial_log.display()))?;
+/// Build the hardened command line for a normal boot.
+fn cloud_hypervisor_args(config: &Config, paths: &SandboxPaths) -> Vec<OsString> {
+    let mut args = common_args(config, paths, true);
+    args.push("--kernel".into());
+    args.push(config.kernel_image.clone().into_os_string());
+    args.push("--cmdline".into());
+    args.push(boot_args(&config.root_device).into());
+
+    args.push("--disk".into());
+    args.push(
+        format!(
+            "path={},image_type={}",
+            config.rootfs_image.display(),
+            config.rootfs_format.as_str()
+        )
+        .into(),
+    );
+    if config.cloud_init {
+        args.push(cloud_init::disk_arg(&paths.cloud_init).into());
+    }
+
+    args.push("--cpus".into());
+    args.push(format!("boot={},max={}", config.vcpus, config.vcpus).into());
+    args.push("--memory".into());
+    args.push(format!("size={}M,shared=on", config.memory_mib).into());
+    args.push("--fs".into());
+    args.push(
+        format!(
+            "tag={},socket={},num_queues=1,queue_size=1024",
+            config.shared_tag,
+            paths.virtiofs_socket.display()
+        )
+        .into(),
+    );
+    args.push("--serial".into());
+    args.push(format!("socket={}", paths.serial_socket.display()).into());
+    args.push("--console".into());
+    args.push("off".into());
+    args
+}
+
+/// Build the command line for a restore. The VM configuration comes from the
+/// snapshot itself, so only VMM-level options are set here.
+fn restore_args(config: &Config, paths: &SandboxPaths, snapshot: &SnapshotMeta) -> Vec<OsString> {
+    let mut args = common_args(config, paths, false);
+    args.push("--restore".into());
+    args.push(format!("source_url={},resume=true", snapshot.source_url()).into());
+    args
+}
+
+fn common_args(config: &Config, paths: &SandboxPaths, landlock: bool) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "--api-socket".into(),
+        paths.api_socket.clone().into_os_string(),
+        "--log-file".into(),
+        paths.log.clone().into_os_string(),
+        "--seccomp".into(),
+        if config.seccomp { "true" } else { "false" }.into(),
+    ];
+    if config.landlock && landlock {
+        args.push("--landlock".into());
+        // Cloud Hypervisor applies Landlock at VM create. Snapshot writes
+        // happen later, so the snapshot root has to be granted up front.
+        args.push("--landlock-rules".into());
+        args.push(format!("path={},access=rw", config.snapshots_dir.display()).into());
+    }
+    args
+}
+
+fn spawn_cloud_hypervisor(
+    config: &Config,
+    paths: &SandboxPaths,
+    restore: Option<&SnapshotMeta>,
+) -> Result<Child> {
+    // Cloud Hypervisor must create the API and serial listeners itself.
+    remove_socket(&paths.api_socket)?;
+    remove_socket(&paths.serial_socket)?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&paths.log)
         .with_context(|| format!("failed to open {}", paths.log.display()))?;
     let stderr = log.try_clone()?;
-    Command::new(&config.firecracker_bin)
-        .arg("--api-sock")
-        .arg(&paths.api_socket)
-        .arg("--id")
-        .arg(format!("hegn-{}", std::process::id()))
-        .stdin(Stdio::from(serial_in))
-        .stdout(Stdio::from(serial_out))
+    let args = match restore {
+        Some(snapshot) => restore_args(config, paths, snapshot),
+        None => cloud_hypervisor_args(config, paths),
+    };
+    Command::new(&config.cloud_hypervisor_bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
         .stderr(Stdio::from(stderr))
         .spawn()
         .with_context(|| {
             format!(
-                "failed to spawn {} (is Firecracker installed?)",
-                config.firecracker_bin.display()
+                "failed to spawn {} (is Cloud Hypervisor installed?)",
+                config.cloud_hypervisor_bin.display()
             )
         })
 }
 
-/// Expose the persistent serial log at `<run>/serial.out` without copying it.
-///
-/// Firecracker writes once to the log file; console attach reads the same
-/// inode through `serial.out`. Stopping the VM removes only the run-directory
-/// link, so the session log survives.
-fn prepare_serial_output(paths: &SandboxPaths, serial_log: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(serial_log)
-        .with_context(|| format!("serial log {} is missing", serial_log.display()))?;
-    if metadata.file_type().is_symlink() {
-        bail!(
-            "refusing to use symlinked serial log {}",
-            serial_log.display()
-        );
-    }
-    if !metadata.file_type().is_file() {
-        bail!("serial log {} is not a regular file", serial_log.display());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(serial_log, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to secure {}", serial_log.display()))?;
-    }
-    let _ = fs::remove_file(&paths.serial_out);
-    fs::hard_link(serial_log, &paths.serial_out).with_context(|| {
-        format!(
-            "failed to link serial log {} to {}",
-            serial_log.display(),
-            paths.serial_out.display()
-        )
-    })?;
-    Ok(())
-}
-
-/// Create a private FIFO for guest serial input, replacing any stale one.
-pub(crate) fn ensure_serial_fifo(path: &Path) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let _ = fs::remove_file(path);
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .with_context(|| format!("invalid FIFO path {}", path.display()))?;
-    // Safety: c_path is a valid NUL-terminated path; mkfifo does not retain it.
-    if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to create {}", path.display()));
-    }
-    Ok(())
-}
-
-async fn wait_for_api(socket: &Path, child: &mut Child, timeout: Duration) -> Result<()> {
-    let client = FirecrackerClient::new(socket);
-    let deadline = Instant::now() + timeout;
+fn start_relay(paths: &SandboxPaths, serial_log: &Path) -> Result<u32> {
+    remove_socket(&paths.console_socket)?;
+    let args = RelayArgs {
+        backend: paths.serial_socket.clone(),
+        frontend: paths.console_socket.clone(),
+        log: serial_log.to_path_buf(),
+    };
+    let pid = relay::spawn(&args)?;
+    let binary = hegn_binary()?;
+    let deadline = Instant::now() + RELAY_START_TIMEOUT;
     while Instant::now() < deadline {
-        if socket.exists() && client.instance_info().await.is_ok() {
-            return Ok(());
+        if is_socket(&paths.console_socket) && process_alive(pid) {
+            return Ok(pid);
         }
-        if let Ok(Some(status)) = child.try_wait() {
-            bail!("Firecracker exited during startup ({status}); check the log");
+        if !process_alive(pid) {
+            bail!("the console relay exited before creating its socket");
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        std::thread::sleep(Duration::from_millis(10));
     }
+    terminate_relay(pid, &binary);
     bail!(
-        "timed out after {timeout:?} waiting for Firecracker API at {}",
-        socket.display()
+        "timed out waiting for the console relay socket {}",
+        paths.console_socket.display()
     )
 }
 
-async fn load_snapshot_into(
-    paths: &SandboxPaths,
-    child: &mut Child,
-    snapshot: &SnapshotMeta,
-) -> Result<()> {
-    wait_for_api(&paths.api_socket, child, API_START_TIMEOUT).await?;
-    FirecrackerClient::new(&paths.api_socket)
-        .load_snapshot(&SnapshotLoad {
-            snapshot_path: snapshot.snapshot_path.display().to_string(),
-            mem_file_path: snapshot.mem_file_path.display().to_string(),
-            track_dirty_pages: Some(true),
-            resume_vm: Some(true),
-        })
-        .await
+async fn wait_for_vm(socket: &Path, child: &mut Child, timeout: Duration) -> Result<()> {
+    let client = CloudHypervisorClient::new(socket);
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if socket.exists()
+            && let Ok(info) = client.info().await
+            && info.state.is_alive()
+        {
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!("Cloud Hypervisor exited during startup ({status}); check the log");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    bail!(
+        "timed out after {timeout:?} waiting for a running Cloud Hypervisor VM at {}",
+        socket.display()
+    )
 }
 
 fn ensure_socket(path: &Path) -> Result<()> {
     if !path.exists() {
         bail!(
-            "no Firecracker API socket at {} — start a sandbox first",
+            "no Cloud Hypervisor API socket at {} — start a sandbox first",
             path.display()
         );
     }
     Ok(())
+}
+
+fn hegn_binary() -> Result<PathBuf> {
+    std::env::current_exe().context("failed to locate the hegn executable")
+}
+
+fn is_socket(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_socket())
+        .unwrap_or(false)
+}
+
+/// Remove a socket or stale socket file, but never a regular file or symlink.
+fn remove_socket(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => fs::remove_file(path)
+            .with_context(|| format!("failed to remove stale socket {}", path.display())),
+        Ok(_) => bail!(
+            "refusing to replace {}: it exists and is not a socket",
+            path.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+/// Tighten Cloud Hypervisor's snapshot output to `0700`/`0600`.
+///
+/// The snapshot directory is already private, but setting the file modes too
+/// keeps the invariant robust if the directory is ever moved or re-created.
+fn secure_snapshot_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("failed to read snapshot directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            bail!(
+                "refusing to secure a symlink in the snapshot directory: {}",
+                path.display()
+            );
+        }
+        let mode = if meta.is_dir() { 0o700 } else { 0o600 };
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+            .with_context(|| format!("failed to secure {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::symlink_metadata(entry.path()).ok())
+        .filter(|meta| meta.file_type().is_file())
+        .map(|meta| meta.len())
+        .sum()
 }
 
 /// Append a timestamped lifecycle line to `run/hegn.log`.
@@ -1004,19 +1247,29 @@ fn terminate(pid: u32, binary: &Path) {
     if !process_matches(pid, binary) {
         return;
     }
+    signal_and_wait(pid, || process_matches(pid, binary));
+}
+
+fn terminate_relay(pid: u32, binary: &Path) {
+    if !relay::process_matches_relay(pid, binary) {
+        return;
+    }
+    signal_and_wait(pid, || relay::process_matches_relay(pid, binary));
+}
+
+fn signal_and_wait(pid: u32, still_running: impl Fn() -> bool) {
     // Safety: the pid was verified to belong to the expected executable.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGTERM);
     }
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if !process_matches(pid, binary) {
-            // Exited, or the PID was recycled by an unrelated process.
+        if !still_running() {
             return;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    if !process_matches(pid, binary) {
+    if !still_running() {
         return;
     }
     // Safety: same verified process as above; escalate after the grace period.
@@ -1028,12 +1281,14 @@ fn terminate(pid: u32, binary: &Path) {
 fn cleanup_files(paths: &SandboxPaths) {
     for path in [
         &paths.api_socket,
+        &paths.serial_socket,
+        &paths.console_socket,
         &paths.virtiofs_socket,
-        &paths.serial_in,
-        &paths.serial_out,
-        &paths.firecracker_pid,
+        &paths.vm_pid,
+        &paths.relay_pid,
         &paths.virtiofs_pid,
         &paths.session,
+        &paths.cloud_init,
     ] {
         let _ = fs::remove_file(path);
     }
@@ -1050,9 +1305,12 @@ mod tests {
         config.state_dir = dir.join("state");
         config.projects_root = dir.join("projects");
         config.snapshots_dir = dir.join("snapshots");
-        config.kernel_image = dir.join("vmlinux.bin");
-        config.rootfs_image = dir.join("rootfs.ext4");
-        config.backend = BackendKind::Firecracker;
+        config.kernel_image = dir.join("vmlinux");
+        config.rootfs_image = dir.join("rootfs.qcow2");
+        config.rootfs_format = crate::config::RootfsFormat::Qcow2;
+        config.root_device = "/dev/vda1".into();
+        config.backend = BackendKind::CloudHypervisor;
+        config.cloud_hypervisor_bin = PathBuf::from("/definitely/missing/cloud-hypervisor");
         config.virtiofsd_bin = PathBuf::from("/definitely/missing/virtiofsd");
         std::fs::write(&config.kernel_image, b"kernel").unwrap();
         std::fs::write(&config.rootfs_image, b"rootfs").unwrap();
@@ -1060,30 +1318,53 @@ mod tests {
         config
     }
 
+    fn strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn paths_live_under_state_dir() {
         let config = Config::default();
         let paths = SandboxPaths::from_config(&config);
         assert_eq!(paths.run_dir, config.state_dir.join("run"));
-        assert_eq!(paths.api_socket.file_name().unwrap(), "firecracker.sock");
+        assert_eq!(
+            paths.api_socket.file_name().unwrap(),
+            "cloud-hypervisor.sock"
+        );
+        assert_eq!(paths.serial_socket.file_name().unwrap(), "serial.sock");
+        assert_eq!(paths.console_socket.file_name().unwrap(), "console.sock");
         assert_eq!(paths.virtiofs_socket.file_name().unwrap(), "virtiofs.sock");
     }
 
     #[test]
     fn run_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().unwrap();
         let manager = SandboxManager::new(config_with_assets(dir.path()));
+        let run_dir = manager.paths().run_dir;
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
         manager.paths().ensure().unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&manager.paths().run_dir)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o700);
-        }
+        let mode = std::fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "an existing run directory must be tightened");
+    }
+
+    #[test]
+    fn run_directory_refuses_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SandboxManager::new(config_with_assets(dir.path()));
+        let paths = manager.paths();
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(paths.run_dir.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &paths.run_dir).unwrap();
+
+        let err = paths.ensure().unwrap_err().to_string();
+        assert!(err.contains("symlinked run directory"), "{err}");
     }
 
     #[test]
@@ -1102,9 +1383,7 @@ mod tests {
     #[test]
     fn start_preflights_binaries_before_spawning_anything() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = config_with_assets(dir.path());
-        config.firecracker_bin = PathBuf::from("/definitely/missing/firecracker");
-        let manager = SandboxManager::new(config);
+        let manager = SandboxManager::new(config_with_assets(dir.path()));
         let project = dir.path().join("projects/demo");
         std::fs::create_dir_all(&project).unwrap();
 
@@ -1112,7 +1391,7 @@ mod tests {
             .start(&project, Harness::Shell)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("firecracker binary"), "{err}");
+        assert!(err.contains("cloud-hypervisor binary"), "{err}");
         assert!(!manager.paths().virtiofs_pid.exists());
         assert!(!manager.paths().api_socket.exists());
     }
@@ -1138,9 +1417,10 @@ mod tests {
             project: project.to_path_buf(),
             harness: Harness::Shell,
             started_at: Utc::now(),
-            firecracker_pid: pid,
+            vm_pid: pid,
+            relay_pid: pid,
             virtiofs_pid: pid,
-            boot_args: ROOT_BOOT_ARGS.into(),
+            boot_args: boot_args("/dev/vda1"),
             serial_log: None,
         };
         std::fs::write(
@@ -1153,9 +1433,7 @@ mod tests {
     #[test]
     fn ensure_console_ignores_a_stale_session_for_another_project() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = config_with_assets(dir.path());
-        config.firecracker_bin = PathBuf::from("/definitely/missing/firecracker");
-        let manager = SandboxManager::new(config);
+        let manager = SandboxManager::new(config_with_assets(dir.path()));
         let other = dir.path().join("projects/other");
         std::fs::create_dir_all(&other).unwrap();
         // Pid 4_000_000_000 cannot exist, so this session is stale.
@@ -1169,14 +1447,14 @@ mod tests {
             !err.contains("already running"),
             "a stale session must not block another project: {err}"
         );
-        assert!(err.contains("firecracker binary"), "{err}");
+        assert!(err.contains("cloud-hypervisor binary"), "{err}");
     }
 
     #[test]
     fn ensure_console_rejects_a_running_session_for_another_project() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
-        config.firecracker_bin = std::env::current_exe().unwrap();
+        config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
         let manager = SandboxManager::new(config);
         let running = dir.path().join("projects/running");
         let other = dir.path().join("projects/other");
@@ -1195,7 +1473,7 @@ mod tests {
     fn ensure_console_matches_a_symlinked_project_path() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
-        config.firecracker_bin = std::env::current_exe().unwrap();
+        config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
         let manager = SandboxManager::new(config);
         let real = dir.path().join("projects/real");
         std::fs::create_dir_all(&real).unwrap();
@@ -1204,12 +1482,15 @@ mod tests {
         write_session(&manager, &real, std::process::id());
 
         // Same VM, same project through a symlink: the conflict check passes
-        // and only the missing serial files are reported.
+        // and only the missing console relay is reported.
         let err = manager
             .ensure_console(&link, Harness::Shell)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("serial console files"), "{err}");
+        assert!(
+            err.contains("console relay") || err.contains("serial"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1238,8 +1519,8 @@ mod tests {
     fn start_reports_missing_virtiofsd() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
-        // Make the Firecracker preflight pass so this test reaches virtiofsd.
-        config.firecracker_bin = std::env::current_exe().unwrap();
+        // Make the Cloud Hypervisor preflight pass so this test reaches virtiofsd.
+        config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
         let manager = SandboxManager::new(config);
         let project = dir.path().join("projects/demo");
         std::fs::create_dir_all(&project).unwrap();
@@ -1250,6 +1531,45 @@ mod tests {
         assert!(
             err.contains("virtiofsd") || err.contains("failed to start"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn start_refuses_an_unreadable_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
+        let fake_virtiofsd = dir.path().join("virtiofsd");
+        std::fs::write(&fake_virtiofsd, b"#!/bin/sh\n").unwrap();
+        config.virtiofsd_bin = fake_virtiofsd;
+        let manager = SandboxManager::new(config);
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        std::fs::write(&paths.session, b"{not json").unwrap();
+        let project = dir.path().join("projects/demo");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let err = manager
+            .start(&project, Harness::Shell)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unreadable"), "{err}");
+        assert_eq!(std::fs::read(&paths.session).unwrap(), b"{not json");
+    }
+
+    #[test]
+    fn stop_refuses_an_unreadable_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SandboxManager::new(config_with_assets(dir.path()));
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        std::fs::write(&paths.session, b"{not json").unwrap();
+
+        let err = manager.stop().unwrap_err().to_string();
+        assert!(err.contains("unreadable"), "{err}");
+        assert!(
+            paths.session.exists(),
+            "unreadable metadata must be preserved"
         );
     }
 
@@ -1268,6 +1588,7 @@ mod tests {
         let report = manager.status().unwrap();
         assert_eq!(report.state, "stopped");
         assert!(!report.virtiofs_running);
+        assert!(!report.relay_running);
         assert!(report.project.is_none());
     }
 
@@ -1281,9 +1602,10 @@ mod tests {
             project: dir.path().join("p"),
             harness: Harness::Codex,
             started_at: Utc::now(),
-            firecracker_pid: 1234,
+            vm_pid: 1234,
+            relay_pid: 5678,
             virtiofs_pid: 4321,
-            boot_args: ROOT_BOOT_ARGS.into(),
+            boot_args: boot_args("/dev/vda1"),
             serial_log: None,
         };
         std::fs::write(
@@ -1293,7 +1615,8 @@ mod tests {
         .unwrap();
         let loaded = manager.session().unwrap();
         assert_eq!(loaded.harness, Harness::Codex);
-        assert_eq!(loaded.firecracker_pid, 1234);
+        assert_eq!(loaded.vm_pid, 1234);
+        assert_eq!(loaded.relay_pid, 5678);
     }
 
     #[test]
@@ -1366,8 +1689,7 @@ mod tests {
             name: "missing".into(),
             created_at: Utc::now(),
             vm_state: "Paused".into(),
-            snapshot_path: dir.path().join("missing.snap"),
-            mem_file_path: dir.path().join("missing.mem"),
+            dir: dir.path().join("missing"),
             project: Some(dir.path().join("projects")),
             size_bytes: 0,
             note: None,
@@ -1387,16 +1709,16 @@ mod tests {
     fn restore_requires_a_project_without_a_session() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SandboxManager::new(config_with_assets(dir.path()));
-        let snap = dir.path().join("vm.snap");
-        let mem = dir.path().join("vm.mem");
-        std::fs::write(&snap, b"state").unwrap();
-        std::fs::write(&mem, b"memory").unwrap();
+        let snap_dir = dir.path().join("snap");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        for name in ["config.json", "state.json", "memory-ranges"] {
+            std::fs::write(snap_dir.join(name), b"x").unwrap();
+        }
         let snapshot = SnapshotMeta {
             name: "orphan".into(),
             created_at: Utc::now(),
             vm_state: "Paused".into(),
-            snapshot_path: snap,
-            mem_file_path: mem,
+            dir: snap_dir,
             project: None,
             size_bytes: 0,
             note: None,
@@ -1413,22 +1735,48 @@ mod tests {
     }
 
     #[test]
-    fn restore_preflights_binaries_before_stopping_a_vm() {
+    fn create_snapshot_rejects_a_different_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SandboxManager::new(config_with_assets(dir.path()));
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        std::fs::write(&paths.api_socket, b"socket placeholder").unwrap();
+        let running = dir.path().join("projects/running");
+        let other = dir.path().join("projects/other");
+        std::fs::create_dir_all(&running).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        write_session(&manager, &running, 1);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(manager.create_snapshot(&other, "snap"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("belongs to"), "{err}");
+    }
+
+    #[test]
+    fn restore_refuses_an_unreadable_session() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
-        config.firecracker_bin = PathBuf::from("/definitely/missing/firecracker");
-        config.virtiofsd_bin = PathBuf::from("/definitely/missing/virtiofsd");
+        config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
+        config.virtiofsd_bin = std::env::current_exe().unwrap();
         let manager = SandboxManager::new(config);
-        let snap = dir.path().join("vm.snap");
-        let mem = dir.path().join("vm.mem");
-        std::fs::write(&snap, b"state").unwrap();
-        std::fs::write(&mem, b"memory").unwrap();
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        std::fs::write(&paths.session, b"{not json").unwrap();
+        let snap_dir = dir.path().join("snap");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        for name in ["config.json", "state.json", "memory-ranges"] {
+            std::fs::write(snap_dir.join(name), b"x").unwrap();
+        }
         let snapshot = SnapshotMeta {
             name: "demo".into(),
             created_at: Utc::now(),
             vm_state: "Paused".into(),
-            snapshot_path: snap,
-            mem_file_path: mem,
+            dir: snap_dir,
             project: Some(dir.path().join("projects")),
             size_bytes: 0,
             note: None,
@@ -1441,67 +1789,190 @@ mod tests {
             .block_on(manager.restore_snapshot(&snapshot))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("firecracker binary"), "{err}");
+        assert!(err.contains("unreadable"), "{err}");
+        assert!(
+            paths.session.exists(),
+            "unreadable metadata must be preserved"
+        );
     }
 
     #[test]
-    fn serial_output_is_hard_linked_to_the_private_log() {
-        use std::os::unix::fs::MetadataExt;
+    fn restore_preflights_binaries_before_stopping_a_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.cloud_hypervisor_bin = PathBuf::from("/definitely/missing/cloud-hypervisor");
+        config.virtiofsd_bin = PathBuf::from("/definitely/missing/virtiofsd");
+        let manager = SandboxManager::new(config);
+        let snap_dir = dir.path().join("snap");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        for name in ["config.json", "state.json", "memory-ranges"] {
+            std::fs::write(snap_dir.join(name), b"x").unwrap();
+        }
+        let snapshot = SnapshotMeta {
+            name: "demo".into(),
+            created_at: Utc::now(),
+            vm_state: "Paused".into(),
+            dir: snap_dir,
+            project: Some(dir.path().join("projects")),
+            size_bytes: 0,
+            note: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(manager.restore_snapshot(&snapshot))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cloud-hypervisor binary"), "{err}");
+    }
+
+    #[test]
+    fn virtiofsd_honours_the_configured_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.virtiofsd_bin = std::env::current_exe().unwrap();
+        config.virtiofs_sandbox = crate::config::VirtiofsSandbox::Chroot;
+        let paths = SandboxPaths::from_config(&config);
+        let virtiofs = virtiofs_config(&config, &paths, dir.path()).unwrap();
+        assert_eq!(virtiofs.sandbox, crate::config::VirtiofsSandbox::Chroot);
+    }
+
+    #[test]
+    fn cloud_hypervisor_args_are_hardened_and_use_native_virtiofs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let paths = SandboxPaths::from_config(&config);
+        let args = strings(&cloud_hypervisor_args(&config, &paths));
+        let joined = args.join(" ");
+        assert!(joined.contains("--kernel"), "{joined}");
+        assert!(joined.contains("--disk"), "{joined}");
+        assert!(joined.contains("image_type=qcow2"), "{joined}");
+        assert!(joined.contains("--memory size=2048M,shared=on"), "{joined}");
+        assert!(joined.contains("--fs tag=workspace"), "{joined}");
+        assert!(joined.contains("--serial socket="), "{joined}");
+        assert!(joined.contains("--console off"), "{joined}");
+        assert!(joined.contains("--seccomp true"), "{joined}");
+        assert!(joined.contains("--landlock"), "{joined}");
+        assert!(joined.contains("--landlock-rules"), "{joined}");
+        assert!(
+            joined.contains(&format!(
+                "path={},access=rw",
+                config.snapshots_dir.display()
+            )),
+            "{joined}"
+        );
+        assert!(!joined.contains("--net"), "{joined}");
+        assert!(
+            joined.contains(&format!("root={}", config.root_device)),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn seccomp_and_landlock_can_be_disabled_explicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.seccomp = false;
+        config.landlock = false;
+        let paths = SandboxPaths::from_config(&config);
+        let joined = strings(&cloud_hypervisor_args(&config, &paths)).join(" ");
+        assert!(joined.contains("--seccomp false"), "{joined}");
+        assert!(!joined.contains("--landlock"), "{joined}");
+    }
+
+    #[test]
+    fn restore_args_come_from_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let paths = SandboxPaths::from_config(&config);
+        let snap_dir = dir.path().join("snap");
+        let snapshot = SnapshotMeta {
+            name: "demo".into(),
+            created_at: Utc::now(),
+            vm_state: "Paused".into(),
+            dir: snap_dir.clone(),
+            project: None,
+            size_bytes: 0,
+            note: None,
+        };
+        let joined = strings(&restore_args(&config, &paths, &snapshot)).join(" ");
+        assert!(
+            joined.contains(&format!(
+                "source_url=file://{},resume=true",
+                snap_dir.display()
+            )),
+            "{joined}"
+        );
+        assert!(!joined.contains("--kernel"), "{joined}");
+        assert!(!joined.contains("--fs"), "{joined}");
+        // Landlock is part of the saved VM config on restore, not a CLI flag.
+        assert!(!joined.contains("--landlock"), "{joined}");
+    }
+
+    #[test]
+    fn boot_args_name_the_architecture_console() {
+        let args = boot_args("/dev/vda1");
+        assert!(args.contains(SERIAL_CONSOLE), "{args}");
+        assert!(args.contains("root=/dev/vda1 rw"), "{args}");
+    }
+
+    #[test]
+    fn snapshot_files_are_tightened_to_private_modes() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let manager = SandboxManager::new(config_with_assets(dir.path()));
-        let paths = manager.paths();
-        paths.ensure().unwrap();
-        let log = dir.path().join("session-test.log");
-        std::fs::write(&log, b"boot\n").unwrap();
-        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        prepare_serial_output(&paths, &log).unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        secure_snapshot_dir(dir.path()).unwrap();
         assert_eq!(
-            std::fs::metadata(&log).unwrap().ino(),
-            std::fs::metadata(&paths.serial_out).unwrap().ino(),
-            "serial.out must expose the same inode as the persistent log"
-        );
-        assert_eq!(
-            std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        std::fs::write(&paths.serial_out, b"guest output\n").unwrap();
-        assert_eq!(std::fs::read(&log).unwrap(), b"guest output\n");
     }
 
     #[test]
-    fn serial_output_refuses_a_symlinked_log() {
+    fn snapshot_securing_refuses_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().unwrap();
-        let manager = SandboxManager::new(config_with_assets(dir.path()));
-        let paths = manager.paths();
-        paths.ensure().unwrap();
-        let target = dir.path().join("target");
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("target");
         std::fs::write(&target, b"secret").unwrap();
-        let link = dir.path().join("session-link.log");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("memory-ranges");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-
-        let err = prepare_serial_output(&paths, &link)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("symlinked serial log"), "{err}");
-        assert!(!paths.serial_out.exists());
+        let err = secure_snapshot_dir(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 
     #[test]
-    fn old_session_records_without_a_log_still_parse() {
-        let raw = r#"{
-            "project": "/projects/demo",
-            "harness": "shell",
-            "started_at": "2026-01-01T00:00:00Z",
-            "firecracker_pid": 1,
-            "virtiofs_pid": 2,
-            "boot_args": ""
-        }"#;
-        let record: SessionRecord = serde_json::from_str(raw).unwrap();
-        assert!(record.serial_log.is_none());
-        assert_eq!(record.project, PathBuf::from("/projects/demo"));
+    fn socket_cleanup_refuses_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud-hypervisor.sock");
+        std::fs::write(&path, b"not a socket").unwrap();
+        let err = remove_socket(&path).unwrap_err().to_string();
+        assert!(err.contains("not a socket"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
+    }
+
+    #[test]
+    fn cloud_init_seed_can_be_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.cloud_init = false;
+        let paths = SandboxPaths::from_config(&config);
+        let args = strings(&cloud_hypervisor_args(&config, &paths));
+        assert!(
+            !args.iter().any(|arg| arg.contains("cloud-init.img")),
+            "{args:?}"
+        );
     }
 
     #[test]
@@ -1512,6 +1983,6 @@ mod tests {
             .unwrap();
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["state"], "stopped");
-        assert_eq!(json["backend"], "firecracker");
+        assert_eq!(json["backend"], "cloud-hypervisor");
     }
 }

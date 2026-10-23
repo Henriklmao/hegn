@@ -63,8 +63,8 @@ impl DoctorReport {
 pub fn run(config: &Config) -> DoctorReport {
     let mut checks = Vec::new();
     checks.push(check_tool(
-        "firecracker",
-        &config.firecracker_bin,
+        "cloud-hypervisor",
+        &config.cloud_hypervisor_bin,
         &["--version"],
         true,
     ));
@@ -96,6 +96,21 @@ pub fn run(config: &Config) -> DoctorReport {
             "/dev/kvm available".to_string()
         } else {
             "/dev/kvm missing (enable KVM / add user to the kvm group)".to_string()
+        },
+    ));
+    let landlock = landlock_active();
+    checks.push(Check::new(
+        "landlock",
+        landlock,
+        config.landlock,
+        if landlock {
+            "Landlock active (VMM filesystem sandbox)".to_string()
+        } else if config.landlock {
+            "Landlock is not active in /sys/kernel/security/lsm; install a kernel with Landlock \
+             or set `landlock = false` (not recommended)"
+                .to_string()
+        } else {
+            "disabled in config (not recommended)".to_string()
         },
     ));
     checks.push(Check::new(
@@ -141,7 +156,7 @@ pub fn run(config: &Config) -> DoctorReport {
     ));
     checks.push(Check::new(
         "backend",
-        config.firecracker_ready(),
+        config.vm_assets_ready(),
         true,
         format!(
             "{} (configured {}); a VM is mandatory",
@@ -163,6 +178,36 @@ pub fn run(config: &Config) -> DoctorReport {
         ok,
         checks,
         assets: images::status(config),
+    }
+}
+
+/// Is the Landlock ABI version Cloud Hypervisor requires (V3) available?
+///
+/// Cloud Hypervisor builds its ruleset with `HardRequirement`. Probing the
+/// syscall is more reliable than parsing securityfs, which may not be mounted.
+fn landlock_active() -> bool {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        // The Landlock syscall is number 444 on the generic and x86_64 tables.
+        const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+        const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+        // Safety: this is the documented version query: a null ruleset, zero
+        // size and the VERSION flag. It has no side effects.
+        let abi = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_CREATE_RULESET,
+                std::ptr::null::<libc::c_void>(),
+                0usize,
+                LANDLOCK_CREATE_RULESET_VERSION,
+            )
+        };
+        abi >= 3
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        std::fs::read_to_string("/sys/kernel/security/lsm")
+            .map(|lsm| lsm.split(',').any(|entry| entry.trim() == "landlock"))
+            .unwrap_or(false)
     }
 }
 
@@ -205,11 +250,16 @@ mod tests {
         config.projects_root = dir.path().join("projects");
         config.kernel_image = dir.path().join("missing-kernel");
         config.rootfs_image = dir.path().join("missing-rootfs");
-        config.firecracker_bin = dir.path().join("missing-firecracker");
+        config.cloud_hypervisor_bin = dir.path().join("missing-cloud-hypervisor");
         config.virtiofsd_bin = dir.path().join("missing-virtiofsd");
         let report = run(&config);
         assert!(!report.ok);
         assert!(report.failures().any(|check| check.name == "kernel image"));
+        assert!(
+            report
+                .failures()
+                .any(|check| check.name == "cloud-hypervisor")
+        );
         assert!(report.failures().any(|check| check.name == "rootfs image"));
         assert!(
             report.failures().any(

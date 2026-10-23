@@ -2,7 +2,7 @@
 name = "hegn"
 version = "0.1.0"
 edition = "2024"
-description = "Firecracker MicroVM sandbox manager and TUI for agentic coding"
+description = "Cloud Hypervisor sandbox manager and TUI for agentic coding"
 license = "GPL-3.0-or-later"
 rust-version = "1.88"
 
@@ -12,6 +12,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 crossterm = "0.29"
 dirs = "7.0.0"
+fatfs = "0.3.6"
 hex = "0.4.3"
 libc = "0.2.191"
 ratatui = "0.30.2"

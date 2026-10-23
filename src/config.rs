@@ -6,25 +6,45 @@ use serde::{Deserialize, Serialize};
 
 /// How the sandbox is selected when a project is opened.
 ///
-/// Both modes require a real Firecracker VM. There is no local-shell fallback:
-/// a missing VM is always a hard error.
+/// Both modes require a real Cloud Hypervisor VM. There is no local-shell
+/// fallback: a missing VM is always a hard error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum BackendKind {
-    /// Boot a VM on demand. Still requires all Firecracker assets and binaries.
+    /// Boot a VM on demand. Still requires all VM assets and binaries.
     #[default]
     Auto,
     /// Boot a VM on demand. Present for explicitness; behaves like `auto`.
-    Firecracker,
+    CloudHypervisor,
 }
 
 impl BackendKind {
-    pub const ALL: [Self; 2] = [Self::Auto, Self::Firecracker];
+    pub const ALL: [Self; 2] = [Self::Auto, Self::CloudHypervisor];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Firecracker => "firecracker",
+            Self::CloudHypervisor => "cloud-hypervisor",
+        }
+    }
+}
+
+/// On-disk format of the root filesystem image passed to Cloud Hypervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RootfsFormat {
+    /// A raw ext4 filesystem or whole-disk image.
+    #[default]
+    Raw,
+    /// A qcow2 image (Cloud Hypervisor's official test images use this).
+    Qcow2,
+}
+
+impl RootfsFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Qcow2 => "qcow2",
         }
     }
 }
@@ -187,10 +207,22 @@ pub struct Config {
     pub snapshots_dir: PathBuf,
     /// Directory containing project templates (`agents.md`, language skeletons).
     pub templates_dir: PathBuf,
-    pub firecracker_bin: PathBuf,
+    pub cloud_hypervisor_bin: PathBuf,
     pub virtiofsd_bin: PathBuf,
     pub kernel_image: PathBuf,
     pub rootfs_image: PathBuf,
+    /// Raw or qcow2. Cloud Hypervisor's official test rootfs is qcow2.
+    pub rootfs_format: RootfsFormat,
+    /// Guest root device, e.g. `/dev/vda` for a whole-disk ext4 image or
+    /// `/dev/vda1` for a partitioned cloud image.
+    pub root_device: String,
+    /// Enable Cloud Hypervisor's Landlock sandbox. A hard requirement.
+    pub landlock: bool,
+    /// Enable Cloud Hypervisor's seccomp filters (on by default upstream).
+    pub seccomp: bool,
+    /// Attach the generated NoCloud seed so official cloud images auto-login
+    /// on the serial console. Ignored by images without cloud-init.
+    pub cloud_init: bool,
     /// Upstream kernel URL and pinned SHA-256 used by `hegn images download`.
     pub kernel_url: String,
     pub kernel_sha256: String,
@@ -227,10 +259,19 @@ impl Default for Config {
             state_dir: state_dir.join("hegn"),
             snapshots_dir: data_dir.join("hegn/snapshots"),
             templates_dir: config_dir.join("hegn/templates"),
-            firecracker_bin: PathBuf::from("firecracker"),
+            cloud_hypervisor_bin: PathBuf::from("cloud-hypervisor"),
             virtiofsd_bin: PathBuf::from("virtiofsd"),
-            kernel_image: data_dir.join("hegn/images/vmlinux.bin"),
-            rootfs_image: data_dir.join("hegn/images/rootfs.ext4"),
+            kernel_image: data_dir
+                .join("hegn/images")
+                .join(crate::images::KERNEL_ARTIFACT),
+            rootfs_image: data_dir
+                .join("hegn/images")
+                .join(crate::images::ROOTFS_ARTIFACT),
+            rootfs_format: crate::images::ROOTFS_FORMAT,
+            root_device: "/dev/vda1".to_string(),
+            landlock: true,
+            seccomp: true,
+            cloud_init: true,
             kernel_url: crate::images::KERNEL_URL.to_string(),
             kernel_sha256: crate::images::KERNEL_SHA256.to_string(),
             rootfs_url: crate::images::ROOTFS_URL.to_string(),
@@ -266,7 +307,7 @@ impl Config {
     /// Selected environment variables override the file so `hegn` can be
     /// exercised in CI without touching the user's real directories:
     /// `HEGN_PROJECTS_ROOT`, `HEGN_STATE_DIR`, `HEGN_SNAPSHOTS_DIR`,
-    /// `HEGN_TEMPLATES_DIR`, `HEGN_FIRECRACKER_BIN`, `HEGN_VIRTIOFSD_BIN`,
+    /// `HEGN_TEMPLATES_DIR`, `HEGN_CLOUD_HYPERVISOR_BIN`, `HEGN_VIRTIOFSD_BIN`,
     /// `HEGN_KERNEL_IMAGE` and `HEGN_ROOTFS_IMAGE`.
     pub fn load() -> Result<Self> {
         let path = Self::config_path();
@@ -305,8 +346,8 @@ impl Config {
         if let Some(value) = path_var("HEGN_TEMPLATES_DIR") {
             self.templates_dir = value;
         }
-        if let Some(value) = path_var("HEGN_FIRECRACKER_BIN") {
-            self.firecracker_bin = value;
+        if let Some(value) = path_var("HEGN_CLOUD_HYPERVISOR_BIN") {
+            self.cloud_hypervisor_bin = value;
         }
         if let Some(value) = path_var("HEGN_VIRTIOFSD_BIN") {
             self.virtiofsd_bin = value;
@@ -316,6 +357,16 @@ impl Config {
         }
         if let Some(value) = path_var("HEGN_ROOTFS_IMAGE") {
             self.rootfs_image = value;
+        }
+        if let Ok(value) = std::env::var("HEGN_ROOTFS_FORMAT") {
+            self.rootfs_format = match value.trim().to_ascii_lowercase().as_str() {
+                "raw" => RootfsFormat::Raw,
+                "qcow2" => RootfsFormat::Qcow2,
+                _ => self.rootfs_format,
+            };
+        }
+        if let Ok(value) = std::env::var("HEGN_ROOT_DEVICE") {
+            self.root_device = value;
         }
         if let Ok(value) = std::env::var("HEGN_KERNEL_URL") {
             self.kernel_url = value;
@@ -338,8 +389,11 @@ impl Config {
         if self.memory_mib < 128 {
             bail!("memory_mib must be at least 128 (got {})", self.memory_mib);
         }
-        if self.shared_tag.is_empty() || self.shared_tag.contains(char::is_whitespace) {
-            bail!("shared_tag must be a non-empty token without whitespace");
+        if self.shared_tag.is_empty()
+            || self.shared_tag.contains(char::is_whitespace)
+            || self.shared_tag.contains(',')
+        {
+            bail!("shared_tag must be a non-empty token without whitespace or commas");
         }
         // virtio-fs tags are limited to 36 bytes including the terminator.
         if self.shared_tag.len() > 36 {
@@ -350,6 +404,22 @@ impl Config {
         }
         if !self.guest_mount.starts_with('/') {
             bail!("guest_mount must be an absolute guest path");
+        }
+        if !self.root_device.starts_with("/dev/") || self.root_device.contains(',') {
+            bail!("root_device must be a guest device path such as /dev/vda1");
+        }
+        // Cloud Hypervisor's CLI packs paths into comma-separated option
+        // values. A comma in one of these paths would silently change the
+        // device configuration, so refuse it up front.
+        for (name, path) in [
+            ("state_dir", &self.state_dir),
+            ("snapshots_dir", &self.snapshots_dir),
+            ("kernel_image", &self.kernel_image),
+            ("rootfs_image", &self.rootfs_image),
+        ] {
+            if path.to_string_lossy().contains(',') {
+                bail!("{name} must not contain a comma");
+            }
         }
         for (name, sha) in [
             ("kernel_sha256", &self.kernel_sha256),
@@ -372,12 +442,22 @@ impl Config {
 
     /// Create runtime and config directories. Safe to call repeatedly.
     pub fn ensure_dirs(&self) -> Result<()> {
-        for dir in [
-            &self.state_dir,
-            &self.snapshots_dir,
-            &self.templates_dir,
-            &self.projects_root,
-        ] {
+        for dir in [&self.state_dir, &self.snapshots_dir] {
+            if let Ok(metadata) = fs::symlink_metadata(dir)
+                && metadata.file_type().is_symlink()
+            {
+                bail!("refusing symlinked private directory {}", dir.display());
+            }
+            fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("failed to secure {}", dir.display()))?;
+            }
+        }
+        for dir in [&self.templates_dir, &self.projects_root] {
             fs::create_dir_all(dir)
                 .with_context(|| format!("failed to create {}", dir.display()))?;
         }
@@ -411,8 +491,7 @@ impl Config {
     /// Private directory for persistent serial-console logs.
     ///
     /// Derived from `state_dir` so existing configurations keep working and
-    /// logs always share a filesystem with the run directory (the serial log
-    /// is hard-linked into the run directory while a VM is alive).
+    /// logs always live next to the run directory they belong to.
     pub fn logs_dir(&self) -> PathBuf {
         self.state_dir.join("logs")
     }
@@ -456,20 +535,20 @@ impl Config {
     ///
     /// Symlinks are rejected: a swapped link could make hegn boot an arbitrary
     /// host file as the guest kernel or root filesystem.
-    pub fn firecracker_ready(&self) -> bool {
+    pub fn vm_assets_ready(&self) -> bool {
         crate::images::is_regular_file(&self.kernel_image)
             && crate::images::is_regular_file(&self.rootfs_image)
     }
 
     /// The backend actually used for work. hegn never falls back to a host
-    /// process, so this is always Firecracker.
+    /// process, so this is always Cloud Hypervisor.
     pub fn effective_backend(&self) -> BackendKind {
-        BackendKind::Firecracker
+        BackendKind::CloudHypervisor
     }
 
     /// Assert that the VM assets required to do any work are present.
     pub fn require_vm_assets(&self) -> Result<()> {
-        if !self.firecracker_ready() {
+        if !self.vm_assets_ready() {
             bail!(
                 "missing VM assets: {} and/or {} do not exist; \
                  run `hegn doctor` and configure kernel_image/rootfs_image",
@@ -529,6 +608,10 @@ mod tests {
         assert!(crate::images::is_sha256(&config.rootfs_sha256));
         assert!(config.kernel_url.starts_with("https://"));
         assert!(config.rootfs_url.starts_with("https://"));
+        assert_eq!(config.root_device, "/dev/vda1");
+        assert_eq!(config.rootfs_format, RootfsFormat::Qcow2);
+        assert!(config.landlock);
+        assert!(config.seccomp);
     }
 
     #[test]
@@ -548,7 +631,9 @@ mod tests {
 vcpus = 4
 memory_mib = 4096
 harness = "opencode"
-backend = "firecracker"
+backend = "cloud-hypervisor"
+rootfs_format = "raw"
+root_device = "/dev/vda"
 "#,
         );
         let config = Config::load_from(&path).unwrap();
@@ -556,7 +641,9 @@ backend = "firecracker"
         assert_eq!(config.vcpus, 4);
         assert_eq!(config.memory_mib, 4096);
         assert_eq!(config.harness, Harness::Opencode);
-        assert_eq!(config.backend, BackendKind::Firecracker);
+        assert_eq!(config.backend, BackendKind::CloudHypervisor);
+        assert_eq!(config.rootfs_format, RootfsFormat::Raw);
+        assert_eq!(config.root_device, "/dev/vda");
         assert_eq!(config.projects_root, Config::default().projects_root);
     }
 
@@ -579,7 +666,13 @@ backend = "firecracker"
         config.guest_mount = "workspace".into();
         assert!(config.validate().is_err());
         config.guest_mount = "/workspace".into();
+        config.root_device = "vda1".into();
+        assert!(config.validate().is_err());
+        config.root_device = "/dev/vda1".into();
         config.shared_tag = "x".repeat(37);
+        assert!(config.validate().is_err());
+        config.shared_tag = "workspace".into();
+        config.kernel_image = PathBuf::from("/images/vmlinux,broken");
         assert!(config.validate().is_err());
     }
 
@@ -636,7 +729,7 @@ backend = "firecracker"
         let mut config = Config::default();
         config.kernel_image = link;
         config.rootfs_image = rootfs;
-        assert!(!config.firecracker_ready());
+        assert!(!config.vm_assets_ready());
         assert!(config.require_vm_assets().is_err());
     }
 
@@ -645,13 +738,13 @@ backend = "firecracker"
         let mut config = Config::default();
         config.kernel_image = PathBuf::from("/definitely/missing/kernel");
         config.rootfs_image = PathBuf::from("/definitely/missing/rootfs");
-        assert_eq!(config.effective_backend(), BackendKind::Firecracker);
-        assert!(!config.firecracker_ready());
+        assert_eq!(config.effective_backend(), BackendKind::CloudHypervisor);
+        assert!(!config.vm_assets_ready());
         assert!(config.require_vm_assets().is_err());
     }
 
     #[test]
-    fn ensure_dirs_creates_a_private_log_directory() {
+    fn ensure_dirs_creates_private_state_snapshot_and_log_directories() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -661,12 +754,31 @@ backend = "firecracker"
         config.templates_dir = dir.path().join("templates");
         config.projects_root = dir.path().join("projects");
         config.ensure_dirs().unwrap();
-        let mode = fs::metadata(config.logs_dir())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700);
+        for path in [
+            config.logs_dir(),
+            config.state_dir.clone(),
+            config.snapshots_dir.clone(),
+        ] {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+
+    #[test]
+    fn ensure_dirs_refuses_symlinked_private_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = dir.path().join("state");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut config = Config::default();
+        config.state_dir = link;
+        config.snapshots_dir = dir.path().join("snapshots");
+        config.templates_dir = dir.path().join("templates");
+        config.projects_root = dir.path().join("projects");
+        let err = config.ensure_dirs().unwrap_err().to_string();
+        assert!(err.contains("symlinked"), "{err}");
     }
 
     #[test]

@@ -39,7 +39,7 @@ impl VirtiofsConfig {
             socket_path: socket_path.into(),
             sandbox: VirtiofsSandbox::Namespace,
             read_only: false,
-            cache: Some("auto".to_string()),
+            cache: Some("never".to_string()),
         }
     }
 
@@ -203,7 +203,7 @@ mod tests {
         assert!(
             rendered
                 .windows(2)
-                .any(|w| w[0] == "--cache" && w[1] == "auto")
+                .any(|w| w[0] == "--cache" && w[1] == "never")
         );
     }
 

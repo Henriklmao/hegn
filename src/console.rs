@@ -1,15 +1,16 @@
-//! Firecracker serial-console transport.
+//! Cloud Hypervisor serial-console transport.
 //!
-//! Firecracker exposes the guest UART on its stdin/stdout. hegn starts the VMM
-//! with a private FIFO for serial input and a file for serial output, so the
-//! TUI and CLI can detach and re-attach to a running VM without restarting it.
+//! Cloud Hypervisor exposes the guest serial port on a Unix socket. hegn's
+//! detached relay is that socket's only client: it keeps the persistent log
+//! growing and re-exposes the console on `run/console.sock` for the TUI and
+//! `hegn attach`.
 //!
 //! There is deliberately no local-shell fallback: a console is only available
-//! while a Firecracker VM is actually running.
+//! while a Cloud Hypervisor VM is actually running.
 
-use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::Config;
 use crate::logs::sanitize_label;
+use crate::relay;
 use crate::sandbox::{SandboxManager, SandboxPaths, process_matches};
 
 /// Transport used by the terminal view. Implementations must never pretend to
@@ -33,13 +35,13 @@ pub trait TerminalConsole: Send {
     fn label(&self) -> &str;
 }
 
-/// A console attached to a running Firecracker VM.
+/// A console attached to a running Cloud Hypervisor VM.
 #[derive(Debug)]
 pub struct VmConsole {
-    serial_in: File,
-    serial_out: File,
-    firecracker_bin: PathBuf,
-    pid: u32,
+    stream: UnixStream,
+    cloud_hypervisor_bin: PathBuf,
+    vm_pid: u32,
+    relay_pid: u32,
     project: PathBuf,
     harness: String,
     label: String,
@@ -52,39 +54,53 @@ impl VmConsole {
     pub fn attach(config: &Config) -> Result<Self> {
         let paths = SandboxPaths::from_config(config);
         let manager = SandboxManager::new(config.clone());
-        let session = manager.session().with_context(|| {
-            format!(
+        let session = match manager.session() {
+            Some(session) => session,
+            None if paths.session.exists() => bail!(
+                "session metadata in {} is unreadable or from an older hegn version; \
+                 stop the old VM and remove the run directory",
+                paths.run_dir.display()
+            ),
+            None => bail!(
                 "no VM session in {}; start one with `hegn sandbox start <project>`",
                 paths.run_dir.display()
-            )
-        })?;
-        if !process_matches(session.firecracker_pid, &config.firecracker_bin) {
+            ),
+        };
+        if !process_matches(session.vm_pid, &config.cloud_hypervisor_bin) {
             bail!(
                 "the VM recorded in {} is not running; start a VM before attaching",
                 paths.session.display()
             );
         }
-        if !paths.serial_in.exists() || !paths.serial_out.exists() {
-            bail!("serial console files are missing; restart the VM with `hegn sandbox start`");
+        let hegn = std::env::current_exe().context("failed to locate the hegn executable")?;
+        if session.relay_pid != 0 && !relay::process_matches_relay(session.relay_pid, &hegn) {
+            bail!("the console relay is not running; restart the VM with `hegn sandbox start`");
         }
-
-        let serial_in = OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&paths.serial_in)
-            .with_context(|| format!("failed to open {}", paths.serial_in.display()))?;
-        let serial_out = File::open(&paths.serial_out)
-            .with_context(|| format!("failed to open {}", paths.serial_out.display()))?;
+        let socket_ok = std::fs::symlink_metadata(&paths.console_socket)
+            .map(|meta| meta.file_type().is_socket())
+            .unwrap_or(false);
+        if !socket_ok {
+            bail!("the console relay socket is missing; restart the VM with `hegn sandbox start`");
+        }
+        let stream = UnixStream::connect(&paths.console_socket).with_context(|| {
+            format!(
+                "failed to connect to the console relay at {}",
+                paths.console_socket.display()
+            )
+        })?;
+        stream
+            .set_nonblocking(true)
+            .context("failed to configure the console relay socket")?;
         let serial_log = session
             .serial_log
             .clone()
             .filter(|path| path.is_file() && !path.is_symlink());
 
         Ok(Self {
-            serial_in,
-            serial_out,
-            firecracker_bin: config.firecracker_bin.clone(),
-            pid: session.firecracker_pid,
+            stream,
+            cloud_hypervisor_bin: config.cloud_hypervisor_bin.clone(),
+            vm_pid: session.vm_pid,
+            relay_pid: session.relay_pid,
             project: session.project.clone(),
             harness: session.harness.label().to_string(),
             label: format!("{} · serial", session.harness.label()),
@@ -114,18 +130,22 @@ impl VmConsole {
 
     /// VM process id (verified when the console was attached).
     pub fn pid(&self) -> u32 {
-        self.pid
+        self.vm_pid
     }
 
     fn read_new(&mut self) -> Vec<Vec<u8>> {
         let mut chunks = Vec::new();
         loop {
             let mut buf = [0u8; 8192];
-            match self.serial_out.read(&mut buf) {
-                Ok(0) => break,
+            match self.stream.read(&mut buf) {
+                Ok(0) => {
+                    self.exited = true;
+                    break;
+                }
                 Ok(n) => chunks.push(buf[..n].to_vec()),
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                // An unreadable serial log is unusable: stop the console rather
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                // An unreadable console is unusable: stop the console rather
                 // than silently dropping guest output for the rest of the
                 // session.
                 Err(_) => {
@@ -141,19 +161,19 @@ impl VmConsole {
 impl TerminalConsole for VmConsole {
     fn send(&mut self, bytes: &[u8]) -> Result<()> {
         let mut remaining = bytes;
-        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        let deadline = Instant::now() + Duration::from_millis(500);
         while !remaining.is_empty() {
-            match self.serial_in.write(remaining) {
+            match self.stream.write(remaining) {
                 Ok(0) => {
-                    if std::time::Instant::now() > deadline {
-                        bail!("guest serial input buffer is full");
+                    if Instant::now() > deadline {
+                        bail!("console relay input buffer is full");
                     }
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Ok(n) => remaining = &remaining[n..],
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() > deadline {
-                        bail!("guest serial input buffer is full");
+                    if Instant::now() > deadline {
+                        bail!("console relay input buffer is full");
                     }
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -171,8 +191,16 @@ impl TerminalConsole for VmConsole {
         if self.exited {
             return true;
         }
-        if !process_matches(self.pid, &self.firecracker_bin) {
+        if !process_matches(self.vm_pid, &self.cloud_hypervisor_bin) {
             self.exited = true;
+        } else if self.relay_pid != 0 {
+            let hegn = std::env::current_exe();
+            if hegn
+                .map(|binary| !relay::process_matches_relay(self.relay_pid, &binary))
+                .unwrap_or(true)
+            {
+                self.exited = true;
+            }
         }
         self.exited
     }
@@ -340,9 +368,9 @@ fn fit_width(input: &str, width: usize) -> String {
 ///
 /// When `bar` is set, the bottom line shows the project, harness, VM pid and
 /// persistent serial log while the guest uses the lines above it. The guest tty
-/// size cannot be changed through the Firecracker serial port, so full-screen
-/// guest programs keep their own geometry; pass `bar = false` to give them the
-/// whole host terminal.
+/// size cannot be changed through the legacy serial port, so full-screen guest
+/// programs keep their own geometry; pass `bar = false` to give them the whole
+/// host terminal.
 pub fn run_interactive(mut console: VmConsole, bar: bool) -> Result<()> {
     use crossterm::event::{self, Event, KeyEventKind, KeyModifiers};
 
@@ -437,15 +465,38 @@ pub fn run_interactive(mut console: VmConsole, bar: bool) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::BackendKind;
-    use crate::sandbox::SandboxPaths;
+    use crate::sandbox::{SandboxPaths, SessionRecord};
     use chrono::Utc;
+    use std::os::unix::net::UnixListener;
 
     fn config(dir: &Path) -> Config {
         let mut config = Config::default();
         config.state_dir = dir.join("state");
-        config.backend = BackendKind::Firecracker;
-        config.firecracker_bin = std::env::current_exe().unwrap();
+        config.backend = BackendKind::CloudHypervisor;
+        config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
         config
+    }
+
+    fn write_session(
+        config: &Config,
+        dir: &Path,
+        vm_pid: u32,
+        relay_pid: u32,
+        log: Option<PathBuf>,
+    ) {
+        let paths = SandboxPaths::from_config(config);
+        paths.ensure().unwrap();
+        let record = SessionRecord {
+            project: dir.to_path_buf(),
+            harness: crate::config::Harness::Opencode,
+            started_at: Utc::now(),
+            vm_pid,
+            relay_pid,
+            virtiofs_pid: std::process::id(),
+            boot_args: String::new(),
+            serial_log: log,
+        };
+        std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
     }
 
     #[test]
@@ -458,39 +509,38 @@ mod tests {
     }
 
     #[test]
-    fn attach_reads_and_writes_the_serial_port() {
-        use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
-
+    fn attach_reads_and_writes_the_relay_socket() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
         let paths = SandboxPaths::from_config(&config);
         paths.ensure().unwrap();
-        crate::sandbox::ensure_serial_fifo(&paths.serial_in).unwrap();
-        // Keep a reader open so writes to the FIFO do not block.
-        let mut fifo_reader = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&paths.serial_in)
-            .unwrap();
-        std::fs::write(&paths.serial_out, b"boot complete\n").unwrap();
+        let listener = UnixListener::bind(&paths.console_socket).unwrap();
         let serial_log = dir.path().join("session-test.log");
         std::fs::write(&serial_log, b"boot complete\n").unwrap();
+        // relay_pid = 0 skips the process check; the socket is the real test.
+        write_session(
+            &config,
+            dir.path(),
+            std::process::id(),
+            0,
+            Some(serial_log.clone()),
+        );
 
-        let record = crate::sandbox::SessionRecord {
-            project: dir.path().to_path_buf(),
-            harness: crate::config::Harness::Opencode,
-            started_at: Utc::now(),
-            firecracker_pid: std::process::id(),
-            virtiofs_pid: std::process::id(),
-            boot_args: String::new(),
-            serial_log: Some(serial_log.clone()),
-        };
-        std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"boot complete\n").unwrap();
+            let mut input = [0u8; 16];
+            let read = stream.read(&mut input).unwrap();
+            assert_eq!(&input[..read], b"ls\r");
+        });
 
         let mut console = VmConsole::attach(&config).unwrap();
-        let output: Vec<u8> = console.drain().into_iter().flatten().collect();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut output = Vec::new();
+        while output != b"boot complete\n" && Instant::now() < deadline {
+            output.extend(console.drain().into_iter().flatten());
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(output, b"boot complete\n");
         assert_eq!(console.project(), dir.path());
         assert!(console.label().contains("OpenCode"));
@@ -499,39 +549,16 @@ mod tests {
         assert_eq!(console.pid(), std::process::id());
 
         console.send(b"ls\r").unwrap();
-        let mut received = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while received != b"ls\r" && std::time::Instant::now() < deadline {
-            let mut buf = [0u8; 16];
-            match fifo_reader.read(&mut buf) {
-                Ok(n) => received.extend_from_slice(&buf[..n]),
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(err) => panic!("fifo read failed: {err}"),
-            }
-        }
-        assert_eq!(received, b"ls\r");
+        server.join().unwrap();
     }
 
     #[test]
-    fn attach_requires_serial_files() {
+    fn attach_requires_the_console_relay() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let paths = SandboxPaths::from_config(&config);
-        paths.ensure().unwrap();
-        let record = crate::sandbox::SessionRecord {
-            project: dir.path().to_path_buf(),
-            harness: crate::config::Harness::Shell,
-            started_at: Utc::now(),
-            firecracker_pid: std::process::id(),
-            virtiofs_pid: std::process::id(),
-            boot_args: String::new(),
-            serial_log: None,
-        };
-        std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
+        write_session(&config, dir.path(), std::process::id(), 0, None);
         let err = VmConsole::attach(&config).unwrap_err().to_string();
-        assert!(err.contains("serial console files are missing"), "{err}");
+        assert!(err.contains("console relay socket is missing"), "{err}");
     }
 
     #[test]
@@ -540,19 +567,9 @@ mod tests {
         let config = config(dir.path());
         let paths = SandboxPaths::from_config(&config);
         paths.ensure().unwrap();
-        crate::sandbox::ensure_serial_fifo(&paths.serial_in).unwrap();
-        std::fs::write(&paths.serial_out, b"").unwrap();
-        let record = crate::sandbox::SessionRecord {
-            project: dir.path().to_path_buf(),
-            harness: crate::config::Harness::Shell,
-            started_at: Utc::now(),
-            // Out of pid_t range: cannot be running, even after pid reuse.
-            firecracker_pid: 4_000_000_000,
-            virtiofs_pid: 4_000_000_000,
-            boot_args: String::new(),
-            serial_log: None,
-        };
-        std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
+        let _listener = UnixListener::bind(&paths.console_socket).unwrap();
+        // Out of pid_t range: cannot be running, even after pid reuse.
+        write_session(&config, dir.path(), 4_000_000_000, 0, None);
 
         let err = VmConsole::attach(&config).unwrap_err().to_string();
         assert!(err.contains("not running"), "{err}");

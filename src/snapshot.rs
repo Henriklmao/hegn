@@ -1,13 +1,19 @@
 //! On-disk snapshot metadata.
 //!
-//! A snapshot is a directory:
+//! A snapshot is a directory written by Cloud Hypervisor:
 //!
 //! ```text
-//! ~/.local/share/hegn/snapshots/<name>/
-//!   snapshot.json   # metadata rendered by the TUI
-//!   vm.snap         # Firecracker snapshot state
-//!   vm.mem          # guest memory
+//! ~/.local/share/hegn/snapshots/
+//!   .staging/<name>/   # the only path the VMM may write
+//!   <name>/
+//!     snapshot.json    # hegn metadata rendered by the TUI
+//!     config.json      # Cloud Hypervisor VM configuration
+//!     state.json       # device and CPU state
+//!     memory-ranges    # guest memory
 //! ```
+//!
+//! Finished snapshots are renamed out of `.staging` before metadata is saved,
+//! so the VMM's Landlock rule never covers completed checkpoints.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,8 +27,8 @@ pub struct SnapshotMeta {
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub vm_state: String,
-    pub snapshot_path: PathBuf,
-    pub mem_file_path: PathBuf,
+    /// Directory passed to Cloud Hypervisor as `file://<dir>`.
+    pub dir: PathBuf,
     pub project: Option<PathBuf>,
     #[serde(default)]
     pub size_bytes: u64,
@@ -33,6 +39,19 @@ pub struct SnapshotMeta {
 impl SnapshotMeta {
     pub fn size_label(&self) -> String {
         human_size(self.size_bytes)
+    }
+
+    /// Cloud Hypervisor's required files. Snapshot directories from other VMM
+    /// formats are intentionally not accepted.
+    pub fn is_restorable(&self) -> bool {
+        self.dir.is_dir()
+            && self.dir.join("config.json").is_file()
+            && self.dir.join("state.json").is_file()
+            && self.dir.join("memory-ranges").is_file()
+    }
+
+    pub fn source_url(&self) -> String {
+        format!("file://{}", self.dir.display())
     }
 }
 
@@ -54,9 +73,10 @@ fn human_size(bytes: u64) -> String {
 /// Paths reserved for a new snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotPaths {
+    /// Directory the VMM writes into (a staging directory in production).
     pub dir: PathBuf,
-    pub snapshot_path: PathBuf,
-    pub mem_file_path: PathBuf,
+    /// Final private snapshot directory once `finalize` has moved it.
+    pub final_dir: PathBuf,
     pub meta_path: PathBuf,
 }
 
@@ -74,6 +94,30 @@ impl SnapshotStore {
         &self.root
     }
 
+    /// Directory the VMM is allowed to write snapshots into.
+    ///
+    /// Keeping this separate from the snapshot root means the VMM never has
+    /// write access to existing checkpoints. The `0700` `.staging` name cannot
+    /// collide with a user snapshot because `sanitize_name` rejects a leading
+    /// dot.
+    pub fn staging_dir(&self) -> PathBuf {
+        self.root.join(".staging")
+    }
+
+    /// Create the staging directory with mode `0700`.
+    pub fn ensure_staging(&self) -> Result<PathBuf> {
+        let staging = self.staging_dir();
+        create_private_dir(&staging)
+            .with_context(|| format!("failed to create {}", staging.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("failed to secure {}", staging.display()))?;
+        }
+        Ok(staging)
+    }
+
     /// Generate a timestamped name such as `hegn-20261022-141500`.
     pub fn suggested_name(prefix: &str) -> String {
         let prefix = sanitize_name(prefix).unwrap_or_else(|_| "snapshot".to_string());
@@ -83,7 +127,7 @@ impl SnapshotStore {
         format!("{prefix}-{}", Utc::now().format("%Y%m%d-%H%M%S"))
     }
 
-    /// Reserve a directory and return the paths Firecracker should write to.
+    /// Reserve a directory and return the paths Cloud Hypervisor writes to.
     ///
     /// Snapshot memory can contain credentials, so the per-snapshot directory
     /// is created with mode 0700 instead of inheriting the process umask.
@@ -99,14 +143,54 @@ impl SnapshotStore {
             .canonicalize()
             .with_context(|| format!("failed to resolve {}", dir.display()))?;
         Ok(SnapshotPaths {
-            snapshot_path: dir.join("vm.snap"),
-            mem_file_path: dir.join("vm.mem"),
             meta_path: dir.join("snapshot.json"),
+            final_dir: dir.clone(),
             dir,
         })
     }
 
-    /// Persist metadata after Firecracker has written the snapshot files.
+    /// Reserve a staging directory under `<root>/.staging`.
+    ///
+    /// Cloud Hypervisor writes here; the finished directory is atomically
+    /// renamed into the snapshot root by [`Self::finalize`]. This keeps the
+    /// VMM's Landlock write rule away from completed checkpoints.
+    pub fn prepare_staged(&self, name: &str) -> Result<SnapshotPaths> {
+        let name = sanitize_name(name)?;
+        let final_dir = self.root.join(&name);
+        if final_dir.exists() {
+            bail!("snapshot '{name}' already exists");
+        }
+        let staging = self.ensure_staging()?;
+        let dir = staging.join(&name);
+        if dir.exists() {
+            bail!("snapshot '{name}' is already being created");
+        }
+        create_private_dir(&dir)
+            .with_context(|| format!("failed to create staging directory {}", dir.display()))?;
+        let dir = dir
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", dir.display()))?;
+        Ok(SnapshotPaths {
+            meta_path: final_dir.join("snapshot.json"),
+            final_dir,
+            dir,
+        })
+    }
+
+    /// Atomically move a finished staging directory into the snapshot root.
+    pub fn finalize(&self, paths: &SnapshotPaths) -> Result<()> {
+        create_private_dir(&self.root)
+            .with_context(|| format!("failed to create {}", self.root.display()))?;
+        fs::rename(&paths.dir, &paths.final_dir).with_context(|| {
+            format!(
+                "failed to move snapshot {} to {}",
+                paths.dir.display(),
+                paths.final_dir.display()
+            )
+        })
+    }
+
+    /// Persist metadata after Cloud Hypervisor has written the snapshot files.
     pub fn save_meta(&self, meta: &SnapshotMeta) -> Result<()> {
         let name = sanitize_name(&meta.name)?;
         let dir = self.root.join(name);
@@ -133,7 +217,7 @@ impl SnapshotStore {
         let mut meta: SnapshotMeta = serde_json::from_str(&raw)
             .with_context(|| format!("failed to parse snapshot {}", path.display()))?;
         if meta.size_bytes == 0 {
-            meta.size_bytes = file_sizes(&meta.snapshot_path, &meta.mem_file_path);
+            meta.size_bytes = dir_size(&meta.dir);
         }
         Ok(meta)
     }
@@ -152,7 +236,7 @@ impl SnapshotStore {
             let name = entry.file_name().to_string_lossy().into_owned();
             if let Ok(mut meta) = self.load(&name) {
                 if meta.size_bytes == 0 {
-                    meta.size_bytes = file_sizes(&meta.snapshot_path, &meta.mem_file_path);
+                    meta.size_bytes = dir_size(&meta.dir);
                 }
                 snapshots.push(meta);
             }
@@ -188,9 +272,16 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-fn file_sizes(snapshot: &Path, mem: &Path) -> u64 {
-    let size = |path: &Path| fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    size(snapshot) + size(mem)
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::symlink_metadata(entry.path()).ok())
+        .filter(|meta| meta.file_type().is_file())
+        .map(|meta| meta.len())
+        .sum()
 }
 
 /// Validate a snapshot name. Names become directory names, so traversal and
@@ -224,12 +315,17 @@ mod tests {
             name: name.into(),
             created_at: Utc::now(),
             vm_state: "Paused".into(),
-            snapshot_path: paths.snapshot_path.clone(),
-            mem_file_path: paths.mem_file_path.clone(),
+            dir: paths.final_dir.clone(),
             project: Some(PathBuf::from("/workspace/demo")),
             size_bytes: 0,
             note: None,
         }
+    }
+
+    fn write_snapshot_files(paths: &SnapshotPaths) {
+        fs::write(paths.dir.join("config.json"), b"{}").unwrap();
+        fs::write(paths.dir.join("state.json"), vec![0u8; 10]).unwrap();
+        fs::write(paths.dir.join("memory-ranges"), vec![0u8; 20]).unwrap();
     }
 
     #[test]
@@ -237,18 +333,57 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(dir.path());
         let paths = store.prepare("first").unwrap();
-        fs::write(&paths.snapshot_path, vec![0u8; 10]).unwrap();
-        fs::write(&paths.mem_file_path, vec![0u8; 20]).unwrap();
+        write_snapshot_files(&paths);
         store.save_meta(&meta("first", &paths)).unwrap();
 
         let list = store.list().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "first");
-        assert_eq!(list[0].size_bytes, 30);
+        assert!(list[0].size_bytes >= 32);
+        assert!(list[0].is_restorable());
 
         store.delete("first").unwrap();
         assert!(store.list().unwrap().is_empty());
         assert!(store.delete("first").is_err());
+    }
+
+    #[test]
+    fn stages_then_finalizes_a_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let paths = store.prepare_staged("demo").unwrap();
+        assert!(paths.dir.starts_with(store.staging_dir()));
+        assert!(!paths.final_dir.exists());
+        write_snapshot_files(&paths);
+        store.finalize(&paths).unwrap();
+        assert!(!paths.dir.exists());
+        assert!(paths.final_dir.is_dir());
+        assert_eq!(
+            std::fs::metadata(store.staging_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        let meta = meta("demo", &paths);
+        store.save_meta(&meta).unwrap();
+        let list = store.list().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].dir, paths.final_dir);
+    }
+
+    #[test]
+    fn staged_names_cannot_collide_with_completed_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let paths = store.prepare_staged("demo").unwrap();
+        store.finalize(&paths).unwrap();
+        assert!(store.prepare_staged("demo").is_err());
+        assert!(store.prepare_staged(".staging").is_err());
     }
 
     #[test]
@@ -309,6 +444,35 @@ mod tests {
         assert!(name.len() <= 100, "{}", name.len());
         sanitize_name(&name).unwrap();
         assert!(SnapshotStore::suggested_name("demo").starts_with("demo-"));
+    }
+
+    #[test]
+    fn source_url_is_a_file_url() {
+        let meta = SnapshotMeta {
+            name: "demo".into(),
+            created_at: Utc::now(),
+            vm_state: "Paused".into(),
+            dir: PathBuf::from("/snapshots/demo"),
+            project: None,
+            size_bytes: 0,
+            note: None,
+        };
+        assert_eq!(meta.source_url(), "file:///snapshots/demo");
+    }
+
+    #[test]
+    fn a_missing_snapshot_is_not_restorable() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = SnapshotMeta {
+            name: "missing".into(),
+            created_at: Utc::now(),
+            vm_state: "Paused".into(),
+            dir: dir.path().join("missing"),
+            project: None,
+            size_bytes: 0,
+            note: None,
+        };
+        assert!(!meta.is_restorable());
     }
 
     #[test]

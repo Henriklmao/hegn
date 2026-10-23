@@ -1,10 +1,11 @@
-//! Downloading and verifying the upstream Firecracker VM assets.
+//! Downloading and verifying the upstream Cloud Hypervisor VM assets.
 //!
-//! hegn deliberately does not build or publish its own guest image. The
-//! kernel and root filesystem come from the official Firecracker CI bucket,
-//! pinned by URL **and** SHA-256. Downloads are streamed into a private
-//! temporary file, verified, and atomically renamed; a checksum mismatch never
-//! leaves a usable file behind.
+//! hegn deliberately does not build or publish its own guest image. The kernel
+//! comes from the official Cloud Hypervisor Linux release and the root
+//! filesystem from Cloud Hypervisor's published test images, pinned by URL
+//! **and** SHA-256. Downloads are streamed into a private temporary file,
+//! verified, and atomically renamed; a checksum mismatch never leaves a usable
+//! file behind.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -18,43 +19,44 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 
-/// Refuse absurdly large downloads before they fill the disk.
-pub const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Refuse absurdly large downloads before they fill the disk. The official
+/// aarch64 cloud image is larger than 2 GiB, so the cap is 4 GiB.
+pub const MAX_ASSET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(target_arch = "x86_64")]
 mod pinned {
-    pub const KERNEL_VERSION: &str = "v1.15";
-    pub const KERNEL_ARTIFACT: &str = "vmlinux-6.1.155";
-    pub const KERNEL_URL: &str =
-        "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155";
+    pub const KERNEL_VERSION: &str = "ch-release-v7.2.8-20261009";
+    pub const KERNEL_ARTIFACT: &str = "vmlinux-x86_64";
+    pub const KERNEL_URL: &str = "https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v7.2.8-20261009/vmlinux-x86_64";
     pub const KERNEL_SHA256: &str =
-        "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2";
+        "edfeb8a8a6c04ff2979e9f1c700feaa29b8f564f952261834ef0b7d2e673a853";
 
-    pub const ROOTFS_VERSION: &str = "v1.10";
-    pub const ROOTFS_ARTIFACT: &str = "ubuntu-22.04.ext4";
+    pub const ROOTFS_VERSION: &str = "20241017";
+    pub const ROOTFS_ARTIFACT: &str = "jammy-server-cloudimg-amd64-custom-20241017-0.qcow2";
     pub const ROOTFS_URL: &str =
-        "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/ubuntu-22.04.ext4";
+        "https://ch-images.azureedge.net/jammy-server-cloudimg-amd64-custom-20241017-0.qcow2";
     pub const ROOTFS_SHA256: &str =
-        "040927105bd01b19e7b02cd5da5a9552b428a7f84bd5ffc22ebfce4ddf258a07";
+        "e05cb642d633e20e8e1390be23856744d3867744764bf3000ad0a9c22dd794e8";
+    pub const ROOTFS_FORMAT: crate::config::RootfsFormat = crate::config::RootfsFormat::Qcow2;
 }
 
 #[cfg(target_arch = "aarch64")]
 mod pinned {
-    pub const KERNEL_VERSION: &str = "v1.15";
-    pub const KERNEL_ARTIFACT: &str = "vmlinux-6.1.155";
-    pub const KERNEL_URL: &str =
-        "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/aarch64/vmlinux-6.1.155";
+    pub const KERNEL_VERSION: &str = "ch-release-v7.2.8-20261009";
+    pub const KERNEL_ARTIFACT: &str = "Image-arm64";
+    pub const KERNEL_URL: &str = "https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v7.2.8-20261009/Image-arm64";
     pub const KERNEL_SHA256: &str =
-        "e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591";
+        "8f8f3d5a983809f87a4e1e9a13053a3361fda47ef04e09c771a41c5e037cb6c2";
 
-    pub const ROOTFS_VERSION: &str = "v1.10";
-    pub const ROOTFS_ARTIFACT: &str = "ubuntu-22.04.ext4";
+    pub const ROOTFS_VERSION: &str = "20220329";
+    pub const ROOTFS_ARTIFACT: &str = "jammy-server-cloudimg-arm64-custom-20220329-0.raw";
     pub const ROOTFS_URL: &str =
-        "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/aarch64/ubuntu-22.04.ext4";
+        "https://ch-images.azureedge.net/jammy-server-cloudimg-arm64-custom-20220329-0.raw";
     pub const ROOTFS_SHA256: &str =
-        "b7a8c7578812f907ad7f72ddea9b57a5d15f461b51bd3e1933b5ad5c8eb1d708";
+        "09b0d626d6cef8d0426aa47b8694194eb476e5696ff19d743e3cd4a175d00645";
+    pub const ROOTFS_FORMAT: crate::config::RootfsFormat = crate::config::RootfsFormat::Raw;
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -474,6 +476,27 @@ mod tests {
         config.rootfs_image = dir.path().join("rootfs");
         let err = download_all(&config, false, false).unwrap_err().to_string();
         assert!(err.contains("symlinked image"), "{err}");
+    }
+
+    #[test]
+    fn pinned_rootfs_format_matches_the_artifact() {
+        match ROOTFS_FORMAT {
+            crate::config::RootfsFormat::Qcow2 => {
+                assert!(ROOTFS_ARTIFACT.ends_with(".qcow2"), "{ROOTFS_ARTIFACT}")
+            }
+            crate::config::RootfsFormat::Raw => {
+                assert!(
+                    [".raw", ".img", ".ext4"]
+                        .iter()
+                        .any(|suffix| ROOTFS_ARTIFACT.ends_with(suffix)),
+                    "{ROOTFS_ARTIFACT}"
+                )
+            }
+        }
+        assert!(KERNEL_URL.starts_with("https://"));
+        assert!(ROOTFS_URL.starts_with("https://"));
+        assert!(is_sha256(KERNEL_SHA256));
+        assert!(is_sha256(ROOTFS_SHA256));
     }
 
     #[test]

@@ -24,8 +24,8 @@ use crate::terminal::TerminalBuffer;
 #[command(
     name = "hegn",
     version,
-    about = "Firecracker MicroVM sandbox manager and TUI for coding agents",
-    long_about = "hegn launches hardware-isolated Firecracker MicroVMs with a shared \
+    about = "Cloud Hypervisor sandbox manager and TUI for coding agents",
+    long_about = "hegn launches hardware-isolated Cloud Hypervisor VMs with a shared \
 workspace, intercepts dangerous commands with tirith-core, and manages VM snapshots. \
 Run without a subcommand to open the TUI."
 )]
@@ -92,7 +92,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: Option<LogCommands>,
     },
-    /// Manage the Firecracker sandbox lifecycle.
+    /// Manage the Cloud Hypervisor sandbox lifecycle.
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommands,
@@ -121,7 +121,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: ImageCommands,
     },
-    /// Check host prerequisites (KVM, Firecracker, virtiofsd, assets, tools).
+    /// Check host prerequisites (KVM, Cloud Hypervisor, virtiofsd, assets, tools).
     Doctor,
 }
 
@@ -158,14 +158,14 @@ pub enum ProjectCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum SandboxCommands {
-    /// Boot virtiofsd + Firecracker for a project.
+    /// Boot virtiofsd + Cloud Hypervisor for a project.
     Start {
         project: String,
         /// Harness recorded in the session metadata.
         #[arg(long, value_enum)]
         harness: Option<Harness>,
     },
-    /// Stop Firecracker and virtiofsd.
+    /// Stop Cloud Hypervisor, the console relay and virtiofsd.
     Stop,
     /// Show VM, virtiofs and pid status.
     Status,
@@ -188,7 +188,7 @@ pub enum SnapshotCommands {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Load a snapshot (boots a fresh Firecracker process).
+    /// Load a snapshot (boots a fresh Cloud Hypervisor process).
     Restore { name: String },
     /// Delete a snapshot directory.
     Delete { name: String },
@@ -799,7 +799,7 @@ fn attach(project: Option<String>, no_bar: bool, config: Config) -> Result<i32> 
             manager.paths().run_dir.display()
         )
     })?;
-    if !process_matches(session.firecracker_pid, &config.firecracker_bin) {
+    if !process_matches(session.vm_pid, &config.cloud_hypervisor_bin) {
         bail!(
             "the VM recorded in {} is not running; start it with `hegn sandbox start`",
             manager.paths().session.display()
@@ -816,7 +816,7 @@ fn attach(project: Option<String>, no_bar: bool, config: Config) -> Result<i32> 
         }
     }
     // VmConsole::attach re-verifies that the recorded pid is still the
-    // configured Firecracker binary and that the serial files exist.
+    // configured Cloud Hypervisor binary and that the console relay exists.
     let console = manager.attach_console()?;
     crate::console::run_interactive(console, !no_bar)?;
     Ok(0)
@@ -984,6 +984,8 @@ fn print_report(report: &SandboxReport, json: bool) -> Result<()> {
         report.vcpus, report.memory_mib
     );
     println!("api socket   {}", report.api_socket.display());
+    println!("serial       {}", report.serial_socket.display());
+    println!("console      {}", report.console_socket.display());
     println!(
         "virtiofs     {} ({})",
         if report.virtiofs_running {
@@ -993,9 +995,15 @@ fn print_report(report: &SandboxReport, json: bool) -> Result<()> {
         },
         report.virtiofs_socket.display()
     );
-    if let Some(pid) = report.firecracker_pid {
+    if let Some(pid) = report.vm_pid {
         println!(
-            "firecracker  pid {pid} ({})",
+            "vm           pid {pid} ({})",
+            if process_alive(pid) { "alive" } else { "dead" }
+        );
+    }
+    if let Some(pid) = report.relay_pid {
+        println!(
+            "relay        pid {pid} ({})",
             if process_alive(pid) { "alive" } else { "dead" }
         );
     }
@@ -1025,8 +1033,8 @@ fn print_snapshot(meta: &SnapshotMeta, json: bool) -> Result<()> {
         );
         println!("  state   {}", meta.vm_state);
         println!("  size    {}", meta.size_label());
-        println!("  snapshot {}", meta.snapshot_path.display());
-        println!("  memory   {}", meta.mem_file_path.display());
+        println!("  dir     {}", meta.dir.display());
+        println!("  source  {}", meta.source_url());
         if let Some(project) = &meta.project {
             println!("  project  {}", project.display());
         }

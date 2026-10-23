@@ -1,9 +1,8 @@
 //! Persistent, private serial-console logs.
 //!
-//! Firecracker writes the guest UART to the file behind
-//! `<state>/run/serial.out`. That file is a hard link to a log in
+//! The detached console relay appends the guest UART to a log in
 //! `<state>/logs/`, so the full boot and session output survives `hegn sandbox
-//! stop` without a second logging process.
+//! stop` even while no terminal is attached.
 //!
 //! Log files can contain whatever an agent printed, including secrets or
 //! terminal escape sequences. They are therefore created with mode `0600`
@@ -222,7 +221,7 @@ impl LogStore {
     /// Like [`Self::prune`], but never deletes `protected`.
     ///
     /// The running session's log is protected so a manual `hegn logs prune`
-    /// cannot unlink the file Firecracker is still writing to.
+    /// cannot unlink the file the console relay is still writing to.
     pub fn prune_except(&self, keep: usize, protected: Option<&Path>) -> Result<usize> {
         let keep = keep.max(1);
         let logs = self.list()?;
@@ -261,8 +260,8 @@ pub fn is_log_name(name: &str) -> bool {
 pub fn tail_bytes(path: &Path, lines: usize) -> Result<Vec<u8>> {
     let mut file = OpenOptions::new()
         .read(true)
-        // O_NONBLOCK keeps a swapped-in FIFO from hanging the CLI; it has no
-        // effect on regular files.
+        // O_NONBLOCK keeps a swapped-in special file from hanging the CLI; it
+        // has no effect on regular files.
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;

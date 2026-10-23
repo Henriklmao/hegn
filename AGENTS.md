@@ -52,7 +52,9 @@ is the minimum bar.
 - `src/config.rs` — config schema; unknown keys are rejected, so update the
   struct *and* the README example when adding options.
 - `src/security.rs` — `tirith-core` integration plus hegn-specific guardrails.
-- `src/firecracker.rs` / `src/sandbox.rs` / `src/virtiofs.rs` — VM lifecycle.
+- `src/cloud_hypervisor.rs` / `src/sandbox.rs` / `src/virtiofs.rs` — VM lifecycle.
+- `src/relay.rs` / `src/console.rs` — detached serial relay and attach transport.
+- `src/cloud_init.rs` — NoCloud seed for the official cloud images.
 - `src/snapshot.rs` / `src/state.rs` — persisted metadata under XDG dirs.
 - `src/images.rs` / `src/doctor.rs` — pinned upstream VM assets and shared
   prerequisite checks.
@@ -72,7 +74,9 @@ documentation. Keep both in sync when behavior changes.
 - Never weaken sandboxing (virtiofs `--sandbox`, private file modes, canonicalized
   paths) for convenience.
 - A missing VM is always a hard error. Never fall back to a host process or
-  local PTY. No work happens outside a Firecracker VM.
+  local PTY. No work happens outside a Cloud Hypervisor VM.
+- Keep Cloud Hypervisor's seccomp and Landlock sandboxes enabled; do not weaken
+  them for convenience.
 - Use `git --no-pager` in every Git invocation during reviews.
 - Write commit messages as `type(scope): summary` (e.g.
   `fix(vm): preflight restore binaries`).
