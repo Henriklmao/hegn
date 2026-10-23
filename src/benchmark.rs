@@ -175,7 +175,7 @@ fn session_cost(config: &Config, notes: &mut Vec<String>) -> Option<SessionCost>
                 continue;
             }
         };
-        if process_alive(session.vm_pid) {
+        if process_alive(session.vm_pid) && cmdline_contains(session.vm_pid, "cloud-hypervisor") {
             let (vcpus, memory_mib) = sandbox_limits(&path, config);
             return Some(build_session(&session, vcpus, memory_mib, notes));
         }
@@ -199,12 +199,18 @@ fn build_session(
     notes: &mut Vec<String>,
 ) -> SessionCost {
     let mut processes = Vec::new();
-    for (role, pid) in [
-        ("cloud-hypervisor", session.vm_pid),
-        ("virtiofsd", session.virtiofs_pid),
-        ("console-relay", session.relay_pid),
+    for (role, pid, needle) in [
+        ("cloud-hypervisor", session.vm_pid, "cloud-hypervisor"),
+        ("virtiofsd", session.virtiofs_pid, "virtiofsd"),
+        ("console-relay", session.relay_pid, "__console-relay"),
     ] {
         if pid == 0 {
+            continue;
+        }
+        if !cmdline_contains(pid, needle) {
+            notes.push(format!(
+                "pid {pid} recorded as {role} no longer belongs to that process"
+            ));
             continue;
         }
         match process_tree_usage(pid) {
@@ -452,6 +458,20 @@ fn process_alive(pid: u32) -> bool {
     pid != 0 && Path::new("/proc").join(pid.to_string()).exists()
 }
 
+/// Whether the process command line contains `needle`.
+///
+/// Session metadata can outlive a reboot, and a recycled pid must not be
+/// reported as the VMM, the file server or the relay.
+fn cmdline_contains(pid: u32, needle: &str) -> bool {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|raw| {
+            String::from_utf8_lossy(&raw)
+                .replace('\0', " ")
+                .contains(needle)
+        })
+        .unwrap_or(false)
+}
+
 /// Render bytes with binary units and one decimal place.
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -614,6 +634,16 @@ mod tests {
     fn read_ppid_matches_the_os_parent() {
         let pid = std::process::id();
         assert_eq!(read_ppid(pid), Some(std::os::unix::process::parent_id()));
+    }
+
+    #[test]
+    fn cmdline_contains_matches_the_test_binary() {
+        let pid = std::process::id();
+        let exe = std::env::current_exe().expect("current exe");
+        let name = exe.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(cmdline_contains(pid, &name));
+        assert!(!cmdline_contains(pid, "definitely-not-on-this-cmdline"));
+        assert!(!cmdline_contains(u32::MAX - 1, "hegn"));
     }
 
     #[test]
