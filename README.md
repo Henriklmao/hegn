@@ -108,6 +108,17 @@ is no local PTY fallback.
 
 ## Installation
 
+### Install with an LLM agent
+
+Hand the installation to your coding agent:
+
+```text
+Install Hegn, a MicroVM base containerization wizard according to the following guide: https://github.com/Henriklmao/hegn/blob/main/docs/llm-setup.md
+```
+
+The guide walks the agent through host checks, installation on Arch (AUR) or any
+glibc distribution, VM images, `hegn doctor` and a smoke test.
+
 ### Arch Linux (AUR)
 
 ```bash
@@ -125,7 +136,7 @@ paru -S hegn-bin
 
 Tagged releases publish `hegn-<tag>-x86_64-linux-gnu` binaries and
 `hegn-<tag>.AppImage` on the
-[releases page](https://github.com/hegn-tui/hegn/releases).
+[releases page](https://github.com/Henriklmao/hegn/releases).
 
 ### Upgrading from an older hegn
 
@@ -149,7 +160,7 @@ so a forgotten old VMM cannot be leaked.
 Requires Rust **1.88+** (edition 2024).
 
 ```bash
-git clone https://github.com/hegn-tui/hegn
+git clone https://github.com/Henriklmao/hegn
 cd hegn
 cargo build --release --locked
 install -Dm755 target/release/hegn ~/.local/bin/hegn

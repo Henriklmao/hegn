@@ -725,6 +725,7 @@ scripts/
   aur-publish.yml   tagged AUR publish
 docs/
   architecture.md   this document
+  llm-setup.md      install guide written for LLM agents
 README.md           user-facing documentation
 AGENTS.md           repository working agreement
 ```

@@ -7,7 +7,7 @@ aur_description='Cloud Hypervisor sandbox manager and TUI for coding agents'
 # Resolve the source repository. GitHub Actions sets GITHUB_REPOSITORY to the
 # repository being built; local runs fall back to the project URL.
 aur_repo_url() {
-    printf 'https://github.com/%s' "${GITHUB_REPOSITORY:-hegn-tui/hegn}"
+    printf 'https://github.com/%s' "${GITHUB_REPOSITORY:-Henriklmao/hegn}"
 }
 
 # Validate a release tag and turn it into an Arch pkgver component.

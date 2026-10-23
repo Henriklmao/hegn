@@ -497,7 +497,7 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
         let toml = toml::to_string_pretty(self)?;
-        let header = "# hegn configuration\n# Docs: https://github.com/hegn-tui/hegn\n\n";
+        let header = "# hegn configuration\n# Docs: https://github.com/Henriklmao/hegn\n\n";
         fs::write(&path, format!("{header}{toml}"))
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(true)
