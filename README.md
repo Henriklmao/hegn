@@ -105,6 +105,9 @@ PTY fallback.
 # build from source
 paru -S hegn
 
+# latest git snapshot
+paru -S hegn-git
+
 # pre-built binary
 paru -S hegn-bin
 ```
