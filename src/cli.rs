@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use crate::app::PACKAGE_CHOICES;
+use crate::benchmark;
 use crate::config::{Config, Harness};
 use crate::doctor;
 use crate::images::{self, AssetStatus};
@@ -123,6 +124,8 @@ pub enum Commands {
     },
     /// Check host prerequisites (KVM, Cloud Hypervisor, virtiofsd, assets, tools).
     Doctor,
+    /// Measure the host cost of the running sandbox and the on-disk usage.
+    Benchmark,
 }
 
 #[derive(Debug, Subcommand)]
@@ -321,6 +324,7 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
         Commands::Config { command } => config_command(command, config, json),
         Commands::Images { command } => image_command(command, config, json),
         Commands::Doctor => doctor(config, json),
+        Commands::Benchmark => benchmark::run(&config, json),
     }
 }
 

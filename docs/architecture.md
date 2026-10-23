@@ -171,6 +171,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `snapshot.rs` | Snapshot metadata store | Sanitized names; private dirs/files; atomic-ish metadata writes |
 | `images.rs` | Upstream asset pins, streaming download, SHA-256 install/verify | HTTPS only by config validation; checksum before rename; no overwrite without `--force` |
 | `doctor.rs` | Shared host checks for CLI and TUI | Required vs optional checks; missing images are downloadable |
+| `benchmark.rs` | Measured host cost: process RSS, disk usage, snapshot estimate | Read-only; never starts or stops a VM; sparse-aware disk accounting; JSON output |
 | `console.rs` | Serial transport over the relay socket, tmux-style attach, status bar | Never pretends a VM exists; verifies VMM and relay; bar content sanitized; `--no-bar` for full-screen guests |
 | `logs.rs` | Log naming, listing, resolve, tail, prune | `O_NOFOLLOW`, regular files only, no foreign files deleted, active log protected |
 | `terminal.rs` | ANSI-aware scrollback | Strips CSI/OSC; caps line bytes and scrollback |
@@ -699,6 +700,7 @@ src/
   main.rs        thin binary / exit codes
   lib.rs         module exports and crate documentation
   cli.rs         clap commands and text/JSON output
+  benchmark.rs   measured host cost and disk usage
   config.rs      schema, defaults, env overrides, validation
   project.rs     discovery, import, templates, git helpers
   security.rs    tirith-core + hegn workspace guardrails

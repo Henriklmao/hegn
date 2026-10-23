@@ -258,6 +258,7 @@ Summarise, with the actual output you collected:
 - resolved binaries: `cloud-hypervisor` / `cloud-hypervisor-static` and
   `virtiofsd` versions, as `hegn doctor` reports them;
 - `hegn doctor` result and `hegn images verify` result;
+- `hegn benchmark --json` output as evidence for RAM and disk usage;
 - config path, state dir and image paths;
 - anything skipped, downgraded or left for the user to decide (for example a
   missing `kvm` group membership that needs a re-login).

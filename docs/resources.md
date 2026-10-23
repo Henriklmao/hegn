@@ -135,18 +135,66 @@ around every command and snapshot-based rollback.
 
 ## Measure on your machine
 
+`hegn benchmark` performs the measurements this document is based on. It is
+read-only: no VM is started, paused or stopped.
+
+```bash
+hegn benchmark          # human-readable report
+hegn benchmark --json   # same data for scripts
+```
+
+```text
+hegn benchmark
+
+Session   oc test (opencode)
+Project   /home/you/Projects/hegn/oc test
+Uptime    16m 30s
+Guest     2 vCPU, 2.0 GiB configured (populated on demand)
+
+PROCESS                PID        RSS    VIRTUAL
+cloud-hypervisor    540642  404.4 MiB    2.0 GiB
+virtiofsd           540638   11.8 MiB    2.1 GiB
+console-relay       540643    5.2 MiB   23.3 MiB
+host total                  421.3 MiB
+
+DISK           ALLOCATED    APPARENT   FILES  PATH
+images           2.1 GiB     2.2 GiB       4  /home/you/.local/share/hegn/images
+snapshots            0 B         0 B       0  /home/you/.local/share/hegn/snapshots
+logs           116.0 KiB   105.2 KiB       4  /home/you/.local/state/hegn/logs
+state          184.0 KiB     4.1 MiB      16  /home/you/.local/state/hegn
+sandboxes              -           -       -  /home/you/.local/share/hegn/sandboxes
+disk total       2.1 GiB
+
+Notes:
+- guest RAM is populated on demand: 2 vCPU, 2.0 GiB configured
+```
+
+What the columns mean:
+
+- **RSS / VIRTUAL** — resident and virtual memory of the session process and
+  its descendants. `virtiofsd` re-executes itself into a sandboxed worker, so
+  the role covers both processes. The TUI and an attached client are not
+  recorded in `session.json`; add roughly 26 MiB and 7 MiB when they are open.
+- **ALLOCATED / APPARENT** — blocks actually used on disk versus the sum of
+  file sizes. They differ for sparse files such as `cloud-init.img` and the
+  qcow2 image, and allocated is the number that matters for free space.
+- **FILES** — number of regular files; symlinks are neither followed nor
+  counted.
+- **Notes** — stale session metadata, stopped processes and the configured
+  guest RAM are reported here instead of failing the command.
+
+Without a running sandbox the command still reports disk usage and the
+configured guest cost. For deeper checks, splurge on the raw sources:
+
 ```bash
 hegn sandbox status --json        # vcpus, memory_mib, pids, running flags
 hegn images status                # kernel/rootfs state and size
 hegn doctor                       # resolved binaries and versions
 hegn logs list                    # session logs and sizes
 
-# host cost of a running session
 ps -o pid,rss,vsz,args -C cloud-hypervisor-static,virtiofsd,hegn
-
-# disk
 du -sh ~/.local/share/hegn/images ~/.local/share/hegn/snapshots \
-       ~/.local/state/hegn/logs ~/.local/state/hegn/run
+       ~/.local/state/hegn/logs
 df -h ~/.local/share/hegn
 free -m
 ```

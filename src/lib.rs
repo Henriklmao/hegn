@@ -20,9 +20,11 @@
 //! - [`app`] — TUI application state and event handling
 //! - [`ui`] — ratatui rendering
 //! - [`tui`] — terminal lifecycle and event loop
+//! - [`benchmark`] — measured host cost and disk usage
 //! - [`cli`] — non-interactive command surface
 
 pub mod app;
+pub mod benchmark;
 pub mod cli;
 pub mod cloud_hypervisor;
 pub mod cloud_init;

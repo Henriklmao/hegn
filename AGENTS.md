@@ -49,6 +49,7 @@ is the minimum bar.
 
 - `src/lib.rs` — module exports; the crate is a library with a thin `main.rs`.
 - `src/cli.rs` — every TUI action needs a non-interactive CLI counterpart.
+- `src/benchmark.rs` — `hegn benchmark`: measured host cost and disk usage.
 - `src/config.rs` — config schema; unknown keys are rejected, so update the
   struct *and* the README example when adding options.
 - `src/security.rs` — `tirith-core` integration plus hegn-specific guardrails.
