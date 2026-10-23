@@ -166,8 +166,8 @@ fn emit(report: BenchmarkReport, json: bool) -> Result<i32> {
 }
 
 fn confirm(question: &str) -> Result<bool> {
-    print!("{question} [y/N] ");
-    io::stdout().flush().context("failed to write the prompt")?;
+    eprint!("{question} [y/N] ");
+    io::stderr().flush().context("failed to write the prompt")?;
     let mut answer = String::new();
     if io::stdin()
         .read_line(&mut answer)
@@ -213,7 +213,8 @@ fn measure_project(config: &Config, project: &str, json: bool) -> Result<i32> {
     let mut report = collect(config);
     report.started = true;
     report.notes.push(format!(
-        "sandbox started for {}; attach with `hegn attach`, stop it with `hegn sandbox stop`",
+        "sandbox started for {}; measured right after the VMM socket came up, so guest RSS \
+         grows while the guest boots (attach with `hegn attach`, stop with `hegn sandbox stop`)",
         path.display()
     ));
     emit(report, json)
@@ -246,7 +247,14 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
         packages: packages_for(config.harness),
         template: template.map(|path| path.display().to_string()),
     };
-    project::write_meta(&path, &meta)?;
+    // `.hegn.toml` is optional; never leave the throwaway project behind
+    // because its metadata could not be written.
+    if let Err(err) = project::write_meta(&path, &meta) {
+        eprintln!(
+            "warning: could not write {}: {err}",
+            path.join(".hegn.toml").display()
+        );
+    }
 
     let started = (|| -> Result<BenchmarkReport> {
         SandboxManager::new(config.clone()).start(&path, config.harness)?;
@@ -303,7 +311,12 @@ fn packages_for(harness: Harness) -> Vec<String> {
 
 /// Remove a throwaway project, refusing anything that is not one of ours.
 fn remove_temp_project(config: &Config, path: &Path) -> Result<()> {
-    let in_projects_root = path.parent() == Some(config.projects_root.as_path());
+    let projects_root = config
+        .projects_root
+        .canonicalize()
+        .unwrap_or_else(|_| config.projects_root.clone());
+    let parent = path.parent().and_then(|dir| dir.canonicalize().ok());
+    let in_projects_root = parent.as_deref() == Some(projects_root.as_path());
     let prefixed = path
         .file_name()
         .and_then(|name| name.to_str())
