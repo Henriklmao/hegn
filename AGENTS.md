@@ -62,8 +62,8 @@ is the minimum bar.
 - `src/app.rs` / `src/ui.rs` / `src/tui.rs` — state machine, rendering, terminal
   event loop.
 
-`project.md` is the design specification; `README.md` is the user-facing
-documentation. Keep both in sync when behavior changes.
+`README.md` is the user-facing documentation. Keep it in sync when behavior
+changes.
 
 ## Conventions
 

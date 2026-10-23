@@ -13,8 +13,8 @@ The package ships a single binary, `hegn`. Run it without a subcommand to open
 the TUI; every TUI action also has a scripting-friendly CLI counterpart.
 
 > **Status:** early (`0.1.0`). The CLI, security engine, snapshots, Cloud
-> Hypervisor serial console and TUI work today. See [`project.md`](project.md) for the
-> design specification and roadmap.
+> Hypervisor serial console and TUI work today. See
+> [`docs/architecture.md`](docs/architecture.md) for the design.
 
 ---
 
@@ -573,9 +573,9 @@ src/
 ```
 
 The crate is a library (`lib.rs`) with a thin binary, so every module is unit
-tested directly. See [`project.md`](project.md) for the specification and
-[`docs/architecture.md`](docs/architecture.md) for the detailed architecture,
-data flows, safety invariants, and image-update pipeline.
+tested directly. See [`docs/architecture.md`](docs/architecture.md) for the
+detailed architecture, data flows, safety invariants, and image-update
+pipeline.
 
 ---
 

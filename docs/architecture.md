@@ -2,8 +2,7 @@
 
 This document describes how `hegn` is put together, which invariants the
 implementation must preserve, and how the pieces fail. It is the detailed
-companion to [`../project.md`](../project.md) (specification) and
-[`../README.md`](../README.md) (user documentation).
+companion to [`../README.md`](../README.md) (user documentation).
 
 `hegn` is a Linux-only Rust application that runs coding agents inside
 Cloud Hypervisor VMs. The host process never runs project work itself. Every
@@ -726,7 +725,6 @@ scripts/
   aur-publish.yml   tagged AUR publish
 docs/
   architecture.md   this document
-project.md          specification and roadmap
 README.md           user-facing documentation
 AGENTS.md           repository working agreement
 ```
