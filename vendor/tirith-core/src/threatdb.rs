@@ -1,0 +1,7056 @@
+//! Threat intelligence database — binary format with sorted sections for O(log n) lookup.
+//!
+//! The DB file (`tirith-threatdb.dat`) is compiled daily by CI from open threat feeds,
+//! signed with Ed25519, and distributed via GitHub Releases.
+//!
+//! ## Binary layout
+//!
+//! | Offset | Field | Size |
+//! |--------|-------|------|
+//! | 0 | Magic `TIRITHDB` | 8 |
+//! | 8 | Format version (u32 LE) | 4 |
+//! | 12 | Build timestamp (u64 LE, Unix epoch secs) | 8 |
+//! | 20 | Build sequence (u64 LE, monotonic) | 8 |
+//! | 28 | Section 1 (packages) offset (u32 LE) | 4 |
+//! | 32 | Section 1 count (u32 LE) | 4 |
+//! | 36 | Section 2 (hostnames) offset (u32 LE) | 4 |
+//! | 40 | Section 2 count (u32 LE) | 4 |
+//! | 44 | Section 3 (IPs) offset (u32 LE) | 4 |
+//! | 48 | Section 3 count (u32 LE) | 4 |
+//! | 52 | Section 4 (typosquats) offset (u32 LE) | 4 |
+//! | 56 | Section 4 count (u32 LE) | 4 |
+//! | 60 | Section 5 (popular pkgs) offset (u32 LE) | 4 |
+//! | 64 | Section 5 count (u32 LE) | 4 |
+//! | 68 | Section 6 (string table) offset (u32 LE) | 4 |
+//! | 72 | Section 6 size (u32 LE, bytes) | 4 |
+//! | 76 | Signer pubkey fingerprint (SHA-256, 32 bytes) | 32 |
+//! | 108 | Ed25519 signature (64 bytes) | 64 |
+//! | 172 | (sections data follows) | ... |
+//!
+//! Signature covers bytes `[0..108)` (header before sig) ++ bytes `[172..)` (all section data).
+
+use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
+
+use ed25519_dalek::{Signature, VerifyingKey, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+use crate::policy;
+use crate::util::levenshtein;
+
+const MAGIC: &[u8; 8] = b"TIRITHDB";
+/// Highest on-disk format this binary can WRITE and is the newest it can READ.
+const FORMAT_VERSION: u32 = 2;
+/// Public view of the highest on-disk format this build understands. The
+/// updater uses it to select the highest `format <= MAX_FORMAT_VERSION` asset
+/// from the v2 index, so a future binary that bumps `FORMAT_VERSION` starts
+/// preferring the newer asset with no manifest-schema change.
+pub const MAX_FORMAT_VERSION: u32 = FORMAT_VERSION;
+/// Oldest on-disk format this binary still accepts on read. A v1 file loads with
+/// every v2 section absent (every v2 lookup returns None), so it behaves exactly
+/// like a pre-v2 binary did. An OLD binary (whose `FORMAT_VERSION` is 1) reading
+/// a v2 file rejects it via the `version != 1` check it shipped with and fails
+/// closed; the dual-cache-filename split below keeps it from ever seeing one.
+const MIN_SUPPORTED_FORMAT_VERSION: u32 = 1;
+/// Total header size in bytes.
+const HEADER_SIZE: usize = 172;
+/// Offset of the Ed25519 signature within the header.
+const SIG_OFFSET: usize = 108;
+/// Offset of the signer fingerprint within the header.
+const FINGERPRINT_OFFSET: usize = 76;
+const FINGERPRINT_LEN: usize = 32;
+/// Canonical v1 cache filename. An OLD binary only ever knows this name, so the
+/// v2 updater must never clobber it (see [`DB_FILENAME_V2`]).
+const DB_FILENAME: &str = "tirith-threatdb.dat";
+/// Distinct v2 cache filename. A v2-capable client writes the v2 DB here and the
+/// loader prefers it when present and parseable, falling back to [`DB_FILENAME`].
+/// A co-located old binary never reads this file, so it is never fail-opened.
+const DB_FILENAME_V2: &str = "tirith-threatdb-v2.dat";
+const SUPPLEMENTAL_DB_FILENAME: &str = "tirith-threatdb-supplemental.dat";
+/// Distinct v2 supplemental filename (same split rationale as [`DB_FILENAME_V2`]).
+const SUPPLEMENTAL_DB_FILENAME_V2: &str = "tirith-threatdb-supplemental-v2.dat";
+/// Re-check file mtime at most every 60 seconds.
+const MTIME_CHECK_INTERVAL_SECS: u64 = 60;
+
+// ---------------------------------------------------------------------------
+// v2 binary format: a fixed EOF footer anchoring a variable, checked descriptor
+// trailer, with all new sections living AFTER `HEADER_SIZE` so the existing
+// Ed25519 signature (over `data[0..SIG_OFFSET]` ++ `data[HEADER_SIZE..]`) covers
+// them with NO change to `SIG_OFFSET` or the signed range.
+// ---------------------------------------------------------------------------
+
+/// Magic at the very end of a v2 file, anchoring the descriptor trailer.
+const FOOTER_MAGIC: &[u8; 8] = b"TRTHDBV2";
+/// Fixed EOF footer size: magic[8] + trailer_offset u64 + trailer_length u64 +
+/// trailer_version u16 + flags u16.
+const FOOTER_SIZE: usize = 8 + 8 + 8 + 2 + 2;
+/// Trailer format version carried in the footer (independent of the section
+/// `record_version`s). Bumped only on a trailer-layout change.
+const TRAILER_VERSION: u16 = 1;
+/// Per-descriptor size in the trailer: section_type u16 + record_version u16 +
+/// offset u64 + length u64 + count u64.
+const DESCRIPTOR_SIZE: usize = 2 + 2 + 8 + 8 + 8;
+/// Upper bound on the descriptor count, so a corrupt trailer_length cannot make
+/// the reader attempt an absurd allocation. Far above the handful of section
+/// types we define.
+const MAX_DESCRIPTORS: u64 = 1024;
+/// Defensive ceiling on any single section's record count. Each v2 record is at
+/// least 32 bytes (a SHA-256), so a file large enough to hold this many is well
+/// past any real DB; the real bound is the file-length check, this only stops a
+/// `count * record_size` multiply from being attempted on a wild value.
+const MAX_SECTION_RECORDS: u64 = 1 << 40;
+
+/// Fixed record size of the artifact-SHA index: full 32-byte SHA-256 +
+/// confidence(u8) + source(u8) + flags(u8) + reserved(u8) + campaign_offset(u32
+/// into the v2 campaign string table; 0xFFFF_FFFF = none).
+const ARTIFACT_SHA_RECORD_SIZE: usize = 32 + 1 + 1 + 1 + 1 + 4;
+/// Fixed record size of the file-hash index: full 32-byte SHA-256 +
+/// confidence(u8) + source(u8) + behavior_tags(u16) + campaign_offset(u32).
+const FILE_HASH_RECORD_SIZE: usize = 32 + 1 + 1 + 2 + 4;
+/// Fixed-size head of a malicious-URL index entry: full 32-byte SHA-256 of the
+/// normalized URL + url_offset(u32 into the v2 campaign string table) +
+/// source(u8) + reserved(u8). The URL string itself lives in the string table,
+/// so the index is fixed-size and binary-searchable on the hash.
+const URL_INDEX_RECORD_SIZE: usize = 32 + 4 + 1 + 1;
+
+/// v2 section type tags (stored in each descriptor's `section_type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u16)]
+enum SectionType {
+    ArtifactSha = 1,
+    FileHash = 2,
+    MaliciousUrl = 3,
+    CampaignStrings = 4,
+    BehaviorTags = 5,
+}
+
+impl SectionType {
+    fn from_u16(v: u16) -> Option<Self> {
+        match v {
+            1 => Some(Self::ArtifactSha),
+            2 => Some(Self::FileHash),
+            3 => Some(Self::MaliciousUrl),
+            4 => Some(Self::CampaignStrings),
+            5 => Some(Self::BehaviorTags),
+            _ => None,
+        }
+    }
+
+    /// Fixed record size for the index sections; `None` for the byte-blob
+    /// sections (campaign string table, behavior-tag bitset) whose `length` is
+    /// authoritative and whose `count` is informational.
+    fn record_size(self) -> Option<usize> {
+        match self {
+            Self::ArtifactSha => Some(ARTIFACT_SHA_RECORD_SIZE),
+            Self::FileHash => Some(FILE_HASH_RECORD_SIZE),
+            Self::MaliciousUrl => Some(URL_INDEX_RECORD_SIZE),
+            Self::CampaignStrings | Self::BehaviorTags => None,
+        }
+    }
+}
+
+/// Ed25519 verification key for threat DB signatures, compiled into the binary.
+/// The corresponding private key is stored as a GitHub Actions secret (THREATDB_SIGNING_KEY).
+static VERIFY_KEY_BYTES: &[u8; PUBLIC_KEY_LENGTH] =
+    include_bytes!("../assets/keys/threatdb-verify.pub");
+
+/// Package ecosystem identifiers, encoded as a single byte in the DB.
+/// Discriminants are part of the on-disk binary format and must stay stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum Ecosystem {
+    Npm = 0,
+    PyPI = 1,
+    RubyGems = 2,
+    Crates = 3,
+    Go = 4,
+    Maven = 5,
+    NuGet = 6,
+    Packagist = 7,
+    // M6 ch1 — distro/docker backends for `tirith install`; threat-DB lookups
+    // are empty until feed wiring extends.
+    Apt = 8,
+    Brew = 9,
+    Dnf = 10,
+    Yum = 11,
+    Pacman = 12,
+    Scoop = 13,
+    Docker = 14,
+}
+
+impl std::fmt::Display for Ecosystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ecosystem::Npm => write!(f, "npm"),
+            Ecosystem::PyPI => write!(f, "pypi"),
+            Ecosystem::RubyGems => write!(f, "rubygems"),
+            Ecosystem::Crates => write!(f, "crates.io"),
+            Ecosystem::Go => write!(f, "go"),
+            Ecosystem::Maven => write!(f, "maven"),
+            Ecosystem::NuGet => write!(f, "nuget"),
+            Ecosystem::Packagist => write!(f, "packagist"),
+            Ecosystem::Apt => write!(f, "apt"),
+            Ecosystem::Brew => write!(f, "brew"),
+            Ecosystem::Dnf => write!(f, "dnf"),
+            Ecosystem::Yum => write!(f, "yum"),
+            Ecosystem::Pacman => write!(f, "pacman"),
+            Ecosystem::Scoop => write!(f, "scoop"),
+            Ecosystem::Docker => write!(f, "docker"),
+        }
+    }
+}
+
+impl Ecosystem {
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Npm),
+            1 => Some(Self::PyPI),
+            2 => Some(Self::RubyGems),
+            3 => Some(Self::Crates),
+            4 => Some(Self::Go),
+            5 => Some(Self::Maven),
+            6 => Some(Self::NuGet),
+            7 => Some(Self::Packagist),
+            8 => Some(Self::Apt),
+            9 => Some(Self::Brew),
+            10 => Some(Self::Dnf),
+            11 => Some(Self::Yum),
+            12 => Some(Self::Pacman),
+            13 => Some(Self::Scoop),
+            14 => Some(Self::Docker),
+            _ => None,
+        }
+    }
+
+    /// Parse an ecosystem from its string name (case-insensitive, with aliases).
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "npm" => Some(Self::Npm),
+            "pypi" => Some(Self::PyPI),
+            "rubygems" => Some(Self::RubyGems),
+            "crates.io" | "crates" | "cargo" => Some(Self::Crates),
+            "go" => Some(Self::Go),
+            "maven" => Some(Self::Maven),
+            "nuget" => Some(Self::NuGet),
+            "packagist" => Some(Self::Packagist),
+            "apt" | "apt-get" => Some(Self::Apt),
+            "brew" | "homebrew" => Some(Self::Brew),
+            "dnf" => Some(Self::Dnf),
+            "yum" => Some(Self::Yum),
+            "pacman" => Some(Self::Pacman),
+            "scoop" => Some(Self::Scoop),
+            "docker" | "oci" => Some(Self::Docker),
+            _ => None,
+        }
+    }
+}
+
+/// Which physical DB file a threat source's records live in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceTier {
+    /// Compiled and Ed25519-signed by CI; verified on download and load.
+    Primary,
+    /// Unsigned user-local overlay compiled from optional opt-in feeds.
+    Supplemental,
+}
+
+impl SourceTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Supplemental => "supplemental",
+        }
+    }
+}
+
+/// Origin of the threat intelligence signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ThreatSource {
+    OssfMalicious = 0,
+    DatadogMalicious = 1,
+    FeodoTracker = 2,
+    EcosystemsTyposquat = 3,
+    CisaKev = 4,
+    Urlhaus = 5,
+    PhishingArmy = 6,
+    PhishTank = 7,
+    ThreatFoxIoc = 8,
+    FireholIp = 9,
+    TorExit = 10,
+    /// Known data-exfiltration / webhook-catcher endpoints (hostnames). Curated
+    /// list supplied at CI time; compiled into the signed primary DB. Appended
+    /// as discriminant 11 so older `.dat` files (sources 0-10) still load.
+    ExfilEndpoint = 11,
+    /// DigitalSide Threat-Intel (davidonzo/Threat-Intel) MISP-style CSV feed of
+    /// malicious URLs, domains, and IPs. Defined but NOT wired into the CI fetch:
+    /// the upstream feed's automated daily updates stopped at 2024-10-18 (freshness
+    /// gate re-checked and FAILED on 2026-07-16), so the source lands in code for a
+    /// future re-enable but is not compiled into the signed DB yet. Supplemental
+    /// until the gate passes and it ships via the signed CI DB. Appended as
+    /// discriminant 12 so older `.dat` files (sources 0-11) still load.
+    DigitalSide = 12,
+}
+
+impl ThreatSource {
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::OssfMalicious),
+            1 => Some(Self::DatadogMalicious),
+            2 => Some(Self::FeodoTracker),
+            3 => Some(Self::EcosystemsTyposquat),
+            4 => Some(Self::CisaKev),
+            5 => Some(Self::Urlhaus),
+            6 => Some(Self::PhishingArmy),
+            7 => Some(Self::PhishTank),
+            8 => Some(Self::ThreatFoxIoc),
+            9 => Some(Self::FireholIp),
+            10 => Some(Self::TorExit),
+            11 => Some(Self::ExfilEndpoint),
+            12 => Some(Self::DigitalSide),
+            _ => None,
+        }
+    }
+
+    /// Every threat source variant, in stable declaration order.
+    pub const ALL: [ThreatSource; 13] = [
+        Self::OssfMalicious,
+        Self::DatadogMalicious,
+        Self::FeodoTracker,
+        Self::EcosystemsTyposquat,
+        Self::CisaKev,
+        Self::Urlhaus,
+        Self::PhishingArmy,
+        Self::PhishTank,
+        Self::ThreatFoxIoc,
+        Self::FireholIp,
+        Self::TorExit,
+        Self::ExfilEndpoint,
+        Self::DigitalSide,
+    ];
+
+    /// Stable machine-readable identifier (snake_case). Used as the key in
+    /// `--format json` and the snapshot history, so it must stay stable.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OssfMalicious => "ossf_malicious",
+            Self::DatadogMalicious => "datadog_malicious",
+            Self::FeodoTracker => "feodo_tracker",
+            Self::EcosystemsTyposquat => "ecosystems_typosquat",
+            Self::CisaKev => "cisa_kev",
+            Self::Urlhaus => "urlhaus",
+            Self::PhishingArmy => "phishing_army",
+            Self::PhishTank => "phishtank",
+            Self::ThreatFoxIoc => "threatfox_ioc",
+            Self::FireholIp => "firehol_ip",
+            Self::TorExit => "tor_exit",
+            Self::ExfilEndpoint => "exfil_endpoint",
+            Self::DigitalSide => "digitalside",
+        }
+    }
+
+    /// Whether this source is carried in the signed CI-built primary DB or in
+    /// the optional user-local supplemental overlay.
+    pub fn tier(&self) -> SourceTier {
+        match self {
+            Self::OssfMalicious
+            | Self::DatadogMalicious
+            | Self::FeodoTracker
+            | Self::EcosystemsTyposquat
+            | Self::CisaKev
+            | Self::ExfilEndpoint => SourceTier::Primary,
+            Self::Urlhaus
+            | Self::PhishingArmy
+            | Self::PhishTank
+            | Self::ThreatFoxIoc
+            | Self::FireholIp
+            | Self::TorExit
+            // Gated feed: Supplemental until the freshness gate passes and it is
+            // compiled into the signed CI DB (upstream stale as of 2024-10-18).
+            | Self::DigitalSide => SourceTier::Supplemental,
+        }
+    }
+
+    /// Upstream project / homepage for the feed (attribution).
+    pub fn upstream_url(&self) -> &'static str {
+        match self {
+            Self::OssfMalicious => "https://github.com/ossf/malicious-packages",
+            Self::DatadogMalicious => {
+                "https://github.com/DataDog/malicious-software-packages-dataset"
+            }
+            Self::FeodoTracker => "https://feodotracker.abuse.ch/",
+            Self::EcosystemsTyposquat => "https://ecosyste.ms/",
+            Self::CisaKev => "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+            Self::Urlhaus => "https://urlhaus.abuse.ch/",
+            Self::PhishingArmy => "https://phishing.army/",
+            Self::PhishTank => "https://phishtank.org/",
+            Self::ThreatFoxIoc => "https://threatfox.abuse.ch/",
+            Self::FireholIp => "https://iplists.firehol.org/",
+            Self::TorExit => "https://www.torproject.org/",
+            // Curated in-tree feed, not a third-party project; point at the repo.
+            Self::ExfilEndpoint => "https://github.com/sheeki03/tirith",
+            Self::DigitalSide => "https://github.com/davidonzo/Threat-Intel",
+        }
+    }
+
+    /// Human-readable label for display.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::OssfMalicious => "OSSF Malicious Packages",
+            Self::DatadogMalicious => "Datadog Malicious Packages",
+            Self::FeodoTracker => "Feodo Tracker",
+            Self::EcosystemsTyposquat => "ecosyste.ms Typosquats",
+            Self::CisaKev => "CISA KEV",
+            Self::Urlhaus => "URLhaus",
+            Self::PhishingArmy => "Phishing Army",
+            Self::PhishTank => "PhishTank",
+            Self::ThreatFoxIoc => "ThreatFox IOC",
+            Self::FireholIp => "FireHOL IP",
+            Self::TorExit => "Tor Exit Node",
+            Self::ExfilEndpoint => "Exfiltration Endpoint",
+            Self::DigitalSide => "DigitalSide Threat-Intel",
+        }
+    }
+
+    /// Default confidence level for network-indicator sources (hostnames, IPs).
+    pub fn default_confidence(self) -> Confidence {
+        match self {
+            Self::TorExit => Confidence::Medium,
+            // Curated exfil destinations are confirmed-bad, like the other
+            // network-indicator hostname feeds.
+            Self::OssfMalicious
+            | Self::DatadogMalicious
+            | Self::FeodoTracker
+            | Self::EcosystemsTyposquat
+            | Self::CisaKev
+            | Self::Urlhaus
+            | Self::PhishingArmy
+            | Self::PhishTank
+            | Self::ThreatFoxIoc
+            | Self::FireholIp
+            | Self::ExfilEndpoint
+            // DigitalSide indicators are confirmed-bad IoCs, like the other
+            // network-indicator hostname/IP feeds.
+            | Self::DigitalSide => Confidence::Confirmed,
+        }
+    }
+}
+
+/// Confidence level for a threat match.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[repr(u8)]
+pub enum Confidence {
+    Low = 0,
+    Medium = 1,
+    Confirmed = 2,
+}
+
+impl Confidence {
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Low),
+            1 => Some(Self::Medium),
+            2 => Some(Self::Confirmed),
+            _ => None,
+        }
+    }
+
+    /// Stable machine-readable identifier (lowercase), matching the serde form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::Confirmed => "confirmed",
+        }
+    }
+}
+
+/// Result of a package, hostname, or IP lookup in the threat DB.
+///
+/// `ecosystem` / `all_versions_malicious` are only meaningful for package
+/// matches; hostname/IP matches leave `ecosystem` as `None`.
+#[derive(Debug, Clone)]
+pub struct ThreatMatch {
+    pub ecosystem: Option<Ecosystem>,
+    pub name: String,
+    pub source: ThreatSource,
+    pub confidence: Confidence,
+    pub reference_url: Option<String>,
+    pub all_versions_malicious: bool,
+}
+
+/// A serializable summary of a malicious-package match.
+///
+/// Neither [`ThreatMatch`] nor [`ThreatSource`] derive `Serialize` (the former
+/// carries non-wire fields, the latter is an on-disk discriminant), so the
+/// constraint-aware assessment carries wire strings instead. `Confidence` does
+/// derive `Serialize`, so it is kept as-is.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ThreatMatchSummary {
+    pub ecosystem: String,
+    pub name: String,
+    /// Stable machine-readable source id (e.g. `ossf_malicious`).
+    pub source_id: String,
+    /// Human-readable source label (e.g. `OSSF Malicious Packages`).
+    pub source_label: String,
+    pub confidence: Confidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_url: Option<String>,
+    pub all_versions_malicious: bool,
+}
+
+/// Why a malicious-package record could not be resolved to a definite hit or
+/// miss for the requested version intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnresolvedReason {
+    /// No version was specified, so a version-specific record cannot be
+    /// confirmed or excluded.
+    UnspecifiedVersion,
+    /// A constraint was given but is outside the supported PEP 440 subset (a
+    /// marker, epoch, local version, `~=`, `===`, wildcard, or a parse failure).
+    ConstraintUnsupported,
+    /// The constraint parsed, but at least one affected version in the record
+    /// is not a plain release version we can compare against.
+    AffectedVersionUnparsed,
+    /// An exact requested or affected version was outside the ecosystem parser
+    /// used for equivalence, so a non-literal mismatch cannot be called clean.
+    ExactVersionUnsupported,
+    /// A public PEP 440 `==` specifier can select an affected local build with
+    /// the same public version. A resolver/lockfile identity would be concrete,
+    /// but an unresolved user specifier cannot be called clean.
+    ExactSpecifierMayResolveLocal,
+}
+
+/// Outcome of a constraint-aware package threat assessment.
+///
+/// Tagged serde enum so a `--format json` consumer can distinguish a proven
+/// exclusion (no warning) from an unresolved request (warning). The variants
+/// are ordered roughly by how alarming they are; see [`ThreatDb::assess_package`]
+/// for the precedence used when merging the primary DB with a supplemental
+/// overlay.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PackageThreatAssessment {
+    /// No malicious record for this `(ecosystem, name)`.
+    NoRecord,
+    /// The requested version (or an all-versions record) is a confirmed hit.
+    ExactMatch(ThreatMatchSummary),
+    /// A constraint was given and provably overlaps the affected versions.
+    ConstraintIntersectsAffected {
+        summary: ThreatMatchSummary,
+        affected_versions: Vec<String>,
+    },
+    /// A constraint was given and provably excludes every affected version
+    /// (the whole requirement parsed, every affected version parsed, all
+    /// evaluated false). Returned ONLY on proven exclusion.
+    ConstraintExcludesAffected,
+    /// A malicious record exists but the request cannot be resolved to a
+    /// definite hit or miss (see [`UnresolvedReason`]).
+    Unresolved {
+        summary: ThreatMatchSummary,
+        reason: UnresolvedReason,
+        affected_versions: Vec<String>,
+    },
+}
+
+/// Result of a typosquat lookup.
+#[derive(Debug, Clone)]
+pub struct TyposquatMatch {
+    pub ecosystem: Ecosystem,
+    pub malicious_name: String,
+    pub target_name: String,
+}
+
+/// Which on-disk format a [`ThreatDbWriter`] should emit. v2 carries the same v1
+/// sections PLUS the artifact/file-hash/URL/campaign/behavior sections behind a
+/// fixed EOF footer; v1 is byte-for-byte the legacy layout (no footer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreatDbFormat {
+    V1,
+    V2,
+}
+
+/// Behavioral capability tags carried as a bitset on a v2 file-hash record.
+/// Discriminants are the bit positions and are part of the on-disk format, so
+/// they must stay stable; new tags append at higher bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum BehaviorTag {
+    ProcessSpawn = 0,
+    NetworkExfil = 1,
+    RuntimeLoader = 2,
+    DynamicCodeLoad = 3,
+    StartupHook = 4,
+    NativeInit = 5,
+    CrossRuntime = 6,
+    CredentialAccess = 7,
+}
+
+impl BehaviorTag {
+    /// The single-bit mask for this tag within a `u16` bitset.
+    pub fn mask(self) -> u16 {
+        1u16 << (self as u16)
+    }
+
+    /// Every tag, in stable bit order.
+    pub const ALL: [BehaviorTag; 8] = [
+        Self::ProcessSpawn,
+        Self::NetworkExfil,
+        Self::RuntimeLoader,
+        Self::DynamicCodeLoad,
+        Self::StartupHook,
+        Self::NativeInit,
+        Self::CrossRuntime,
+        Self::CredentialAccess,
+    ];
+
+    /// Decode a bitset into the set of tags it carries (stable bit order).
+    pub fn from_bits(bits: u16) -> Vec<BehaviorTag> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|t| bits & t.mask() != 0)
+            .collect()
+    }
+
+    /// Stable snake_case identifier for this tag. Used as the token in the
+    /// curated file-hash feed and any machine-readable enrichment output, so it
+    /// must stay stable across releases (the on-disk format keys on the bit
+    /// position, not the name, but the name is a public contract for the feed).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessSpawn => "process_spawn",
+            Self::NetworkExfil => "network_exfil",
+            Self::RuntimeLoader => "runtime_loader",
+            Self::DynamicCodeLoad => "dynamic_code_load",
+            Self::StartupHook => "startup_hook",
+            Self::NativeInit => "native_init",
+            Self::CrossRuntime => "cross_runtime",
+            Self::CredentialAccess => "credential_access",
+        }
+    }
+
+    /// Parse a stable snake_case identifier back into a tag. Case-insensitive and
+    /// surrounding-whitespace tolerant. Returns `None` for an unknown token so a
+    /// feed entry carrying a tag this build does not recognize is skipped rather
+    /// than mismapped (the curated-feed parser reports the skip).
+    pub fn from_name(s: &str) -> Option<Self> {
+        let needle = s.trim();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|t| t.as_str().eq_ignore_ascii_case(needle))
+    }
+}
+
+/// Result of an artifact-SHA-256 lookup against the v2 artifact index. Returned
+/// only by a v2 DB; v1 (and the artifact index being absent) yields `None`.
+#[derive(Debug, Clone)]
+pub struct ArtifactMatch {
+    pub source: ThreatSource,
+    pub confidence: Confidence,
+    /// True when the record marks the whole artifact malicious (vs. a specific
+    /// version attestation); mirrors the package `all_versions_malicious` flag.
+    pub all_versions_malicious: bool,
+    /// Optional campaign label resolved from the v2 campaign string table.
+    pub campaign: Option<String>,
+}
+
+/// Result of a file-content SHA-256 lookup against the v2 file-hash index.
+#[derive(Debug, Clone)]
+pub struct FileIndicatorMatch {
+    pub source: ThreatSource,
+    pub confidence: Confidence,
+    /// Decoded behavioral capability tags carried by the record.
+    pub behavior_tags: Vec<BehaviorTag>,
+    pub campaign: Option<String>,
+}
+
+/// Aggregate statistics about a loaded DB.
+#[derive(Debug, Clone, Default)]
+pub struct ThreatDbStats {
+    pub format_version: u32,
+    pub build_timestamp: u64,
+    pub build_sequence: u64,
+    pub package_count: u32,
+    pub hostname_count: u32,
+    pub ip_count: u32,
+    pub typosquat_count: u32,
+    pub popular_count: u32,
+    pub string_table_bytes: u32,
+    /// Number of records in the v2 artifact-SHA section. Zero for v1.
+    pub artifact_sha256_count: u64,
+    /// Number of records in the v2 file-content-hash section. Zero for v1.
+    pub file_sha256_count: u64,
+    /// Number of records in the v2 malicious-URL section. Zero for v1.
+    pub malicious_url_count: u64,
+}
+
+/// Per-section record counts attributed to one [`ThreatSource`].
+///
+/// Keeping the section dimensions prevents a stable total for one source from
+/// hiding the complete loss of one indicator kind (for example, artifact hashes
+/// disappearing while package records grow by the same amount).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceRecordCounts {
+    pub package_count: u64,
+    pub hostname_count: u64,
+    pub ip_count: u64,
+    pub typosquat_count: u64,
+    pub artifact_sha256_count: u64,
+    pub file_sha256_count: u64,
+    pub malicious_url_count: u64,
+}
+
+impl SourceRecordCounts {
+    pub fn total(self) -> u64 {
+        self.package_count
+            + self.hostname_count
+            + self.ip_count
+            + self.typosquat_count
+            + self.artifact_sha256_count
+            + self.file_sha256_count
+            + self.malicious_url_count
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.package_count += other.package_count;
+        self.hostname_count += other.hostname_count;
+        self.ip_count += other.ip_count;
+        self.typosquat_count += other.typosquat_count;
+        self.artifact_sha256_count += other.artifact_sha256_count;
+        self.file_sha256_count += other.file_sha256_count;
+        self.malicious_url_count += other.malicious_url_count;
+    }
+}
+
+/// Per-source record counts derived by walking a loaded DB's sections.
+///
+/// `per_source` is private and holds at most one entry per source (an
+/// invariant `count_for`/`merge` rely on); the accessor exposes it read-only.
+#[derive(Debug, Clone, Default)]
+pub struct SourceBreakdown {
+    per_source: Vec<(ThreatSource, u64)>,
+    by_section: Vec<(ThreatSource, SourceRecordCounts)>,
+    pub typosquat_count: u64,
+    pub popular_count: u64,
+}
+
+impl SourceBreakdown {
+    /// Read-only view of the per-source counts, at most one entry per source.
+    pub fn per_source(&self) -> &[(ThreatSource, u64)] {
+        &self.per_source
+    }
+
+    /// Section-specific counts for `source`, or all-zero counts when absent.
+    pub fn section_counts_for(&self, source: ThreatSource) -> SourceRecordCounts {
+        self.by_section
+            .iter()
+            .find_map(|(candidate, counts)| (*candidate == source).then_some(*counts))
+            .unwrap_or_default()
+    }
+
+    /// Fold another breakdown's counts into this one (overlay into primary).
+    fn merge(&mut self, other: SourceBreakdown) {
+        for (src, count) in other.per_source {
+            if let Some((_, existing)) = self.per_source.iter_mut().find(|(s, _)| *s == src) {
+                *existing += count;
+            } else {
+                self.per_source.push((src, count));
+            }
+        }
+        for (src, counts) in other.by_section {
+            if let Some((_, existing)) = self
+                .by_section
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == src)
+            {
+                existing.merge(counts);
+            } else {
+                self.by_section.push((src, counts));
+            }
+        }
+        self.typosquat_count += other.typosquat_count;
+        self.popular_count += other.popular_count;
+    }
+
+    /// Count for a specific source (0 if absent).
+    pub fn count_for(&self, src: ThreatSource) -> u64 {
+        self.per_source
+            .iter()
+            .find(|(s, _)| *s == src)
+            .map(|(_, c)| *c)
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ThreatDbError {
+    #[error("invalid magic: expected TIRITHDB")]
+    InvalidMagic,
+    #[error("unsupported format version {0}")]
+    UnsupportedVersion(u32),
+    #[error("file too small: {0} bytes, need at least {HEADER_SIZE}")]
+    FileTooSmall(usize),
+    #[error("section offset/count out of bounds")]
+    SectionOutOfBounds,
+    #[error("invalid signature")]
+    InvalidSignature,
+    #[error("signer fingerprint mismatch")]
+    FingerprintMismatch,
+    #[error("rollback detected: sequence {got} <= current {current}")]
+    RollbackDetected { got: u64, current: u64 },
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid record at offset {0}")]
+    InvalidRecord(usize),
+    #[error("string table offset out of bounds: {0}")]
+    StringOutOfBounds(u32),
+    /// The fixed EOF footer was present but structurally invalid (bad magic,
+    /// unsupported trailer version, or trailer bounds that do not fit the file
+    /// or escape the signed region). A v2 file that fails this is rejected, so
+    /// the DB never loads from a corrupt v2 trailer (fail closed for v2 data).
+    #[error("invalid v2 trailer: {0}")]
+    InvalidTrailer(&'static str),
+    /// A field, record count, offset, or total size exceeded the on-disk
+    /// format limit during a build. The writer refuses to emit (and sign) a
+    /// truncated or internally corrupt database.
+    #[error("database build limit exceeded: {0}")]
+    BuildLimitExceeded(&'static str),
+}
+
+/// Checked narrowing to the format's u16 length prefix.
+fn u16_len(len: usize, what: &'static str) -> Result<u16, ThreatDbError> {
+    u16::try_from(len).map_err(|_| ThreatDbError::BuildLimitExceeded(what))
+}
+
+/// Checked narrowing to the format's u32 offsets and counts.
+fn u32_off(len: usize, what: &'static str) -> Result<u32, ThreatDbError> {
+    u32::try_from(len).map_err(|_| ThreatDbError::BuildLimitExceeded(what))
+}
+
+/// Package index entry (8 bytes): offset_into_data(u32 LE) + key_hash(u32 LE,
+/// FNV-1a of (ecosystem, name)). Records are variable-size, length-prefixed:
+/// ecosystem(u8), name_len(u16)+name, source(u8), confidence(u8), flags(u8;
+/// bit0=all_versions_malicious), version_count(u16) + [len(u16)+bytes]*,
+/// reference_offset(u32 into string table; 0xFFFFFFFF = none).
+const PKG_INDEX_ENTRY_SIZE: usize = 8;
+
+/// IP record: u32 LE (IPv4) + source(u8) = 5 bytes.
+const IP_RECORD_SIZE: usize = 5;
+
+/// Typosquat index entry: offset(u32 LE) + key_hash(u32 LE) = 8 bytes.
+const TYPOSQUAT_INDEX_ENTRY_SIZE: usize = 8;
+
+/// Popular package index entry: offset(u32 LE) + key_hash(u32 LE) = 8 bytes.
+const POPULAR_INDEX_ENTRY_SIZE: usize = 8;
+
+/// Hostname index entry: offset(u32 LE) + key_hash(u32 LE) = 8 bytes.
+const HOSTNAME_INDEX_ENTRY_SIZE: usize = 8;
+
+/// FNV-1a 32-bit hash used for both string-table dedup and index key hashes.
+fn fnv1a_hash(data: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in data {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// Canonical DNS identity shared by threat-indicator ingestion and lookup.
+/// `url::Host::parse` applies the crate's single WHATWG/IDNA policy; removing
+/// the terminal root label first makes `example.test` and `example.test.` the
+/// same DNS name. Invalid and IP-shaped inputs are not hostname indicators.
+pub fn canonical_threat_hostname(host: &str) -> Option<String> {
+    let without_root = host.trim_end_matches('.');
+    if without_root.is_empty() {
+        return None;
+    }
+    match url::Host::parse(without_root).ok()? {
+        url::Host::Domain(domain) => {
+            let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+            (!normalized.is_empty()).then_some(normalized)
+        }
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
+    }
+}
+
+fn pkg_key_hash(eco: Ecosystem, name: &[u8]) -> u32 {
+    let mut buf = Vec::with_capacity(1 + name.len());
+    buf.push(eco as u8);
+    buf.extend_from_slice(name);
+    fnv1a_hash(&buf)
+}
+
+/// Canonical registry identity for a package name.
+///
+/// This is the single source of truth for package, typosquat, and popular-name
+/// indices. It deliberately does not apply one global lowercase rule: npm, Go,
+/// Maven, and RubyGems names retain case as part of the supplied identity,
+/// while PyPI has PEP 503 separator folding and NuGet/Packagist/Scoop use
+/// lowercase registry keys. crates.io additionally treats ASCII case and
+/// hyphen/underscore spelling differences as the same package identity.
+pub fn canonical_package_name(eco: Ecosystem, name: &str) -> String {
+    match eco {
+        Ecosystem::PyPI => {
+            let mut canonical = String::with_capacity(name.len());
+            let mut in_separator_run = false;
+            for ch in name.chars() {
+                if matches!(ch, '-' | '_' | '.') {
+                    if !in_separator_run {
+                        canonical.push('-');
+                        in_separator_run = true;
+                    }
+                } else {
+                    canonical.extend(ch.to_lowercase());
+                    in_separator_run = false;
+                }
+            }
+            canonical
+        }
+        Ecosystem::NuGet | Ecosystem::Packagist | Ecosystem::Scoop => name.to_lowercase(),
+        Ecosystem::Crates => name
+            .chars()
+            .map(|ch| match ch {
+                '_' => '-',
+                _ => ch.to_ascii_lowercase(),
+            })
+            .collect(),
+        Ecosystem::Apt
+        | Ecosystem::Brew
+        | Ecosystem::Dnf
+        | Ecosystem::Yum
+        | Ecosystem::Pacman
+        | Ecosystem::Docker => name.to_ascii_lowercase(),
+        Ecosystem::Npm | Ecosystem::RubyGems | Ecosystem::Go | Ecosystem::Maven => name.to_string(),
+    }
+}
+
+/// These registries use the same key bytes in both database formats. Other
+/// ecosystems need the legacy canonical index to include spelling aliases.
+fn package_name_preserves_spelling(eco: Ecosystem) -> bool {
+    matches!(
+        eco,
+        Ecosystem::Npm | Ecosystem::RubyGems | Ecosystem::Go | Ecosystem::Maven
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionEquivalence {
+    Equal,
+    Different,
+    Unknown,
+}
+
+/// Compare a requested exact version to one affected-version record using the
+/// ecosystem's actual version identity. Literal equality is always sufficient;
+/// a non-literal comparison is `Unknown` when either side is outside the parser
+/// we can prove correct, never a clean `Different` miss.
+fn affected_version_equivalence(
+    eco: Ecosystem,
+    affected: &str,
+    requested: &str,
+) -> VersionEquivalence {
+    use crate::version_intent::{
+        canonical_composer_version, canonical_nuget_version, canonical_pep440_version,
+        canonical_rubygems_version, canonical_semver, SemverPrefix,
+    };
+
+    if affected == requested {
+        return VersionEquivalence::Equal;
+    }
+
+    match eco {
+        Ecosystem::PyPI => {
+            let (Some(affected), Some(requested)) = (
+                canonical_pep440_version(affected),
+                canonical_pep440_version(requested),
+            ) else {
+                return VersionEquivalence::Unknown;
+            };
+            if affected == requested
+                // A requested local build contains its public/base release's
+                // code. Do not invert this: a local-only malicious record does
+                // not make every build of the public release malicious.
+                || (affected.local.is_none()
+                    && requested.local.is_some()
+                    && affected.public == requested.public)
+            {
+                VersionEquivalence::Equal
+            } else {
+                VersionEquivalence::Different
+            }
+        }
+        Ecosystem::Npm | Ecosystem::Crates | Ecosystem::Go => {
+            let prefix = if eco == Ecosystem::Go {
+                SemverPrefix::RequiredV
+            } else {
+                SemverPrefix::OptionalV
+            };
+            match (
+                canonical_semver(affected, prefix),
+                canonical_semver(requested, prefix),
+            ) {
+                (Some(a), Some(b)) if a == b => VersionEquivalence::Equal,
+                (Some(_), Some(_)) => VersionEquivalence::Different,
+                _ => VersionEquivalence::Unknown,
+            }
+        }
+        Ecosystem::NuGet => match (
+            canonical_nuget_version(affected),
+            canonical_nuget_version(requested),
+        ) {
+            (Some(a), Some(b)) if a == b => VersionEquivalence::Equal,
+            (Some(_), Some(_)) => VersionEquivalence::Different,
+            _ => VersionEquivalence::Unknown,
+        },
+        Ecosystem::Packagist => match (
+            canonical_composer_version(affected),
+            canonical_composer_version(requested),
+        ) {
+            (Some(a), Some(b)) if a == b => VersionEquivalence::Equal,
+            (Some(_), Some(_)) => VersionEquivalence::Different,
+            _ => VersionEquivalence::Unknown,
+        },
+        Ecosystem::RubyGems => match (
+            canonical_rubygems_version(affected),
+            canonical_rubygems_version(requested),
+        ) {
+            (Some(a), Some(b)) if a == b => VersionEquivalence::Equal,
+            (Some(_), Some(_)) => VersionEquivalence::Different,
+            _ => VersionEquivalence::Unknown,
+        },
+        // Maven coordinates and Docker tags/digests are literal identities.
+        Ecosystem::Maven | Ecosystem::Docker => VersionEquivalence::Different,
+        // Tirith does not yet carry complete registry-native comparators for
+        // these version schemes. A non-literal mismatch must remain unresolved.
+        Ecosystem::Apt
+        | Ecosystem::Brew
+        | Ecosystem::Dnf
+        | Ecosystem::Yum
+        | Ecosystem::Pacman
+        | Ecosystem::Scoop => VersionEquivalence::Unknown,
+    }
+}
+
+/// PEP 440 ignores candidate local labels when a public-only `==` specifier is
+/// evaluated. Therefore `==1.0` may resolve to `1.0+vendor1`, while a lockfile's
+/// resolved `1.0` identity does not. This is intentionally separate from
+/// [`affected_version_equivalence`], whose arguments are concrete identities.
+fn pep440_exact_specifier_includes_affected_local(
+    eco: Ecosystem,
+    affected: &str,
+    requested: &str,
+) -> bool {
+    if eco != Ecosystem::PyPI {
+        return false;
+    }
+    let (Some(affected), Some(requested)) = (
+        crate::version_intent::canonical_pep440_version(affected),
+        crate::version_intent::canonical_pep440_version(requested),
+    ) else {
+        return false;
+    };
+    affected.local.is_some() && requested.local.is_none() && affected.public == requested.public
+}
+
+fn canonical_version_for_storage(eco: Ecosystem, version: &str) -> String {
+    use crate::version_intent::{
+        canonical_composer_version, canonical_nuget_version, canonical_pep440_version,
+        canonical_rubygems_version, canonical_semver, SemverPrefix,
+    };
+
+    let canonical = match eco {
+        Ecosystem::PyPI => canonical_pep440_version(version).map(|value| value.full()),
+        Ecosystem::Npm | Ecosystem::Crates => canonical_semver(version, SemverPrefix::OptionalV),
+        Ecosystem::Go => {
+            canonical_semver(version, SemverPrefix::RequiredV).map(|value| format!("v{value}"))
+        }
+        Ecosystem::NuGet => canonical_nuget_version(version),
+        Ecosystem::Packagist => canonical_composer_version(version),
+        Ecosystem::RubyGems => canonical_rubygems_version(version),
+        _ => None,
+    };
+    canonical.unwrap_or_else(|| version.to_string())
+}
+
+fn read_u16_le(buf: &[u8], off: usize) -> Option<u16> {
+    buf.get(off..off + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+}
+
+fn read_u32_le(buf: &[u8], off: usize) -> Option<u32> {
+    buf.get(off..off + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn read_u64_le(buf: &[u8], off: usize) -> Option<u64> {
+    buf.get(off..off + 8)
+        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+}
+
+/// One parsed, structurally-validated v2 trailer descriptor.
+struct Descriptor {
+    section_type: SectionType,
+    #[allow(dead_code)] // record_version retained for forward-compat dispatch
+    record_version: u16,
+    offset: u64,
+    length: u64,
+    count: u64,
+}
+
+/// Locate and fully validate the v2 footer + descriptor trailer, returning the
+/// section extents the reader will index into. Every arithmetic step is checked
+/// and every offset is bounds- and signed-region-validated, so a hostile file
+/// can only ever be REJECTED, never made to read out of bounds.
+///
+/// Validations (any failure rejects the whole file):
+/// - fixed EOF footer present, magic matches, `trailer_version` supported;
+/// - the trailer region `[trailer_offset, trailer_offset+trailer_length)` lies
+///   inside the file, after `HEADER_SIZE` (never inside the signature header),
+///   and entirely before the fixed footer;
+/// - `trailer_length` is an exact multiple of [`DESCRIPTOR_SIZE`] and the
+///   descriptor count is `<= MAX_DESCRIPTORS`;
+/// - every descriptor's `section_type` is known (unknown mandatory type rejects;
+///   we treat all defined types as mandatory in v1 of the trailer);
+/// - no duplicate `section_type`;
+/// - each section `[offset, offset+length)` fits the file, starts after
+///   `HEADER_SIZE`, and ends at or before `trailer_offset` (so no section runs
+///   into the trailer or footer);
+/// - for fixed-record sections, `count * record_size == length` with the
+///   multiply done checked (`count <= MAX_SECTION_RECORDS` first);
+/// - no two sections overlap.
+fn parse_v2_footer(data: &[u8]) -> Result<V2Sections, ThreatDbError> {
+    use ThreatDbError::InvalidTrailer;
+
+    let file_len = data.len() as u64;
+    // The header and the footer must both fit, and they must not overlap.
+    let footer_start = file_len
+        .checked_sub(FOOTER_SIZE as u64)
+        .ok_or(InvalidTrailer("file shorter than footer"))?;
+    if footer_start < HEADER_SIZE as u64 {
+        return Err(InvalidTrailer("footer overlaps header"));
+    }
+    let footer = &data[footer_start as usize..];
+
+    if &footer[0..8] != FOOTER_MAGIC {
+        return Err(InvalidTrailer("bad footer magic"));
+    }
+    let trailer_offset =
+        read_u64_le(footer, 8).ok_or(InvalidTrailer("truncated trailer_offset"))?;
+    let trailer_length =
+        read_u64_le(footer, 16).ok_or(InvalidTrailer("truncated trailer_length"))?;
+    let trailer_version =
+        read_u16_le(footer, 24).ok_or(InvalidTrailer("truncated trailer_version"))?;
+    // flags at footer[26..28] reserved for future use; bit usage is validated
+    // per-descriptor, not here.
+    if trailer_version != TRAILER_VERSION {
+        return Err(InvalidTrailer("unsupported trailer version"));
+    }
+
+    // Trailer region must sit after the header, before the footer, in bounds.
+    let trailer_end = trailer_offset
+        .checked_add(trailer_length)
+        .ok_or(InvalidTrailer("trailer extent overflow"))?;
+    if trailer_offset < HEADER_SIZE as u64 {
+        return Err(InvalidTrailer("trailer offset inside header"));
+    }
+    if trailer_end > footer_start {
+        return Err(InvalidTrailer("trailer runs into footer"));
+    }
+
+    if trailer_length % DESCRIPTOR_SIZE as u64 != 0 {
+        return Err(InvalidTrailer("trailer length not a descriptor multiple"));
+    }
+    let descriptor_count = trailer_length / DESCRIPTOR_SIZE as u64;
+    if descriptor_count > MAX_DESCRIPTORS {
+        return Err(InvalidTrailer("too many descriptors"));
+    }
+
+    // Parse each descriptor with full bounds + arithmetic checks.
+    let mut descriptors: Vec<Descriptor> = Vec::with_capacity(descriptor_count as usize);
+    let mut seen_types: Vec<u16> = Vec::new();
+    for i in 0..descriptor_count {
+        let base = (trailer_offset + i * DESCRIPTOR_SIZE as u64) as usize;
+        let raw_type = read_u16_le(data, base).ok_or(InvalidTrailer("truncated descriptor"))?;
+        let record_version =
+            read_u16_le(data, base + 2).ok_or(InvalidTrailer("truncated descriptor"))?;
+        let offset = read_u64_le(data, base + 4).ok_or(InvalidTrailer("truncated descriptor"))?;
+        let length = read_u64_le(data, base + 12).ok_or(InvalidTrailer("truncated descriptor"))?;
+        let count = read_u64_le(data, base + 20).ok_or(InvalidTrailer("truncated descriptor"))?;
+
+        // Unknown mandatory section type rejects (the trailer carries only
+        // sections this version understands).
+        let section_type =
+            SectionType::from_u16(raw_type).ok_or(InvalidTrailer("unknown section type"))?;
+        if seen_types.contains(&raw_type) {
+            return Err(InvalidTrailer("duplicate section type"));
+        }
+        seen_types.push(raw_type);
+
+        // Section extent must fit the file, sit after the header, and end at or
+        // before the trailer (so it cannot run into the trailer or footer).
+        let section_end = offset
+            .checked_add(length)
+            .ok_or(InvalidTrailer("section extent overflow"))?;
+        if offset < HEADER_SIZE as u64 {
+            return Err(InvalidTrailer("section offset inside header"));
+        }
+        if section_end > trailer_offset {
+            return Err(InvalidTrailer("section runs into trailer"));
+        }
+
+        // Fixed-record sections: count * record_size must equal length exactly,
+        // with the multiply checked.
+        if let Some(rec_size) = section_type.record_size() {
+            if count > MAX_SECTION_RECORDS {
+                return Err(InvalidTrailer("absurd section count"));
+            }
+            let expected = count
+                .checked_mul(rec_size as u64)
+                .ok_or(InvalidTrailer("count * record_size overflow"))?;
+            if expected != length {
+                return Err(InvalidTrailer("section length != count * record_size"));
+            }
+        }
+
+        descriptors.push(Descriptor {
+            section_type,
+            record_version,
+            offset,
+            length,
+            count,
+        });
+    }
+
+    // Reject any pairwise overlap among the sections (the trailer/footer/header
+    // are already excluded by the per-descriptor checks above).
+    for a in 0..descriptors.len() {
+        for b in (a + 1)..descriptors.len() {
+            let da = &descriptors[a];
+            let db = &descriptors[b];
+            let a_end = da.offset + da.length; // checked above
+            let b_end = db.offset + db.length;
+            if da.offset < b_end && db.offset < a_end {
+                return Err(InvalidTrailer("overlapping sections"));
+            }
+        }
+    }
+
+    // Assemble the located extents. Absent optional sections stay zero/empty.
+    let mut out = V2Sections::default();
+    for d in &descriptors {
+        match d.section_type {
+            SectionType::ArtifactSha => {
+                out.artifact_sha_offset = d.offset;
+                out.artifact_sha_count = d.count;
+            }
+            SectionType::FileHash => {
+                out.file_hash_offset = d.offset;
+                out.file_hash_count = d.count;
+            }
+            SectionType::MaliciousUrl => {
+                out.url_offset = d.offset;
+                out.url_count = d.count;
+            }
+            SectionType::CampaignStrings => {
+                out.campaign_offset = d.offset;
+                out.campaign_length = d.length;
+            }
+            SectionType::BehaviorTags => {
+                // Validated structurally above; tags ride inline on file-hash
+                // records, so nothing more to retain for lookup.
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// In-memory threat intelligence database loaded from the signed binary file.
+#[derive(Debug)]
+pub struct ThreatDb {
+    data: Vec<u8>,
+    supplemental: Option<Box<ThreatDb>>,
+    // Parsed header fields cached for fast access.
+    format_version: u32,
+    build_timestamp: u64,
+    build_sequence: u64,
+    pkg_index_offset: u32,
+    pkg_index_count: u32,
+    hostname_index_offset: u32,
+    hostname_index_count: u32,
+    ip_offset: u32,
+    ip_count: u32,
+    typosquat_index_offset: u32,
+    typosquat_index_count: u32,
+    popular_index_offset: u32,
+    popular_index_count: u32,
+    string_table_offset: u32,
+    string_table_size: u32,
+    /// Lazily-built canonical view over legacy v1 package keys. A v1 file must
+    /// keep raw bytes for old readers, but new lookups must not rescan the full
+    /// package table on every command.
+    legacy_package_index: OnceLock<std::collections::HashMap<(Ecosystem, String), Vec<u32>>>,
+    /// Parsed v2 sections, or `None` for a v1 file (every v2 lookup then
+    /// returns None and defers to the supplemental overlay, behaving exactly
+    /// like a pre-v2 binary).
+    v2: Option<V2Sections>,
+}
+
+/// Located, validated v2 section extents (absolute byte offsets into `data`).
+/// Present only when [`ThreatDb::from_bytes`] parsed a valid v2 footer + trailer.
+#[derive(Debug, Clone, Default)]
+struct V2Sections {
+    /// Artifact-SHA index: sorted by the full 32-byte hash.
+    artifact_sha_offset: u64,
+    artifact_sha_count: u64,
+    /// File-content-hash index: sorted by the full 32-byte hash.
+    file_hash_offset: u64,
+    file_hash_count: u64,
+    /// Malicious-URL index: sorted by the full 32-byte hash of the normalized URL.
+    url_offset: u64,
+    url_count: u64,
+    /// v2 campaign / URL string table (length-prefixed entries, like the v1 one).
+    campaign_offset: u64,
+    campaign_length: u64,
+    // The behavior-tag bitset rides inline on each file-hash record, so no
+    // separate section needs to be retained for lookup; the descriptor is still
+    // validated structurally on load.
+}
+
+impl ThreatDb {
+    /// Load and verify a threat DB from raw bytes.
+    ///
+    /// `min_sequence` enforces rollback protection — the DB is rejected if its
+    /// build sequence is <= this value. Pass 0 to skip.
+    pub fn from_bytes(data: Vec<u8>, min_sequence: u64) -> Result<Self, ThreatDbError> {
+        if data.len() < HEADER_SIZE {
+            return Err(ThreatDbError::FileTooSmall(data.len()));
+        }
+
+        if &data[0..8] != MAGIC {
+            return Err(ThreatDbError::InvalidMagic);
+        }
+
+        let err = || ThreatDbError::InvalidRecord(0);
+        let version = read_u32_le(&data, 8).ok_or_else(err)?;
+        // Range-accepting: any format in [MIN..=FORMAT_VERSION] loads. A v1 file
+        // loads with v2 sections absent; a v2 file loads its v2 sections. An OLD
+        // binary (FORMAT_VERSION == 1) keeps its `version != 1` reject and fails
+        // closed on a v2 file.
+        if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&version) {
+            return Err(ThreatDbError::UnsupportedVersion(version));
+        }
+
+        let build_timestamp = read_u64_le(&data, 12).ok_or_else(err)?;
+        let build_sequence = read_u64_le(&data, 20).ok_or_else(err)?;
+
+        // Rollback protection.
+        if min_sequence > 0 && build_sequence <= min_sequence {
+            return Err(ThreatDbError::RollbackDetected {
+                got: build_sequence,
+                current: min_sequence,
+            });
+        }
+
+        // Section offsets/counts (all within bounds-checked HEADER_SIZE).
+        let pkg_index_offset = read_u32_le(&data, 28).ok_or_else(err)?;
+        let pkg_index_count = read_u32_le(&data, 32).ok_or_else(err)?;
+        let hostname_index_offset = read_u32_le(&data, 36).ok_or_else(err)?;
+        let hostname_index_count = read_u32_le(&data, 40).ok_or_else(err)?;
+        let ip_offset = read_u32_le(&data, 44).ok_or_else(err)?;
+        let ip_count = read_u32_le(&data, 48).ok_or_else(err)?;
+        let typosquat_index_offset = read_u32_le(&data, 52).ok_or_else(err)?;
+        let typosquat_index_count = read_u32_le(&data, 56).ok_or_else(err)?;
+        let popular_index_offset = read_u32_le(&data, 60).ok_or_else(err)?;
+        let popular_index_count = read_u32_le(&data, 64).ok_or_else(err)?;
+        let string_table_offset = read_u32_le(&data, 68).ok_or_else(err)?;
+        let string_table_size = read_u32_le(&data, 72).ok_or_else(err)?;
+
+        // Bounds checks on sections.
+        let len = data.len() as u64;
+        let check_section = |off: u32, count: u32, entry_size: usize| -> bool {
+            let end = off as u64 + count as u64 * entry_size as u64;
+            end <= len
+        };
+
+        if !check_section(ip_offset, ip_count, IP_RECORD_SIZE) {
+            return Err(ThreatDbError::SectionOutOfBounds);
+        }
+
+        // Index extents are validated here; individual variable-size records
+        // are validated lazily on access.
+        if !check_section(pkg_index_offset, pkg_index_count, PKG_INDEX_ENTRY_SIZE) {
+            return Err(ThreatDbError::SectionOutOfBounds);
+        }
+        if !check_section(
+            hostname_index_offset,
+            hostname_index_count,
+            HOSTNAME_INDEX_ENTRY_SIZE,
+        ) {
+            return Err(ThreatDbError::SectionOutOfBounds);
+        }
+        if !check_section(
+            typosquat_index_offset,
+            typosquat_index_count,
+            TYPOSQUAT_INDEX_ENTRY_SIZE,
+        ) {
+            return Err(ThreatDbError::SectionOutOfBounds);
+        }
+        if !check_section(
+            popular_index_offset,
+            popular_index_count,
+            POPULAR_INDEX_ENTRY_SIZE,
+        ) {
+            return Err(ThreatDbError::SectionOutOfBounds);
+        }
+
+        if (string_table_offset as u64 + string_table_size as u64) > len {
+            return Err(ThreatDbError::SectionOutOfBounds);
+        }
+
+        // v2 footer/trailer. Only parsed for a v2 file; a v1 file has no footer
+        // and `v2` stays None. A v2 file with a malformed footer/trailer is
+        // REJECTED (fail closed for v2 data) rather than silently degraded.
+        let v2 = if version >= 2 {
+            Some(parse_v2_footer(&data)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            data,
+            supplemental: None,
+            format_version: version,
+            build_timestamp,
+            build_sequence,
+            pkg_index_offset,
+            pkg_index_count,
+            hostname_index_offset,
+            hostname_index_count,
+            ip_offset,
+            ip_count,
+            typosquat_index_offset,
+            typosquat_index_count,
+            popular_index_offset,
+            popular_index_count,
+            string_table_offset,
+            string_table_size,
+            legacy_package_index: OnceLock::new(),
+            v2,
+        })
+    }
+
+    /// Load from the default data directory (`~/.local/share/tirith/tirith-threatdb.dat`).
+    pub fn load_from_data_dir() -> Result<Self, ThreatDbError> {
+        let path = Self::default_path().ok_or_else(|| {
+            ThreatDbError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot determine data directory",
+            ))
+        })?;
+        Self::load_from_path(&path, 0)
+    }
+
+    /// Load from a specific path with rollback protection.
+    pub fn load_from_path(path: &Path, min_sequence: u64) -> Result<Self, ThreatDbError> {
+        let data = std::fs::read(path)?;
+        Self::from_bytes(data, min_sequence)
+    }
+
+    /// Canonical v1 filesystem path for the primary threat DB. Checks
+    /// `TIRITH_THREATDB_PATH` first, then `~/.local/share/tirith/...`.
+    ///
+    /// This is the path an OLD (v1-only) binary reads, and the only one the v2
+    /// updater must never clobber. The loader resolves the *effective* path via
+    /// [`resolve_primary_path`], which prefers the v2 file when present and
+    /// parseable.
+    pub fn default_path() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("TIRITH_THREATDB_PATH") {
+            if !p.is_empty() {
+                return Some(PathBuf::from(p));
+            }
+        }
+        policy::data_dir().map(|d| d.join(DB_FILENAME))
+    }
+
+    /// Distinct v2 primary DB path. A v2-capable client writes the v2 DB here so
+    /// a co-located old binary, which only knows [`default_path`], never reads a
+    /// v2 file it cannot parse (and is therefore never fail-opened).
+    ///
+    /// Honors the same `TIRITH_THREATDB_PATH` override as [`default_path`] by
+    /// deriving a sibling `*-v2.dat` name next to the overridden path, so tests
+    /// and operators that redirect the primary path also redirect its v2 sibling.
+    ///
+    /// [`default_path`]: Self::default_path
+    pub fn default_path_v2() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("TIRITH_THREATDB_PATH") {
+            if !p.is_empty() {
+                return Some(v2_sibling(&PathBuf::from(p)));
+            }
+        }
+        policy::data_dir().map(|d| d.join(DB_FILENAME_V2))
+    }
+
+    /// Effective primary DB path the loader should read: the v2 file when it is
+    /// present, structurally loadable, AND signature-valid, else the v1 file. An
+    /// old binary never calls this and only ever reads [`default_path`].
+    ///
+    /// Requiring a valid signature here (not merely "parseable") closes a
+    /// fail-open: a structurally-valid but unsigned/wrong-key v2 planted beside a
+    /// good v1 must NOT shadow it, since the cache loads exactly the resolved
+    /// primary and would otherwise reject the bad v2 without falling back.
+    ///
+    /// [`default_path`]: Self::default_path
+    pub fn resolve_primary_path() -> Option<PathBuf> {
+        resolve_preferring_v2(Self::default_path_v2(), Self::default_path(), true)
+    }
+
+    /// Canonical v1 supplemental DB path for user-local keyed feeds compiled on
+    /// the user's machine during `tirith threat-db update`.
+    pub fn supplemental_path() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("TIRITH_THREATDB_SUPPLEMENTAL_PATH") {
+            if !p.is_empty() {
+                return Some(PathBuf::from(p));
+            }
+        }
+        policy::data_dir().map(|d| d.join(SUPPLEMENTAL_DB_FILENAME))
+    }
+
+    /// Distinct v2 supplemental DB path (same split rationale as
+    /// [`default_path_v2`]).
+    ///
+    /// [`default_path_v2`]: Self::default_path_v2
+    pub fn supplemental_path_v2() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("TIRITH_THREATDB_SUPPLEMENTAL_PATH") {
+            if !p.is_empty() {
+                return Some(v2_sibling(&PathBuf::from(p)));
+            }
+        }
+        policy::data_dir().map(|d| d.join(SUPPLEMENTAL_DB_FILENAME_V2))
+    }
+
+    /// Effective supplemental DB path: the v2 file when present and structurally
+    /// loadable, else the v1 file, else `None` when neither exists. The
+    /// supplemental overlay is intentionally UNSIGNED (its authenticity is
+    /// anchored to local machine policy, not CI), so the resolver requires only
+    /// "parseable" here, never a signature.
+    pub fn resolve_supplemental_path() -> Option<PathBuf> {
+        resolve_preferring_v2(
+            Self::supplemental_path_v2(),
+            Self::supplemental_path(),
+            false,
+        )
+    }
+
+    fn with_supplemental(mut self, supplemental: Option<ThreatDb>) -> Self {
+        self.supplemental = supplemental.map(Box::new);
+        self
+    }
+
+    /// Verify the Ed25519 signature and signer fingerprint against the embedded
+    /// public key. Returns `Err(reason)` on any failure.
+    pub fn verify_signature(&self) -> Result<(), String> {
+        let key_fingerprint = Sha256::digest(VERIFY_KEY_BYTES);
+        let stored_fp = &self.data[FINGERPRINT_OFFSET..FINGERPRINT_OFFSET + FINGERPRINT_LEN];
+        if key_fingerprint.as_slice() != stored_fp {
+            return Err("signer fingerprint does not match embedded public key".to_string());
+        }
+
+        let verify_key = VerifyingKey::from_bytes(VERIFY_KEY_BYTES)
+            .map_err(|e| format!("invalid embedded public key: {e}"))?;
+
+        let sig_bytes = &self.data[SIG_OFFSET..SIG_OFFSET + SIGNATURE_LENGTH];
+        let signature = Signature::from_slice(sig_bytes)
+            .map_err(|e| format!("invalid signature in header: {e}"))?;
+
+        // Signed message = header before sig ++ all data after header.
+        let mut signed_data = Vec::with_capacity(SIG_OFFSET + (self.data.len() - HEADER_SIZE));
+        signed_data.extend_from_slice(&self.data[..SIG_OFFSET]);
+        signed_data.extend_from_slice(&self.data[HEADER_SIZE..]);
+
+        use ed25519_dalek::Verifier;
+        verify_key
+            .verify(&signed_data, &signature)
+            .map_err(|_| "Ed25519 signature verification failed".to_string())
+    }
+
+    pub fn build_time(&self) -> u64 {
+        self.build_timestamp
+    }
+
+    pub fn build_sequence(&self) -> u64 {
+        self.build_sequence
+    }
+
+    pub fn stats(&self) -> ThreatDbStats {
+        let overlay = self
+            .supplemental
+            .as_deref()
+            .map(|db| db.stats())
+            .unwrap_or_default();
+        ThreatDbStats {
+            format_version: self.format_version,
+            build_timestamp: self.build_timestamp,
+            build_sequence: self.build_sequence,
+            package_count: self.pkg_index_count + overlay.package_count,
+            hostname_count: self.hostname_index_count + overlay.hostname_count,
+            ip_count: self.ip_count + overlay.ip_count,
+            typosquat_count: self.typosquat_index_count + overlay.typosquat_count,
+            popular_count: self.popular_index_count + overlay.popular_count,
+            string_table_bytes: self.string_table_size + overlay.string_table_bytes,
+            artifact_sha256_count: self
+                .v2
+                .as_ref()
+                .map_or(0, |sections| sections.artifact_sha_count)
+                + overlay.artifact_sha256_count,
+            file_sha256_count: self
+                .v2
+                .as_ref()
+                .map_or(0, |sections| sections.file_hash_count)
+                + overlay.file_sha256_count,
+            malicious_url_count: self.v2.as_ref().map_or(0, |sections| sections.url_count)
+                + overlay.malicious_url_count,
+        }
+    }
+
+    /// Count how many records each [`ThreatSource`] contributes, across this DB
+    /// and any supplemental overlay. Walks every section (no per-source
+    /// manifest on disk); malformed records are skipped best-effort.
+    pub fn source_breakdown(&self) -> SourceBreakdown {
+        let mut breakdown = self.source_breakdown_self();
+        if let Some(overlay) = self.supplemental.as_deref() {
+            breakdown.merge(overlay.source_breakdown());
+        }
+        breakdown
+    }
+
+    /// Per-source counts for this DB file only (no overlay recursion).
+    fn source_breakdown_self(&self) -> SourceBreakdown {
+        let mut counts: std::collections::BTreeMap<u8, SourceRecordCounts> =
+            std::collections::BTreeMap::new();
+
+        // Packages: index entries point to variable-size records.
+        for i in 0..self.pkg_index_count {
+            if let Some((data_off, _)) = self.pkg_index_entry(i) {
+                if let Some(rec) = self.parse_pkg_record(data_off as usize) {
+                    counts.entry(rec.source as u8).or_default().package_count += 1;
+                }
+            }
+        }
+
+        // Hostnames: record is source(u8) + name_len(u16 LE) + name.
+        for i in 0..self.hostname_index_count {
+            let base = self.hostname_index_offset as usize + i as usize * HOSTNAME_INDEX_ENTRY_SIZE;
+            if let Some(data_off) = read_u32_le(&self.data, base) {
+                if let Some(src) = self
+                    .data
+                    .get(data_off as usize)
+                    .and_then(|&b| ThreatSource::from_u8(b))
+                {
+                    counts.entry(src as u8).or_default().hostname_count += 1;
+                }
+            }
+        }
+
+        // IPs: fixed-size records, source byte at offset+4.
+        for i in 0..self.ip_count {
+            let base = self.ip_offset as usize + i as usize * IP_RECORD_SIZE;
+            if let Some(src) = self
+                .data
+                .get(base + 4)
+                .and_then(|&b| ThreatSource::from_u8(b))
+            {
+                counts.entry(src as u8).or_default().ip_count += 1;
+            }
+        }
+
+        // V2 fixed-record sections carry their source at a stable byte offset.
+        // Descriptor parsing already proved each extent/count pair is in-bounds;
+        // retain checked arithmetic here so this reporting path remains robust if
+        // those invariants change later.
+        if let Some(v2) = self.v2.as_ref() {
+            let mut walk_sources =
+                |offset: u64, count: u64, record_size: usize, source_offset: usize, section: u8| {
+                    for index in 0..count {
+                        let Some(base) = index
+                            .checked_mul(record_size as u64)
+                            .and_then(|delta| offset.checked_add(delta))
+                            .and_then(|absolute| usize::try_from(absolute).ok())
+                        else {
+                            continue;
+                        };
+                        let Some(src) = self
+                            .data
+                            .get(base + source_offset)
+                            .and_then(|&raw| ThreatSource::from_u8(raw))
+                        else {
+                            continue;
+                        };
+                        let entry = counts.entry(src as u8).or_default();
+                        match section {
+                            0 => entry.artifact_sha256_count += 1,
+                            1 => entry.file_sha256_count += 1,
+                            2 => entry.malicious_url_count += 1,
+                            _ => unreachable!("known v2 section selector"),
+                        }
+                    }
+                };
+            walk_sources(
+                v2.artifact_sha_offset,
+                v2.artifact_sha_count,
+                ARTIFACT_SHA_RECORD_SIZE,
+                33,
+                0,
+            );
+            walk_sources(
+                v2.file_hash_offset,
+                v2.file_hash_count,
+                FILE_HASH_RECORD_SIZE,
+                33,
+                1,
+            );
+            walk_sources(v2.url_offset, v2.url_count, URL_INDEX_RECORD_SIZE, 36, 2);
+        }
+
+        // Typosquat records carry no source byte, so attribute that whole index
+        // to its defined source while keeping the section dimension explicit.
+        counts
+            .entry(ThreatSource::EcosystemsTyposquat as u8)
+            .or_default()
+            .typosquat_count += self.typosquat_index_count as u64;
+
+        let by_section: Vec<(ThreatSource, SourceRecordCounts)> = ThreatSource::ALL
+            .iter()
+            .map(|src| (*src, counts.get(&(*src as u8)).copied().unwrap_or_default()))
+            .collect();
+
+        SourceBreakdown {
+            per_source: by_section
+                .iter()
+                .map(|(source, counts)| (*source, counts.total()))
+                .collect(),
+            by_section,
+            // Typosquat and popular counts are also reported as their own
+            // categories (popular has no single source).
+            typosquat_count: self.typosquat_index_count as u64,
+            popular_count: self.popular_index_count as u64,
+        }
+    }
+
+    fn read_string_table_entry(&self, offset: u32) -> Option<&str> {
+        if offset == 0xFFFF_FFFF {
+            return None;
+        }
+        let abs = self.string_table_offset as usize + offset as usize;
+        let len = read_u16_le(&self.data, abs)? as usize;
+        let start = abs + 2;
+        let end = start + len;
+        if end > self.data.len() {
+            return None;
+        }
+        std::str::from_utf8(&self.data[start..end]).ok()
+    }
+
+    /// Returns (data_offset, key_hash) for a package index entry.
+    fn pkg_index_entry(&self, idx: u32) -> Option<(u32, u32)> {
+        let base = self.pkg_index_offset as usize + idx as usize * PKG_INDEX_ENTRY_SIZE;
+        let data_off = read_u32_le(&self.data, base)?;
+        let hash = read_u32_le(&self.data, base + 4)?;
+        Some((data_off, hash))
+    }
+
+    /// Locate every package record that has this registry identity. v2 stores
+    /// canonical keys and therefore scans only the equal-hash index run. A
+    /// canonical v2 key may intentionally retain multiple evidence claims:
+    /// combining their versions, scope, and metadata into one physical record
+    /// would let an unrelated broad claim overwrite stronger exact evidence.
+    /// v1 records must retain their historical spellings for old readers. For
+    /// registries whose identity preserves spelling, the same hash search is
+    /// valid in v1. Other registries need a lazily built canonical index, since
+    /// there can be more than one v1 spelling of
+    /// one modern identity (`foo.bar`, `foo__bar`), and every physical claim in
+    /// either format must participate in assessment.
+    fn package_record_indices(&self, eco: Ecosystem, canonical_name: &str) -> Vec<u32> {
+        if self.format_version >= 2 || package_name_preserves_spelling(eco) {
+            let target_hash = pkg_key_hash(eco, canonical_name.as_bytes());
+            let mut lo = 0;
+            let mut hi = self.pkg_index_count;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let Some((_, hash)) = self.pkg_index_entry(mid) else {
+                    return Vec::new();
+                };
+                if hash < target_hash {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+
+            let mut indices = Vec::new();
+            let mut idx = lo;
+            while idx < self.pkg_index_count {
+                let Some((data_off, hash)) = self.pkg_index_entry(idx) else {
+                    break;
+                };
+                if hash != target_hash {
+                    break;
+                }
+                if self
+                    .parse_pkg_record(data_off as usize)
+                    .is_some_and(|record| record.ecosystem == eco && record.name == canonical_name)
+                {
+                    indices.push(idx);
+                }
+                idx += 1;
+            }
+            return indices;
+        }
+
+        self.legacy_package_index
+            .get_or_init(|| {
+                let mut index = std::collections::HashMap::new();
+                for idx in 0..self.pkg_index_count {
+                    let Some((data_off, _)) = self.pkg_index_entry(idx) else {
+                        continue;
+                    };
+                    // Skip direct-index ecosystems before parsing their version
+                    // lists or allocating canonical names. They never use this
+                    // map, and can comprise most of a legacy database.
+                    if self
+                        .data
+                        .get(data_off as usize)
+                        .and_then(|&value| Ecosystem::from_u8(value))
+                        .is_some_and(package_name_preserves_spelling)
+                    {
+                        continue;
+                    }
+                    let Some(record) = self.parse_pkg_record(data_off as usize) else {
+                        continue;
+                    };
+                    index
+                        .entry((
+                            record.ecosystem,
+                            canonical_package_name(record.ecosystem, record.name),
+                        ))
+                        .or_insert_with(Vec::new)
+                        .push(idx);
+                }
+                index
+            })
+            .get(&(eco, canonical_name.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Group every physical record for one canonical registry identity before
+    /// matching it. Legacy v1 can contain several raw spellings that a new
+    /// reader treats as one package; choosing the first hash/index entry would
+    /// make severity depend on storage order. Each physical claim keeps its own
+    /// versions and evidence until the requested intent identifies which claims
+    /// actually participate.
+    fn package_record_group<'a>(
+        &'a self,
+        eco: Ecosystem,
+        canonical_name: &str,
+    ) -> Option<CanonicalPkgGroup<'a>> {
+        let mut claims = Vec::new();
+        for idx in self.package_record_indices(eco, canonical_name) {
+            let Some(record) = self
+                .pkg_index_entry(idx)
+                .and_then(|(data_off, _)| self.parse_pkg_record(data_off as usize))
+            else {
+                continue;
+            };
+            let mut versions = record.versions;
+            versions.sort_unstable();
+            versions.dedup();
+            claims.push(CanonicalPkgClaim {
+                metadata_name: record.name,
+                source: record.source,
+                confidence: record.confidence,
+                all_versions_malicious: record.all_versions_malicious,
+                versions,
+                reference_url: self.read_string_table_entry(record.reference_offset),
+            });
+        }
+        if claims.is_empty() {
+            return None;
+        }
+        claims.sort_by(|left, right| {
+            pkg_claim_metadata_cmp(left, right).then_with(|| left.versions.cmp(&right.versions))
+        });
+        Some(CanonicalPkgGroup {
+            ecosystem: eco,
+            name: canonical_name.to_string(),
+            claims,
+        })
+    }
+
+    /// Parse a package record at an absolute offset.
+    fn parse_pkg_record(&self, off: usize) -> Option<PkgRecord<'_>> {
+        let eco = Ecosystem::from_u8(*self.data.get(off)?)?;
+        let name_len = read_u16_le(&self.data, off + 1)? as usize;
+        let name_start = off + 3;
+        let name_end = name_start + name_len;
+        if name_end + 4 > self.data.len() {
+            return None;
+        }
+        let name = std::str::from_utf8(&self.data[name_start..name_end]).ok()?;
+        let mut cursor = name_end;
+
+        let source = ThreatSource::from_u8(*self.data.get(cursor)?)?;
+        cursor += 1;
+        let confidence = Confidence::from_u8(*self.data.get(cursor)?)?;
+        cursor += 1;
+        let flags = *self.data.get(cursor)?;
+        cursor += 1;
+        let all_versions_malicious = (flags & 1) != 0;
+
+        let version_count = read_u16_le(&self.data, cursor)? as usize;
+        cursor += 2;
+
+        let mut versions = Vec::with_capacity(version_count);
+        for _ in 0..version_count {
+            let vlen = read_u16_le(&self.data, cursor)? as usize;
+            cursor += 2;
+            let vend = cursor + vlen;
+            if vend > self.data.len() {
+                return None;
+            }
+            let v = std::str::from_utf8(&self.data[cursor..vend]).ok()?;
+            versions.push(v);
+            cursor = vend;
+        }
+
+        let ref_offset = read_u32_le(&self.data, cursor)?;
+
+        Some(PkgRecord {
+            ecosystem: eco,
+            name,
+            source,
+            confidence,
+            all_versions_malicious,
+            versions,
+            reference_offset: ref_offset,
+        })
+    }
+
+    /// Check a package against the threat DB.
+    ///
+    /// - If `version` is `Some`, match if `all_versions_malicious` is set OR
+    ///   the version appears in the record's affected versions list.
+    /// - If `version` is `None`, match only if `all_versions_malicious` is set.
+    pub fn check_package(
+        &self,
+        eco: Ecosystem,
+        name: &str,
+        version: Option<&str>,
+    ) -> Option<ThreatMatch> {
+        let name = canonical_package_name(eco, name);
+        if let Some(group) = self.package_record_group(eco, &name) {
+            let matched_claim = group
+                .claims
+                .iter()
+                .filter(|claim| match version {
+                    Some(v) => {
+                        claim.all_versions_malicious
+                            || claim.versions.iter().any(|rv| {
+                                affected_version_equivalence(eco, rv, v)
+                                    == VersionEquivalence::Equal
+                            })
+                    }
+                    None => claim.all_versions_malicious,
+                })
+                .max_by(|left, right| pkg_claim_metadata_cmp(left, right));
+            if let Some(claim) = matched_claim {
+                return Some(ThreatMatch {
+                    ecosystem: Some(group.ecosystem),
+                    name: group.name.clone(),
+                    source: claim.source,
+                    confidence: claim.confidence,
+                    reference_url: claim.reference_url.map(String::from),
+                    all_versions_malicious: claim.all_versions_malicious,
+                });
+            }
+        }
+
+        self.supplemental
+            .as_deref()
+            .and_then(|db| db.check_package(eco, &name, version))
+    }
+
+    /// Constraint-aware, serializable package threat assessment.
+    ///
+    /// Unlike [`check_package`](Self::check_package) (a yes/no match kept as a
+    /// shim), this distinguishes an unpinned/constrained request that cannot be
+    /// resolved from one that provably excludes every affected version. An
+    /// `all_versions_malicious` record hard-matches even when the intent is
+    /// [`Unspecified`](crate::version_intent::VersionIntent::Unspecified).
+    ///
+    /// Supplemental precedence (merging this DB with its overlay): an exact
+    /// match wins (primary preferred); else if either layer is unresolved the
+    /// result is `Unresolved` with deduplicated affected versions; else a
+    /// concrete intersection; else a proven exclusion; else `NoRecord`. A
+    /// `ConstraintExcludesAffected` is therefore returned only when NO layer is
+    /// exact, intersecting, or unresolved.
+    pub fn assess_package(
+        &self,
+        eco: Ecosystem,
+        name: &str,
+        intent: &crate::version_intent::VersionIntent,
+    ) -> PackageThreatAssessment {
+        let here = self.assess_package_self(eco, name, intent);
+        let overlay = self
+            .supplemental
+            .as_deref()
+            .map(|db| db.assess_package(eco, name, intent));
+        match overlay {
+            Some(overlay) => merge_assessments(here, overlay),
+            None => here,
+        }
+    }
+
+    /// Assess against this DB layer only (no overlay recursion).
+    fn assess_package_self(
+        &self,
+        eco: Ecosystem,
+        name: &str,
+        intent: &crate::version_intent::VersionIntent,
+    ) -> PackageThreatAssessment {
+        let name = canonical_package_name(eco, name);
+        let Some(group) = self.package_record_group(eco, &name) else {
+            return PackageThreatAssessment::NoRecord;
+        };
+        self.assess_package_group(eco, &group, intent)
+    }
+
+    /// Assess one canonical package group after all legacy spellings and claim
+    /// metadata have been combined deterministically.
+    fn assess_package_group(
+        &self,
+        eco: Ecosystem,
+        group: &CanonicalPkgGroup<'_>,
+        intent: &crate::version_intent::VersionIntent,
+    ) -> PackageThreatAssessment {
+        let mut assessments = group
+            .claims
+            .iter()
+            .map(|claim| self.assess_package_claim(eco, group, claim, intent));
+        let Some(first) = assessments.next() else {
+            return PackageThreatAssessment::NoRecord;
+        };
+        assessments.fold(first, merge_canonical_group_assessments)
+    }
+
+    fn assess_package_claim(
+        &self,
+        eco: Ecosystem,
+        group: &CanonicalPkgGroup<'_>,
+        claim: &CanonicalPkgClaim<'_>,
+        intent: &crate::version_intent::VersionIntent,
+    ) -> PackageThreatAssessment {
+        use crate::version_intent::{ReleaseVersion, VersionIntent};
+
+        let summary = self.summarize_claim(group, claim);
+        let affected: Vec<String> = claim.versions.iter().map(|v| v.to_string()).collect();
+
+        // An all-versions-malicious record hard-matches regardless of intent.
+        if claim.all_versions_malicious {
+            return PackageThreatAssessment::ExactMatch(summary);
+        }
+
+        // A version-specific malicious record with no affected-version data
+        // cannot prove either a hit or an exclusion for any request.
+        if claim.versions.is_empty() {
+            return PackageThreatAssessment::Unresolved {
+                summary,
+                reason: UnresolvedReason::AffectedVersionUnparsed,
+                affected_versions: affected,
+            };
+        }
+
+        match intent {
+            VersionIntent::Exact(v) | VersionIntent::Resolved(v) => {
+                let is_resolved = matches!(intent, VersionIntent::Resolved(_));
+                let mut unknown = false;
+                let mut local_overlap = false;
+                let matched = claim.versions.iter().any(|rv| {
+                    match affected_version_equivalence(eco, rv, v) {
+                        VersionEquivalence::Equal => true,
+                        VersionEquivalence::Different => {
+                            if !is_resolved
+                                && pep440_exact_specifier_includes_affected_local(eco, rv, v)
+                            {
+                                local_overlap = true;
+                            }
+                            false
+                        }
+                        VersionEquivalence::Unknown => {
+                            unknown = true;
+                            false
+                        }
+                    }
+                });
+                if matched {
+                    PackageThreatAssessment::ExactMatch(summary)
+                } else if local_overlap {
+                    PackageThreatAssessment::Unresolved {
+                        summary,
+                        reason: UnresolvedReason::ExactSpecifierMayResolveLocal,
+                        affected_versions: affected,
+                    }
+                } else if unknown {
+                    PackageThreatAssessment::Unresolved {
+                        summary,
+                        reason: UnresolvedReason::ExactVersionUnsupported,
+                        affected_versions: affected,
+                    }
+                } else {
+                    // This concrete version is not the malicious one; no record
+                    // for the request in this layer.
+                    PackageThreatAssessment::NoRecord
+                }
+            }
+            VersionIntent::Unspecified => PackageThreatAssessment::Unresolved {
+                summary,
+                reason: UnresolvedReason::UnspecifiedVersion,
+                affected_versions: affected,
+            },
+            VersionIntent::Constraint { parsed, .. } => {
+                let Some(constraint) = parsed else {
+                    return PackageThreatAssessment::Unresolved {
+                        summary,
+                        reason: UnresolvedReason::ConstraintUnsupported,
+                        affected_versions: affected,
+                    };
+                };
+                // Every affected version must parse for a proven exclusion;
+                // otherwise we cannot claim the constraint excludes them.
+                let mut parsed_affected: Vec<(String, ReleaseVersion)> =
+                    Vec::with_capacity(claim.versions.len());
+                for v in &claim.versions {
+                    match ReleaseVersion::parse(v) {
+                        Some(rv) => parsed_affected.push((v.to_string(), rv)),
+                        None => {
+                            return PackageThreatAssessment::Unresolved {
+                                summary,
+                                reason: UnresolvedReason::AffectedVersionUnparsed,
+                                affected_versions: affected,
+                            };
+                        }
+                    }
+                }
+                let intersecting: Vec<String> = parsed_affected
+                    .iter()
+                    .filter(|(_, rv)| constraint.matches(rv))
+                    .map(|(s, _)| s.clone())
+                    .collect();
+                if intersecting.is_empty() {
+                    PackageThreatAssessment::ConstraintExcludesAffected
+                } else {
+                    PackageThreatAssessment::ConstraintIntersectsAffected {
+                        summary,
+                        affected_versions: intersecting,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Build a serializable summary for one claim in a canonical package group.
+    fn summarize_claim(
+        &self,
+        group: &CanonicalPkgGroup<'_>,
+        claim: &CanonicalPkgClaim<'_>,
+    ) -> ThreatMatchSummary {
+        ThreatMatchSummary {
+            ecosystem: group.ecosystem.to_string(),
+            name: group.name.clone(),
+            source_id: claim.source.as_str().to_string(),
+            source_label: claim.source.label().to_string(),
+            confidence: claim.confidence,
+            reference_url: claim.reference_url.map(String::from),
+            all_versions_malicious: claim.all_versions_malicious,
+        }
+    }
+
+    #[cfg(test)]
+    fn binary_search_pkg_index(&self, eco: Ecosystem, name: &str, target_hash: u32) -> Option<u32> {
+        if self.pkg_index_count == 0 {
+            return None;
+        }
+        let mut lo: u32 = 0;
+        let mut hi: u32 = self.pkg_index_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (data_off, hash) = self.pkg_index_entry(mid)?;
+
+            // Compare by hash first (fast path), then verify the actual key.
+            match hash.cmp(&target_hash) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let rec = self.parse_pkg_record(data_off as usize)?;
+                    match (rec.ecosystem as u8, rec.name).cmp(&(eco as u8, name)) {
+                        std::cmp::Ordering::Equal => return Some(mid),
+                        std::cmp::Ordering::Less => lo = mid + 1,
+                        std::cmp::Ordering::Greater => hi = mid,
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check a hostname against the threat DB.
+    pub fn check_hostname(&self, host: &str) -> Option<ThreatMatch> {
+        let normalized = canonical_threat_hostname(host)?;
+        if let Some(m) = self.lookup_hostname_with_domain_scope(&normalized) {
+            return Some(m);
+        }
+        self.supplemental
+            .as_deref()
+            .and_then(|db| db.check_hostname(&normalized))
+    }
+
+    /// Exact lookup, plus label-boundary suffix matching: an indicator for
+    /// `bad.example` also covers `random.bad.example`, because whoever
+    /// controls a listed zone controls every subdomain of it. The walk stops
+    /// before a suffix with fewer than two labels, so a bare TLD can never be
+    /// used as the matching indicator. The indicator name is returned as the
+    /// queried (full) hostname so callers report what was actually seen.
+    fn lookup_hostname_with_domain_scope(&self, normalized: &str) -> Option<ThreatMatch> {
+        let mut candidate = normalized;
+        loop {
+            if let Some(m) = self.lookup_hostname_exact(normalized, candidate) {
+                return Some(m);
+            }
+            let dot = candidate.find('.')?;
+            let parent = &candidate[dot + 1..];
+            if !parent.contains('.') {
+                // The remaining suffix is (at or below) the public-suffix
+                // boundary; never match a single-label indicator.
+                return None;
+            }
+            candidate = parent;
+        }
+    }
+
+    /// Exact-match `candidate` against this database's hostname index,
+    /// reporting the match under the originally queried `normalized` name.
+    fn lookup_hostname_exact(&self, normalized: &str, candidate: &str) -> Option<ThreatMatch> {
+        if self.hostname_index_count == 0 {
+            return None;
+        }
+        let target_hash = fnv1a_hash(candidate.as_bytes());
+
+        let idx = self.binary_search_hostname_index(candidate, target_hash)?;
+        let base = self.hostname_index_offset as usize + idx as usize * HOSTNAME_INDEX_ENTRY_SIZE;
+        let data_off = read_u32_le(&self.data, base)? as usize;
+
+        // Hostname record: source(u8) + name_len(u16 LE) + name(bytes).
+        let source = ThreatSource::from_u8(*self.data.get(data_off)?)?;
+        let name_len = read_u16_le(&self.data, data_off + 1)? as usize;
+        let name_start = data_off + 3;
+        let name_end = name_start + name_len;
+        if name_end > self.data.len() {
+            return None;
+        }
+
+        Some(ThreatMatch {
+            ecosystem: None,
+            name: normalized.to_string(),
+            confidence: source.default_confidence(),
+            source,
+            reference_url: None,
+            all_versions_malicious: false,
+        })
+    }
+
+    fn binary_search_hostname_index(&self, normalized: &str, target_hash: u32) -> Option<u32> {
+        if self.hostname_index_count == 0 {
+            return None;
+        }
+        let mut lo: u32 = 0;
+        let mut hi: u32 = self.hostname_index_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let base =
+                self.hostname_index_offset as usize + mid as usize * HOSTNAME_INDEX_ENTRY_SIZE;
+            let _data_off = read_u32_le(&self.data, base)?;
+            let hash = read_u32_le(&self.data, base + 4)?;
+            match hash.cmp(&target_hash) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let data_off = _data_off as usize;
+                    let name_len = read_u16_le(&self.data, data_off + 1)? as usize;
+                    let name_start = data_off + 3;
+                    let name_end = name_start + name_len;
+                    if name_end > self.data.len() {
+                        return None;
+                    }
+                    let stored = std::str::from_utf8(&self.data[name_start..name_end]).ok()?;
+                    match stored.cmp(normalized) {
+                        std::cmp::Ordering::Equal => return Some(mid),
+                        std::cmp::Ordering::Less => lo = mid + 1,
+                        std::cmp::Ordering::Greater => hi = mid,
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check an IPv4 address against the threat DB.
+    pub fn check_ip(&self, ip: Ipv4Addr) -> Option<ThreatMatch> {
+        if self.ip_count == 0 {
+            return self.supplemental.as_deref().and_then(|db| db.check_ip(ip));
+        }
+        let target = u32::from(ip);
+        let Some(idx) = self.binary_search_ip(target) else {
+            return self.supplemental.as_deref().and_then(|db| db.check_ip(ip));
+        };
+        let base = self.ip_offset as usize + idx as usize * IP_RECORD_SIZE;
+        let source = ThreatSource::from_u8(*self.data.get(base + 4)?)?;
+
+        Some(ThreatMatch {
+            ecosystem: None,
+            name: ip.to_string(),
+            confidence: source.default_confidence(),
+            source,
+            reference_url: None,
+            all_versions_malicious: false,
+        })
+    }
+
+    fn binary_search_ip(&self, target: u32) -> Option<u32> {
+        let mut lo: u32 = 0;
+        let mut hi: u32 = self.ip_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let base = self.ip_offset as usize + mid as usize * IP_RECORD_SIZE;
+            let val = read_u32_le(&self.data, base)?;
+            match val.cmp(&target) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(mid),
+            }
+        }
+        None
+    }
+
+    /// Check a package name against known typosquats.
+    pub fn check_typosquat(&self, eco: Ecosystem, name: &str) -> Option<TyposquatMatch> {
+        let name = canonical_package_name(eco, name);
+        if self.typosquat_index_count == 0 {
+            return self
+                .supplemental
+                .as_deref()
+                .and_then(|db| db.check_typosquat(eco, &name));
+        }
+        let indices: Vec<u32> = if self.format_version >= 2 {
+            let target_hash = pkg_key_hash(eco, name.as_bytes());
+            self.binary_search_typosquat_index(eco, &name, target_hash)
+                .into_iter()
+                .collect()
+        } else {
+            (0..self.typosquat_index_count)
+                .filter(|&idx| {
+                    self.typosquat_names_at(idx)
+                        .is_some_and(|(record_eco, malicious, _)| {
+                            record_eco == eco && canonical_package_name(eco, malicious) == name
+                        })
+                })
+                .collect()
+        };
+        for idx in indices {
+            let Some((record_eco, malicious_name, target_name)) = self.typosquat_names_at(idx)
+            else {
+                continue;
+            };
+            return Some(TyposquatMatch {
+                ecosystem: record_eco,
+                malicious_name: canonical_package_name(record_eco, malicious_name),
+                target_name: canonical_package_name(record_eco, target_name),
+            });
+        }
+
+        self.supplemental
+            .as_deref()
+            .and_then(|db| db.check_typosquat(eco, &name))
+    }
+
+    /// Parse the two names from one typosquat index entry.
+    fn typosquat_names_at(&self, idx: u32) -> Option<(Ecosystem, &str, &str)> {
+        let base = self.typosquat_index_offset as usize + idx as usize * TYPOSQUAT_INDEX_ENTRY_SIZE;
+        let data_off = read_u32_le(&self.data, base)? as usize;
+        let ecosystem = Ecosystem::from_u8(*self.data.get(data_off)?)?;
+        let mut cursor = data_off + 1;
+        let malicious_len = read_u16_le(&self.data, cursor)? as usize;
+        cursor += 2;
+        let malicious_end = cursor.checked_add(malicious_len)?;
+        let malicious_name = std::str::from_utf8(self.data.get(cursor..malicious_end)?).ok()?;
+        cursor = malicious_end;
+        let target_len = read_u16_le(&self.data, cursor)? as usize;
+        cursor += 2;
+        let target_end = cursor.checked_add(target_len)?;
+        let target_name = std::str::from_utf8(self.data.get(cursor..target_end)?).ok()?;
+        Some((ecosystem, malicious_name, target_name))
+    }
+
+    fn binary_search_typosquat_index(
+        &self,
+        eco: Ecosystem,
+        name: &str,
+        target_hash: u32,
+    ) -> Option<u32> {
+        let mut lo: u32 = 0;
+        let mut hi: u32 = self.typosquat_index_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let base =
+                self.typosquat_index_offset as usize + mid as usize * TYPOSQUAT_INDEX_ENTRY_SIZE;
+            let _data_off = read_u32_le(&self.data, base)?;
+            let hash = read_u32_le(&self.data, base + 4)?;
+            match hash.cmp(&target_hash) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let data_off = _data_off as usize;
+                    let rec_eco = Ecosystem::from_u8(*self.data.get(data_off)?)?;
+                    let mal_len = read_u16_le(&self.data, data_off + 1)? as usize;
+                    let mal_start = data_off + 3;
+                    let mal_end = mal_start + mal_len;
+                    if mal_end > self.data.len() {
+                        return None;
+                    }
+                    let stored = std::str::from_utf8(&self.data[mal_start..mal_end]).ok()?;
+                    match (rec_eco as u8, stored).cmp(&(eco as u8, name)) {
+                        std::cmp::Ordering::Equal => return Some(mid),
+                        std::cmp::Ordering::Less => lo = mid + 1,
+                        std::cmp::Ordering::Greater => hi = mid,
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Read a length-prefixed entry from the v2 campaign string table at a
+    /// relative `offset` (`0xFFFF_FFFF` = none). Mirrors the v1 string-table
+    /// reader but keyed off the v2 campaign section's absolute base.
+    fn read_campaign_string(&self, offset: u32) -> Option<&str> {
+        if offset == 0xFFFF_FFFF {
+            return None;
+        }
+        let v2 = self.v2.as_ref()?;
+        let abs = v2.campaign_offset.checked_add(offset as u64)? as usize;
+        let len = read_u16_le(&self.data, abs)? as usize;
+        let start = abs.checked_add(2)?;
+        let end = start.checked_add(len)?;
+        // The string must stay inside the campaign section's own extent.
+        if end as u64 > v2.campaign_offset + v2.campaign_length {
+            return None;
+        }
+        std::str::from_utf8(&self.data[start..end]).ok()
+    }
+
+    /// Binary-search a fixed-record v2 index (artifact or file-hash) whose first
+    /// 32 bytes per record are the full SHA-256, sorted ascending. Returns the
+    /// absolute byte offset of the matching record, or `None`.
+    fn binary_search_hash_index(
+        &self,
+        section_offset: u64,
+        section_count: u64,
+        record_size: usize,
+        target: &[u8; 32],
+    ) -> Option<usize> {
+        if section_count == 0 {
+            return None;
+        }
+        let mut lo: u64 = 0;
+        let mut hi: u64 = section_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let base = (section_offset + mid * record_size as u64) as usize;
+            let stored = self.data.get(base..base + 32)?;
+            match stored.cmp(&target[..]) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(base),
+            }
+        }
+        None
+    }
+
+    /// Look up a wheel/sdist artifact by the FULL 32-byte SHA-256 of its bytes.
+    ///
+    /// Returns `None` for a v1 file (no artifact index) and defers to the
+    /// supplemental overlay on a local miss, exactly mirroring [`check_hostname`].
+    /// This is one of the two methods PR B8 reserved a feature-gated seam for;
+    /// DB-B only ADDS it.
+    ///
+    /// [`check_hostname`]: Self::check_hostname
+    pub fn check_artifact_sha256(&self, sha256: &[u8; 32]) -> Option<ArtifactMatch> {
+        if let Some(v2) = self.v2.as_ref() {
+            if let Some(base) = self.binary_search_hash_index(
+                v2.artifact_sha_offset,
+                v2.artifact_sha_count,
+                ARTIFACT_SHA_RECORD_SIZE,
+                sha256,
+            ) {
+                // Record layout: sha[32] confidence(u8) source(u8) flags(u8)
+                // reserved(u8) campaign_offset(u32).
+                let confidence = Confidence::from_u8(*self.data.get(base + 32)?)?;
+                let source = ThreatSource::from_u8(*self.data.get(base + 33)?)?;
+                let flags = *self.data.get(base + 34)?;
+                let all_versions_malicious = flags & 1 != 0;
+                let campaign_offset = read_u32_le(&self.data, base + 36)?;
+                let campaign = self.read_campaign_string(campaign_offset).map(String::from);
+                return Some(ArtifactMatch {
+                    source,
+                    confidence,
+                    all_versions_malicious,
+                    campaign,
+                });
+            }
+        }
+        self.supplemental
+            .as_deref()
+            .and_then(|db| db.check_artifact_sha256(sha256))
+    }
+
+    /// Look up a file by the FULL 32-byte SHA-256 of its content against the v2
+    /// file-hash index. `None` for v1; defers to supplemental on a miss.
+    pub fn check_file_sha256(&self, sha256: &[u8; 32]) -> Option<FileIndicatorMatch> {
+        if let Some(v2) = self.v2.as_ref() {
+            if let Some(base) = self.binary_search_hash_index(
+                v2.file_hash_offset,
+                v2.file_hash_count,
+                FILE_HASH_RECORD_SIZE,
+                sha256,
+            ) {
+                // Record layout: sha[32] confidence(u8) source(u8)
+                // behavior_tags(u16) campaign_offset(u32).
+                let confidence = Confidence::from_u8(*self.data.get(base + 32)?)?;
+                let source = ThreatSource::from_u8(*self.data.get(base + 33)?)?;
+                let tag_bits = read_u16_le(&self.data, base + 34)?;
+                let campaign_offset = read_u32_le(&self.data, base + 36)?;
+                let campaign = self.read_campaign_string(campaign_offset).map(String::from);
+                return Some(FileIndicatorMatch {
+                    source,
+                    confidence,
+                    behavior_tags: BehaviorTag::from_bits(tag_bits),
+                    campaign,
+                });
+            }
+        }
+        self.supplemental
+            .as_deref()
+            .and_then(|db| db.check_file_sha256(sha256))
+    }
+
+    /// Look up a normalized URL string against the v2 malicious-URL index. The
+    /// index is keyed on the SHA-256 of the normalized URL; after locating the
+    /// hash, the stored URL is compared for an exact match (so a hash collision
+    /// cannot produce a false positive). `None` for v1; defers to supplemental.
+    pub fn check_malicious_url(&self, normalized_url: &str) -> Option<ThreatSource> {
+        if let Some(v2) = self.v2.as_ref() {
+            let digest = Sha256::digest(normalized_url.as_bytes());
+            let mut target = [0u8; 32];
+            target.copy_from_slice(&digest);
+            if let Some(base) = self.binary_search_hash_index(
+                v2.url_offset,
+                v2.url_count,
+                URL_INDEX_RECORD_SIZE,
+                &target,
+            ) {
+                // Record layout: sha[32] url_offset(u32) source(u8) reserved(u8).
+                let url_offset = read_u32_le(&self.data, base + 32)?;
+                let source = ThreatSource::from_u8(*self.data.get(base + 36)?)?;
+                // Compare the stored URL after locating the hash range.
+                if self.read_campaign_string(url_offset) == Some(normalized_url) {
+                    return Some(source);
+                }
+            }
+        }
+        self.supplemental
+            .as_deref()
+            .and_then(|db| db.check_malicious_url(normalized_url))
+    }
+
+    /// Whether `name` is itself a known-popular package in `eco`. Exact-match
+    /// companion to [`check_popular_distance`], which instead flags near-misses.
+    ///
+    /// [`check_popular_distance`]: Self::check_popular_distance
+    pub fn is_popular_package(&self, eco: Ecosystem, name: &str) -> bool {
+        let name = canonical_package_name(eco, name);
+        // Linear scan: the popular index is sorted by (ecosystem, name), not by
+        // hash, so a hash-keyed binary search would be unsound.
+        for i in 0..self.popular_index_count {
+            let base = self.popular_index_offset as usize + i as usize * POPULAR_INDEX_ENTRY_SIZE;
+            let data_off = match read_u32_le(&self.data, base) {
+                Some(v) => v as usize,
+                None => continue,
+            };
+            let rec_eco = match self.data.get(data_off).and_then(|&b| Ecosystem::from_u8(b)) {
+                Some(e) => e,
+                None => continue,
+            };
+            if rec_eco != eco {
+                continue;
+            }
+            let name_len = match read_u16_le(&self.data, data_off + 1) {
+                Some(l) => l as usize,
+                None => continue,
+            };
+            let name_start = data_off + 3;
+            let name_end = name_start + name_len;
+            if name_end > self.data.len() {
+                continue;
+            }
+            if let Ok(popular_name) = std::str::from_utf8(&self.data[name_start..name_end]) {
+                if canonical_package_name(rec_eco, popular_name) == name {
+                    return true;
+                }
+            }
+        }
+        self.supplemental
+            .as_deref()
+            .map(|db| db.is_popular_package(eco, &name))
+            .unwrap_or(false)
+    }
+
+    /// Find the closest popular package name within Levenshtein distance.
+    /// Returns `(popular_name, distance)` if distance <= 1.
+    pub fn check_popular_distance(&self, eco: Ecosystem, name: &str) -> Option<(String, usize)> {
+        let name = canonical_package_name(eco, name);
+        // Linear scan is fine for ~5k short names.
+        let mut best: Option<(String, usize)> = None;
+        let max_distance = 1;
+
+        for i in 0..self.popular_index_count {
+            let base = self.popular_index_offset as usize + i as usize * POPULAR_INDEX_ENTRY_SIZE;
+            let data_off = match read_u32_le(&self.data, base) {
+                Some(v) => v as usize,
+                None => continue,
+            };
+
+            // Popular record: ecosystem(u8) + name_len(u16 LE) + name(bytes).
+            let rec_eco = match self.data.get(data_off).and_then(|&b| Ecosystem::from_u8(b)) {
+                Some(e) => e,
+                None => continue,
+            };
+            if rec_eco != eco {
+                continue;
+            }
+
+            let name_len = match read_u16_le(&self.data, data_off + 1) {
+                Some(l) => l as usize,
+                None => continue,
+            };
+            let name_start = data_off + 3;
+            let name_end = name_start + name_len;
+            if name_end > self.data.len() {
+                continue;
+            }
+            let popular_name = match std::str::from_utf8(&self.data[name_start..name_end]) {
+                Ok(s) => canonical_package_name(rec_eco, s),
+                Err(_) => continue,
+            };
+
+            // Skip exact matches — the package itself is popular, not suspicious.
+            if popular_name == name {
+                continue;
+            }
+
+            let dist = levenshtein(&name, &popular_name);
+            if dist <= max_distance {
+                match &best {
+                    Some((_, d)) if dist < *d => {
+                        best = Some((popular_name.clone(), dist));
+                    }
+                    None => {
+                        best = Some((popular_name.clone(), dist));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let overlay = self
+            .supplemental
+            .as_deref()
+            .and_then(|db| db.check_popular_distance(eco, &name));
+
+        // Return whichever result has the smaller edit distance; prefer primary on tie.
+        match (best, overlay) {
+            (Some(a), Some(b)) if b.1 < a.1 => Some(b),
+            (Some(a), _) => Some(a),
+            (None, b) => b,
+        }
+    }
+
+    /// Get the cached threat DB instance, loading/reloading as needed.
+    /// Re-checks file mtime every 60s; returns `None` on miss/failure (fail-open).
+    pub fn cached() -> Option<Arc<ThreatDb>> {
+        let cache = CACHE.get_or_init(ThreatDbCache::new);
+        cache.get()
+    }
+
+    /// Force-refresh the cached DB. Honors source/overlay changes even when the
+    /// primary build sequence is unchanged (tests, supplemental rebuilds).
+    pub fn refresh_cache() {
+        if let Some(cache) = CACHE.get() {
+            cache.force_reload();
+        } else {
+            let _ = CACHE.get_or_init(ThreatDbCache::new);
+        }
+    }
+}
+
+// Internal parsed record (borrows from DB data).
+struct PkgRecord<'a> {
+    ecosystem: Ecosystem,
+    name: &'a str,
+    source: ThreatSource,
+    confidence: Confidence,
+    all_versions_malicious: bool,
+    versions: Vec<&'a str>,
+    reference_offset: u32,
+}
+
+/// One logical registry identity after canonical-equivalent physical records
+/// have been grouped. Each claim retains its own versions and evidence so a
+/// high-confidence claim for version A cannot promote an unrelated version B.
+struct CanonicalPkgGroup<'a> {
+    ecosystem: Ecosystem,
+    name: String,
+    claims: Vec<CanonicalPkgClaim<'a>>,
+}
+
+struct CanonicalPkgClaim<'a> {
+    metadata_name: &'a str,
+    source: ThreatSource,
+    confidence: Confidence,
+    all_versions_malicious: bool,
+    versions: Vec<&'a str>,
+    reference_url: Option<&'a str>,
+}
+
+/// Total, semantic ordering for evidence attached to claims of the same
+/// canonical package. Among claims that actually participate in the requested
+/// version assessment, stronger confidence wins before breadth of scope. This
+/// prevents a weaker all-version claim from downgrading an overlapping
+/// confirmed exact-version claim. An actual reference, source, reference value,
+/// and raw spelling are deterministic tie-breakers; all metadata always moves
+/// as one evidence unit.
+fn pkg_claim_metadata_cmp(
+    left: &CanonicalPkgClaim<'_>,
+    right: &CanonicalPkgClaim<'_>,
+) -> std::cmp::Ordering {
+    (
+        left.confidence,
+        left.all_versions_malicious,
+        left.reference_url.is_some(),
+        left.source.as_str(),
+        left.reference_url.unwrap_or(""),
+        left.metadata_name,
+    )
+        .cmp(&(
+            right.confidence,
+            right.all_versions_malicious,
+            right.reference_url.is_some(),
+            right.source.as_str(),
+            right.reference_url.unwrap_or(""),
+            right.metadata_name,
+        ))
+}
+
+fn threat_summary_cmp(left: &ThreatMatchSummary, right: &ThreatMatchSummary) -> std::cmp::Ordering {
+    (
+        left.confidence,
+        left.all_versions_malicious,
+        left.reference_url.is_some(),
+        left.source_id.as_str(),
+        left.reference_url.as_deref().unwrap_or(""),
+        left.name.as_str(),
+    )
+        .cmp(&(
+            right.confidence,
+            right.all_versions_malicious,
+            right.reference_url.is_some(),
+            right.source_id.as_str(),
+            right.reference_url.as_deref().unwrap_or(""),
+            right.name.as_str(),
+        ))
+}
+
+/// Merge two assessments from physical records in the same canonical v1
+/// group. Outcome precedence matches the cross-layer merge below, but evidence
+/// selection is semantic rather than "first record wins". Only claims that
+/// produced the winning outcome can provide its summary.
+fn merge_canonical_group_assessments(
+    left: PackageThreatAssessment,
+    right: PackageThreatAssessment,
+) -> PackageThreatAssessment {
+    use PackageThreatAssessment as P;
+
+    match (&left, &right) {
+        (P::ExactMatch(left_summary), P::ExactMatch(right_summary)) => {
+            return if threat_summary_cmp(right_summary, left_summary).is_gt() {
+                P::ExactMatch(right_summary.clone())
+            } else {
+                P::ExactMatch(left_summary.clone())
+            };
+        }
+        (P::ExactMatch(summary), _) => return P::ExactMatch(summary.clone()),
+        (_, P::ExactMatch(summary)) => return P::ExactMatch(summary.clone()),
+        _ => {}
+    }
+
+    let affected_from = |assessment: &PackageThreatAssessment| -> Vec<String> {
+        match assessment {
+            P::ConstraintIntersectsAffected {
+                affected_versions, ..
+            }
+            | P::Unresolved {
+                affected_versions, ..
+            } => affected_versions.clone(),
+            _ => Vec::new(),
+        }
+    };
+    let merged_affected = || {
+        let mut affected = affected_from(&left);
+        affected.extend(affected_from(&right));
+        affected.sort();
+        affected.dedup();
+        affected
+    };
+
+    let unresolved = match (&left, &right) {
+        (
+            P::Unresolved {
+                summary: left_summary,
+                reason: left_reason,
+                ..
+            },
+            P::Unresolved {
+                summary: right_summary,
+                reason: right_reason,
+                ..
+            },
+        ) => {
+            if threat_summary_cmp(right_summary, left_summary).is_gt() {
+                Some((right_summary.clone(), *right_reason))
+            } else {
+                Some((left_summary.clone(), *left_reason))
+            }
+        }
+        (
+            P::Unresolved {
+                summary, reason, ..
+            },
+            _,
+        )
+        | (
+            _,
+            P::Unresolved {
+                summary, reason, ..
+            },
+        ) => Some((summary.clone(), *reason)),
+        _ => None,
+    };
+    if let Some((summary, reason)) = unresolved {
+        return P::Unresolved {
+            summary,
+            reason,
+            affected_versions: merged_affected(),
+        };
+    }
+
+    let intersecting_summary = match (&left, &right) {
+        (
+            P::ConstraintIntersectsAffected {
+                summary: left_summary,
+                ..
+            },
+            P::ConstraintIntersectsAffected {
+                summary: right_summary,
+                ..
+            },
+        ) => Some(if threat_summary_cmp(right_summary, left_summary).is_gt() {
+            right_summary.clone()
+        } else {
+            left_summary.clone()
+        }),
+        (P::ConstraintIntersectsAffected { summary, .. }, _)
+        | (_, P::ConstraintIntersectsAffected { summary, .. }) => Some(summary.clone()),
+        _ => None,
+    };
+    if let Some(summary) = intersecting_summary {
+        return P::ConstraintIntersectsAffected {
+            summary,
+            affected_versions: merged_affected(),
+        };
+    }
+
+    if matches!(left, P::ConstraintExcludesAffected)
+        || matches!(right, P::ConstraintExcludesAffected)
+    {
+        P::ConstraintExcludesAffected
+    } else {
+        P::NoRecord
+    }
+}
+
+/// Combine a primary-layer assessment with a supplemental-layer assessment.
+///
+/// Precedence (`primary` preferred on ties): an exact match wins; else if
+/// either layer is unresolved the result is `Unresolved` with deduplicated
+/// affected versions drawn from every layer that names any (so the warning
+/// lists them all); else a concrete intersection (deduped); else a proven
+/// exclusion; else `NoRecord`. Crucially, `ConstraintExcludesAffected` (which
+/// emits NO warning) survives only when no layer is exact, unresolved, or
+/// intersecting, so the overlay can never silence a primary hit and vice versa.
+fn merge_assessments(
+    primary: PackageThreatAssessment,
+    overlay: PackageThreatAssessment,
+) -> PackageThreatAssessment {
+    use PackageThreatAssessment as P;
+
+    // 1. Exact match wins, primary preferred.
+    if let P::ExactMatch(s) = &primary {
+        return P::ExactMatch(s.clone());
+    }
+    if let P::ExactMatch(s) = &overlay {
+        return P::ExactMatch(s.clone());
+    }
+
+    // Collect affected versions named by either layer (for the merged lists).
+    let affected_from = |a: &PackageThreatAssessment| -> Vec<String> {
+        match a {
+            P::ConstraintIntersectsAffected {
+                affected_versions, ..
+            }
+            | P::Unresolved {
+                affected_versions, ..
+            } => affected_versions.clone(),
+            _ => Vec::new(),
+        }
+    };
+    let summary_from = |a: &PackageThreatAssessment| -> Option<ThreatMatchSummary> {
+        match a {
+            P::ConstraintIntersectsAffected { summary, .. } | P::Unresolved { summary, .. } => {
+                Some(summary.clone())
+            }
+            _ => None,
+        }
+    };
+    let merge_affected = || {
+        let mut v = affected_from(&primary);
+        v.extend(affected_from(&overlay));
+        v.sort();
+        v.dedup();
+        v
+    };
+
+    // 2. Any unresolved layer makes the result unresolved (primary's reason and
+    // summary preferred), carrying the union of affected versions.
+    let primary_unresolved = matches!(primary, P::Unresolved { .. });
+    let overlay_unresolved = matches!(overlay, P::Unresolved { .. });
+    if primary_unresolved || overlay_unresolved {
+        let (reason, summary) = if let P::Unresolved {
+            reason, summary, ..
+        } = &primary
+        {
+            (*reason, summary.clone())
+        } else if let P::Unresolved {
+            reason, summary, ..
+        } = &overlay
+        {
+            (*reason, summary.clone())
+        } else {
+            unreachable!("one layer is Unresolved")
+        };
+        return P::Unresolved {
+            summary,
+            reason,
+            affected_versions: merge_affected(),
+        };
+    }
+
+    // 3. A concrete intersection in either layer (primary summary preferred).
+    let primary_intersects = matches!(primary, P::ConstraintIntersectsAffected { .. });
+    let overlay_intersects = matches!(overlay, P::ConstraintIntersectsAffected { .. });
+    if primary_intersects || overlay_intersects {
+        let summary = summary_from(&primary)
+            .or_else(|| summary_from(&overlay))
+            .expect("an intersecting layer carries a summary");
+        return P::ConstraintIntersectsAffected {
+            summary,
+            affected_versions: merge_affected(),
+        };
+    }
+
+    // 4. A proven exclusion in either layer (no exact/unresolved/intersect
+    // anywhere, so this is safe to report as "no warning").
+    if matches!(primary, P::ConstraintExcludesAffected)
+        || matches!(overlay, P::ConstraintExcludesAffected)
+    {
+        return P::ConstraintExcludesAffected;
+    }
+
+    // 5. Neither layer had any record.
+    P::NoRecord
+}
+
+static CACHE: OnceLock<ThreatDbCache> = OnceLock::new();
+
+struct ThreatDbCache {
+    state: RwLock<Option<CachedThreatDb>>,
+    last_mtime_check: AtomicU64,
+}
+
+struct CachedThreatDb {
+    db: Arc<ThreatDb>,
+    source: CacheSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheFile {
+    path: PathBuf,
+    modified: std::time::SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl CacheFile {
+    fn from_path(path: PathBuf) -> Option<Self> {
+        let metadata = std::fs::metadata(&path).ok()?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            path,
+            modified: metadata.modified().ok()?,
+            len: metadata.len(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+}
+
+/// Compare complete source metadata, retaining subsecond changes and resolved
+/// paths. A seconds-only combined stamp misses rapid overlay replacements and
+/// switches to a different DB file with the same timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheSource {
+    primary: CacheFile,
+    supplemental: Option<CacheFile>,
+}
+
+impl ThreatDbCache {
+    fn new() -> Self {
+        let cache = Self {
+            state: RwLock::new(None),
+            last_mtime_check: AtomicU64::new(0),
+        };
+        // Attempt initial load
+        cache.force_reload();
+        cache
+    }
+
+    fn get(&self) -> Option<Arc<ThreatDb>> {
+        let now = unix_now();
+        let last_check = self.last_mtime_check.load(Ordering::Relaxed);
+        if now.saturating_sub(last_check) >= MTIME_CHECK_INTERVAL_SECS {
+            self.last_mtime_check.store(now, Ordering::Relaxed);
+            match current_cache_source() {
+                Some(source) => {
+                    let changed = self.state.read().ok().is_some_and(|guard| {
+                        guard.as_ref().is_none_or(|cached| cached.source != source)
+                    });
+                    if changed {
+                        self.reload(&source, false);
+                    }
+                }
+                None => self.clear(),
+            }
+        }
+        self.state
+            .read()
+            .ok()?
+            .as_ref()
+            .map(|cached| Arc::clone(&cached.db))
+    }
+
+    fn force_reload(&self) {
+        if let Some(source) = current_cache_source() {
+            self.reload(&source, true);
+        } else {
+            self.clear();
+        }
+    }
+
+    fn reload(&self, source: &CacheSource, allow_downgrade: bool) {
+        match ThreatDb::load_from_path(&source.primary.path, 0) {
+            Ok(primary_db) => {
+                if let Err(e) = primary_db.verify_signature() {
+                    eprintln!(
+                        "tirith: warning: threat DB failed signature verification, ignoring update: {e}"
+                    );
+                    return;
+                }
+                // Supplemental overlays are intentionally NOT signature-verified
+                // (authenticity is anchored to local machine policy, not CI);
+                // `load_from_path` still validates binary structure/header/version.
+                let supplemental_db = source.supplemental.as_ref().and_then(|file| {
+                    match ThreatDb::load_from_path(&file.path, 0) {
+                        Ok(db) => Some(db),
+                        Err(e) => {
+                            eprintln!(
+                                "tirith: warning: failed to load supplemental threat DB {}: {e}",
+                                file.path.display()
+                            );
+                            None
+                        }
+                    }
+                });
+                let new_db = primary_db.with_supplemental(supplemental_db);
+                if let Ok(mut guard) = self.state.write() {
+                    // Read the currently accepted sequence under the publication
+                    // lock: another reload may have completed during validation.
+                    let current_seq = guard.as_ref().map_or(0, |cached| cached.db.build_sequence);
+                    let source_changed =
+                        guard.as_ref().is_none_or(|cached| cached.source != *source);
+                    if should_replace_cached_db(
+                        current_seq,
+                        new_db.build_sequence,
+                        source_changed,
+                        allow_downgrade,
+                    ) {
+                        // Publish the DB and its accepted source together. A bad
+                        // signature, malformed primary DB, or rollback never
+                        // advances it. Invalid supplemental data is still omitted.
+                        *guard = Some(CachedThreatDb {
+                            db: Arc::new(new_db),
+                            source: source.clone(),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("tirith: warning: failed to reload threat DB: {e}");
+            }
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut guard) = self.state.write() {
+            *guard = None;
+        }
+    }
+}
+
+fn should_replace_cached_db(
+    current_sequence: u64,
+    new_sequence: u64,
+    source_changed: bool,
+    allow_downgrade: bool,
+) -> bool {
+    allow_downgrade
+        || current_sequence == 0
+        || new_sequence > current_sequence
+        || (new_sequence == current_sequence && source_changed)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Derive the `*-v2.dat` sibling of a `.dat` path: replace a trailing `.dat`
+/// extension with `-v2.dat`, falling back to appending `-v2` for any other name.
+fn v2_sibling(path: &Path) -> PathBuf {
+    if path.extension().and_then(|e| e.to_str()) == Some("dat") {
+        let mut s = path.as_os_str().to_os_string();
+        // Strip ".dat" (4 bytes) and append "-v2.dat".
+        let lossy = s.to_string_lossy();
+        if let Some(stem) = lossy.strip_suffix(".dat") {
+            return PathBuf::from(format!("{stem}-v2.dat"));
+        }
+        s.push("-v2");
+        return PathBuf::from(s);
+    }
+    let mut s = path.as_os_str().to_os_string();
+    s.push("-v2");
+    PathBuf::from(s)
+}
+
+/// Prefer `v2_path` when it exists AND loads (any format), else `v1_path` when
+/// it exists, else `None`. "Loads" means [`ThreatDb::load_from_path`] succeeds;
+/// when `require_signature` is set, the v2 file must ALSO pass
+/// [`ThreatDb::verify_signature`]. A present-but-corrupt (or, for the signed
+/// primary, wrongly-signed) v2 file is skipped so it never shadows a good v1.
+fn resolve_preferring_v2(
+    v2_path: Option<PathBuf>,
+    v1_path: Option<PathBuf>,
+    require_signature: bool,
+) -> Option<PathBuf> {
+    if let Some(ref v2) = v2_path {
+        if v2.exists() {
+            if let Ok(db) = ThreatDb::load_from_path(v2, 0) {
+                if !require_signature || db.verify_signature().is_ok() {
+                    return v2_path;
+                }
+            }
+        }
+    }
+    match v1_path {
+        Some(p) if p.exists() => Some(p),
+        // No v1 file but a (corrupt-or-not) v2 path: fall back to whatever v1
+        // path was configured so the caller's "missing" handling is unchanged.
+        _ => v1_path,
+    }
+}
+
+fn current_cache_source() -> Option<CacheSource> {
+    // Prefer the v2 primary/supplemental files when present and parseable; an
+    // old binary never reaches this code and only ever reads the v1 names.
+    let primary = CacheFile::from_path(ThreatDb::resolve_primary_path()?)?;
+    let supplemental = ThreatDb::resolve_supplemental_path().and_then(CacheFile::from_path);
+    Some(CacheSource {
+        primary,
+        supplemental,
+    })
+}
+
+/// Builder for creating threat DB files (used by the compiler binary to
+/// produce `.dat` files).
+///
+/// Usage:
+/// ```ignore
+/// let mut writer = ThreatDbWriter::new(build_timestamp, build_sequence);
+/// writer.add_package(Ecosystem::Npm, "evil-pkg", &["1.0.0"], ThreatSource::OssfMalicious,
+///                    Confidence::Confirmed, true, Some("https://ref"));
+/// writer.add_ip(Ipv4Addr::new(1,2,3,4), ThreatSource::FeodoTracker);
+/// writer.write_to(Path::new("threatdb.dat"), &signing_key)?;
+/// ```
+#[derive(Clone)]
+pub struct ThreatDbWriter {
+    build_timestamp: u64,
+    build_sequence: u64,
+    packages: Vec<WriterPkg>,
+    hostnames: Vec<WriterHostname>,
+    ips: Vec<WriterIp>,
+    typosquats: Vec<WriterTyposquat>,
+    popular: Vec<WriterPopular>,
+    string_table: StringTable,
+    // v2-only inputs. Empty for a v1 build; only emitted by `build_format(V2,..)`.
+    artifact_shas: Vec<WriterArtifactSha>,
+    file_hashes: Vec<WriterFileHash>,
+    malicious_urls: Vec<WriterMaliciousUrl>,
+}
+
+#[derive(Clone)]
+struct WriterArtifactSha {
+    sha256: [u8; 32],
+    source: ThreatSource,
+    confidence: Confidence,
+    all_versions_malicious: bool,
+    /// Campaign label offset into the v2 campaign string table (set at build).
+    campaign: Option<String>,
+}
+
+#[derive(Clone)]
+struct WriterFileHash {
+    sha256: [u8; 32],
+    source: ThreatSource,
+    confidence: Confidence,
+    behavior_tags: u16,
+    campaign: Option<String>,
+}
+
+#[derive(Clone)]
+struct WriterMaliciousUrl {
+    /// The normalized URL string (stored in the campaign string table) and
+    /// keyed in the index by its SHA-256.
+    normalized_url: String,
+    source: ThreatSource,
+}
+
+#[derive(Clone)]
+struct WriterPkg {
+    ecosystem: Ecosystem,
+    name: String,
+    versions: Vec<String>,
+    source: ThreatSource,
+    confidence: Confidence,
+    all_versions_malicious: bool,
+    reference_offset: u32, // into string table
+}
+
+#[derive(Clone)]
+struct WriterHostname {
+    name: String,
+    source: ThreatSource,
+}
+
+#[derive(Clone)]
+struct WriterIp {
+    addr: u32,
+    source: ThreatSource,
+}
+
+#[derive(Clone)]
+struct WriterTyposquat {
+    ecosystem: Ecosystem,
+    malicious_name: String,
+    target_name: String,
+}
+
+#[derive(Clone)]
+struct WriterPopular {
+    ecosystem: Ecosystem,
+    name: String,
+}
+
+/// Deduplicated string table builder.
+#[derive(Clone)]
+struct StringTable {
+    data: Vec<u8>,
+    index: std::collections::HashMap<String, u32>,
+    /// Set when an interned string exceeded a format limit. The build fails
+    /// instead of emitting a table whose length prefix wrapped.
+    overflowed: bool,
+}
+
+impl StringTable {
+    fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            index: std::collections::HashMap::new(),
+            overflowed: false,
+        }
+    }
+
+    /// Intern a string, returning its offset. Strings that exceed the u16
+    /// length prefix, or a table that exceeds the u32 offset space, mark the
+    /// table overflowed: the build then fails closed instead of serializing a
+    /// corrupt prefix. Returns the no-reference sentinel on overflow.
+    fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&off) = self.index.get(s) {
+            return off;
+        }
+        let bytes = s.as_bytes();
+        let Ok(len) = u16_len(bytes.len(), "string table entry too long") else {
+            self.overflowed = true;
+            return 0xFFFF_FFFF;
+        };
+        let Ok(off) = u32_off(self.data.len(), "string table too large") else {
+            self.overflowed = true;
+            return 0xFFFF_FFFF;
+        };
+        if self.data.len() + 2 + bytes.len() > u32::MAX as usize {
+            self.overflowed = true;
+            return 0xFFFF_FFFF;
+        }
+        self.data.extend_from_slice(&len.to_le_bytes());
+        self.data.extend_from_slice(bytes);
+        self.index.insert(s.to_string(), off);
+        off
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    fn len(&self) -> u32 {
+        self.data.len() as u32
+    }
+}
+
+impl ThreatDbWriter {
+    pub fn new(build_timestamp: u64, build_sequence: u64) -> Self {
+        Self {
+            build_timestamp,
+            build_sequence,
+            packages: Vec::new(),
+            hostnames: Vec::new(),
+            ips: Vec::new(),
+            typosquats: Vec::new(),
+            popular: Vec::new(),
+            string_table: StringTable::new(),
+            artifact_shas: Vec::new(),
+            file_hashes: Vec::new(),
+            malicious_urls: Vec::new(),
+        }
+    }
+
+    /// Add a malicious-artifact record keyed by the FULL 32-byte SHA-256 of the
+    /// artifact bytes. v2-only: ignored by a `ThreatDbFormat::V1` build.
+    pub fn add_artifact_sha256(
+        &mut self,
+        sha256: [u8; 32],
+        source: ThreatSource,
+        confidence: Confidence,
+        all_versions_malicious: bool,
+        campaign: Option<&str>,
+    ) {
+        self.artifact_shas.push(WriterArtifactSha {
+            sha256,
+            source,
+            confidence,
+            all_versions_malicious,
+            campaign: campaign.map(str::to_string),
+        });
+    }
+
+    /// Add a malicious-file record keyed by the FULL 32-byte SHA-256 of the file
+    /// content, carrying a behavior-tag bitset. v2-only.
+    pub fn add_file_sha256(
+        &mut self,
+        sha256: [u8; 32],
+        source: ThreatSource,
+        confidence: Confidence,
+        behavior_tags: &[BehaviorTag],
+        campaign: Option<&str>,
+    ) {
+        let bits = behavior_tags.iter().fold(0u16, |acc, t| acc | t.mask());
+        self.file_hashes.push(WriterFileHash {
+            sha256,
+            source,
+            confidence,
+            behavior_tags: bits,
+            campaign: campaign.map(str::to_string),
+        });
+    }
+
+    /// Add a malicious-URL record. The normalized URL is stored and the index is
+    /// keyed by its SHA-256. Populate ONLY from explicit indicator fields, never
+    /// OpenSSF `references`. v2-only.
+    pub fn add_malicious_url(&mut self, normalized_url: &str, source: ThreatSource) {
+        self.malicious_urls.push(WriterMaliciousUrl {
+            normalized_url: normalized_url.to_string(),
+            source,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_package(
+        &mut self,
+        eco: Ecosystem,
+        name: &str,
+        versions: &[&str],
+        source: ThreatSource,
+        confidence: Confidence,
+        all_versions_malicious: bool,
+        reference: Option<&str>,
+    ) {
+        let ref_offset = match reference {
+            Some(r) => self.string_table.intern(r),
+            None => 0xFFFF_FFFF,
+        };
+        self.packages.push(WriterPkg {
+            ecosystem: eco,
+            // Keep the caller's spelling here. A v1 build is a compatibility
+            // artifact consumed by binaries whose reader performs literal key
+            // and version comparisons. Only a v2 working copy is canonicalized
+            // in `build_format_in_place` below.
+            name: name.to_string(),
+            versions: versions
+                .iter()
+                .map(|version| (*version).to_string())
+                .collect(),
+            source,
+            confidence,
+            all_versions_malicious,
+            reference_offset: ref_offset,
+        });
+    }
+
+    pub fn add_hostname(&mut self, name: &str, source: ThreatSource) {
+        if let Some(name) = canonical_threat_hostname(name) {
+            self.hostnames.push(WriterHostname { name, source });
+        }
+    }
+
+    pub fn add_ip(&mut self, addr: Ipv4Addr, source: ThreatSource) {
+        self.ips.push(WriterIp {
+            addr: u32::from(addr),
+            source,
+        });
+    }
+
+    pub fn add_typosquat(&mut self, eco: Ecosystem, malicious_name: &str, target_name: &str) {
+        self.typosquats.push(WriterTyposquat {
+            ecosystem: eco,
+            malicious_name: malicious_name.to_string(),
+            target_name: target_name.to_string(),
+        });
+    }
+
+    pub fn add_popular(&mut self, eco: Ecosystem, name: &str) {
+        self.popular.push(WriterPopular {
+            ecosystem: eco,
+            name: name.to_string(),
+        });
+    }
+
+    /// Build and write a v1 database to a file. Signs with the provided keypair.
+    pub fn write_to(
+        mut self,
+        path: &Path,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(), ThreatDbError> {
+        let bytes = self.build(signing_key)?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    /// Build and write a database of the requested format to a file.
+    pub fn write_to_format(
+        mut self,
+        format: ThreatDbFormat,
+        path: &Path,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(), ThreatDbError> {
+        let bytes = self.build_format(format, signing_key)?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    /// Build a v1 database into bytes (the legacy default). Byte-for-byte the
+    /// pre-v2 layout: no footer, no v2 sections, version stamp 1.
+    pub fn build(
+        &mut self,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<Vec<u8>, ThreatDbError> {
+        self.build_format(ThreatDbFormat::V1, signing_key)
+    }
+
+    /// Build a database of the requested format into bytes. A v1 build emits the
+    /// legacy layout unchanged; a v2 build appends the artifact / file-hash /
+    /// URL / campaign / behavior sections, a checked descriptor trailer, and a
+    /// fixed EOF footer, all AFTER `HEADER_SIZE` so the existing signed range
+    /// (`[0..SIG_OFFSET)` ++ `[HEADER_SIZE..)`) covers them unchanged.
+    pub fn build_format(
+        &mut self,
+        format: ThreatDbFormat,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<Vec<u8>, ThreatDbError> {
+        // Building one format must not rewrite the source data used by a later
+        // build of the other format. In particular, the compiler emits v1 and
+        // then v2 from one writer: old binaries need the v1 feed spellings,
+        // while new binaries get canonical v2 identities.
+        let mut working = self.clone();
+        working.build_format_in_place(format, signing_key)
+    }
+
+    fn build_format_in_place(
+        &mut self,
+        format: ThreatDbFormat,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<Vec<u8>, ThreatDbError> {
+        if format == ThreatDbFormat::V2 {
+            for package in &mut self.packages {
+                package.name = canonical_package_name(package.ecosystem, &package.name);
+                for version in &mut package.versions {
+                    *version = canonical_version_for_storage(package.ecosystem, version);
+                }
+            }
+            for typosquat in &mut self.typosquats {
+                typosquat.malicious_name =
+                    canonical_package_name(typosquat.ecosystem, &typosquat.malicious_name);
+                typosquat.target_name =
+                    canonical_package_name(typosquat.ecosystem, &typosquat.target_name);
+            }
+            for popular in &mut self.popular {
+                popular.name = canonical_package_name(popular.ecosystem, &popular.name);
+            }
+        }
+
+        // Sort and deduplicate each section.
+        // Canonical spellings can make previously distinct feed records share
+        // one registry key (for example PyPI `foo.bar` and `foo__bar`). Merge
+        // only claims whose complete evidence identity and scope agree. A
+        // version-specific Confirmed claim and an all-version Medium claim must
+        // remain separate physical records: OR-ing their scope and selecting
+        // one metadata tuple would necessarily corrupt one of the two results.
+        // Sorting by the full claim identity makes equal claims adjacent, so
+        // their affected versions can still be combined in O(n) time.
+        if format == ThreatDbFormat::V2 {
+            self.packages.sort_by(|a, b| {
+                (
+                    a.ecosystem as u8,
+                    &a.name,
+                    a.source as u8,
+                    a.confidence as u8,
+                    a.all_versions_malicious,
+                    a.reference_offset,
+                )
+                    .cmp(&(
+                        b.ecosystem as u8,
+                        &b.name,
+                        b.source as u8,
+                        b.confidence as u8,
+                        b.all_versions_malicious,
+                        b.reference_offset,
+                    ))
+            });
+            let mut merged_packages: Vec<WriterPkg> = Vec::with_capacity(self.packages.len());
+            for mut package in std::mem::take(&mut self.packages) {
+                if let Some(existing) = merged_packages.last_mut().filter(|existing| {
+                    existing.ecosystem == package.ecosystem
+                        && existing.name == package.name
+                        && existing.source == package.source
+                        && existing.confidence == package.confidence
+                        && existing.all_versions_malicious == package.all_versions_malicious
+                        && existing.reference_offset == package.reference_offset
+                }) {
+                    existing.versions.append(&mut package.versions);
+                } else {
+                    merged_packages.push(package);
+                }
+            }
+            for package in &mut merged_packages {
+                package.versions.sort();
+                package.versions.dedup();
+            }
+            self.packages = merged_packages;
+        } else {
+            // This is the exact pre-v2 behavior: same-spelling duplicates keep
+            // the first record. Do not silently change what a v1-only reader
+            // observes under the legacy format stamp.
+            self.packages
+                .sort_by(|a, b| (a.ecosystem as u8, &a.name).cmp(&(b.ecosystem as u8, &b.name)));
+            self.packages
+                .dedup_by(|a, b| a.ecosystem == b.ecosystem && a.name == b.name);
+        }
+
+        // One physical network record cannot retain multiple provenance claims.
+        // Resolve overlaps by the stable source discriminant before deduplication
+        // so feed insertion order never changes the signed attribution.
+        self.hostnames.sort_by(|a, b| {
+            (a.name.as_str(), a.source as u8).cmp(&(b.name.as_str(), b.source as u8))
+        });
+        self.hostnames.dedup_by(|a, b| a.name == b.name);
+
+        self.ips.sort_by_key(|ip| (ip.addr, ip.source as u8));
+        self.ips.dedup_by_key(|ip| ip.addr);
+
+        self.typosquats.sort_by(|a, b| {
+            (a.ecosystem as u8, &a.malicious_name).cmp(&(b.ecosystem as u8, &b.malicious_name))
+        });
+        self.typosquats
+            .dedup_by(|a, b| a.ecosystem == b.ecosystem && a.malicious_name == b.malicious_name);
+
+        self.popular
+            .sort_by(|a, b| (a.ecosystem as u8, &a.name).cmp(&(b.ecosystem as u8, &b.name)));
+        self.popular
+            .dedup_by(|a, b| a.ecosystem == b.ecosystem && a.name == b.name);
+
+        // Fail closed before serializing: any string-table overflow recorded
+        // at intern time, any field that cannot fit its u16 length prefix, and
+        // any count or offset that cannot fit u32 must abort the build rather
+        // than emit a signed but internally corrupt database.
+        if self.string_table.overflowed {
+            return Err(ThreatDbError::BuildLimitExceeded(
+                "string table entry or total size exceeds format limits",
+            ));
+        }
+        u32_off(self.packages.len(), "too many package records")?;
+        u32_off(self.hostnames.len(), "too many hostname records")?;
+        u32_off(self.ips.len(), "too many IP records")?;
+        u32_off(self.typosquats.len(), "too many typosquat records")?;
+        u32_off(self.popular.len(), "too many popular records")?;
+        for pkg in &self.packages {
+            u16_len(pkg.name.len(), "package name too long")?;
+            u16_len(pkg.versions.len(), "too many versions for one package")?;
+            for v in &pkg.versions {
+                u16_len(v.len(), "version string too long")?;
+            }
+        }
+        for hn in &self.hostnames {
+            u16_len(hn.name.len(), "hostname too long")?;
+        }
+        for ts in &self.typosquats {
+            u16_len(ts.malicious_name.len(), "typosquat name too long")?;
+            u16_len(ts.target_name.len(), "typosquat target name too long")?;
+        }
+        for pop in &self.popular {
+            u16_len(pop.name.len(), "popular package name too long")?;
+        }
+
+        let mut pkg_data: Vec<u8> = Vec::new();
+        let mut pkg_index: Vec<(u32, u32)> = Vec::new(); // (data_offset, key_hash)
+
+        for pkg in &self.packages {
+            let data_offset =
+                u32_off(HEADER_SIZE + pkg_data.len(), "package data offset overflow")?;
+            let key_hash = pkg_key_hash(pkg.ecosystem, pkg.name.as_bytes());
+
+            pkg_data.push(pkg.ecosystem as u8);
+            let name_bytes = pkg.name.as_bytes();
+            pkg_data.extend_from_slice(
+                &u16_len(name_bytes.len(), "package name too long")?.to_le_bytes(),
+            );
+            pkg_data.extend_from_slice(name_bytes);
+            pkg_data.push(pkg.source as u8);
+            pkg_data.push(pkg.confidence as u8);
+            let flags: u8 = if pkg.all_versions_malicious { 1 } else { 0 };
+            pkg_data.push(flags);
+            pkg_data.extend_from_slice(
+                &u16_len(pkg.versions.len(), "too many versions for one package")?.to_le_bytes(),
+            );
+            for v in &pkg.versions {
+                let vbytes = v.as_bytes();
+                pkg_data.extend_from_slice(
+                    &u16_len(vbytes.len(), "version string too long")?.to_le_bytes(),
+                );
+                pkg_data.extend_from_slice(vbytes);
+            }
+            pkg_data.extend_from_slice(&pkg.reference_offset.to_le_bytes());
+
+            pkg_index.push((data_offset, key_hash));
+        }
+
+        // Hostname data region
+        let mut hostname_data: Vec<u8> = Vec::new();
+        let mut hostname_index: Vec<(u32, u32)> = Vec::new();
+
+        for hn in &self.hostnames {
+            let key_hash = fnv1a_hash(hn.name.as_bytes());
+            let local_off = hostname_data.len();
+
+            hostname_data.push(hn.source as u8);
+            let name_bytes = hn.name.as_bytes();
+            hostname_data
+                .extend_from_slice(&u16_len(name_bytes.len(), "hostname too long")?.to_le_bytes());
+            hostname_data.extend_from_slice(name_bytes);
+
+            hostname_index.push((
+                u32_off(local_off, "hostname data offset overflow")?,
+                key_hash,
+            ));
+        }
+
+        // Typosquat data region
+        let mut typo_data: Vec<u8> = Vec::new();
+        let mut typo_index: Vec<(u32, u32)> = Vec::new();
+
+        for ts in &self.typosquats {
+            let local_off = typo_data.len();
+            let key_hash = pkg_key_hash(ts.ecosystem, ts.malicious_name.as_bytes());
+
+            typo_data.push(ts.ecosystem as u8);
+            let mal_bytes = ts.malicious_name.as_bytes();
+            typo_data.extend_from_slice(
+                &u16_len(mal_bytes.len(), "typosquat name too long")?.to_le_bytes(),
+            );
+            typo_data.extend_from_slice(mal_bytes);
+            let tgt_bytes = ts.target_name.as_bytes();
+            typo_data.extend_from_slice(
+                &u16_len(tgt_bytes.len(), "typosquat target name too long")?.to_le_bytes(),
+            );
+            typo_data.extend_from_slice(tgt_bytes);
+
+            typo_index.push((
+                u32_off(local_off, "typosquat data offset overflow")?,
+                key_hash,
+            ));
+        }
+
+        // Popular data region
+        let mut popular_data: Vec<u8> = Vec::new();
+        let mut popular_index: Vec<(u32, u32)> = Vec::new();
+
+        for pop in &self.popular {
+            let local_off = popular_data.len();
+            let key_hash = pkg_key_hash(pop.ecosystem, pop.name.as_bytes());
+
+            popular_data.push(pop.ecosystem as u8);
+            let name_bytes = pop.name.as_bytes();
+            popular_data.extend_from_slice(
+                &u16_len(name_bytes.len(), "popular package name too long")?.to_le_bytes(),
+            );
+            popular_data.extend_from_slice(name_bytes);
+
+            popular_index.push((
+                u32_off(local_off, "popular data offset overflow")?,
+                key_hash,
+            ));
+        }
+
+        // IP records
+        let mut ip_data: Vec<u8> = Vec::with_capacity(self.ips.len() * IP_RECORD_SIZE);
+        for ip in &self.ips {
+            ip_data.extend_from_slice(&ip.addr.to_le_bytes());
+            ip_data.push(ip.source as u8);
+        }
+
+        // File layout after header:
+        //   pkg_index | pkg_data | hostname_index | hostname_data |
+        //   ip_data | typo_index | typo_data | popular_index | popular_data | string_table
+
+        let pkg_index_size = pkg_index.len() * PKG_INDEX_ENTRY_SIZE;
+        let hostname_index_size = hostname_index.len() * HOSTNAME_INDEX_ENTRY_SIZE;
+        let typo_index_size = typo_index.len() * TYPOSQUAT_INDEX_ENTRY_SIZE;
+        let popular_index_size = popular_index.len() * POPULAR_INDEX_ENTRY_SIZE;
+
+        let mut offset = HEADER_SIZE;
+
+        let pkg_index_offset = u32_off(offset, "package index offset overflow")?;
+        offset += pkg_index_size;
+        let pkg_data_offset = offset;
+        offset += pkg_data.len();
+
+        let hostname_index_offset = u32_off(offset, "hostname index offset overflow")?;
+        offset += hostname_index_size;
+        let hostname_data_offset = offset;
+        offset += hostname_data.len();
+
+        let ip_data_offset = u32_off(offset, "IP data offset overflow")?;
+        offset += ip_data.len();
+
+        let typo_index_offset = u32_off(offset, "typosquat index offset overflow")?;
+        offset += typo_index_size;
+        let typo_data_offset = offset;
+        offset += typo_data.len();
+
+        let popular_index_offset = u32_off(offset, "popular index offset overflow")?;
+        offset += popular_index_size;
+        let popular_data_offset = offset;
+        offset += popular_data.len();
+
+        let string_table_offset = u32_off(offset, "string table offset overflow")?;
+        // The u32 offset space is the hard format limit for the whole file.
+        offset += self.string_table.len() as usize;
+        u32_off(offset, "total database size exceeds format limit")?;
+
+        // Fix up data offsets to be absolute. pkg_index was built as
+        // HEADER_SIZE + local; rebase onto the real pkg_data_offset.
+        for (data_off, _) in &mut pkg_index {
+            let local_off = *data_off as usize - HEADER_SIZE;
+            *data_off = u32_off(pkg_data_offset + local_off, "package data offset overflow")?;
+        }
+
+        for (data_off, _) in &mut hostname_index {
+            *data_off = u32_off(
+                hostname_data_offset + *data_off as usize,
+                "hostname data offset overflow",
+            )?;
+        }
+
+        for (data_off, _) in &mut typo_index {
+            *data_off = u32_off(
+                typo_data_offset + *data_off as usize,
+                "typosquat data offset overflow",
+            )?;
+        }
+
+        for (data_off, _) in &mut popular_index {
+            *data_off = u32_off(
+                popular_data_offset + *data_off as usize,
+                "popular data offset overflow",
+            )?;
+        }
+
+        // Sort index vectors by hash so binary search works (data was sorted by
+        // (ecosystem, name), but lookups use FNV hash ordering).
+        pkg_index.sort_by_key(|&(_, hash)| hash);
+        hostname_index.sort_by_key(|&(_, hash)| hash);
+        typo_index.sort_by_key(|&(_, hash)| hash);
+
+        let total_size = HEADER_SIZE
+            + pkg_index_size
+            + pkg_data.len()
+            + hostname_index_size
+            + hostname_data.len()
+            + ip_data.len()
+            + typo_index_size
+            + typo_data.len()
+            + popular_index_size
+            + popular_data.len()
+            + self.string_table.len() as usize;
+
+        let mut buf = vec![0u8; total_size];
+
+        // Header (signature + fingerprint filled in after the data is written).
+        // The version stamp is format-selected: a v1 build stamps 1 (so existing
+        // signed DBs and an old binary are unaffected), a v2 build stamps 2.
+        let stamped_version: u32 = match format {
+            ThreatDbFormat::V1 => 1,
+            ThreatDbFormat::V2 => 2,
+        };
+        buf[0..8].copy_from_slice(MAGIC);
+        buf[8..12].copy_from_slice(&stamped_version.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.build_timestamp.to_le_bytes());
+        buf[20..28].copy_from_slice(&self.build_sequence.to_le_bytes());
+        buf[28..32].copy_from_slice(&pkg_index_offset.to_le_bytes());
+        buf[32..36].copy_from_slice(
+            &u32_off(self.packages.len(), "too many package records")?.to_le_bytes(),
+        );
+        buf[36..40].copy_from_slice(&hostname_index_offset.to_le_bytes());
+        buf[40..44].copy_from_slice(
+            &u32_off(self.hostnames.len(), "too many hostname records")?.to_le_bytes(),
+        );
+        buf[44..48].copy_from_slice(&ip_data_offset.to_le_bytes());
+        buf[48..52].copy_from_slice(&u32_off(self.ips.len(), "too many IP records")?.to_le_bytes());
+        buf[52..56].copy_from_slice(&typo_index_offset.to_le_bytes());
+        buf[56..60].copy_from_slice(
+            &u32_off(self.typosquats.len(), "too many typosquat records")?.to_le_bytes(),
+        );
+        buf[60..64].copy_from_slice(&popular_index_offset.to_le_bytes());
+        buf[64..68].copy_from_slice(
+            &u32_off(self.popular.len(), "too many popular records")?.to_le_bytes(),
+        );
+        buf[68..72].copy_from_slice(&string_table_offset.to_le_bytes());
+        buf[72..76].copy_from_slice(&self.string_table.len().to_le_bytes());
+
+        let fingerprint = Sha256::digest(signing_key.verifying_key().as_bytes());
+        buf[FINGERPRINT_OFFSET..FINGERPRINT_OFFSET + FINGERPRINT_LEN].copy_from_slice(&fingerprint);
+
+        // Write sections in layout order.
+        let mut pos = HEADER_SIZE;
+
+        for (data_off, hash) in &pkg_index {
+            buf[pos..pos + 4].copy_from_slice(&data_off.to_le_bytes());
+            buf[pos + 4..pos + 8].copy_from_slice(&hash.to_le_bytes());
+            pos += PKG_INDEX_ENTRY_SIZE;
+        }
+        buf[pos..pos + pkg_data.len()].copy_from_slice(&pkg_data);
+        pos += pkg_data.len();
+
+        for (data_off, hash) in &hostname_index {
+            buf[pos..pos + 4].copy_from_slice(&data_off.to_le_bytes());
+            buf[pos + 4..pos + 8].copy_from_slice(&hash.to_le_bytes());
+            pos += HOSTNAME_INDEX_ENTRY_SIZE;
+        }
+        buf[pos..pos + hostname_data.len()].copy_from_slice(&hostname_data);
+        pos += hostname_data.len();
+
+        buf[pos..pos + ip_data.len()].copy_from_slice(&ip_data);
+        pos += ip_data.len();
+
+        for (data_off, hash) in &typo_index {
+            buf[pos..pos + 4].copy_from_slice(&data_off.to_le_bytes());
+            buf[pos + 4..pos + 8].copy_from_slice(&hash.to_le_bytes());
+            pos += TYPOSQUAT_INDEX_ENTRY_SIZE;
+        }
+        buf[pos..pos + typo_data.len()].copy_from_slice(&typo_data);
+        pos += typo_data.len();
+
+        for (data_off, hash) in &popular_index {
+            buf[pos..pos + 4].copy_from_slice(&data_off.to_le_bytes());
+            buf[pos + 4..pos + 8].copy_from_slice(&hash.to_le_bytes());
+            pos += POPULAR_INDEX_ENTRY_SIZE;
+        }
+        buf[pos..pos + popular_data.len()].copy_from_slice(&popular_data);
+        pos += popular_data.len();
+
+        let st = self.string_table.bytes();
+        buf[pos..pos + st.len()].copy_from_slice(st);
+
+        // v2: append the new sections, a checked descriptor trailer, and a fixed
+        // EOF footer. All of this lands at >= `HEADER_SIZE`, so the existing
+        // signed range covers it with no change to `SIG_OFFSET`. A v1 build skips
+        // this entirely and is byte-for-byte the legacy layout.
+        if format == ThreatDbFormat::V2 {
+            self.append_v2_sections(&mut buf)?;
+        }
+
+        // Sign: header before sig ++ all data after header. Unchanged from v1:
+        // for a v2 file the appended trailing bytes are simply part of the
+        // `[HEADER_SIZE..]` tail and are signed automatically.
+        let mut signed_data = Vec::with_capacity(SIG_OFFSET + (buf.len() - HEADER_SIZE));
+        signed_data.extend_from_slice(&buf[..SIG_OFFSET]);
+        signed_data.extend_from_slice(&buf[HEADER_SIZE..]);
+
+        use ed25519_dalek::Signer;
+        let signature = signing_key.sign(&signed_data);
+        buf[SIG_OFFSET..SIG_OFFSET + SIGNATURE_LENGTH].copy_from_slice(&signature.to_bytes());
+
+        Ok(buf)
+    }
+
+    /// Append the v2 sections, descriptor trailer, and fixed EOF footer to a
+    /// freshly-built v1 body. The layout (all after `HEADER_SIZE`):
+    ///
+    /// ```text
+    /// [v1 body up to the v1 string table]
+    /// artifact_sha index      (sorted by full SHA-256)
+    /// file_hash index         (sorted by full SHA-256)
+    /// url index               (sorted by full SHA-256 of the normalized URL)
+    /// campaign string table   (length-prefixed; also holds URL strings)
+    /// behavior-tag bitset      (a single u16 bitset for emitted file hashes)
+    /// descriptor trailer      (one [`Descriptor`] per present section)
+    /// fixed EOF footer        (magic + trailer_offset/length + version + flags)
+    /// ```
+    fn append_v2_sections(&mut self, buf: &mut Vec<u8>) -> Result<(), ThreatDbError> {
+        // Build a dedicated v2 campaign string table. Both campaign labels and
+        // malicious-URL strings live here; the index records carry offsets into
+        // it. Keep it separate from the v1 string table so v1 offsets are
+        // untouched.
+        let mut campaign_table = StringTable::new();
+
+        // Sort + dedup the artifact/file/URL inputs by their hash so binary
+        // search is sound; store and sort the FULL 32-byte SHA-256.
+        self.artifact_shas.sort_by_key(|a| a.sha256);
+        self.artifact_shas.dedup_by(|a, b| a.sha256 == b.sha256);
+        self.file_hashes.sort_by_key(|f| f.sha256);
+        self.file_hashes.dedup_by(|a, b| a.sha256 == b.sha256);
+
+        // URL records: key on SHA-256 of the normalized URL, sort + dedup by it.
+        let mut url_records: Vec<([u8; 32], &WriterMaliciousUrl)> = self
+            .malicious_urls
+            .iter()
+            .map(|u| {
+                let digest = Sha256::digest(u.normalized_url.as_bytes());
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&digest);
+                (key, u)
+            })
+            .collect();
+        url_records.sort_by_key(|r| r.0);
+        url_records.dedup_by(|a, b| a.0 == b.0);
+
+        // Artifact-SHA section bytes.
+        let mut artifact_bytes: Vec<u8> =
+            Vec::with_capacity(self.artifact_shas.len() * ARTIFACT_SHA_RECORD_SIZE);
+        for a in &self.artifact_shas {
+            let campaign_offset = match &a.campaign {
+                Some(c) => campaign_table.intern(c),
+                None => 0xFFFF_FFFF,
+            };
+            artifact_bytes.extend_from_slice(&a.sha256);
+            artifact_bytes.push(a.confidence as u8);
+            artifact_bytes.push(a.source as u8);
+            artifact_bytes.push(if a.all_versions_malicious { 1 } else { 0 });
+            artifact_bytes.push(0); // reserved
+            artifact_bytes.extend_from_slice(&campaign_offset.to_le_bytes());
+        }
+
+        // File-hash section bytes.
+        let mut file_bytes: Vec<u8> =
+            Vec::with_capacity(self.file_hashes.len() * FILE_HASH_RECORD_SIZE);
+        for f in &self.file_hashes {
+            let campaign_offset = match &f.campaign {
+                Some(c) => campaign_table.intern(c),
+                None => 0xFFFF_FFFF,
+            };
+            file_bytes.extend_from_slice(&f.sha256);
+            file_bytes.push(f.confidence as u8);
+            file_bytes.push(f.source as u8);
+            file_bytes.extend_from_slice(&f.behavior_tags.to_le_bytes());
+            file_bytes.extend_from_slice(&campaign_offset.to_le_bytes());
+        }
+
+        // URL section bytes (the URL string itself is interned in the campaign
+        // table; the record stores only its offset + source).
+        let mut url_bytes: Vec<u8> = Vec::with_capacity(url_records.len() * URL_INDEX_RECORD_SIZE);
+        for (key, u) in &url_records {
+            let url_offset = campaign_table.intern(&u.normalized_url);
+            url_bytes.extend_from_slice(key);
+            url_bytes.extend_from_slice(&url_offset.to_le_bytes());
+            url_bytes.push(u.source as u8);
+            url_bytes.push(0); // reserved
+        }
+
+        // The campaign table is now final (all interns done above).
+        if campaign_table.overflowed {
+            return Err(ThreatDbError::BuildLimitExceeded(
+                "campaign/URL string table entry or total size exceeds format limits",
+            ));
+        }
+        let campaign_bytes = campaign_table.bytes().to_vec();
+
+        // Behavior-tag bitset section: an OR of every emitted file-hash record's
+        // tags. The per-record tags are authoritative for lookup; this aggregate
+        // section exists so the format carries an explicit, descriptor-anchored
+        // bitset (and so future readers can summarize without scanning records).
+        let aggregate_tags = self
+            .file_hashes
+            .iter()
+            .fold(0u16, |acc, f| acc | f.behavior_tags);
+        let behavior_bytes = aggregate_tags.to_le_bytes().to_vec();
+
+        // Lay the sections out contiguously after the current `buf` end, all of
+        // which is already past `HEADER_SIZE`.
+        let mut descriptors: Vec<(SectionType, u64, u64, u64)> = Vec::new(); // (type, offset, length, count)
+        let place = |buf: &mut Vec<u8>,
+                     descriptors: &mut Vec<(SectionType, u64, u64, u64)>,
+                     ty: SectionType,
+                     bytes: &[u8],
+                     count: u64| {
+            let offset = buf.len() as u64;
+            buf.extend_from_slice(bytes);
+            descriptors.push((ty, offset, bytes.len() as u64, count));
+        };
+
+        place(
+            buf,
+            &mut descriptors,
+            SectionType::ArtifactSha,
+            &artifact_bytes,
+            self.artifact_shas.len() as u64,
+        );
+        place(
+            buf,
+            &mut descriptors,
+            SectionType::FileHash,
+            &file_bytes,
+            self.file_hashes.len() as u64,
+        );
+        place(
+            buf,
+            &mut descriptors,
+            SectionType::MaliciousUrl,
+            &url_bytes,
+            url_records.len() as u64,
+        );
+        place(
+            buf,
+            &mut descriptors,
+            SectionType::CampaignStrings,
+            &campaign_bytes,
+            // count is informational for a byte-blob section; report bytes.
+            campaign_bytes.len() as u64,
+        );
+        place(
+            buf,
+            &mut descriptors,
+            SectionType::BehaviorTags,
+            &behavior_bytes,
+            behavior_bytes.len() as u64,
+        );
+
+        // Descriptor trailer, in section-type order.
+        let trailer_offset = buf.len() as u64;
+        for (ty, offset, length, count) in &descriptors {
+            buf.extend_from_slice(&(*ty as u16).to_le_bytes());
+            buf.extend_from_slice(&1u16.to_le_bytes()); // record_version
+            buf.extend_from_slice(&offset.to_le_bytes());
+            buf.extend_from_slice(&length.to_le_bytes());
+            buf.extend_from_slice(&count.to_le_bytes());
+        }
+        let trailer_length = buf.len() as u64 - trailer_offset;
+
+        // Fixed EOF footer.
+        buf.extend_from_slice(FOOTER_MAGIC);
+        buf.extend_from_slice(&trailer_offset.to_le_bytes());
+        buf.extend_from_slice(&trailer_length.to_le_bytes());
+        buf.extend_from_slice(&TRAILER_VERSION.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes()); // flags (reserved)
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
+    use tirith_test_support::GlobalStateGuard;
+
+    fn invalidate_global_test_caches() {
+        if let Some(cache) = CACHE.get() {
+            cache.clear();
+            cache.last_mtime_check.store(0, Ordering::Relaxed);
+        }
+        crate::context_detect::invalidate_cache();
+    }
+
+    fn isolated_global_state() -> GlobalStateGuard {
+        let mut guard = GlobalStateGuard::new().expect("isolate process-global ThreatDB state");
+        invalidate_global_test_caches();
+        guard.after_restore(invalidate_global_test_caches);
+        guard
+    }
+
+    /// Helper: create a writer, add test data, build, and return a ThreatDb.
+    fn build_test_db(signing_key: &SigningKey) -> ThreatDb {
+        let mut writer = ThreatDbWriter::new(1700000000, 42);
+
+        // Packages
+        writer.add_package(
+            Ecosystem::Npm,
+            "evil-package",
+            &["1.0.0", "1.0.1"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            Some("https://example.com/advisory/1"),
+        );
+        writer.add_package(
+            Ecosystem::PyPI,
+            "malware-pkg",
+            &[],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            true,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::Npm,
+            "borderline-pkg",
+            &["2.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Medium,
+            false,
+            Some("https://example.com/advisory/2"),
+        );
+
+        // IPs
+        writer.add_ip(Ipv4Addr::new(192, 168, 1, 100), ThreatSource::FeodoTracker);
+        writer.add_ip(Ipv4Addr::new(10, 0, 0, 1), ThreatSource::FeodoTracker);
+        writer.add_ip(Ipv4Addr::new(203, 0, 113, 50), ThreatSource::FeodoTracker);
+
+        // Typosquats
+        writer.add_typosquat(Ecosystem::Npm, "reacct", "react");
+        writer.add_typosquat(Ecosystem::PyPI, "reqeusts", "requests");
+
+        // Popular packages
+        writer.add_popular(Ecosystem::Npm, "react");
+        writer.add_popular(Ecosystem::Npm, "express");
+        writer.add_popular(Ecosystem::PyPI, "requests");
+        writer.add_popular(Ecosystem::PyPI, "flask");
+
+        let bytes = writer.build(signing_key).expect("build failed");
+        ThreatDb::from_bytes(bytes, 0).expect("load failed")
+    }
+
+    fn signed_fixture_db_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fixtures")
+            .join("test-threatdb.dat")
+    }
+
+    /// A FROZEN v1 DB blob, captured once from `ThreatDbWriter::build` with a
+    /// fixed key `[7u8; 32]`, timestamp 1_700_000_000, sequence 7, one npm
+    /// package `frozen-evil@1.0.0` (Confirmed, OSSF, ref) and one Feodo IP. It is
+    /// hard-coded (not regenerated) so the v1-load path is pinned: any future
+    /// writer change that would alter the v1 byte layout fails
+    /// `frozen_v1_blob_still_loads`, and the range-accepting v2 reader must keep
+    /// loading this exact blob with every v2 lookup returning None.
+    #[rustfmt::skip]
+    const FROZEN_V1_DB: &[u8] = &[
+        0x54, 0x49, 0x52, 0x49, 0x54, 0x48, 0x44, 0x42, 0x01, 0x00, 0x00, 0x00, 0x00, 0xf1, 0x53, 0x65,
+        0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xac, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0xd2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd2, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0xd7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd7, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xd7, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0xfe, 0x81, 0x2c, 0x12,
+        0xf3, 0xab, 0x4c, 0xe6, 0xac, 0x5d, 0xb6, 0x9a, 0xc3, 0x52, 0xf9, 0x06, 0xcb, 0x1b, 0x11, 0xef,
+        0x43, 0xfb, 0x33, 0xe2, 0x52, 0xef, 0x7f, 0xf5, 0x52, 0x26, 0x38, 0x89, 0x1d, 0xb2, 0x0a, 0x25,
+        0xd4, 0x1b, 0x74, 0xcc, 0x95, 0xe5, 0x50, 0x6e, 0x37, 0x52, 0x8b, 0x3b, 0xa8, 0x43, 0xaa, 0xb8,
+        0x97, 0xd6, 0xf5, 0x2f, 0x44, 0xa6, 0xaa, 0xf1, 0x3e, 0x1f, 0xae, 0x90, 0x01, 0x06, 0xdb, 0x73,
+        0xd4, 0x2c, 0x21, 0x70, 0xf3, 0x17, 0x25, 0x94, 0x4e, 0x3e, 0x7e, 0xd4, 0xc6, 0xf5, 0xaa, 0x5d,
+        0x9b, 0xb1, 0xa7, 0x52, 0xe0, 0x28, 0xa1, 0x95, 0xc9, 0x64, 0x0c, 0x07, 0xb4, 0x00, 0x00, 0x00,
+        0xfa, 0x0d, 0x42, 0xcb, 0x00, 0x0b, 0x00, 0x66, 0x72, 0x6f, 0x7a, 0x65, 0x6e, 0x2d, 0x65, 0x76,
+        0x69, 0x6c, 0x00, 0x02, 0x00, 0x01, 0x00, 0x05, 0x00, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00, 0x00,
+        0x00, 0x00, 0x07, 0x71, 0x00, 0xcb, 0x02, 0x1a, 0x00, 0x68, 0x74, 0x74, 0x70, 0x73, 0x3a, 0x2f,
+        0x2f, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x66, 0x72, 0x6f,
+        0x7a, 0x65, 0x6e,
+    ];
+
+    /// A v1 blob frozen at the byte level loads on the range-accepting reader,
+    /// keeps its v1 lookups, and returns None for every v2 lookup. This is the
+    /// regression guard that the v1-load path never breaks, even after future
+    /// writer changes.
+    #[test]
+    fn frozen_v1_blob_still_loads() {
+        let db = ThreatDb::from_bytes(FROZEN_V1_DB.to_vec(), 0).expect("frozen v1 blob must load");
+        assert_eq!(db.stats().format_version, 1);
+        assert_eq!(db.stats().build_sequence, 7);
+        // v1 lookups still resolve.
+        let m = db
+            .check_package(Ecosystem::Npm, "frozen-evil", Some("1.0.0"))
+            .expect("frozen package must match");
+        assert_eq!(m.source, ThreatSource::OssfMalicious);
+        assert_eq!(
+            m.reference_url.as_deref(),
+            Some("https://example.com/frozen")
+        );
+        assert!(db.check_ip(Ipv4Addr::new(203, 0, 113, 7)).is_some());
+        // Every v2 lookup returns None on a v1 file.
+        assert!(db.check_artifact_sha256(&[0u8; 32]).is_none());
+        assert!(db.check_file_sha256(&[0u8; 32]).is_none());
+        assert!(db.check_malicious_url("http://evil.example/x").is_none());
+    }
+
+    /// The committed shared v1 fixture (`tests/fixtures/test-threatdb.dat`) also
+    /// loads on the new reader and exposes no v2 sections, so the production v1
+    /// asset is never rejected by a v2-capable binary.
+    #[test]
+    fn committed_v1_fixture_loads_with_no_v2_sections() {
+        let path = signed_fixture_db_path();
+        let db = ThreatDb::load_from_path(&path, 0).expect("committed v1 fixture must load");
+        assert_eq!(db.stats().format_version, 1);
+        assert!(db.check_artifact_sha256(&[0u8; 32]).is_none());
+        assert!(db.check_file_sha256(&[0u8; 32]).is_none());
+    }
+
+    /// Helper: a 32-byte SHA-256-shaped array seeded from a single byte.
+    fn sha(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    #[test]
+    fn test_round_trip_all_sections() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        let stats = db.stats();
+        assert_eq!(stats.format_version, 1);
+        assert_eq!(stats.build_timestamp, 1700000000);
+        assert_eq!(stats.build_sequence, 42);
+        assert_eq!(stats.package_count, 3);
+        assert_eq!(stats.ip_count, 3);
+        assert_eq!(stats.typosquat_count, 2);
+        assert_eq!(stats.popular_count, 4);
+        assert_eq!(stats.hostname_count, 0);
+    }
+
+    #[test]
+    fn test_package_version_in_list() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        let m = db
+            .check_package(Ecosystem::Npm, "evil-package", Some("1.0.0"))
+            .expect("should match");
+        assert_eq!(m.source, ThreatSource::OssfMalicious);
+        assert_eq!(m.confidence, Confidence::Confirmed);
+        assert!(!m.all_versions_malicious);
+        assert!(m.reference_url.is_some());
+    }
+
+    #[test]
+    fn test_package_version_not_in_list() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        assert!(db
+            .check_package(Ecosystem::Npm, "evil-package", Some("2.0.0"))
+            .is_none());
+    }
+
+    #[test]
+    fn test_package_no_version_all_malicious() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        let m = db
+            .check_package(Ecosystem::PyPI, "malware-pkg", None)
+            .expect("should match all-versions-malicious without version");
+        assert!(m.all_versions_malicious);
+        assert_eq!(m.source, ThreatSource::DatadogMalicious);
+    }
+
+    #[test]
+    fn test_package_no_version_not_all_malicious() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        assert!(
+            db.check_package(Ecosystem::Npm, "evil-package", None)
+                .is_none(),
+            "should NOT match when no version provided and all_versions_malicious=false"
+        );
+    }
+
+    #[test]
+    fn test_package_all_malicious_with_version() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        let m = db
+            .check_package(Ecosystem::PyPI, "malware-pkg", Some("99.99.99"))
+            .expect("all_versions_malicious should match any version");
+        assert!(m.all_versions_malicious);
+    }
+
+    #[test]
+    fn test_package_missing() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        assert!(db
+            .check_package(Ecosystem::Npm, "safe-package", Some("1.0.0"))
+            .is_none());
+    }
+
+    #[test]
+    fn test_package_wrong_ecosystem() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        assert!(db
+            .check_package(Ecosystem::PyPI, "evil-package", Some("1.0.0"))
+            .is_none());
+    }
+
+    #[test]
+    fn test_package_medium_confidence() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        let m = db
+            .check_package(Ecosystem::Npm, "borderline-pkg", Some("2.0.0"))
+            .expect("should match");
+        assert_eq!(m.confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn package_indices_share_registry_canonical_names() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 43);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "Malware.Pkg",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        // The same PyPI identity must merge rather than silently losing either
+        // affected-version record during writer deduplication.
+        writer.add_package(
+            Ecosystem::PyPI,
+            "malware__pkg",
+            &["2.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::NuGet,
+            "Newtonsoft.JSON",
+            &["13.0.3"],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::Npm,
+            "CasePkg",
+            &["1.2.3"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::RubyGems,
+            "CaseGem",
+            &["1.2.3"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::Crates,
+            "Serde_JSON",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_typosquat(Ecosystem::PyPI, "Reqeusts__Plus", "Requests");
+        writer.add_popular(Ecosystem::PyPI, "Friendly-._-Bard");
+        let db = ThreatDb::from_bytes(
+            writer
+                .build_format(ThreatDbFormat::V2, &key)
+                .expect("build"),
+            0,
+        )
+        .expect("load");
+
+        assert_eq!(db.stats().package_count, 5);
+        for version in ["1", "2.0"] {
+            assert!(db
+                .check_package(Ecosystem::PyPI, "MALWARE-._-PKG", Some(version))
+                .is_some());
+        }
+        assert!(db
+            .check_package(Ecosystem::NuGet, "newtonsoft.json", Some("13.0.3"))
+            .is_some());
+        let typo = db
+            .check_typosquat(Ecosystem::PyPI, "REQEUSTS-._-PLUS")
+            .expect("canonical typosquat key");
+        assert_eq!(typo.target_name, "requests");
+        assert!(db.is_popular_package(Ecosystem::PyPI, "friendly__bard"));
+
+        // Legitimate non-equivalent control: npm names are not globally folded.
+        assert!(db
+            .check_package(Ecosystem::Npm, "CasePkg", Some("1.2.3"))
+            .is_some());
+        assert!(db
+            .check_package(Ecosystem::Npm, "casepkg", Some("1.2.3"))
+            .is_none());
+        assert!(db
+            .check_package(Ecosystem::RubyGems, "CaseGem", Some("1.2.3"))
+            .is_some());
+        assert!(db
+            .check_package(Ecosystem::RubyGems, "casegem", Some("1.2.3"))
+            .is_none());
+        assert!(db
+            .check_package(Ecosystem::Crates, "serde-json", Some("1.0.0"))
+            .is_some());
+    }
+
+    #[test]
+    fn canonical_package_merge_keeps_all_version_claim_metadata_in_both_orders() {
+        let key = SigningKey::generate(&mut OsRng);
+        for all_versions_first in [false, true] {
+            let mut writer = ThreatDbWriter::new(1700000000, 44);
+            let add_specific = |writer: &mut ThreatDbWriter| {
+                writer.add_package(
+                    Ecosystem::PyPI,
+                    "Coverage.Pkg",
+                    &["1.0.0"],
+                    ThreatSource::OssfMalicious,
+                    Confidence::Confirmed,
+                    false,
+                    Some("https://example.invalid/specific"),
+                );
+            };
+            let add_all = |writer: &mut ThreatDbWriter| {
+                writer.add_package(
+                    Ecosystem::PyPI,
+                    "coverage__pkg",
+                    &[],
+                    ThreatSource::DatadogMalicious,
+                    Confidence::Medium,
+                    true,
+                    Some("https://example.invalid/all"),
+                );
+            };
+            if all_versions_first {
+                add_all(&mut writer);
+                add_specific(&mut writer);
+            } else {
+                add_specific(&mut writer);
+                add_all(&mut writer);
+            }
+            let db = ThreatDb::from_bytes(
+                writer
+                    .build_format(ThreatDbFormat::V2, &key)
+                    .expect("build"),
+                0,
+            )
+            .expect("load");
+
+            let matched = db
+                .check_package(Ecosystem::PyPI, "COVERAGE-._-PKG", Some("99.0"))
+                .expect("all-version canonical match");
+            assert!(matched.all_versions_malicious);
+            assert_eq!(matched.source, ThreatSource::DatadogMalicious);
+            assert_eq!(matched.confidence, Confidence::Medium);
+            assert_eq!(
+                matched.reference_url.as_deref(),
+                Some("https://example.invalid/all")
+            );
+        }
+    }
+
+    #[test]
+    fn package_index_matches_linear_identity_lookup_in_both_formats() {
+        let key = SigningKey::from_bytes(&[23u8; 32]);
+        let identities = [
+            (Ecosystem::Npm, "CasePkg", "casepkg"),
+            (Ecosystem::RubyGems, "CaseGem", "casegem"),
+            (Ecosystem::Go, "example.org/CaseMod", "example.org/casemod"),
+            (
+                Ecosystem::Maven,
+                "org.example:CaseJar",
+                "org.example:casejar",
+            ),
+            (Ecosystem::PyPI, "Case.Pkg", "case__pkg"),
+            (Ecosystem::Crates, "Case_Crate", "case-crate"),
+            (Ecosystem::NuGet, "Case.Pkg", "case.pkg"),
+            (
+                Ecosystem::Npm,
+                "collision-dceuwm5peg8j",
+                "collision-8mseactbvp7x",
+            ),
+        ];
+        // The equal-hash run must compare the actual names as well. These are
+        // distinct npm identities with a frozen FNV-1a collision.
+        assert_eq!(
+            pkg_key_hash(Ecosystem::Npm, b"collision-dceuwm5peg8j"),
+            pkg_key_hash(Ecosystem::Npm, b"collision-8mseactbvp7x")
+        );
+        for format in [ThreatDbFormat::V1, ThreatDbFormat::V2] {
+            let mut writer = ThreatDbWriter::new(1_700_000_000, 46);
+            for &(eco, name, alternate) in &identities {
+                for (name, source, version) in [
+                    (name, ThreatSource::OssfMalicious, "1.0.0"),
+                    (name, ThreatSource::DatadogMalicious, "2.0.0"),
+                    (alternate, ThreatSource::OssfMalicious, "3.0.0"),
+                ] {
+                    writer.add_package(
+                        eco,
+                        name,
+                        &[version],
+                        source,
+                        Confidence::Confirmed,
+                        false,
+                        None,
+                    );
+                }
+            }
+            let db = ThreatDb::from_bytes(writer.build_format(format, &key).unwrap(), 0).unwrap();
+            // A cold miss and a hit in each spelling-preserving registry must
+            // not initialize the map covering unrelated legacy registries.
+            for &(eco, name, alternate) in &identities[..4] {
+                assert!(db.package_record_indices(eco, "absent").is_empty());
+                assert!(!db.package_record_indices(eco, name).is_empty());
+                assert!(!db.package_record_indices(eco, alternate).is_empty());
+                assert!(db.legacy_package_index.get().is_none());
+            }
+            // Compare with all physical records, including separate evidence
+            // claims in v2 and the multiple legacy spellings of one identity.
+            for &(eco, name, alternate) in &identities {
+                for query in [name, alternate, "absent"] {
+                    let canonical = canonical_package_name(eco, query);
+                    let expected: Vec<_> = (0..db.pkg_index_count)
+                        .filter(|&idx| {
+                            db.pkg_index_entry(idx)
+                                .and_then(|(off, _)| db.parse_pkg_record(off as usize))
+                                .is_some_and(|record| {
+                                    record.ecosystem == eco
+                                        && canonical_package_name(eco, record.name) == canonical
+                                })
+                        })
+                        .collect();
+                    assert_eq!(db.package_record_indices(eco, &canonical), expected);
+                }
+            }
+            if let Some(index) = db.legacy_package_index.get() {
+                assert!(index
+                    .keys()
+                    .all(|(eco, _)| !package_name_preserves_spelling(*eco)));
+            }
+        }
+    }
+
+    /// Simulate the exact package lookup shipped by a v1-only reader: raw key
+    /// hash plus literal affected-version comparison, with no canonicalization.
+    fn legacy_v1_exact_package_lookup(
+        db: &ThreatDb,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+    ) -> bool {
+        let hash = pkg_key_hash(ecosystem, name.as_bytes());
+        db.binary_search_pkg_index(ecosystem, name, hash)
+            .and_then(|idx| db.pkg_index_entry(idx))
+            .and_then(|(offset, _)| db.parse_pkg_record(offset as usize))
+            .is_some_and(|record| {
+                record.all_versions_malicious || record.versions.contains(&version)
+            })
+    }
+
+    fn legacy_v1_exact_typosquat_lookup(db: &ThreatDb, ecosystem: Ecosystem, name: &str) -> bool {
+        let hash = pkg_key_hash(ecosystem, name.as_bytes());
+        db.binary_search_typosquat_index(ecosystem, name, hash)
+            .is_some()
+    }
+
+    fn legacy_v1_exact_popular_lookup(db: &ThreatDb, ecosystem: Ecosystem, name: &str) -> bool {
+        (0..db.popular_index_count).any(|idx| {
+            let base = db.popular_index_offset as usize + idx as usize * POPULAR_INDEX_ENTRY_SIZE;
+            let Some(offset) = read_u32_le(&db.data, base).map(|offset| offset as usize) else {
+                return false;
+            };
+            let Some(record_ecosystem) = db
+                .data
+                .get(offset)
+                .and_then(|&value| Ecosystem::from_u8(value))
+            else {
+                return false;
+            };
+            let Some(length) = read_u16_le(&db.data, offset + 1).map(|length| length as usize)
+            else {
+                return false;
+            };
+            std::str::from_utf8(
+                db.data
+                    .get(offset + 3..offset + 3 + length)
+                    .unwrap_or_default(),
+            )
+            .is_ok_and(|stored| record_ecosystem == ecosystem && stored == name)
+        })
+    }
+
+    #[test]
+    fn v1_publication_preserves_legacy_keys_and_versions_while_new_reader_canonicalizes() {
+        let key = SigningKey::from_bytes(&[19u8; 32]);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 45);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "legacy----pkg",
+            &["1.0RC1"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::Crates,
+            "legacy_crate",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_typosquat(Ecosystem::PyPI, "reqeusts----plus", "requests");
+        writer.add_popular(Ecosystem::Crates, "serde_json");
+
+        let v1 = writer
+            .build_format(ThreatDbFormat::V1, &key)
+            .expect("build compatible v1");
+        let legacy = ThreatDb::from_bytes(v1, 0).expect("load v1");
+        assert_eq!(legacy.format_version, 1);
+
+        // A v1-only binary still finds the exact bytes it historically hashed.
+        assert!(legacy_v1_exact_package_lookup(
+            &legacy,
+            Ecosystem::PyPI,
+            "legacy----pkg",
+            "1.0RC1"
+        ));
+        assert!(legacy_v1_exact_package_lookup(
+            &legacy,
+            Ecosystem::Crates,
+            "legacy_crate",
+            "1.0.0"
+        ));
+        assert!(legacy_v1_exact_typosquat_lookup(
+            &legacy,
+            Ecosystem::PyPI,
+            "reqeusts----plus"
+        ));
+        assert!(legacy_v1_exact_popular_lookup(
+            &legacy,
+            Ecosystem::Crates,
+            "serde_json"
+        ));
+
+        // The new reader consumes that same raw v1 file through canonical
+        // request spellings, including every package-name index.
+        assert!(legacy
+            .check_package(Ecosystem::PyPI, "LEGACY-._-PKG", Some("1rc1"))
+            .is_some());
+        assert!(legacy
+            .check_package(Ecosystem::Crates, "Legacy-Crate", Some("1.0.0"))
+            .is_some());
+        assert!(legacy
+            .check_typosquat(Ecosystem::PyPI, "REQEUSTS-._-PLUS")
+            .is_some());
+        assert!(legacy.is_popular_package(Ecosystem::Crates, "Serde-Json"));
+
+        // A subsequent v2 build uses a cloned/canonical working set and cannot
+        // retroactively mutate the v1 publication inputs.
+        let v2 = writer
+            .build_format(ThreatDbFormat::V2, &key)
+            .expect("build canonical v2");
+        let canonical = ThreatDb::from_bytes(v2, 0).expect("load v2");
+        assert_eq!(canonical.format_version, 2);
+        assert!(canonical
+            .check_package(Ecosystem::PyPI, "legacy__pkg", Some("1.0rc01"))
+            .is_some());
+        assert!(canonical.is_popular_package(Ecosystem::Crates, "serde-json"));
+    }
+
+    #[test]
+    fn v1_canonical_group_chooses_strongest_exact_claim_in_both_orders() {
+        let key = SigningKey::from_bytes(&[20u8; 32]);
+        for confirmed_first in [false, true] {
+            let mut writer = ThreatDbWriter::new(1_700_000_000, 46);
+            let add_confirmed = |writer: &mut ThreatDbWriter| {
+                writer.add_package(
+                    Ecosystem::PyPI,
+                    "foo.bar",
+                    &["1.0"],
+                    ThreatSource::OssfMalicious,
+                    Confidence::Confirmed,
+                    false,
+                    Some("https://example.invalid/confirmed"),
+                );
+            };
+            let add_medium = |writer: &mut ThreatDbWriter| {
+                writer.add_package(
+                    Ecosystem::PyPI,
+                    "foo__bar",
+                    &["1.0"],
+                    ThreatSource::DatadogMalicious,
+                    Confidence::Medium,
+                    false,
+                    Some("https://example.invalid/medium"),
+                );
+            };
+            if confirmed_first {
+                add_confirmed(&mut writer);
+                add_medium(&mut writer);
+            } else {
+                add_medium(&mut writer);
+                add_confirmed(&mut writer);
+            }
+            let db = ThreatDb::from_bytes(
+                writer
+                    .build_format(ThreatDbFormat::V1, &key)
+                    .expect("build v1"),
+                0,
+            )
+            .expect("load v1");
+
+            let matched = db
+                .check_package(Ecosystem::PyPI, "foo-bar", Some("1.0"))
+                .expect("canonical exact match");
+            assert_eq!(matched.confidence, Confidence::Confirmed);
+            assert_eq!(matched.source, ThreatSource::OssfMalicious);
+            assert_eq!(
+                matched.reference_url.as_deref(),
+                Some("https://example.invalid/confirmed")
+            );
+
+            let assessed = db.assess_package(
+                Ecosystem::PyPI,
+                "foo-bar",
+                &VersionIntent::Exact("1.0".to_string()),
+            );
+            let PackageThreatAssessment::ExactMatch(summary) = assessed else {
+                panic!("expected exact assessment");
+            };
+            assert_eq!(summary.confidence, Confidence::Confirmed);
+            assert_eq!(summary.source_id, ThreatSource::OssfMalicious.as_str());
+            assert_eq!(
+                summary.reference_url.as_deref(),
+                Some("https://example.invalid/confirmed")
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_group_ranks_confidence_before_breadth_in_both_formats_and_orders() {
+        let key = SigningKey::from_bytes(&[21u8; 32]);
+        for (format, expected_version) in [(ThreatDbFormat::V1, 1), (ThreatDbFormat::V2, 2)] {
+            for all_versions_first in [false, true] {
+                let mut writer = ThreatDbWriter::new(1_700_000_000, 47);
+                let add_specific = |writer: &mut ThreatDbWriter| {
+                    writer.add_package(
+                        Ecosystem::PyPI,
+                        "scope.pkg",
+                        &["1.0"],
+                        ThreatSource::OssfMalicious,
+                        Confidence::Confirmed,
+                        false,
+                        Some("https://osv.dev/vulnerability/MAL-2026-0001"),
+                    );
+                };
+                let add_all = |writer: &mut ThreatDbWriter| {
+                    writer.add_package(
+                        Ecosystem::PyPI,
+                        "scope__pkg",
+                        &[],
+                        ThreatSource::DatadogMalicious,
+                        Confidence::Medium,
+                        true,
+                        Some("https://example.invalid/all"),
+                    );
+                };
+                if all_versions_first {
+                    add_all(&mut writer);
+                    add_specific(&mut writer);
+                } else {
+                    add_specific(&mut writer);
+                    add_all(&mut writer);
+                }
+                let db = ThreatDb::from_bytes(
+                    writer.build_format(format, &key).expect("build threat DB"),
+                    0,
+                )
+                .expect("load threat DB");
+
+                assert_eq!(db.format_version, expected_version);
+                assert_eq!(db.stats().package_count, 2);
+
+                // Both physical records participate for 1.0. The confirmed exact
+                // claim must win over the broader Medium claim without mixing any
+                // of their source/scope/reference metadata.
+                let matched = db
+                    .check_package(Ecosystem::PyPI, "scope-pkg", Some("1.0"))
+                    .expect("overlapping exact canonical match");
+                assert!(!matched.all_versions_malicious);
+                assert_eq!(matched.confidence, Confidence::Confirmed);
+                assert_eq!(matched.source, ThreatSource::OssfMalicious);
+                assert_eq!(
+                    matched.reference_url.as_deref(),
+                    Some("https://osv.dev/vulnerability/MAL-2026-0001")
+                );
+
+                let PackageThreatAssessment::ExactMatch(summary) = db.assess_package(
+                    Ecosystem::PyPI,
+                    "scope-pkg",
+                    &VersionIntent::Exact("1.0".to_string()),
+                ) else {
+                    panic!("expected overlapping exact assessment");
+                };
+                assert!(!summary.all_versions_malicious);
+                assert_eq!(summary.confidence, Confidence::Confirmed);
+                assert_eq!(summary.source_id, ThreatSource::OssfMalicious.as_str());
+                assert_eq!(
+                    summary.reference_url.as_deref(),
+                    Some("https://osv.dev/vulnerability/MAL-2026-0001")
+                );
+
+                // The exact claim does not participate for an unrelated version,
+                // so the all-version evidence remains the correct atomic result.
+                let matched = db
+                    .check_package(Ecosystem::PyPI, "scope-pkg", Some("99.0"))
+                    .expect("all-version canonical match");
+                assert!(matched.all_versions_malicious);
+                assert_eq!(matched.confidence, Confidence::Medium);
+                assert_eq!(matched.source, ThreatSource::DatadogMalicious);
+                assert_eq!(
+                    matched.reference_url.as_deref(),
+                    Some("https://example.invalid/all")
+                );
+
+                let PackageThreatAssessment::ExactMatch(summary) = db.assess_package(
+                    Ecosystem::PyPI,
+                    "scope-pkg",
+                    &VersionIntent::Exact("99.0".to_string()),
+                ) else {
+                    panic!("expected unrelated all-version assessment");
+                };
+                assert!(summary.all_versions_malicious);
+                assert_eq!(summary.confidence, Confidence::Medium);
+                assert_eq!(summary.source_id, ThreatSource::DatadogMalicious.as_str());
+                assert_eq!(
+                    summary.reference_url.as_deref(),
+                    Some("https://example.invalid/all")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v1_canonical_group_does_not_promote_evidence_across_versions() {
+        let key = SigningKey::from_bytes(&[22u8; 32]);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 48);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "version.pkg",
+            &["1.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            Some("https://example.invalid/confirmed-v1"),
+        );
+        writer.add_package(
+            Ecosystem::PyPI,
+            "version__pkg",
+            &["2.0"],
+            ThreatSource::DatadogMalicious,
+            Confidence::Medium,
+            false,
+            Some("https://example.invalid/medium-v2"),
+        );
+        let db = ThreatDb::from_bytes(
+            writer
+                .build_format(ThreatDbFormat::V1, &key)
+                .expect("build v1"),
+            0,
+        )
+        .expect("load v1");
+
+        for (version, confidence, reference) in [
+            (
+                "1.0",
+                Confidence::Confirmed,
+                "https://example.invalid/confirmed-v1",
+            ),
+            (
+                "2.0",
+                Confidence::Medium,
+                "https://example.invalid/medium-v2",
+            ),
+        ] {
+            let matched = db
+                .check_package(Ecosystem::PyPI, "version-pkg", Some(version))
+                .expect("version-specific match");
+            assert_eq!(matched.confidence, confidence);
+            assert_eq!(matched.reference_url.as_deref(), Some(reference));
+
+            let PackageThreatAssessment::ExactMatch(summary) = db.assess_package(
+                Ecosystem::PyPI,
+                "version-pkg",
+                &VersionIntent::Exact(version.to_string()),
+            ) else {
+                panic!("expected exact assessment for {version}");
+            };
+            assert_eq!(summary.confidence, confidence);
+            assert_eq!(summary.reference_url.as_deref(), Some(reference));
+        }
+    }
+
+    #[test]
+    fn test_ip_found() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        let m = db
+            .check_ip(Ipv4Addr::new(192, 168, 1, 100))
+            .expect("should find IP");
+        assert_eq!(m.source, ThreatSource::FeodoTracker);
+    }
+
+    #[test]
+    fn test_ip_not_found() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        assert!(db.check_ip(Ipv4Addr::new(8, 8, 8, 8)).is_none());
+    }
+
+    #[test]
+    fn test_ip_first_element() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        assert!(db.check_ip(Ipv4Addr::new(10, 0, 0, 1)).is_some());
+    }
+
+    #[test]
+    fn test_ip_last_element() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        assert!(db.check_ip(Ipv4Addr::new(203, 0, 113, 50)).is_some());
+    }
+
+    #[test]
+    fn test_typosquat_found() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        let m = db
+            .check_typosquat(Ecosystem::Npm, "reacct")
+            .expect("should find typosquat");
+        assert_eq!(m.target_name, "react");
+    }
+
+    #[test]
+    fn test_typosquat_not_found() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        assert!(db.check_typosquat(Ecosystem::Npm, "react").is_none());
+    }
+
+    #[test]
+    fn test_typosquat_wrong_ecosystem() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        assert!(db.check_typosquat(Ecosystem::PyPI, "reacct").is_none());
+    }
+
+    #[test]
+    fn test_popular_distance_1() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        let result = db.check_popular_distance(Ecosystem::PyPI, "reqests");
+        assert!(result.is_some(), "should find close match");
+        let (name, dist) = result.unwrap();
+        assert_eq!(name, "requests");
+        assert_eq!(dist, 1);
+    }
+
+    #[test]
+    fn test_popular_exact_match_skipped() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        assert!(db.check_popular_distance(Ecosystem::Npm, "react").is_none());
+    }
+
+    #[test]
+    fn test_popular_distance_too_far() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        assert!(db.check_popular_distance(Ecosystem::Npm, "xyz").is_none());
+    }
+
+    #[test]
+    fn test_is_popular_package_exact_match() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        // Exact, in the right ecosystem → true.
+        assert!(db.is_popular_package(Ecosystem::Npm, "react"));
+        assert!(db.is_popular_package(Ecosystem::PyPI, "requests"));
+        // Right name, wrong ecosystem → false.
+        assert!(!db.is_popular_package(Ecosystem::PyPI, "react"));
+        // A near-miss is not an exact match → false.
+        assert!(!db.is_popular_package(Ecosystem::Npm, "reactt"));
+        // Unknown name → false.
+        assert!(!db.is_popular_package(Ecosystem::Npm, "totally-unknown-pkg"));
+    }
+
+    #[test]
+    fn test_is_popular_package_finds_supplemental_overlay() {
+        let key = SigningKey::generate(&mut OsRng);
+        let primary =
+            ThreatDb::from_bytes(ThreatDbWriter::new(1700000000, 1).build(&key).unwrap(), 0)
+                .unwrap();
+        let mut overlay_writer = ThreatDbWriter::new(1700000001, 1);
+        overlay_writer.add_popular(Ecosystem::Crates, "serde");
+        let overlay =
+            ThreatDb::from_bytes(overlay_writer.build(&key).unwrap(), 0).expect("overlay load");
+        let db = primary.with_supplemental(Some(overlay));
+
+        assert!(db.is_popular_package(Ecosystem::Crates, "serde"));
+        assert!(!db.is_popular_package(Ecosystem::Crates, "not-there"));
+    }
+
+    #[test]
+    fn test_hostname_empty_section() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+
+        assert!(db.check_hostname("evil.example.com").is_none());
+    }
+
+    #[test]
+    fn hostname_ioc_matches_dns_case_root_dot_and_idna_aliases() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+        writer.add_hostname("BÜCHER.Example.", ThreatSource::Urlhaus);
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        for alias in [
+            "bücher.example",
+            "BÜCHER.EXAMPLE.",
+            "xn--bcher-kva.example",
+            "XN--BCHER-KVA.EXAMPLE.",
+        ] {
+            let matched = db
+                .check_hostname(alias)
+                .unwrap_or_else(|| panic!("canonical hostname alias did not match: {alias}"));
+            assert_eq!(matched.name, "xn--bcher-kva.example");
+        }
+        assert!(db.check_hostname(".").is_none());
+        assert!(db.check_hostname("127.0.0.1").is_none());
+    }
+
+    #[test]
+    fn overlapping_network_ioc_source_is_independent_of_insertion_order() {
+        let key = SigningKey::generate(&mut OsRng);
+        let build = |reverse: bool| {
+            let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+            if reverse {
+                writer.add_hostname("overlap.example", ThreatSource::PhishTank);
+                writer.add_hostname("overlap.example", ThreatSource::Urlhaus);
+                writer.add_ip(Ipv4Addr::new(203, 0, 113, 8), ThreatSource::TorExit);
+                writer.add_ip(Ipv4Addr::new(203, 0, 113, 8), ThreatSource::FeodoTracker);
+            } else {
+                writer.add_hostname("overlap.example", ThreatSource::Urlhaus);
+                writer.add_hostname("overlap.example", ThreatSource::PhishTank);
+                writer.add_ip(Ipv4Addr::new(203, 0, 113, 8), ThreatSource::FeodoTracker);
+                writer.add_ip(Ipv4Addr::new(203, 0, 113, 8), ThreatSource::TorExit);
+            }
+            ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load")
+        };
+
+        for db in [build(false), build(true)] {
+            assert_eq!(
+                db.check_hostname("overlap.example")
+                    .map(|matched| matched.source),
+                Some(ThreatSource::Urlhaus)
+            );
+            assert_eq!(
+                db.check_ip(Ipv4Addr::new(203, 0, 113, 8))
+                    .map(|matched| matched.source),
+                Some(ThreatSource::FeodoTracker)
+            );
+        }
+    }
+
+    #[test]
+    fn test_signature_valid() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
+
+        let bytes = writer.build(&key).expect("build");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load");
+
+        // Negative path: the embedded placeholder key won't match the signer.
+        assert!(
+            db.verify_signature().is_err(),
+            "placeholder key should not verify real signature"
+        );
+    }
+
+    #[test]
+    fn test_signature_corrupt_byte() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
+
+        let mut bytes = writer.build(&key).expect("build");
+
+        if bytes.len() > HEADER_SIZE + 1 {
+            bytes[HEADER_SIZE + 1] ^= 0xFF;
+        }
+
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load");
+        assert!(
+            db.verify_signature().is_err(),
+            "corrupt data should fail verification"
+        );
+    }
+
+    #[test]
+    fn test_signature_with_matching_key() {
+        // Verification works when checked against the key that actually signed
+        // (simulating the real key replacing the placeholder).
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
+
+        let bytes = writer.build(&key).expect("build");
+
+        let sig_bytes = &bytes[SIG_OFFSET..SIG_OFFSET + SIGNATURE_LENGTH];
+        let signature = Signature::from_slice(sig_bytes).expect("parse sig");
+
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&bytes[..SIG_OFFSET]);
+        signed_data.extend_from_slice(&bytes[HEADER_SIZE..]);
+
+        use ed25519_dalek::Verifier;
+        assert!(
+            key.verifying_key().verify(&signed_data, &signature).is_ok(),
+            "signature should verify against signing key"
+        );
+    }
+
+    #[test]
+    fn test_rollback_rejected() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 5);
+        writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
+        let bytes = writer.build(&key).expect("build");
+
+        let err = ThreatDb::from_bytes(bytes, 10).expect_err("should reject rollback");
+        match err {
+            ThreatDbError::RollbackDetected {
+                got: 5,
+                current: 10,
+            } => {}
+            other => panic!("expected RollbackDetected, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_rollback_equal_rejected() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 10);
+        writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
+        let bytes = writer.build(&key).expect("build");
+
+        let err = ThreatDb::from_bytes(bytes, 10).expect_err("equal sequence should be rejected");
+        assert!(matches!(err, ThreatDbError::RollbackDetected { .. }));
+    }
+
+    #[test]
+    fn test_rollback_newer_accepted() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 20);
+        writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
+        let bytes = writer.build(&key).expect("build");
+
+        assert!(ThreatDb::from_bytes(bytes, 10).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_magic() {
+        let mut data = vec![0u8; HEADER_SIZE + 10];
+        data[0..8].copy_from_slice(b"BADMAGIC");
+        assert!(matches!(
+            ThreatDb::from_bytes(data, 0),
+            Err(ThreatDbError::InvalidMagic)
+        ));
+    }
+
+    #[test]
+    fn test_file_too_small() {
+        let data = vec![0u8; 10];
+        assert!(matches!(
+            ThreatDb::from_bytes(data, 0),
+            Err(ThreatDbError::FileTooSmall(_))
+        ));
+    }
+
+    #[test]
+    fn test_unsupported_version() {
+        let mut data = vec![0u8; HEADER_SIZE + 10];
+        data[0..8].copy_from_slice(MAGIC);
+        data[8..12].copy_from_slice(&99u32.to_le_bytes());
+        assert!(matches!(
+            ThreatDb::from_bytes(data, 0),
+            Err(ThreatDbError::UnsupportedVersion(99))
+        ));
+    }
+
+    #[test]
+    fn test_single_entry_db() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_package(
+            Ecosystem::Crates,
+            "only-pkg",
+            &["0.1.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let bytes = writer.build(&key).expect("build");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load");
+
+        assert!(db
+            .check_package(Ecosystem::Crates, "only-pkg", Some("0.1.0"))
+            .is_some());
+        assert!(db
+            .check_package(Ecosystem::Crates, "other", Some("0.1.0"))
+            .is_none());
+    }
+
+    #[test]
+    fn test_empty_db() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        let bytes = writer.build(&key).expect("build");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load");
+
+        assert!(db.check_package(Ecosystem::Npm, "anything", None).is_none());
+        assert!(db.check_ip(Ipv4Addr::new(1, 2, 3, 4)).is_none());
+        assert!(db.check_typosquat(Ecosystem::Npm, "anything").is_none());
+        assert!(db.check_hostname("anything.com").is_none());
+        assert!(db
+            .check_popular_distance(Ecosystem::Npm, "anything")
+            .is_none());
+
+        let stats = db.stats();
+        assert_eq!(stats.package_count, 0);
+        assert_eq!(stats.ip_count, 0);
+    }
+
+    #[test]
+    fn test_cache_returns_none_when_no_file() {
+        let _guard = isolated_global_state();
+        assert!(
+            ThreatDb::cached().is_none(),
+            "a fresh isolated ThreatDB root must not inherit an ambient cache"
+        );
+    }
+
+    #[test]
+    fn test_writer_deduplicates() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+
+        // Same package twice.
+        writer.add_package(
+            Ecosystem::Npm,
+            "dupe-pkg",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::Npm,
+            "dupe-pkg",
+            &["2.0.0"],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+
+        // Same IP twice.
+        writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
+        writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
+
+        let bytes = writer.build(&key).expect("build");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load");
+
+        assert_eq!(
+            db.stats().package_count,
+            1,
+            "duplicate packages should be deduped"
+        );
+        assert_eq!(db.stats().ip_count, 1, "duplicate IPs should be deduped");
+    }
+
+    #[test]
+    fn test_supplemental_overlay_lookup_and_stats() {
+        let key = SigningKey::generate(&mut OsRng);
+
+        let mut primary_writer = ThreatDbWriter::new(1700000000, 1);
+        primary_writer.add_package(
+            Ecosystem::Npm,
+            "primary-pkg",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let primary = ThreatDb::from_bytes(primary_writer.build(&key).expect("primary build"), 0)
+            .expect("primary load");
+
+        let mut supplemental_writer = ThreatDbWriter::new(1700000001, 1);
+        supplemental_writer.add_package(
+            Ecosystem::PyPI,
+            "overlay-pkg",
+            &["2.0.0"],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        supplemental_writer.add_hostname("overlay.example", ThreatSource::Urlhaus);
+        supplemental_writer.add_ip(Ipv4Addr::new(203, 0, 113, 77), ThreatSource::ThreatFoxIoc);
+        supplemental_writer.add_typosquat(Ecosystem::Npm, "reacct", "react");
+        supplemental_writer.add_popular(Ecosystem::Npm, "react");
+
+        let supplemental = ThreatDb::from_bytes(
+            supplemental_writer.build(&key).expect("supplemental build"),
+            0,
+        )
+        .expect("supplemental load");
+
+        let db = primary.with_supplemental(Some(supplemental));
+
+        assert!(db
+            .check_package(Ecosystem::Npm, "primary-pkg", Some("1.0.0"))
+            .is_some());
+        assert!(db
+            .check_package(Ecosystem::PyPI, "overlay-pkg", Some("2.0.0"))
+            .is_some());
+        assert!(db.check_hostname("overlay.example").is_some());
+        assert!(db.check_ip(Ipv4Addr::new(203, 0, 113, 77)).is_some());
+        assert!(db.check_typosquat(Ecosystem::Npm, "reacct").is_some());
+        assert_eq!(
+            db.check_popular_distance(Ecosystem::Npm, "reac"),
+            Some(("react".to_string(), 1))
+        );
+
+        let stats = db.stats();
+        assert_eq!(stats.package_count, 2);
+        assert_eq!(stats.hostname_count, 1);
+        assert_eq!(stats.ip_count, 1);
+        assert_eq!(stats.typosquat_count, 1);
+        assert_eq!(stats.popular_count, 1);
+    }
+
+    #[test]
+    fn test_supplemental_overlay_falls_through_on_primary_version_mismatch() {
+        let key = SigningKey::generate(&mut OsRng);
+
+        let mut primary_writer = ThreatDbWriter::new(1700000000, 1);
+        primary_writer.add_package(
+            Ecosystem::Npm,
+            "shared-pkg",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let primary = ThreatDb::from_bytes(primary_writer.build(&key).expect("primary build"), 0)
+            .expect("primary load");
+
+        let mut supplemental_writer = ThreatDbWriter::new(1700000001, 1);
+        supplemental_writer.add_package(
+            Ecosystem::Npm,
+            "shared-pkg",
+            &["2.0.0"],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let supplemental = ThreatDb::from_bytes(
+            supplemental_writer.build(&key).expect("supplemental build"),
+            0,
+        )
+        .expect("supplemental load");
+
+        let db = primary.with_supplemental(Some(supplemental));
+        let threat = db
+            .check_package(Ecosystem::Npm, "shared-pkg", Some("2.0.0"))
+            .expect("supplemental version should match");
+        assert_eq!(threat.source, ThreatSource::DatadogMalicious);
+    }
+
+    #[test]
+    fn test_cache_source_requires_primary_db() {
+        let guard = isolated_global_state();
+        let primary = guard.roots().threatdb.clone();
+        let supplemental = guard.roots().threatdb_supplemental.clone();
+
+        assert_eq!(current_cache_source(), None);
+
+        std::fs::write(&supplemental, b"overlay").unwrap();
+        assert_eq!(current_cache_source(), None);
+
+        std::fs::remove_file(&supplemental).unwrap();
+        std::fs::write(&primary, b"primary").unwrap();
+        let primary_only = current_cache_source().expect("primary mtime");
+
+        std::fs::write(&supplemental, b"overlay-updated").unwrap();
+        let combined = current_cache_source().expect("combined mtime");
+        assert_ne!(primary_only, combined);
+    }
+
+    fn set_cache_test_mtime(path: &Path, nanos: u32) {
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, nanos);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+
+    fn write_cache_test_overlay(path: &Path, name: &str, nanos: u32) {
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+        writer.add_package(
+            Ecosystem::Npm,
+            name,
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            true,
+            None,
+        );
+        writer
+            .write_to(path, &SigningKey::from_bytes(&[7u8; 32]))
+            .unwrap();
+        set_cache_test_mtime(path, nanos);
+    }
+
+    #[test]
+    fn periodic_cache_check_detects_same_second_overlay_replacement() {
+        let guard = isolated_global_state();
+        let primary = &guard.roots().threatdb;
+        let supplemental = &guard.roots().threatdb_supplemental;
+        std::fs::copy(signed_fixture_db_path(), primary).unwrap();
+        write_cache_test_overlay(supplemental, "old-package", 100_000_000);
+        let cache = ThreatDbCache::new();
+        let before = cache.get().unwrap();
+        let old_source = cache.state.read().unwrap().as_ref().unwrap().source.clone();
+
+        write_cache_test_overlay(supplemental, "new-package", 200_000_000);
+        let new_source = current_cache_source().unwrap();
+        assert_eq!(old_source.primary, new_source.primary);
+        let old_overlay = old_source.supplemental.unwrap();
+        let new_overlay = new_source.supplemental.unwrap();
+        assert_eq!(old_overlay.len, new_overlay.len);
+        assert_eq!(
+            old_overlay
+                .modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            new_overlay
+                .modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        );
+        assert_ne!(old_overlay.modified, new_overlay.modified);
+
+        cache.last_mtime_check.store(0, Ordering::Relaxed);
+        let after = cache.get().unwrap();
+        assert!(after
+            .check_package(Ecosystem::Npm, "new-package", None)
+            .is_some());
+        assert!(after
+            .check_package(Ecosystem::Npm, "old-package", None)
+            .is_none());
+        assert!(before
+            .check_package(Ecosystem::Npm, "old-package", None)
+            .is_some());
+    }
+
+    #[test]
+    fn periodic_cache_check_detects_resolved_primary_and_overlay_path_changes() {
+        let guard = isolated_global_state();
+        let primary = &guard.roots().threatdb;
+        let supplemental = &guard.roots().threatdb_supplemental;
+        std::fs::copy(signed_fixture_db_path(), primary).unwrap();
+        set_cache_test_mtime(primary, 100_000_000);
+        write_cache_test_overlay(supplemental, "old-package", 100_000_000);
+        let cache = ThreatDbCache::new();
+        let before = cache.get().unwrap();
+
+        // An identical signed file at the preferred path is still a different
+        // source. Resolution accepts either format at the preferred v2 name.
+        let preferred_primary = ThreatDb::default_path_v2().unwrap();
+        std::fs::hard_link(primary, &preferred_primary).unwrap();
+        cache.last_mtime_check.store(0, Ordering::Relaxed);
+        let after_primary = cache.get().unwrap();
+        assert!(!Arc::ptr_eq(&before, &after_primary));
+        assert_eq!(
+            cache
+                .state
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .source
+                .primary
+                .path,
+            preferred_primary
+        );
+
+        let preferred_overlay = ThreatDb::supplemental_path_v2().unwrap();
+        write_cache_test_overlay(&preferred_overlay, "new-package", 100_000_000);
+        cache.last_mtime_check.store(0, Ordering::Relaxed);
+        let after_overlay = cache.get().unwrap();
+        assert!(after_overlay
+            .check_package(Ecosystem::Npm, "new-package", None)
+            .is_some());
+        assert!(after_overlay
+            .check_package(Ecosystem::Npm, "old-package", None)
+            .is_none());
+        assert_eq!(
+            cache
+                .state
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .source
+                .supplemental
+                .as_ref()
+                .unwrap()
+                .path,
+            preferred_overlay
+        );
+    }
+
+    #[test]
+    fn invalid_signature_does_not_advance_accepted_cache_source() {
+        let guard = isolated_global_state();
+        let primary = &guard.roots().threatdb;
+        std::fs::copy(signed_fixture_db_path(), primary).unwrap();
+        set_cache_test_mtime(primary, 100_000_000);
+        let cache = ThreatDbCache::new();
+        let before = cache.get().unwrap();
+        let accepted_source = cache.state.read().unwrap().as_ref().unwrap().source.clone();
+
+        // A valid binary structure signed with an untrusted key must retain the
+        // old DB and fingerprint, so a later corrected update is still retried.
+        write_cache_test_overlay(primary, "untrusted-package", 200_000_000);
+        cache.last_mtime_check.store(0, Ordering::Relaxed);
+        let rejected = cache.get().unwrap();
+        assert!(Arc::ptr_eq(&before, &rejected));
+        assert_eq!(
+            cache.state.read().unwrap().as_ref().unwrap().source,
+            accepted_source
+        );
+
+        std::fs::copy(signed_fixture_db_path(), primary).unwrap();
+        set_cache_test_mtime(primary, 200_000_000);
+        cache.last_mtime_check.store(0, Ordering::Relaxed);
+        let corrected = cache.get().unwrap();
+        assert!(!Arc::ptr_eq(&before, &corrected));
+        assert_eq!(
+            cache.state.read().unwrap().as_ref().unwrap().source,
+            current_cache_source().unwrap()
+        );
+    }
+
+    #[test]
+    fn cache_source_changes_preserve_sequence_rollback_rules() {
+        assert!(!should_replace_cached_db(42, 41, true, false));
+        assert!(!should_replace_cached_db(42, 42, false, false));
+        assert!(should_replace_cached_db(42, 42, true, false));
+        assert!(should_replace_cached_db(42, 43, false, false));
+        assert!(should_replace_cached_db(42, 41, true, true));
+        assert!(should_replace_cached_db(0, 0, false, false));
+    }
+
+    #[test]
+    fn test_refresh_cache_reloads_when_only_supplemental_changes() {
+        let guard = isolated_global_state();
+        let fixture = signed_fixture_db_path();
+        let primary = guard.roots().threatdb.clone();
+        let supplemental = guard.roots().threatdb_supplemental.clone();
+        let signing_key = SigningKey::generate(&mut OsRng);
+
+        std::fs::copy(&fixture, &primary).expect("install primary fixture in isolated root");
+        ThreatDb::refresh_cache();
+
+        let before = ThreatDb::cached().expect("fixture DB should load");
+        assert!(
+            before
+                .check_package(Ecosystem::PyPI, "overlay-pkg", Some("2.0.0"))
+                .is_none(),
+            "fixture DB should not include the test-only supplemental package"
+        );
+
+        let mut writer = ThreatDbWriter::new(1700000001, 1);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "overlay-pkg",
+            &["2.0.0"],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer
+            .write_to(&supplemental, &signing_key)
+            .expect("write supplemental DB");
+
+        ThreatDb::refresh_cache();
+
+        let after = ThreatDb::cached().expect("fixture DB with supplemental should load");
+        assert!(
+            after
+                .check_package(Ecosystem::PyPI, "overlay-pkg", Some("2.0.0"))
+                .is_some(),
+            "refresh_cache should pick up supplemental changes even when the primary sequence is unchanged"
+        );
+    }
+
+    #[test]
+    fn test_refresh_cache_clears_when_current_source_disappears() {
+        let guard = isolated_global_state();
+        let fixture = signed_fixture_db_path();
+        let primary = guard.roots().threatdb.clone();
+
+        std::fs::copy(&fixture, &primary).expect("install primary fixture in isolated root");
+        ThreatDb::refresh_cache();
+        assert!(ThreatDb::cached().is_some(), "fixture DB should load");
+
+        std::fs::remove_file(&primary).expect("remove isolated primary fixture");
+        ThreatDb::refresh_cache();
+        assert!(
+            ThreatDb::cached().is_none(),
+            "refresh_cache should clear the cached DB when the configured primary file disappears"
+        );
+    }
+
+    #[test]
+    fn test_string_table_deduplication() {
+        let mut st = StringTable::new();
+        let off1 = st.intern("https://example.com");
+        let off2 = st.intern("https://example.com");
+        let off3 = st.intern("https://other.com");
+
+        assert_eq!(off1, off2, "same string should return same offset");
+        assert_ne!(
+            off1, off3,
+            "different strings should have different offsets"
+        );
+    }
+
+    #[test]
+    fn test_reference_url_round_trip() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_package(
+            Ecosystem::Npm,
+            "ref-pkg",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            Some("https://example.com/advisory/123"),
+        );
+        let bytes = writer.build(&key).expect("build");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load");
+
+        let m = db
+            .check_package(Ecosystem::Npm, "ref-pkg", Some("1.0.0"))
+            .expect("should match");
+        assert_eq!(
+            m.reference_url.as_deref(),
+            Some("https://example.com/advisory/123")
+        );
+    }
+
+    #[test]
+    fn threat_source_all_covers_every_variant() {
+        // Guards `threat-db sources` against silently dropping a source: every
+        // variant must round-trip through ALL, with no duplicates.
+        for src in ThreatSource::ALL {
+            assert_eq!(
+                ThreatSource::from_u8(src as u8),
+                Some(src),
+                "ALL entry {src:?} must round-trip through from_u8"
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for src in ThreatSource::ALL {
+            assert!(seen.insert(src as u8), "ALL has a duplicate: {src:?}");
+        }
+        assert_eq!(ThreatSource::ALL.len(), 13);
+        // Discriminant 12 is now DigitalSide; 13 is the first out-of-range value.
+        assert_eq!(
+            ThreatSource::from_u8(12),
+            Some(ThreatSource::DigitalSide),
+            "discriminant 12 must decode to DigitalSide"
+        );
+        assert!(
+            ThreatSource::from_u8(13).is_none(),
+            "from_u8 must reject an out-of-range discriminant"
+        );
+    }
+
+    #[test]
+    fn threat_source_as_str_is_unique_and_stable() {
+        let mut seen = std::collections::HashSet::new();
+        for src in ThreatSource::ALL {
+            let s = src.as_str();
+            assert!(!s.is_empty());
+            assert!(seen.insert(s), "as_str collision on {s:?}");
+        }
+        // Spot-check a couple of stable identifiers.
+        assert_eq!(ThreatSource::OssfMalicious.as_str(), "ossf_malicious");
+        assert_eq!(ThreatSource::TorExit.as_str(), "tor_exit");
+        assert_eq!(ThreatSource::DigitalSide.as_str(), "digitalside");
+    }
+
+    #[test]
+    fn threat_source_tier_split_matches_feed_origin() {
+        // The feeds compiled into the signed CI DB are Primary (incl. the
+        // curated exfil-endpoint hostname feed).
+        for src in [
+            ThreatSource::OssfMalicious,
+            ThreatSource::DatadogMalicious,
+            ThreatSource::FeodoTracker,
+            ThreatSource::EcosystemsTyposquat,
+            ThreatSource::CisaKev,
+            ThreatSource::ExfilEndpoint,
+        ] {
+            assert_eq!(src.tier(), SourceTier::Primary, "{src:?} should be primary");
+        }
+        // The rest are opt-in supplemental (incl. the gated DigitalSide feed,
+        // which stays supplemental until its freshness gate passes).
+        for src in [
+            ThreatSource::Urlhaus,
+            ThreatSource::PhishingArmy,
+            ThreatSource::PhishTank,
+            ThreatSource::ThreatFoxIoc,
+            ThreatSource::FireholIp,
+            ThreatSource::TorExit,
+            ThreatSource::DigitalSide,
+        ] {
+            assert_eq!(
+                src.tier(),
+                SourceTier::Supplemental,
+                "{src:?} should be supplemental"
+            );
+        }
+    }
+
+    #[test]
+    fn digitalside_hostname_and_ip_roundtrip_with_source_attribution() {
+        // Build an in-memory signed DB with an ephemeral key (the production
+        // verify key is never touched), carrying one DigitalSide-sourced hostname
+        // and one IP, then confirm the lookups attribute the match to DigitalSide.
+        // Synthetic RFC-2606 / RFC-5737 indicators only, never real IoCs.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_hostname("malware.example", ThreatSource::DigitalSide);
+        writer.add_ip(Ipv4Addr::new(192, 0, 2, 66), ThreatSource::DigitalSide);
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        let host_match = db
+            .check_hostname("malware.example")
+            .expect("DigitalSide hostname must be found");
+        assert_eq!(host_match.source, ThreatSource::DigitalSide);
+        assert_eq!(host_match.confidence, Confidence::Confirmed);
+
+        let ip_match = db
+            .check_ip(Ipv4Addr::new(192, 0, 2, 66))
+            .expect("DigitalSide IP must be found");
+        assert_eq!(ip_match.source, ThreatSource::DigitalSide);
+
+        // Attribution also flows through the per-source breakdown.
+        let bd = db.source_breakdown();
+        assert_eq!(bd.count_for(ThreatSource::DigitalSide), 2);
+    }
+
+    #[test]
+    fn source_breakdown_counts_records_per_source() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_package(
+            Ecosystem::Npm,
+            "evil-a",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            true,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::PyPI,
+            "evil-b",
+            &[],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            true,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::Npm,
+            "evil-c",
+            &["2.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Medium,
+            false,
+            None,
+        );
+        writer.add_hostname("bad.example", ThreatSource::Urlhaus);
+        writer.add_hostname("phish.example", ThreatSource::PhishTank);
+        writer.add_ip(Ipv4Addr::new(203, 0, 113, 1), ThreatSource::FeodoTracker);
+        writer.add_ip(Ipv4Addr::new(203, 0, 113, 2), ThreatSource::TorExit);
+        writer.add_typosquat(Ecosystem::Npm, "reacct", "react");
+        writer.add_popular(Ecosystem::Npm, "react");
+
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let bd = db.source_breakdown();
+
+        assert_eq!(bd.count_for(ThreatSource::OssfMalicious), 2);
+        assert_eq!(bd.count_for(ThreatSource::DatadogMalicious), 1);
+        assert_eq!(bd.count_for(ThreatSource::Urlhaus), 1);
+        assert_eq!(bd.count_for(ThreatSource::PhishTank), 1);
+        assert_eq!(bd.count_for(ThreatSource::FeodoTracker), 1);
+        assert_eq!(bd.count_for(ThreatSource::TorExit), 1);
+        assert_eq!(bd.count_for(ThreatSource::CisaKev), 0);
+        // Typosquats are attributed to EcosystemsTyposquat (not 0).
+        assert_eq!(bd.count_for(ThreatSource::EcosystemsTyposquat), 1);
+        assert_eq!(bd.typosquat_count, 1);
+        assert_eq!(bd.popular_count, 1);
+
+        // 3 packages + 2 hostnames + 2 IPs + 1 typosquat = 8; popular is separate.
+        let total: u64 = bd.per_source().iter().map(|(_, c)| c).sum();
+        assert_eq!(total, 8);
+    }
+
+    #[test]
+    fn v2_stats_and_source_breakdown_include_every_indicator_section() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_artifact_sha256(
+            [0x11; 32],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_file_sha256(
+            [0x22; 32],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            &[],
+            None,
+        );
+        writer.add_malicious_url("https://bad.example/payload", ThreatSource::Urlhaus);
+        let bytes = writer
+            .build_format(ThreatDbFormat::V2, &key)
+            .expect("v2 build");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("v2 load");
+
+        let stats = db.stats();
+        assert_eq!(stats.artifact_sha256_count, 1);
+        assert_eq!(stats.file_sha256_count, 1);
+        assert_eq!(stats.malicious_url_count, 1);
+
+        let breakdown = db.source_breakdown();
+        assert_eq!(
+            breakdown
+                .section_counts_for(ThreatSource::OssfMalicious)
+                .artifact_sha256_count,
+            1
+        );
+        assert_eq!(
+            breakdown
+                .section_counts_for(ThreatSource::DatadogMalicious)
+                .file_sha256_count,
+            1
+        );
+        assert_eq!(
+            breakdown
+                .section_counts_for(ThreatSource::Urlhaus)
+                .malicious_url_count,
+            1
+        );
+        assert_eq!(
+            breakdown
+                .per_source()
+                .iter()
+                .map(|(_, count)| count)
+                .sum::<u64>(),
+            3
+        );
+    }
+
+    #[test]
+    fn source_breakdown_folds_in_supplemental_overlay() {
+        let key = SigningKey::generate(&mut OsRng);
+
+        let mut primary_writer = ThreatDbWriter::new(1700000000, 1);
+        primary_writer.add_ip(Ipv4Addr::new(203, 0, 113, 1), ThreatSource::FeodoTracker);
+        let primary =
+            ThreatDb::from_bytes(primary_writer.build(&key).expect("build"), 0).expect("load");
+
+        let mut overlay_writer = ThreatDbWriter::new(1700000001, 1);
+        overlay_writer.add_hostname("bad.example", ThreatSource::Urlhaus);
+        overlay_writer.add_ip(Ipv4Addr::new(203, 0, 113, 9), ThreatSource::TorExit);
+        let overlay =
+            ThreatDb::from_bytes(overlay_writer.build(&key).expect("build"), 0).expect("load");
+
+        let db = primary.with_supplemental(Some(overlay));
+        let bd = db.source_breakdown();
+
+        assert_eq!(bd.count_for(ThreatSource::FeodoTracker), 1);
+        assert_eq!(bd.count_for(ThreatSource::Urlhaus), 1);
+        assert_eq!(bd.count_for(ThreatSource::TorExit), 1);
+    }
+
+    #[test]
+    fn source_breakdown_empty_db_is_all_zero() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let bd = db.source_breakdown();
+        for (_, count) in bd.per_source() {
+            assert_eq!(*count, 0);
+        }
+        assert_eq!(bd.typosquat_count, 0);
+        assert_eq!(bd.popular_count, 0);
+    }
+
+    /// `Ecosystem` discriminants are part of the on-disk binary format — a
+    /// renumber would misread every signed DB shipped to date. Pin them.
+    #[test]
+    fn test_ecosystem_discriminants_are_contiguous() {
+        // Existing (must NEVER change — they are written by signed DBs).
+        assert_eq!(Ecosystem::Npm as u8, 0);
+        assert_eq!(Ecosystem::PyPI as u8, 1);
+        assert_eq!(Ecosystem::RubyGems as u8, 2);
+        assert_eq!(Ecosystem::Crates as u8, 3);
+        assert_eq!(Ecosystem::Go as u8, 4);
+        assert_eq!(Ecosystem::Maven as u8, 5);
+        assert_eq!(Ecosystem::NuGet as u8, 6);
+        assert_eq!(Ecosystem::Packagist as u8, 7);
+        // M6 ch1 additions — appended, not inserted.
+        assert_eq!(Ecosystem::Apt as u8, 8);
+        assert_eq!(Ecosystem::Brew as u8, 9);
+        assert_eq!(Ecosystem::Dnf as u8, 10);
+        assert_eq!(Ecosystem::Yum as u8, 11);
+        assert_eq!(Ecosystem::Pacman as u8, 12);
+        assert_eq!(Ecosystem::Scoop as u8, 13);
+        assert_eq!(Ecosystem::Docker as u8, 14);
+        // from_u8 round-trips every value; unknown bytes return None.
+        for v in 0u8..=14 {
+            let eco = Ecosystem::from_u8(v).expect("must decode");
+            assert_eq!(eco as u8, v, "round-trip failed for byte {v}");
+        }
+        assert!(Ecosystem::from_u8(255).is_none());
+    }
+
+    /// M6 ch1 — lookups for the new ecosystems (no feed wiring yet) must return
+    /// empty without panicking on a populated DB.
+    #[test]
+    fn test_new_ecosystem_lookups_are_empty_no_panic() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        for eco in [
+            Ecosystem::Apt,
+            Ecosystem::Brew,
+            Ecosystem::Dnf,
+            Ecosystem::Yum,
+            Ecosystem::Pacman,
+            Ecosystem::Scoop,
+            Ecosystem::Docker,
+        ] {
+            assert!(db.check_package(eco, "nginx", Some("1.0.0")).is_none());
+            assert!(db.check_package(eco, "nginx", None).is_none());
+            assert!(!db.is_popular_package(eco, "nginx"));
+            assert!(db.check_typosquat(eco, "nginx").is_none());
+            assert!(db.check_popular_distance(eco, "nginx").is_none());
+        }
+    }
+
+    // ── assess_package (A1b) ───────────────────────────────────────────────
+
+    use crate::version_intent::{VersionConstraint, VersionIntent};
+
+    /// A DB whose only record is `pypi/vuln-pkg` affected at 1.4.2 and 1.4.3
+    /// (matching the acceptance-criteria example), version-specific.
+    fn build_constraint_db(signing_key: &SigningKey) -> ThreatDb {
+        let mut writer = ThreatDbWriter::new(1700000000, 7);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "vuln-pkg",
+            &["1.4.2", "1.4.3"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            Some("https://example.com/advisory/vuln"),
+        );
+        let bytes = writer.build(signing_key).expect("build failed");
+        ThreatDb::from_bytes(bytes, 0).expect("load failed")
+    }
+
+    fn constraint_intent(raw: &str) -> VersionIntent {
+        VersionIntent::Constraint {
+            parsed: VersionConstraint::parse(raw),
+            raw: raw.to_string(),
+        }
+    }
+
+    #[test]
+    fn assess_exact_version_in_list_is_exact_match() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        let a = db.assess_package(
+            Ecosystem::Npm,
+            "evil-package",
+            &VersionIntent::Exact("1.0.0".to_string()),
+        );
+        match a {
+            PackageThreatAssessment::ExactMatch(s) => {
+                assert_eq!(s.name, "evil-package");
+                assert_eq!(s.source_id, "ossf_malicious");
+                assert!(!s.all_versions_malicious);
+            }
+            other => panic!("expected ExactMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_exact_pin_matches_trailing_zero_record() {
+        // The record lists `1.4.0`; a pin of `==1.4` must still hit it. The
+        // literal string compare alone would miss (`"1.4" != "1.4.0"`), so the
+        // numeric-equality fallback is what makes this an ExactMatch.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 11);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "foo",
+            &["1.4.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let bytes = writer.build(&key).expect("build failed");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load failed");
+
+        let intent = VersionIntent::from_pep440_specifier("==1.4");
+        assert_eq!(intent, VersionIntent::Exact("1.4".to_string()));
+        match db.assess_package(Ecosystem::PyPI, "foo", &intent) {
+            PackageThreatAssessment::ExactMatch(s) => {
+                assert_eq!(s.name, "foo");
+                assert!(!s.all_versions_malicious);
+            }
+            other => panic!("expected ExactMatch for `==1.4` vs `1.4.0`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_pep440_spelling_and_local_direction_respect_intent_provenance() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 12);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "evil-pre",
+            &["1.0rc1"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::PyPI,
+            "evil-base",
+            &["1.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::PyPI,
+            "local-only",
+            &["1.0+vendor1"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        let prerelease = VersionIntent::from_pep440_specifier("==v1.0RC01");
+        assert!(matches!(
+            db.assess_package(Ecosystem::PyPI, "evil-pre", &prerelease),
+            PackageThreatAssessment::ExactMatch(_)
+        ));
+        let local = VersionIntent::from_pep440_specifier("==1.0+Ubuntu_01");
+        assert!(matches!(
+            db.assess_package(Ecosystem::PyPI, "evil-base", &local),
+            PackageThreatAssessment::ExactMatch(_)
+        ));
+
+        // A public-only PEP 440 specifier can resolve to a local build with the
+        // same public version, so it cannot produce a clean miss.
+        let public_specifier = VersionIntent::from_pep440_specifier("==1.0");
+        assert!(matches!(
+            db.assess_package(Ecosystem::PyPI, "local-only", &public_specifier),
+            PackageThreatAssessment::Unresolved {
+                reason: UnresolvedReason::ExactSpecifierMayResolveLocal,
+                ..
+            }
+        ));
+
+        // A lockfile/installed-artifact identity is already resolved. Concrete
+        // public `1.0` is not the affected local-only `1.0+vendor1` artifact.
+        let resolved_public = VersionIntent::Resolved("1.0".to_string());
+        assert_eq!(
+            db.assess_package(Ecosystem::PyPI, "local-only", &resolved_public),
+            PackageThreatAssessment::NoRecord
+        );
+    }
+
+    #[test]
+    fn assess_ecosystem_version_identity_preserves_literal_and_resolver_semantics() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 14);
+        for (eco, name, version) in [
+            (Ecosystem::Packagist, "vendor/evil", "1.2.3-RC1"),
+            (Ecosystem::Go, "example.com/evil", "v2.0.0+incompatible"),
+            (Ecosystem::Crates, "evil-crate", "1.2.3+vendor.7"),
+            (Ecosystem::RubyGems, "evil-gem", "1.0-RC1"),
+            (Ecosystem::Docker, "library/evil", "v1.2.3"),
+        ] {
+            writer.add_package(
+                eco,
+                name,
+                &[version],
+                ThreatSource::OssfMalicious,
+                Confidence::Confirmed,
+                false,
+                None,
+            );
+        }
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        for (eco, name, intent) in [
+            (
+                Ecosystem::Packagist,
+                "vendor/evil",
+                VersionIntent::from_composer_version("v1.2.3.0-rc01"),
+            ),
+            (
+                Ecosystem::Go,
+                "example.com/evil",
+                VersionIntent::from_go_version("v2.0.0+incompatible"),
+            ),
+            (
+                Ecosystem::Docker,
+                "library/evil",
+                VersionIntent::from_docker_version("v1.2.3"),
+            ),
+            (
+                Ecosystem::Crates,
+                "evil-crate",
+                VersionIntent::from_cargo_version("=1.2.3+vendor.7"),
+            ),
+            (
+                Ecosystem::RubyGems,
+                "evil-gem",
+                VersionIntent::from_gem_version("1.0.pre.RC1"),
+            ),
+        ] {
+            assert!(matches!(
+                db.assess_package(eco, name, &intent),
+                PackageThreatAssessment::ExactMatch(_)
+            ));
+        }
+
+        assert_eq!(
+            db.assess_package(
+                Ecosystem::RubyGems,
+                "evil-gem",
+                &VersionIntent::from_gem_version("2.0"),
+            ),
+            PackageThreatAssessment::NoRecord
+        );
+
+        // Docker tags are not SemVer aliases: these are different registry
+        // references even though one has only a leading `v` difference.
+        assert_eq!(
+            db.assess_package(
+                Ecosystem::Docker,
+                "library/evil",
+                &VersionIntent::from_docker_version("1.2.3"),
+            ),
+            PackageThreatAssessment::NoRecord
+        );
+    }
+
+    #[test]
+    fn unsupported_exact_equivalence_is_unresolved_not_clean() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 13);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "opaque-version",
+            &["not-a-pep440-version"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let intent = VersionIntent::Exact("another-opaque-version".to_string());
+        match db.assess_package(Ecosystem::PyPI, "opaque-version", &intent) {
+            PackageThreatAssessment::Unresolved { reason, .. } => {
+                assert_eq!(reason, UnresolvedReason::ExactVersionUnsupported);
+            }
+            other => panic!("expected fail-closed Unresolved, got {other:?}"),
+        }
+
+        // Identical opaque registry strings are still a proven exact hit.
+        let identical = VersionIntent::Exact("not-a-pep440-version".to_string());
+        assert!(matches!(
+            db.assess_package(Ecosystem::PyPI, "opaque-version", &identical),
+            PackageThreatAssessment::ExactMatch(_)
+        ));
+    }
+
+    #[test]
+    fn digit_leading_npm_selector_stays_unresolved_against_malicious_versions() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        let intent = VersionIntent::from_npm_version("1stable");
+        assert!(matches!(
+            intent,
+            VersionIntent::Constraint { parsed: None, .. }
+        ));
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "evil-package", &intent),
+            PackageThreatAssessment::Unresolved {
+                reason: UnresolvedReason::ConstraintUnsupported,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn assess_exact_version_not_in_list_is_no_record() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        let a = db.assess_package(
+            Ecosystem::Npm,
+            "evil-package",
+            &VersionIntent::Exact("2.0.0".to_string()),
+        );
+        assert_eq!(a, PackageThreatAssessment::NoRecord);
+    }
+
+    #[test]
+    fn assess_unspecified_against_version_specific_is_unresolved() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        let a = db.assess_package(Ecosystem::Npm, "evil-package", &VersionIntent::Unspecified);
+        match a {
+            PackageThreatAssessment::Unresolved {
+                reason,
+                affected_versions,
+                ..
+            } => {
+                assert_eq!(reason, UnresolvedReason::UnspecifiedVersion);
+                assert_eq!(affected_versions, vec!["1.0.0", "1.0.1"]);
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_unspecified_against_all_versions_is_exact_match() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        let a = db.assess_package(Ecosystem::PyPI, "malware-pkg", &VersionIntent::Unspecified);
+        match a {
+            PackageThreatAssessment::ExactMatch(s) => {
+                assert!(s.all_versions_malicious);
+                assert_eq!(s.source_id, "datadog_malicious");
+            }
+            other => panic!("expected ExactMatch for all-versions record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_no_record_for_unknown_package() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        let a = db.assess_package(
+            Ecosystem::Npm,
+            "totally-fine",
+            &VersionIntent::Exact("1.0.0".to_string()),
+        );
+        assert_eq!(a, PackageThreatAssessment::NoRecord);
+    }
+
+    #[test]
+    fn assess_constraint_excludes_affected() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_constraint_db(&key);
+        // affected 1.4.2 / 1.4.3; >=1.4.4 excludes both.
+        let a = db.assess_package(Ecosystem::PyPI, "vuln-pkg", &constraint_intent(">=1.4.4"));
+        assert_eq!(a, PackageThreatAssessment::ConstraintExcludesAffected);
+    }
+
+    #[test]
+    fn assess_constraint_intersects_affected() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_constraint_db(&key);
+        // >=1.4.2,<1.4.4 overlaps both affected versions.
+        let a = db.assess_package(
+            Ecosystem::PyPI,
+            "vuln-pkg",
+            &constraint_intent(">=1.4.2,<1.4.4"),
+        );
+        match a {
+            PackageThreatAssessment::ConstraintIntersectsAffected {
+                affected_versions, ..
+            } => {
+                assert_eq!(affected_versions, vec!["1.4.2", "1.4.3"]);
+            }
+            other => panic!("expected ConstraintIntersectsAffected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_unparsed_constraint_is_unresolved_not_excludes() {
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_constraint_db(&key);
+        // `===1.4.4` (arbitrary equality) and a marker must never claim exclusion.
+        for raw in ["===1.4.4", ">=1.0 ; python_version < \"3.9\"", "==1.4.*"] {
+            let a = db.assess_package(Ecosystem::PyPI, "vuln-pkg", &constraint_intent(raw));
+            match a {
+                PackageThreatAssessment::Unresolved { reason, .. } => {
+                    assert_eq!(
+                        reason,
+                        UnresolvedReason::ConstraintUnsupported,
+                        "raw `{raw}` should be ConstraintUnsupported"
+                    );
+                }
+                other => panic!("expected Unresolved for `{raw}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn assess_affected_version_unparsed_is_unresolved() {
+        // A record whose affected version is not a plain release version cannot
+        // be proven excluded, so a constraint over it stays Unresolved.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 9);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "weird-ver",
+            &["1.0.0rc1"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let bytes = writer.build(&key).expect("build failed");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load failed");
+        let a = db.assess_package(Ecosystem::PyPI, "weird-ver", &constraint_intent(">=1.0.0"));
+        match a {
+            PackageThreatAssessment::Unresolved { reason, .. } => {
+                assert_eq!(reason, UnresolvedReason::AffectedVersionUnparsed);
+            }
+            other => panic!("expected Unresolved (AffectedVersionUnparsed), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_supplemental_unresolved_dedups_affected() {
+        // Primary excludes (>=1.4.4 over 1.4.2/1.4.3) but a supplemental overlay
+        // is unresolved for the same name; the merge must surface Unresolved
+        // (never the primary's exclusion) with deduplicated affected versions.
+        let key = SigningKey::generate(&mut OsRng);
+        let primary_bytes = {
+            let mut w = ThreatDbWriter::new(1700000000, 11);
+            w.add_package(
+                Ecosystem::PyPI,
+                "split-pkg",
+                &["1.4.2", "1.4.3"],
+                ThreatSource::OssfMalicious,
+                Confidence::Confirmed,
+                false,
+                None,
+            );
+            w.build(&key).expect("build primary")
+        };
+        let supp_bytes = {
+            let mut w = ThreatDbWriter::new(1700000000, 12);
+            w.add_package(
+                Ecosystem::PyPI,
+                "split-pkg",
+                &["1.4.3", "1.4.9"],
+                ThreatSource::DatadogMalicious,
+                Confidence::Confirmed,
+                false,
+                None,
+            );
+            w.build(&key).expect("build supplemental")
+        };
+        let supplemental = ThreatDb::from_bytes(supp_bytes, 0).expect("load supp");
+        let db = ThreatDb::from_bytes(primary_bytes, 0)
+            .expect("load primary")
+            .with_supplemental(Some(supplemental));
+
+        // >=1.4.4 excludes the primary's {1.4.2,1.4.3}; for the supplemental
+        // {1.4.3,1.4.9} it intersects (1.4.9). The merged result must intersect.
+        let a = db.assess_package(Ecosystem::PyPI, "split-pkg", &constraint_intent(">=1.4.4"));
+        match a {
+            PackageThreatAssessment::ConstraintIntersectsAffected {
+                affected_versions, ..
+            } => {
+                assert_eq!(affected_versions, vec!["1.4.9"]);
+            }
+            other => panic!("expected ConstraintIntersectsAffected from overlay, got {other:?}"),
+        }
+
+        // An Unspecified request is unresolved in both layers; affected versions
+        // are the deduplicated union across both.
+        let a2 = db.assess_package(Ecosystem::PyPI, "split-pkg", &VersionIntent::Unspecified);
+        match a2 {
+            PackageThreatAssessment::Unresolved {
+                affected_versions, ..
+            } => {
+                assert_eq!(affected_versions, vec!["1.4.2", "1.4.3", "1.4.9"]);
+            }
+            other => panic!("expected Unresolved with merged affected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_package_shim_still_matches() {
+        // Regression: the kept `check_package` shim behaves exactly as before.
+        let key = SigningKey::generate(&mut OsRng);
+        let db = build_test_db(&key);
+        assert!(db
+            .check_package(Ecosystem::Npm, "evil-package", Some("1.0.0"))
+            .is_some());
+        assert!(db
+            .check_package(Ecosystem::Npm, "evil-package", Some("2.0.0"))
+            .is_none());
+        assert!(db
+            .check_package(Ecosystem::Npm, "evil-package", None)
+            .is_none());
+        assert!(db
+            .check_package(Ecosystem::PyPI, "malware-pkg", None)
+            .is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // v2 format (DB-B): writer/reader roundtrip, backward compat, footer/
+    // trailer rejection, signature, and per-format cache-filename selection.
+    // ------------------------------------------------------------------
+
+    /// Build a v2 DB carrying one v1 package plus one artifact hash, one file
+    /// hash (with behavior tags + campaign), and one malicious URL.
+    fn build_v2_db(key: &SigningKey) -> Vec<u8> {
+        let mut writer = ThreatDbWriter::new(1_700_000_500, 100);
+        // A v1 package so the v1 sections are non-empty too.
+        writer.add_package(
+            Ecosystem::PyPI,
+            "v2-pkg",
+            &["1.2.3"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            Some("https://example.com/v2"),
+        );
+        writer.add_artifact_sha256(
+            sha(0xAA),
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            true,
+            Some("miasma"),
+        );
+        writer.add_file_sha256(
+            sha(0xBB),
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            &[BehaviorTag::ProcessSpawn, BehaviorTag::CrossRuntime],
+            Some("miasma"),
+        );
+        writer.add_malicious_url(
+            "http://sfrclak.com:8000/6202033",
+            ThreatSource::ExfilEndpoint,
+        );
+        writer
+            .build_format(ThreatDbFormat::V2, key)
+            .expect("v2 build")
+    }
+
+    #[test]
+    fn v2_roundtrip_artifact_file_url_hits() {
+        let key = SigningKey::generate(&mut OsRng);
+        let bytes = build_v2_db(&key);
+        let db = ThreatDb::from_bytes(bytes, 0).expect("v2 load");
+
+        assert_eq!(db.stats().format_version, 2);
+
+        // v1 package still resolves on a v2 file.
+        assert!(db
+            .check_package(Ecosystem::PyPI, "v2-pkg", Some("1.2.3"))
+            .is_some());
+
+        // Artifact hash hit.
+        let am = db.check_artifact_sha256(&sha(0xAA)).expect("artifact hit");
+        assert_eq!(am.source, ThreatSource::OssfMalicious);
+        assert!(am.all_versions_malicious);
+        assert_eq!(am.campaign.as_deref(), Some("miasma"));
+        // Artifact miss.
+        assert!(db.check_artifact_sha256(&sha(0xAB)).is_none());
+
+        // File hash hit with behavior tags + campaign.
+        let fm = db.check_file_sha256(&sha(0xBB)).expect("file hit");
+        assert_eq!(fm.source, ThreatSource::OssfMalicious);
+        assert!(fm.behavior_tags.contains(&BehaviorTag::ProcessSpawn));
+        assert!(fm.behavior_tags.contains(&BehaviorTag::CrossRuntime));
+        assert!(!fm.behavior_tags.contains(&BehaviorTag::NetworkExfil));
+        assert_eq!(fm.campaign.as_deref(), Some("miasma"));
+        assert!(db.check_file_sha256(&sha(0xBC)).is_none());
+
+        // URL hit (exact compare after locating the hash) + miss.
+        assert_eq!(
+            db.check_malicious_url("http://sfrclak.com:8000/6202033"),
+            Some(ThreatSource::ExfilEndpoint)
+        );
+        assert!(db
+            .check_malicious_url("http://sfrclak.com:8000/other")
+            .is_none());
+    }
+
+    #[test]
+    fn v2_signature_verifies_against_signing_key() {
+        // Freshly-signed v2 verifies against the key that signed it (the
+        // embedded production key is a placeholder in tests, so we verify
+        // against the signer directly, like test_signature_with_matching_key).
+        let key = SigningKey::generate(&mut OsRng);
+        let bytes = build_v2_db(&key);
+        let sig_bytes = &bytes[SIG_OFFSET..SIG_OFFSET + SIGNATURE_LENGTH];
+        let signature = Signature::from_slice(sig_bytes).expect("parse sig");
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&bytes[..SIG_OFFSET]);
+        signed_data.extend_from_slice(&bytes[HEADER_SIZE..]);
+        use ed25519_dalek::Verifier;
+        assert!(
+            key.verifying_key().verify(&signed_data, &signature).is_ok(),
+            "v2 signature must verify over [0..SIG_OFFSET) ++ [HEADER_SIZE..)"
+        );
+    }
+
+    #[test]
+    fn v2_corrupt_section_byte_fails_signature() {
+        // A byte flipped inside the appended v2 region must break the signature,
+        // proving the v2 sections + trailer + footer are inside the signed range.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut bytes = build_v2_db(&key);
+        // Flip a byte well after the v1 header (in the v2 area / trailer / footer).
+        let idx = bytes.len() - 10;
+        bytes[idx] ^= 0xFF;
+        let sig_bytes = &bytes[SIG_OFFSET..SIG_OFFSET + SIGNATURE_LENGTH];
+        let signature = Signature::from_slice(sig_bytes).expect("parse sig");
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&bytes[..SIG_OFFSET]);
+        signed_data.extend_from_slice(&bytes[HEADER_SIZE..]);
+        use ed25519_dalek::Verifier;
+        assert!(
+            key.verifying_key()
+                .verify(&signed_data, &signature)
+                .is_err(),
+            "tampering with the v2 region must invalidate the signature"
+        );
+    }
+
+    #[test]
+    fn v2_rollback_still_enforced() {
+        // The rollback build_sequence check is preserved verbatim for v2.
+        let key = SigningKey::generate(&mut OsRng);
+        let bytes = build_v2_db(&key); // sequence 100
+        let err = ThreatDb::from_bytes(bytes, 200).expect_err("v2 rollback must reject");
+        assert!(matches!(err, ThreatDbError::RollbackDetected { .. }));
+    }
+
+    #[test]
+    fn v2_empty_sections_roundtrip() {
+        // A v2 DB with no v2 records at all still loads and every v2 lookup
+        // returns None (empty sections are valid).
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+        writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
+        let bytes = writer
+            .build_format(ThreatDbFormat::V2, &key)
+            .expect("v2 build");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("empty v2 load");
+        assert_eq!(db.stats().format_version, 2);
+        assert!(db.check_artifact_sha256(&sha(1)).is_none());
+        assert!(db.check_file_sha256(&sha(1)).is_none());
+        assert!(db.check_malicious_url("http://x").is_none());
+    }
+
+    #[test]
+    fn v2_supplemental_overlay_resolves_v2_lookups() {
+        // A v2 lookup that misses the primary defers to a v2 supplemental.
+        let key = SigningKey::generate(&mut OsRng);
+        let primary = ThreatDb::from_bytes(
+            ThreatDbWriter::new(1, 1)
+                .build_format(ThreatDbFormat::V2, &key)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+        let mut overlay_writer = ThreatDbWriter::new(2, 1);
+        overlay_writer.add_artifact_sha256(
+            sha(0xCC),
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let overlay = ThreatDb::from_bytes(
+            overlay_writer
+                .build_format(ThreatDbFormat::V2, &key)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+        let db = primary.with_supplemental(Some(overlay));
+        let am = db
+            .check_artifact_sha256(&sha(0xCC))
+            .expect("supplemental artifact hit");
+        assert_eq!(am.source, ThreatSource::DatadogMalicious);
+    }
+
+    /// Take a valid v2 DB and overwrite the fixed footer fields via a closure,
+    /// returning the mutated bytes (for rejection tests).
+    fn v2_with_footer_mut(mutate: impl FnOnce(&mut [u8])) -> Vec<u8> {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut bytes = build_v2_db(&key);
+        let foot = bytes.len() - FOOTER_SIZE;
+        mutate(&mut bytes[foot..]);
+        bytes
+    }
+
+    #[test]
+    fn v2_reject_bad_footer_magic() {
+        let bytes = v2_with_footer_mut(|f| f[0] ^= 0xFF);
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_unsupported_trailer_version() {
+        // trailer_version is at footer[24..26].
+        let bytes = v2_with_footer_mut(|f| f[24..26].copy_from_slice(&999u16.to_le_bytes()));
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_trailer_offset_out_of_bounds() {
+        // trailer_offset at footer[8..16]: push it past EOF.
+        let bytes = v2_with_footer_mut(|f| {
+            f[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_trailer_offset_inside_header() {
+        // A trailer_offset inside the signature header (< HEADER_SIZE) is rejected.
+        let bytes = v2_with_footer_mut(|f| {
+            f[8..16].copy_from_slice(&10u64.to_le_bytes());
+            // keep a small length so only the offset rule trips.
+            f[16..24].copy_from_slice(&(DESCRIPTOR_SIZE as u64).to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_trailer_length_not_descriptor_multiple() {
+        // trailer_length at footer[16..24]: set to a non-multiple.
+        let bytes = v2_with_footer_mut(|f| {
+            f[16..24].copy_from_slice(&((DESCRIPTOR_SIZE as u64) + 1).to_le_bytes())
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    /// Build a v2 DB and rewrite a chosen descriptor field in the trailer, given
+    /// a mutator over the descriptor index and a mutable slice of its 32 bytes.
+    fn v2_with_descriptor_mut(which: usize, mutate: impl FnOnce(&mut [u8])) -> Vec<u8> {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut bytes = build_v2_db(&key);
+        let foot = bytes.len() - FOOTER_SIZE;
+        let trailer_offset =
+            u64::from_le_bytes(bytes[foot + 8..foot + 16].try_into().unwrap()) as usize;
+        let dbase = trailer_offset + which * DESCRIPTOR_SIZE;
+        mutate(&mut bytes[dbase..dbase + DESCRIPTOR_SIZE]);
+        bytes
+    }
+
+    #[test]
+    fn v2_reject_duplicate_section_type() {
+        // Rewrite descriptor 1's section_type to equal descriptor 0's.
+        let bytes = v2_with_descriptor_mut(1, |d| {
+            d[0..2].copy_from_slice(&(SectionType::ArtifactSha as u16).to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_unknown_section_type() {
+        let bytes = v2_with_descriptor_mut(0, |d| {
+            d[0..2].copy_from_slice(&4242u16.to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_section_offset_inside_header() {
+        // descriptor offset field is at descriptor[4..12].
+        let bytes = v2_with_descriptor_mut(0, |d| {
+            d[4..12].copy_from_slice(&10u64.to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_section_count_times_record_size_mismatch() {
+        // Inflate the artifact-sha descriptor count so count*record_size != length.
+        let bytes = v2_with_descriptor_mut(0, |d| {
+            d[20..28].copy_from_slice(&9999u64.to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_section_running_into_trailer() {
+        // Extend the artifact-sha section length so it overlaps the trailer.
+        let bytes = v2_with_descriptor_mut(0, |d| {
+            d[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_full_32_byte_hash_no_short_prefix_collision() {
+        // Two hashes sharing a long common prefix but differing in the LAST byte
+        // must be distinguished (the index keys on the full 32 bytes).
+        let key = SigningKey::generate(&mut OsRng);
+        let mut a = [0x11u8; 32];
+        let mut b = [0x11u8; 32];
+        a[31] = 0x01;
+        b[31] = 0x02;
+        let mut writer = ThreatDbWriter::new(1, 1);
+        writer.add_artifact_sha256(
+            a,
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let bytes = writer.build_format(ThreatDbFormat::V2, &key).unwrap();
+        let db = ThreatDb::from_bytes(bytes, 0).unwrap();
+        assert!(
+            db.check_artifact_sha256(&a).is_some(),
+            "exact 32-byte match hits"
+        );
+        assert!(
+            db.check_artifact_sha256(&b).is_none(),
+            "a hash differing only in the last byte must NOT match"
+        );
+    }
+
+    #[test]
+    fn v2_sibling_path_derivation() {
+        assert_eq!(
+            v2_sibling(Path::new("/x/tirith-threatdb.dat")),
+            PathBuf::from("/x/tirith-threatdb-v2.dat")
+        );
+        assert_eq!(
+            v2_sibling(Path::new("/x/custom.bin")),
+            PathBuf::from("/x/custom.bin-v2")
+        );
+    }
+
+    #[test]
+    fn resolve_preferring_v2_parseable_else_v1() {
+        // Drive the resolver directly with require_signature=false (the
+        // supplemental discipline), so a self-signed v2 can be exercised. The
+        // signed-primary discipline is covered by
+        // `resolve_primary_requires_valid_signature` below.
+        let key = SigningKey::generate(&mut OsRng);
+        let tmp = tempfile::tempdir().unwrap();
+        let v1_path = tmp.path().join("v1.dat");
+        let v2_path = tmp.path().join("v2.dat");
+        ThreatDbWriter::new(1, 1)
+            .write_to(&v1_path, &key)
+            .expect("write v1");
+
+        // Only v1 present -> v1.
+        assert_eq!(
+            resolve_preferring_v2(Some(v2_path.clone()), Some(v1_path.clone()), false),
+            Some(v1_path.clone())
+        );
+        // Both present, v2 parseable -> v2.
+        ThreatDbWriter::new(2, 2)
+            .write_to_format(ThreatDbFormat::V2, &v2_path, &key)
+            .expect("write v2");
+        assert_eq!(
+            resolve_preferring_v2(Some(v2_path.clone()), Some(v1_path.clone()), false),
+            Some(v2_path.clone())
+        );
+        // v2 corrupt -> falls back to v1 (corrupt v2 never shadows).
+        std::fs::write(&v2_path, b"not a db").unwrap();
+        assert_eq!(
+            resolve_preferring_v2(Some(v2_path.clone()), Some(v1_path.clone()), false),
+            Some(v1_path.clone())
+        );
+    }
+
+    #[test]
+    fn resolve_primary_requires_valid_signature() {
+        // The signed-primary resolver (require_signature=true) must NOT prefer a
+        // structurally-valid v2 that fails signature verification against the
+        // embedded key (a self-signed DB does), so a planted unsigned v2 cannot
+        // shadow a good v1 and fail-open the DB.
+        let key = SigningKey::generate(&mut OsRng);
+        let tmp = tempfile::tempdir().unwrap();
+        let v1_path = tmp.path().join("v1.dat");
+        let v2_path = tmp.path().join("v2.dat");
+        ThreatDbWriter::new(1, 1)
+            .write_to(&v1_path, &key)
+            .expect("write v1");
+        ThreatDbWriter::new(2, 2)
+            .write_to_format(ThreatDbFormat::V2, &v2_path, &key)
+            .expect("write v2");
+        // Self-signed v2 fails the embedded-key signature check -> falls back to v1.
+        assert_eq!(
+            resolve_preferring_v2(Some(v2_path.clone()), Some(v1_path.clone()), true),
+            Some(v1_path.clone()),
+            "an unverifiable v2 must not shadow a good v1 under the signed-primary discipline"
+        );
+    }
+
+    #[test]
+    fn resolve_primary_path_falls_back_to_v1_for_self_signed_v2() {
+        // End-to-end through resolve_primary_path (which requires a valid
+        // signature): a self-signed v2 beside a v1 resolves to v1.
+        let guard = isolated_global_state();
+        let key = SigningKey::generate(&mut OsRng);
+        let v1_path = guard.roots().threatdb.clone();
+        let v2_path = v2_sibling(&v1_path);
+        ThreatDbWriter::new(1, 1)
+            .write_to(&v1_path, &key)
+            .expect("write v1");
+        ThreatDbWriter::new(2, 2)
+            .write_to_format(ThreatDbFormat::V2, &v2_path, &key)
+            .expect("write v2");
+        // v2 exists and parses but is self-signed, so the signed-primary resolver
+        // falls back to the v1 path.
+        assert_eq!(ThreatDb::resolve_primary_path(), Some(v1_path.clone()));
+        // With no v2 at all, still v1.
+        std::fs::remove_file(&v2_path).unwrap();
+        assert_eq!(ThreatDb::resolve_primary_path(), Some(v1_path.clone()));
+    }
+}

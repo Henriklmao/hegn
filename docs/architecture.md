@@ -723,6 +723,10 @@ scripts/
   vm-images.yml     weekly upstream pin refresh PR
   release.yml       tagged AppImage release
   aur-publish.yml   tagged AUR publish
+vendor/
+  tirith-core/      patched newest upstream release (RustSec fixes)
+vendor/
+  tirith-core/      patched newest upstream release (RustSec fixes)
 docs/
   architecture.md   this document
   llm-setup.md      install guide written for LLM agents

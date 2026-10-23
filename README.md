@@ -583,8 +583,10 @@ src/
   tui.rs         terminal lifecycle and event loop
 ```
 
-The crate is a library (`lib.rs`) with a thin binary, so every module is unit
-tested directly. See [`docs/architecture.md`](docs/architecture.md) for the
+`vendor/tirith-core/` is a local copy of the newest upstream release with only
+its vulnerable transitive dependencies patched; see
+`vendor/tirith-core/PATCHES.md`. The crate is a library (`lib.rs`) with a thin
+binary, so every module is unit tested directly. See [`docs/architecture.md`](docs/architecture.md) for the
 detailed architecture, data flows, safety invariants, and image-update
 pipeline.
 

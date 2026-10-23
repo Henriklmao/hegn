@@ -32,6 +32,11 @@ unicode-width = "0.2.2"
 [dev-dependencies]
 tempfile = "3.27.0"
 
+# tirith-core 0.4.2 is the newest release, but its transitive dependencies
+# carry RUSTSEC advisories. The vendored copy only updates those dependencies
+[patch.crates-io]
+tirith-core = { path = "vendor/tirith-core" }
+
 [profile.release]
 lto = "thin"
 strip = true
