@@ -2,7 +2,8 @@
 
 This document describes how `hegn` is put together, which invariants the
 implementation must preserve, and how the pieces fail. It is the detailed
-companion to [`../README.md`](../README.md) (user documentation).
+companion to [`../README.md`](../README.md) (user documentation); measured host
+cost and storage figures live in [`resources.md`](resources.md).
 
 `hegn` is a Linux-only Rust application that runs coding agents inside
 Cloud Hypervisor VMs. The host process never runs project work itself. Every
@@ -730,6 +731,7 @@ vendor/
 docs/
   architecture.md   this document
   llm-setup.md      install guide written for LLM agents
+  resources.md      host cost, overhead and storage
 README.md           user-facing documentation
 AGENTS.md           repository working agreement
 ```

@@ -42,6 +42,7 @@ uname -srm                                   # Linux, x86_64 or aarch64
 test -r /dev/kvm && test -w /dev/kvm && echo "kvm: ok" || echo "kvm: missing"
 id -nG | tr ' ' '\n' | grep -qx kvm && echo "kvm group: ok" || echo "kvm group: missing"
 ldd --version | head -1                      # glibc host
+df -h ~                                      # need ~2.5 GiB free, plus snapshots
 command -v paru yay 2>/dev/null              # AUR helper (Arch family only)
 ```
 
@@ -50,7 +51,7 @@ command -v paru yay 2>/dev/null              # AUR helper (Arch family only)
 | Linux kernel 6.2+ | yes | Use a current distribution kernel. |
 | `/dev/kvm` readable/writable by the user | yes | Enable VT-x/AMD-V (and nested virt inside a VM) in firmware/hypervisor, then add the user to `kvm`: `sudo usermod -aG kvm "$USER"` (needs a new login session). |
 | glibc | yes for the pre-built binaries | On musl (Alpine) install from source. |
-| Disk space | a few hundred MB | For the pinned kernel + rootfs images under `~/.local/share/hegn/images`. |
+| Disk space | ~2.5 GiB free | 46 MiB kernel + 1.9 GiB rootfs + ~10 MiB tools, plus ~`memory_mib` per snapshot. |
 
 **Gate:** `test -r /dev/kvm && test -w /dev/kvm` must succeed. If it does not,
 stop and report the exact `ls -l /dev/kvm` output and whether the host is itself
@@ -260,6 +261,28 @@ Summarise, with the actual output you collected:
 - config path, state dir and image paths;
 - anything skipped, downgraded or left for the user to decide (for example a
   missing `kvm` group membership that needs a re-login).
+
+---
+
+## Footprint and storage
+
+Measured on a default 2 vCPU / 2048 MiB guest:
+
+- **RAM on the host:** `memory_mib` + ~50 MiB (`virtiofsd` ~12 MiB, console
+  relay ~5 MiB, VMM bookkeeping), plus ~26 MiB while the TUI is open. Guest RAM
+  is mapped up front and populated on demand.
+- **Disk:** 46 MiB kernel + 1.9 GiB qcow2 rootfs, shared by all projects and
+  writable/persistent; `hegn` ~19 MiB, `cloud-hypervisor-static` ~7 MiB,
+  `virtiofsd` ~2.4 MiB; ~4 MiB per session in `state_dir/run`.
+- **Snapshots:** roughly `memory_mib` each (`memory-ranges`, sparse where the
+  guest never touched pages); disk contents are not included.
+- **Logs:** a few tens of KiB per interactive session, retention 50 files,
+  `hegn logs prune --keep 20`.
+- Only one sandbox runs at a time, so this is the whole host cost.
+
+Before downloading, confirm free space with `df -h ~`, and report it to the
+user. Full measurements, the native-vs-VM comparison and cleanup tips are in
+[`resources.md`](resources.md).
 
 ---
 

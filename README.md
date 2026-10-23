@@ -95,6 +95,7 @@ fix.
 | Landlock | A host kernel with Landlock ABI v3 (Linux 6.2 or newer). `hegn doctor` probes it; set `landlock = false` only if you accept the reduced isolation. |
 | [virtiofsd](https://gitlab.com/virtio-fs/virtiofsd) | `virtiofsd` on `PATH` (or set `virtiofsd_bin`). Distribution install locations such as `/usr/lib/virtiofsd` (Arch), `/usr/libexec/virtiofsd` (Fedora) and `/usr/lib/qemu/virtiofsd` (Debian) are detected automatically. |
 | Kernel + rootfs images | A guest kernel and qcow2/raw root filesystem. Defaults under `~/.local/share/hegn/images/`; see `kernel_image`, `rootfs_image`, `rootfs_format` and `root_device`. |
+| Free disk | ~2.5 GiB for the pinned images and tools, plus ~`memory_mib` per snapshot and log space. |
 | `git` | Used for project status, session branches and checkpoints. |
 | `lazygit`, `$EDITOR` | Optional, for the `g` and `e` shortcuts. |
 
@@ -103,6 +104,21 @@ fix.
 Both backend modes require a real Cloud Hypervisor VM. A missing kernel,
 rootfs, Cloud Hypervisor binary, virtiofsd, or KVM device is a hard error; there
 is no local PTY fallback.
+
+---
+
+## Resource footprint
+
+A running session costs the configured `memory_mib` (default 2 GiB) plus roughly
+50 MiB for `virtiofsd`, the console relay and VMM bookkeeping, and ~26 MiB more
+while the TUI is open. Only one VM runs at a time. On disk, the pinned images
+take ~2.2 GiB (shared by every project), the binary ~19 MiB, and a snapshot
+about as much as the guest RAM; session logs are pruned by count.
+
+Compute runs near-native under KVM, while many-small-file I/O is slower because
+the workspace is exported through virtio-fs with `--cache=never`. Measured
+numbers, the native comparison and tuning tips are in
+[`docs/resources.md`](docs/resources.md).
 
 ---
 
