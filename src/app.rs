@@ -1214,6 +1214,10 @@ impl App {
         if self.focus == Focus::Snapshots {
             return self.confirm_restore_snapshot();
         }
+        if self.sandbox.state == SandboxState::Starting {
+            self.toast("a VM is already starting…", ToastLevel::Warn);
+            return Vec::new();
+        }
         let Some(project) = self.selected_project().cloned() else {
             self.toast("no project selected", ToastLevel::Warn);
             return Vec::new();
@@ -2039,6 +2043,19 @@ mod tests {
             }
             other => panic!("expected StartSandbox, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_second_start_is_rejected_while_the_first_is_booting() {
+        let (_dir, mut app) = test_app();
+        app.sandbox.state = SandboxState::Starting;
+        let effects = app.open_selected();
+        assert!(effects.is_empty());
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("already starting"))
+        );
     }
 
     #[test]

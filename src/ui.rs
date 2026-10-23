@@ -104,11 +104,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(left).style(Style::default()), inner);
 
     let status = match app.sandbox.state {
-        SandboxState::Running => ("● running", GREEN),
-        SandboxState::Starting => ("◐ starting", YELLOW),
-        SandboxState::Paused => ("Ⅱ paused", YELLOW),
-        SandboxState::Failed => ("✕ failed", RED),
-        SandboxState::Stopped => ("○ stopped", MUTED),
+        SandboxState::Running => ("● running".to_string(), GREEN),
+        SandboxState::Starting => (format!("{} starting", spinner(app.tick())), YELLOW),
+        SandboxState::Paused => ("Ⅱ paused".to_string(), YELLOW),
+        SandboxState::Failed => ("✕ failed".to_string(), RED),
+        SandboxState::Stopped => ("○ stopped".to_string(), MUTED),
     };
     let right_text = format!("{}  {} ", status.0, app.sandbox.backend);
     let width = right_text.width() as u16;
@@ -443,11 +443,11 @@ fn render_sandbox_panel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
 
     let (state_label, state_color) = match app.sandbox.state {
-        SandboxState::Running => ("RUNNING", GREEN),
-        SandboxState::Starting => ("STARTING", YELLOW),
-        SandboxState::Paused => ("PAUSED", YELLOW),
-        SandboxState::Failed => ("FAILED", RED),
-        SandboxState::Stopped => ("STOPPED", MUTED),
+        SandboxState::Running => ("RUNNING".to_string(), GREEN),
+        SandboxState::Starting => (format!("STARTING {}", spinner(app.tick())), YELLOW),
+        SandboxState::Paused => ("PAUSED".to_string(), YELLOW),
+        SandboxState::Failed => ("FAILED".to_string(), RED),
+        SandboxState::Stopped => ("STOPPED".to_string(), MUTED),
     };
     let uptime = app
         .sandbox

@@ -17,7 +17,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::app::{App, Effect, ToastLevel};
-use crate::config::Config;
+use crate::config::{Config, Harness};
+use crate::console::TerminalConsole;
 use crate::doctor::DoctorReport;
 use crate::project;
 use crate::ui;
@@ -26,6 +27,11 @@ const TICK: Duration = Duration::from_millis(50);
 
 enum ScanMessage {
     Projects(Vec<project::Project>),
+    Started {
+        console: Box<dyn TerminalConsole>,
+        branch: Option<Result<String, String>>,
+    },
+    StartFailed(String),
     Doctor {
         report: DoctorReport,
         note: Option<String>,
@@ -104,6 +110,19 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
     loop {
         match scan_rx.try_recv() {
             Ok(ScanMessage::Projects(projects)) => app.set_projects(projects),
+            Ok(ScanMessage::Started { console, branch }) => {
+                app.attach_console(console);
+                match branch {
+                    Some(Ok(branch)) => {
+                        app.toast(format!("session branch {branch}"), ToastLevel::Info)
+                    }
+                    Some(Err(err)) => {
+                        app.toast(format!("branch not created: {err}"), ToastLevel::Warn)
+                    }
+                    None => {}
+                }
+            }
+            Ok(ScanMessage::StartFailed(err)) => app.fail_start(err),
             Ok(ScanMessage::Doctor { report, note }) => app.show_doctor(report, note),
             Ok(ScanMessage::Error(err)) => {
                 app.loading = false;
@@ -156,6 +175,45 @@ fn spawn_image_download(config: Config, tx: mpsc::Sender<ScanMessage>) {
     }
 }
 
+fn spawn_start(
+    config: Config,
+    project: std::path::PathBuf,
+    harness: Harness,
+    tx: mpsc::Sender<ScanMessage>,
+) {
+    let thread_tx = tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("hegn-start-vm".into())
+        .spawn(move || {
+            let manager = crate::sandbox::SandboxManager::new(config.clone());
+            match manager.ensure_console(&project, harness) {
+                Ok(console) => {
+                    let branch = if config.auto_branch
+                        && project::read_git_summary(&project).is_repo
+                    {
+                        Some(
+                            project::create_session_branch(&project).map_err(|err| err.to_string()),
+                        )
+                    } else {
+                        None
+                    };
+                    let _ = thread_tx.send(ScanMessage::Started {
+                        console: Box::new(console),
+                        branch,
+                    });
+                }
+                Err(err) => {
+                    let _ = thread_tx.send(ScanMessage::StartFailed(err.to_string()));
+                }
+            }
+        });
+    if let Err(err) = spawned {
+        let _ = tx.send(ScanMessage::StartFailed(format!(
+            "could not start the VM start thread: {err}"
+        )));
+    }
+}
+
 fn handle_effects(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -187,22 +245,8 @@ fn handle_effects(
                 }
             }
             Effect::StartSandbox { project, harness } => {
-                let manager = crate::sandbox::SandboxManager::new(app.config.clone());
-                match manager.ensure_console(&project, harness) {
-                    Ok(console) => {
-                        app.attach_console(Box::new(console));
-                        if app.config.auto_branch && project::read_git_summary(&project).is_repo {
-                            match project::create_session_branch(&project) {
-                                Ok(branch) => {
-                                    app.toast(format!("session branch {branch}"), ToastLevel::Info)
-                                }
-                                Err(err) => app
-                                    .toast(format!("branch not created: {err}"), ToastLevel::Warn),
-                            }
-                        }
-                    }
-                    Err(err) => app.fail_start(err.to_string()),
-                }
+                app.toast("starting VM…", ToastLevel::Info);
+                spawn_start(app.config.clone(), project, harness, scan_tx.clone());
             }
             Effect::RestoreSnapshot(snapshot) => {
                 let manager = crate::sandbox::SandboxManager::new(app.config.clone());
@@ -297,4 +341,32 @@ fn open_lazygit(path: &Path) -> Result<()> {
         anyhow::bail!("lazygit exited with {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vm_start_runs_off_the_ui_thread_and_reports_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.projects_root = dir.path().join("projects");
+        config.state_dir = dir.path().join("state");
+        config.snapshots_dir = dir.path().join("snapshots");
+        config.templates_dir = dir.path().join("templates");
+        config.kernel_image = dir.path().join("missing-kernel");
+        config.rootfs_image = dir.path().join("missing-rootfs");
+        std::fs::create_dir_all(&config.projects_root).unwrap();
+        let project = config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        spawn_start(config, project, Harness::Shell, tx);
+        let message = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker did not report a result");
+        assert!(matches!(message, ScanMessage::StartFailed(_)));
+    }
 }
