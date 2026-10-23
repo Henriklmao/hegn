@@ -246,7 +246,7 @@ impl SandboxManager {
             }
         };
         let virtiofs_pid = virtiofs.pid();
-        if let Err(err) = fs::write(&paths.virtiofs_pid, virtiofs_pid.to_string()) {
+        if let Err(err) = write_private(&paths.virtiofs_pid, virtiofs_pid.to_string()) {
             virtiofs.kill();
             cleanup_files(&paths);
             let _ = fs::remove_file(&serial_log);
@@ -320,8 +320,8 @@ impl SandboxManager {
             serial_log: Some(serial_log.clone()),
         };
         let recorded = (|| -> Result<()> {
-            fs::write(&paths.firecracker_pid, firecracker_pid.to_string())?;
-            fs::write(&paths.session, serde_json::to_string_pretty(&record)?)?;
+            write_private(&paths.firecracker_pid, firecracker_pid.to_string())?;
+            write_private(&paths.session, serde_json::to_string_pretty(&record)?)?;
             Ok(())
         })();
         if let Err(err) = recorded {
@@ -617,7 +617,7 @@ impl SandboxManager {
             }
         };
         let virtiofs_pid = virtiofs.pid();
-        if let Err(err) = fs::write(&paths.virtiofs_pid, virtiofs_pid.to_string()) {
+        if let Err(err) = write_private(&paths.virtiofs_pid, virtiofs_pid.to_string()) {
             virtiofs.kill();
             cleanup_files(&paths);
             return Err(err).context("failed to record the virtiofsd pid");
@@ -673,8 +673,8 @@ impl SandboxManager {
             serial_log: Some(serial_log.clone()),
         };
         let recorded = (|| -> Result<()> {
-            fs::write(&paths.firecracker_pid, firecracker_pid.to_string())?;
-            fs::write(&paths.session, serde_json::to_string_pretty(&record)?)?;
+            write_private(&paths.firecracker_pid, firecracker_pid.to_string())?;
+            write_private(&paths.session, serde_json::to_string_pretty(&record)?)?;
             Ok(())
         })();
         if let Err(err) = recorded {
@@ -876,6 +876,25 @@ fn ensure_socket(path: &Path) -> Result<()> {
             path.display()
         );
     }
+    Ok(())
+}
+
+/// Write a runtime metadata file with mode `0600`.
+///
+/// The run directory itself is `0700`, but keeping the files private too makes
+/// the invariant robust against a future path move or permission mistake.
+fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    file.write_all(contents.as_ref())?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -1233,6 +1252,20 @@ mod tests {
         let loaded = manager.session().unwrap();
         assert_eq!(loaded.harness, Harness::Codex);
         assert_eq!(loaded.firecracker_pid, 1234);
+    }
+
+    #[test]
+    fn runtime_metadata_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        write_private(&path, br#"{"test":true}"#).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), br#"{"test":true}"#);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
