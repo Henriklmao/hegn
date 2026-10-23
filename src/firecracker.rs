@@ -164,15 +164,34 @@ impl FirecrackerClient {
     }
 
     pub async fn put_drive(&self, drive: &Drive) -> Result<()> {
-        self.put("/drives", drive).await
+        // Firecracker addresses resources by ID in the path.
+        self.put(&format!("/drives/{}", path_id(&drive.drive_id)?), drive)
+            .await
     }
 
     pub async fn put_vhost_user_fs(&self, fs: &VhostUserFs) -> Result<()> {
-        self.put("/vhost-user-fs", fs).await
+        let id = path_id(&fs.fs_id)?;
+        match self.put(&format!("/vhost-user-fs/{id}"), fs).await {
+            Ok(()) => Ok(()),
+            Err(err) if unsupported_path(&err) => {
+                // Some virtio-fs-enabled Firecracker forks expose a
+                // collection endpoint instead of `/vhost-user-fs/{id}`.
+                self.put("/vhost-user-fs", fs).await.with_context(|| {
+                    "this Firecracker build does not expose virtio-fs; hegn needs a \
+                     virtio-fs-enabled Firecracker build (upstream Firecracker has no \
+                     virtio-fs device)"
+                })
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn put_network_interface(&self, nic: &NetworkInterface) -> Result<()> {
-        self.put("/network-interfaces", nic).await
+        self.put(
+            &format!("/network-interfaces/{}", path_id(&nic.iface_id)?),
+            nic,
+        )
+        .await
     }
 
     /// `PUT /actions` with `{"action_type": "..."}`.
@@ -298,18 +317,102 @@ impl FirecrackerClient {
         }
         stream.flush().await?;
 
-        let mut raw = Vec::new();
-        stream
-            .take(MAX_RESPONSE_BYTES as u64 + 1)
-            .read_to_end(&mut raw)
-            .await?;
+        let raw = read_http_response(&mut stream).await?;
+        parse_http_response(&raw)
+    }
+}
+
+/// Read one HTTP response from a persistent Firecracker connection.
+///
+/// `read_to_end` is deliberately not used: Firecracker may keep the socket
+/// open even when the request asked for `Connection: close`. Framing the body
+/// with `Content-Length` (or chunked encoding) lets the client return as soon
+/// as the response is complete instead of waiting for EOF until the timeout.
+async fn read_http_response(stream: &mut UnixStream) -> Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    loop {
+        let mut buffer = [0u8; 8 * 1024];
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buffer[..read]);
         if raw.len() > MAX_RESPONSE_BYTES {
             return Err(
                 Error::Protocol(format!("response exceeds {MAX_RESPONSE_BYTES} bytes")).into(),
             );
         }
-        parse_http_response(&raw)
+
+        let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = std::str::from_utf8(&raw[..header_end])
+            .map_err(|_| Error::Protocol("headers are not UTF-8".into()))?;
+        let status = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        // 204/304 and 1xx responses have no body and end at the header block.
+        if status == 204 || status == 304 || (100..200).contains(&status) {
+            return Ok(raw);
+        }
+        if let Some(length) =
+            header_value(headers, "content-length").and_then(|value| value.parse::<usize>().ok())
+        {
+            let needed = header_end
+                .checked_add(4)
+                .and_then(|offset| offset.checked_add(length))
+                .ok_or_else(|| Error::Protocol("content length overflow".into()))?;
+            if raw.len() >= needed {
+                return Ok(raw);
+            }
+        } else if header_value(headers, "transfer-encoding")
+            .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
+        {
+            // Keep reading until the chunked body (including its terminator)
+            // is complete. A transient decode error means "not yet complete".
+            if decode_chunked(&raw[header_end + 4..]).is_ok() {
+                return Ok(raw);
+            }
+        } else {
+            // No framing: EOF is the only delimiter.
+        }
     }
+    if raw.is_empty() {
+        return Err(Error::Protocol("empty response".into()).into());
+    }
+    Ok(raw)
+}
+
+fn unsupported_path(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<Error>().is_some_and(|err| {
+        matches!(
+            err,
+            Error::Status { status: 400 | 404, body }
+                if body.contains("Invalid request method and/or path")
+                    || body.contains("ID cannot be empty")
+        )
+    })
+}
+
+/// Validate a Firecracker resource ID before putting it in a URL path.
+fn path_id(id: &str) -> Result<&str> {
+    if id.is_empty() {
+        bail!("firecracker resource id cannot be empty");
+    }
+    if id.contains('/') || id.chars().any(char::is_control) {
+        bail!("firecracker resource id contains an unsafe character: '{id}'");
+    }
+    Ok(id)
+}
+
+fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
 }
 
 #[derive(Debug)]
@@ -548,6 +651,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn puts_drives_and_vhost_user_fs_by_id() {
+        let (_dir, path, handle) = spawn_mock(vec![(204, String::new()), (204, String::new())]);
+        let client = FirecrackerClient::new(&path);
+        client
+            .put_drive(&Drive {
+                drive_id: "rootfs".into(),
+                path_on_host: "/img/rootfs.ext4".into(),
+                is_root_device: true,
+                is_read_only: false,
+            })
+            .await
+            .unwrap();
+        client
+            .put_vhost_user_fs(&VhostUserFs {
+                fs_id: "workspace".into(),
+                socket: "/run/virtiofs.sock".into(),
+                tag: "workspace".into(),
+            })
+            .await
+            .unwrap();
+
+        let requests = handle.await.unwrap();
+        assert_eq!(requests[0].path, "/drives/rootfs");
+        assert_eq!(requests[1].path, "/vhost-user-fs/workspace");
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_a_collection_vhost_user_fs_endpoint() {
+        let (_dir, path, handle) = spawn_mock(vec![
+            (
+                400,
+                r#"{"fault_message":"Invalid request method and/or path: PUT vhost-user-fs."}"#
+                    .into(),
+            ),
+            (204, String::new()),
+        ]);
+        let client = FirecrackerClient::new(&path);
+        client
+            .put_vhost_user_fs(&VhostUserFs {
+                fs_id: "workspace".into(),
+                socket: "/run/virtiofs.sock".into(),
+                tag: "workspace".into(),
+            })
+            .await
+            .unwrap();
+        let requests = handle.await.unwrap();
+        assert_eq!(requests[0].path, "/vhost-user-fs/workspace");
+        assert_eq!(requests[1].path, "/vhost-user-fs");
+    }
+
+    #[tokio::test]
+    async fn unsupported_virtio_fs_reports_the_missing_build_capability() {
+        let (_dir, path, _handle) = spawn_mock(vec![
+            (
+                400,
+                r#"{"fault_message":"Invalid request method and/or path: PUT vhost-user-fs."}"#
+                    .into(),
+            ),
+            (
+                400,
+                r#"{"fault_message":"Invalid request method and/or path: PUT vhost-user-fs."}"#
+                    .into(),
+            ),
+        ]);
+        let err = FirecrackerClient::new(&path)
+            .put_vhost_user_fs(&VhostUserFs {
+                fs_id: "workspace".into(),
+                socket: "/run/virtiofs.sock".into(),
+                tag: "workspace".into(),
+            })
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("virtio-fs-enabled"), "{message}");
+    }
+
+    #[test]
+    fn rejects_unsafe_resource_ids() {
+        assert!(path_id("rootfs").is_ok());
+        assert!(path_id("").is_err());
+        assert!(path_id("../rootfs").is_err());
+        assert!(path_id("root\nfs").is_err());
+    }
+
+    #[tokio::test]
     async fn pauses_and_resumes_via_patch_vm() {
         let (_dir, path, handle) = spawn_mock(vec![(204, String::new()), (204, String::new())]);
         let client = FirecrackerClient::new(&path);
@@ -577,6 +765,62 @@ mod tests {
         assert_eq!(info.state, VmState::Running);
         assert_eq!(info.vmm_version, "1.9.0");
         assert_eq!(handle.await.unwrap()[0].method, "GET");
+    }
+
+    #[tokio::test]
+    async fn reads_a_framed_response_without_waiting_for_socket_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_request(&mut stream).await;
+            let body = r#"{"id":"hegn","state":"Not started","vmm_version":"1.17.0","app_name":"Firecracker"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            // Firecracker may keep the connection open; the client must not
+            // wait for this sleep/EOF to finish the response.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let info = tokio::time::timeout(
+            Duration::from_millis(500),
+            FirecrackerClient::new(&path).instance_info(),
+        )
+        .await
+        .expect("client waited for EOF instead of Content-Length")
+        .unwrap();
+        assert_eq!(info.state, VmState::NotStarted);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn no_content_responses_do_not_wait_for_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            FirecrackerClient::new(&path).action(Action::InstanceStart),
+        )
+        .await
+        .expect("client waited for EOF after a bodyless 204")
+        .unwrap();
+        server.abort();
     }
 
     #[tokio::test]
