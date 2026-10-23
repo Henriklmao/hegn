@@ -720,13 +720,20 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
             width,
             height: 1,
         };
-        spans.push(Span::styled(
-            format!(" {text} "),
+        let style = if app.hovered == Some(button.action) {
+            // Inverted: the terminal accent becomes the text color and the
+            // default background becomes the button background.
+            Style::default()
+                .fg(ACCENT)
+                .bg(ON_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
             Style::default()
                 .fg(ON_ACCENT)
                 .bg(ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ));
+                .add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled(format!(" {text} "), style));
         spans.push(Span::raw(" "));
         hits.push(FooterHit {
             rect,

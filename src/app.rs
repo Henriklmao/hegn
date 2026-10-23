@@ -369,6 +369,8 @@ pub struct App {
     pub scroll: usize,
     pub toast: Option<Toast>,
     pub footer_hits: Vec<FooterHit>,
+    /// Footer button under the mouse pointer, for the inverted hover style.
+    pub hovered: Option<ActionId>,
     pub should_quit: bool,
     pub loading: bool,
     pub session_closed_reported: bool,
@@ -409,6 +411,7 @@ impl App {
             scroll: 0,
             toast: None,
             footer_hits: Vec::new(),
+            hovered: None,
             should_quit: false,
             loading: true,
             session_closed_reported: false,
@@ -555,6 +558,7 @@ impl App {
 
     /// Handle a key press and return side effects for the terminal loop.
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        self.hovered = None;
         if self.modal.is_some() {
             return self.handle_modal_key(key);
         }
@@ -1443,6 +1447,15 @@ impl App {
     /// Mouse handling for footer clicks, row selection and scrolling.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Vec<Effect> {
         match mouse.kind {
+            MouseEventKind::Moved => {
+                let pos = (mouse.column, mouse.row);
+                self.hovered = self
+                    .footer_hits
+                    .iter()
+                    .find(|hit| rect_contains(hit.rect, pos))
+                    .map(|hit| hit.action);
+                Vec::new()
+            }
             MouseEventKind::ScrollUp => {
                 if self.screen == Screen::Terminal {
                     self.scroll = self.scroll.saturating_add(3).min(self.terminal.len());
@@ -1873,6 +1886,34 @@ mod tests {
         assert!(app.modal.is_none());
         assert!(app.snapshots.is_empty());
         assert!(!app.config.snapshots_dir.join("old").exists());
+    }
+
+    #[test]
+    fn footer_buttons_track_mouse_hover() {
+        let (_dir, mut app) = test_app();
+        app.footer_hits = vec![FooterHit {
+            rect: Rect::new(4, 10, 8, 1),
+            action: ActionId::Open,
+        }];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 6,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.hovered, Some(ActionId::Open));
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 40,
+            row: 20,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.hovered, None);
+
+        app.hovered = Some(ActionId::Open);
+        app.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(app.hovered, None, "keyboard input clears the hover state");
     }
 
     #[test]
