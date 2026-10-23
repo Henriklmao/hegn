@@ -118,12 +118,15 @@ fn spawn_scan(config: Config, tx: mpsc::Sender<ScanMessage>) {
     let thread_tx = tx.clone();
     let spawned = std::thread::Builder::new()
         .name("hegn-project-scan".into())
-        .spawn(move || match project::discover(&config.projects_root) {
-            Ok(projects) => {
-                let _ = thread_tx.send(ScanMessage::Projects(projects));
-            }
-            Err(err) => {
-                let _ = thread_tx.send(ScanMessage::Error(err.to_string()));
+        .spawn(move || {
+            let protected = config.protected_paths();
+            match project::discover_protected(&config.projects_root, &protected) {
+                Ok(projects) => {
+                    let _ = thread_tx.send(ScanMessage::Projects(projects));
+                }
+                Err(err) => {
+                    let _ = thread_tx.send(ScanMessage::Error(err.to_string()));
+                }
             }
         });
     if let Err(err) = spawned {

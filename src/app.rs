@@ -4,7 +4,7 @@
 //! is a pure renderer and [`crate::tui`] owns the terminal loop. This separation
 //! makes the dashboard testable with ratatui's `TestBackend`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -144,10 +144,12 @@ impl SandboxStatus {
 pub enum ActionId {
     Open,
     Create,
+    Import,
     Confirm,
     Cancel,
     NextField,
     SubmitCreate,
+    SubmitImport,
     Edit,
     Lazygit,
     Refresh,
@@ -257,6 +259,44 @@ impl CreateProjectForm {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportFocus {
+    Path,
+    Name,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportProjectForm {
+    pub path: String,
+    pub name: String,
+    pub focus: ImportFocus,
+    pub error: Option<String>,
+}
+
+impl ImportProjectForm {
+    pub fn new() -> Self {
+        Self {
+            path: String::new(),
+            name: String::new(),
+            focus: ImportFocus::Path,
+            error: None,
+        }
+    }
+
+    fn cycle_focus(&mut self) {
+        self.focus = match self.focus {
+            ImportFocus::Path => ImportFocus::Name,
+            ImportFocus::Name => ImportFocus::Path,
+        };
+    }
+}
+
+impl Default for ImportProjectForm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SecurityPrompt {
     pub command: String,
@@ -297,6 +337,7 @@ impl DoctorModal {
 #[derive(Debug, Clone)]
 pub enum Modal {
     CreateProject(CreateProjectForm),
+    ImportProject(ImportProjectForm),
     Doctor(DoctorModal),
     Security(SecurityPrompt),
     Confirm(ConfirmPrompt),
@@ -617,6 +658,10 @@ impl App {
                 )));
                 Vec::new()
             }
+            KeyCode::Char('h') | KeyCode::Left if self.focus == Focus::Projects => {
+                self.modal = Some(Modal::ImportProject(ImportProjectForm::new()));
+                Vec::new()
+            }
             KeyCode::Char('e') => self.effect_for_selected(Effect::OpenEditor),
             KeyCode::Char('g') => self.effect_for_selected(Effect::OpenLazygit),
             KeyCode::Char('r') => vec![Effect::RefreshProjects],
@@ -859,6 +904,23 @@ impl App {
                 }
             },
             Modal::Security(prompt) => self.handle_security_key(key, prompt),
+            Modal::ImportProject(mut form) => {
+                if key.code == KeyCode::Esc {
+                    return Vec::new();
+                }
+                match key.code {
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        form.cycle_focus();
+                        self.modal = Some(Modal::ImportProject(form));
+                    }
+                    KeyCode::Enter => return self.submit_import_project(form),
+                    _ => {
+                        self.edit_import_form(&mut form, key);
+                        self.modal = Some(Modal::ImportProject(form));
+                    }
+                }
+                Vec::new()
+            }
             Modal::CreateProject(mut form) => {
                 if key.code == KeyCode::Esc {
                     return Vec::new();
@@ -979,6 +1041,64 @@ impl App {
                 let mut form = form;
                 form.error = Some(err.to_string());
                 self.modal = Some(Modal::CreateProject(form));
+            }
+        }
+        Vec::new()
+    }
+
+    fn edit_import_form(&self, form: &mut ImportProjectForm, key: KeyEvent) {
+        let field = match form.focus {
+            ImportFocus::Path => &mut form.path,
+            ImportFocus::Name => &mut form.name,
+        };
+        match key.code {
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if field.len() < 4096 {
+                    field.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                field.pop();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                field.clear();
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_import_project(&mut self, form: ImportProjectForm) -> Vec<Effect> {
+        let path = form.path.trim();
+        if path.is_empty() {
+            let mut form = form;
+            form.error = Some("enter the path of an existing directory".into());
+            self.modal = Some(Modal::ImportProject(form));
+            return Vec::new();
+        }
+        let name = {
+            let name = form.name.trim();
+            (!name.is_empty()).then_some(name)
+        };
+        match self.config.import_project(Path::new(path), name) {
+            Ok(link) => {
+                let loaded = Project::load(link.clone());
+                let target = link
+                    .canonicalize()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| link.display().to_string());
+                self.add_project(loaded);
+                self.toast(
+                    format!("imported {} → {target}", link.display()),
+                    ToastLevel::Info,
+                );
+            }
+            Err(err) => {
+                let mut form = form;
+                form.error = Some(err.to_string());
+                self.modal = Some(Modal::ImportProject(form));
             }
         }
         Vec::new()
@@ -1193,6 +1313,10 @@ impl App {
                 )));
                 Vec::new()
             }
+            ActionId::Import => {
+                self.modal = Some(Modal::ImportProject(ImportProjectForm::new()));
+                Vec::new()
+            }
             ActionId::Confirm => {
                 if matches!(self.modal, Some(Modal::Confirm(_))) {
                     self.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
@@ -1208,7 +1332,10 @@ impl App {
                 }
             }
             ActionId::NextField => {
-                if matches!(self.modal, Some(Modal::CreateProject(_))) {
+                if matches!(
+                    self.modal,
+                    Some(Modal::CreateProject(_) | Modal::ImportProject(_))
+                ) {
                     self.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
                 } else {
                     Vec::new()
@@ -1216,6 +1343,14 @@ impl App {
             }
             ActionId::SubmitCreate => match self.modal.take() {
                 Some(Modal::CreateProject(form)) => self.submit_create_project(form),
+                Some(other) => {
+                    self.modal = Some(other);
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
+            ActionId::SubmitImport => match self.modal.take() {
+                Some(Modal::ImportProject(form)) => self.submit_import_project(form),
                 Some(other) => {
                     self.modal = Some(other);
                     Vec::new()
@@ -1903,6 +2038,62 @@ mod tests {
                 assert_eq!(*harness, app.config.harness);
             }
             other => panic!("expected StartSandbox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn h_and_left_open_the_import_modal_from_the_project_list() {
+        let (_dir, mut app) = test_app();
+        app.handle_key(key(KeyCode::Char('h')));
+        assert!(matches!(app.modal, Some(Modal::ImportProject(_))));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+
+        app.handle_key(key(KeyCode::Left));
+        assert!(matches!(app.modal, Some(Modal::ImportProject(_))));
+    }
+
+    #[test]
+    fn import_form_creates_a_symlink_and_adds_the_project() {
+        let (dir, mut app) = test_app();
+        let source = dir.path().join("outside/demo");
+        std::fs::create_dir_all(&source).unwrap();
+
+        app.handle_key(key(KeyCode::Char('h')));
+        for ch in source.to_string_lossy().chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.modal.is_none(), "successful import closes the modal");
+        let link = app.config.projects_root.join("demo");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(app.projects.iter().any(|project| project.name == "demo"));
+        let toast = app.toast.as_ref().expect("import toast");
+        assert!(toast.text.contains("imported"), "{}", toast.text);
+    }
+
+    #[test]
+    fn importing_hegn_state_is_rejected_in_the_form() {
+        let (_dir, mut app) = test_app();
+        std::fs::create_dir_all(&app.config.state_dir).unwrap();
+        let state_path = app.config.state_dir.to_string_lossy().into_owned();
+        app.handle_key(key(KeyCode::Char('h')));
+        for ch in state_path.chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        match &app.modal {
+            Some(Modal::ImportProject(form)) => {
+                let error = form.error.as_deref().unwrap_or_default();
+                assert!(error.contains("overlaps hegn state"), "{error}");
+            }
+            other => panic!("expected import modal with an error, got {other:?}"),
         }
     }
 

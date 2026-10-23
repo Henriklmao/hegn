@@ -184,7 +184,7 @@ impl Default for Config {
         let data_dir = dirs::data_dir().unwrap_or_else(|| home.join(".local/share"));
 
         Self {
-            projects_root: home.join("Projects"),
+            projects_root: home.join("Projects/hegn"),
             state_dir: state_dir.join("hegn"),
             snapshots_dir: data_dir.join("hegn/snapshots"),
             templates_dir: config_dir.join("hegn/templates"),
@@ -378,7 +378,35 @@ impl Config {
         self.state_dir.join("logs")
     }
 
-    /// Static assets are only usable when both images exist.
+    /// Paths that must never be exported to a guest or imported as a project.
+    ///
+    /// This covers runtime sockets/logs, snapshots, templates and the config
+    /// directory. Project import and discovery both consult this list.
+    pub fn protected_paths(&self) -> Vec<PathBuf> {
+        let mut protected = vec![
+            self.state_dir.clone(),
+            self.snapshots_dir.clone(),
+            self.templates_dir.clone(),
+        ];
+        if let Some(parent) = Self::config_path().parent() {
+            protected.push(parent.to_path_buf());
+        }
+        protected
+    }
+
+    /// Import an existing directory into the project picker as a symlink.
+    ///
+    /// hegn state, snapshots and templates are protected so an imported
+    /// project can never expose VM sockets, logs or snapshot memory to the
+    /// guest.
+    pub fn import_project(&self, source: &Path, name: Option<&str>) -> Result<PathBuf> {
+        crate::project::import_project(&self.projects_root, source, name, &self.protected_paths())
+    }
+
+    /// Static assets are only usable when both images are real files.
+    ///
+    /// Symlinks are rejected: a swapped link could make hegn boot an arbitrary
+    /// host file as the guest kernel or root filesystem.
     pub fn firecracker_ready(&self) -> bool {
         crate::images::is_regular_file(&self.kernel_image)
             && crate::images::is_regular_file(&self.rootfs_image)
@@ -443,6 +471,25 @@ mod tests {
         assert_eq!(config.guest_mount, "/workspace");
         assert_eq!(config.shared_tag, "workspace");
         assert_eq!(config.security, SecurityMode::Enforce);
+        assert!(
+            config.projects_root.ends_with("Projects/hegn"),
+            "new projects belong in Projects/hegn: {}",
+            config.projects_root.display()
+        );
+        assert!(crate::images::is_sha256(&config.kernel_sha256));
+        assert!(crate::images::is_sha256(&config.rootfs_sha256));
+        assert!(config.kernel_url.starts_with("https://"));
+        assert!(config.rootfs_url.starts_with("https://"));
+    }
+
+    #[test]
+    fn rejects_invalid_image_pins() {
+        let mut config = Config::default();
+        config.kernel_sha256 = "not-a-digest".into();
+        assert!(config.validate().is_err());
+        config.kernel_sha256 = crate::images::KERNEL_SHA256.into();
+        config.rootfs_url = "http://example.com/rootfs".into();
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -501,6 +548,23 @@ backend = "firecracker"
         let (_dir, path) = temp_config("backend = \"pty\"\n");
         let err = format!("{:#}", Config::load_from(&path).unwrap_err());
         assert!(err.contains("unknown variant"), "{err}");
+    }
+
+    #[test]
+    fn symlinked_vm_assets_are_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-kernel");
+        std::fs::write(&real, b"kernel").unwrap();
+        let link = dir.path().join("kernel");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let rootfs = dir.path().join("rootfs");
+        std::fs::write(&rootfs, b"rootfs").unwrap();
+
+        let mut config = Config::default();
+        config.kernel_image = link;
+        config.rootfs_image = rootfs;
+        assert!(!config.firecracker_ready());
+        assert!(config.require_vm_assets().is_err());
     }
 
     #[test]

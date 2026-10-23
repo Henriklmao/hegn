@@ -92,11 +92,6 @@ pub enum Commands {
         #[command(subcommand)]
         command: Option<LogCommands>,
     },
-    /// Inspect, download and verify the pinned upstream VM images.
-    Images {
-        #[command(subcommand)]
-        command: ImageCommands,
-    },
     /// Manage the Firecracker sandbox lifecycle.
     Sandbox {
         #[command(subcommand)]
@@ -121,6 +116,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    /// Inspect, download and verify the pinned upstream VM images.
+    Images {
+        #[command(subcommand)]
+        command: ImageCommands,
+    },
     /// Check host prerequisites (KVM, Firecracker, virtiofsd, assets, tools).
     Doctor,
 }
@@ -139,6 +139,18 @@ pub enum ProjectCommands {
         /// Packages recorded for the VM template (comma separated).
         #[arg(long = "package", value_delimiter = ',')]
         packages: Vec<String>,
+    },
+    /// Import an existing directory as a symlink under projects_root.
+    ///
+    /// The directory is never moved or copied. hegn refuses to import the
+    /// filesystem root, the home directory, an ancestor of projects_root, or
+    /// anything that overlaps hegn state.
+    Import {
+        /// Existing project directory (absolute, relative or starting with ~).
+        path: PathBuf,
+        /// Name in the picker (defaults to the directory name).
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Print project metadata and git status.
     Info { project: String },
@@ -267,7 +279,8 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
             Ok(0)
         }
         Commands::Projects { query } => {
-            let projects = project::discover(&config.projects_root)?;
+            let projects =
+                project::discover_protected(&config.projects_root, &config.protected_paths())?;
             let indices = project::filter_projects(&projects, query.as_deref().unwrap_or(""));
             let selected: Vec<&project::Project> = indices.iter().map(|&i| &projects[i]).collect();
             if json {
@@ -371,6 +384,31 @@ fn project_command(command: ProjectCommands, config: Config, json: bool) -> Resu
                 println!("Harness: {} ({})", harness.label(), harness.command());
                 println!("Packages: {}", packages.join(", "));
                 println!("Next: hegn open {}", path.display());
+            }
+            Ok(0)
+        }
+        ProjectCommands::Import { path, name } => {
+            let link = config.import_project(&path, name.as_deref())?;
+            let target = link.canonicalize().with_context(|| {
+                format!("failed to resolve imported project {}", link.display())
+            })?;
+            let info = project::Project::load(link.clone());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "name": info.name,
+                        "path": link,
+                        "target": target,
+                        "git": info.git,
+                    }))?
+                );
+            } else {
+                println!("Imported {}", info.name);
+                println!("  link   {}", link.display());
+                println!("  target {}", target.display());
+                println!("  git    {}", info.git.badge());
+                println!("Next: hegn open {}", info.name);
             }
             Ok(0)
         }
@@ -1091,6 +1129,62 @@ mod tests {
         let meta = project::read_meta(&config.projects_root.join("demo"));
         assert_eq!(meta.harness, Some(Harness::Codex));
         assert_eq!(meta.packages, vec!["git", "python3"]);
+    }
+
+    #[test]
+    fn project_import_creates_a_picker_symlink() {
+        let (dir, config) = config();
+        let source = dir.path().join("outside/demo");
+        std::fs::create_dir_all(&source).unwrap();
+        let code = project_command(
+            ProjectCommands::Import {
+                path: source.clone(),
+                name: None,
+            },
+            config.clone(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        let link = config.projects_root.join("demo");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(link.canonicalize().unwrap(), source.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn project_import_parses_and_rejects_unsafe_sources() {
+        let (_dir, config) = config();
+        let cli = Cli::try_parse_from(["hegn", "project", "import", "/tmp/example", "--name", "x"])
+            .unwrap();
+        match cli.command {
+            Some(Commands::Project {
+                command: ProjectCommands::Import { path, name },
+            }) => {
+                assert_eq!(path, PathBuf::from("/tmp/example"));
+                assert_eq!(name.as_deref(), Some("x"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(config.import_project(Path::new("/"), None).is_err());
+    }
+
+    #[test]
+    fn image_status_and_missing_verify() {
+        let (_dir, config) = config();
+        assert_eq!(
+            image_command(ImageCommands::Status, config.clone(), true).unwrap(),
+            0
+        );
+        // Missing images are a verification failure, not a pass.
+        assert_eq!(
+            image_command(ImageCommands::Verify, config, true).unwrap(),
+            1
+        );
     }
 
     #[test]

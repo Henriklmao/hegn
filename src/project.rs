@@ -88,14 +88,43 @@ impl Project {
 /// skipped. Git is queried for each project; this may block and should run off
 /// the UI thread.
 pub fn discover(root: &Path) -> io::Result<Vec<Project>> {
+    discover_protected(root, &[])
+}
+
+/// Like [`discover`], but also skips any project that overlaps hegn state.
+///
+/// Callers with a [`crate::config::Config`] should pass
+/// `config.protected_paths()` so a manually planted symlink to the run
+/// directory, logs or snapshots can never be opened as a project.
+pub fn discover_protected(root: &Path, protected: &[PathBuf]) -> io::Result<Vec<Project>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
+    let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let home = dirs::home_dir().and_then(|home| home.canonicalize().ok());
+    let protected: Vec<PathBuf> = protected
+        .iter()
+        .map(|path| absolute_or_canonical(path))
+        .collect();
     let mut projects = Vec::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_dir() {
+        // Resolve imports (symlinks) but never let a link widen the picker to
+        // the filesystem root, the home directory, an ancestor of the projects
+        // root, or hegn state. Opening such a "project" would export far too
+        // much to the guest through virtiofsd.
+        let canonical = match path.canonicalize() {
+            Ok(canonical) if canonical.is_dir() => canonical,
+            _ => continue,
+        };
+        if canonical == Path::new("/")
+            || home.as_ref().is_some_and(|home| &canonical == home)
+            || root_canonical.starts_with(&canonical)
+            || protected
+                .iter()
+                .any(|path| canonical.starts_with(path) || path.starts_with(&canonical))
+        {
             continue;
         }
         let name = entry.file_name();
@@ -107,6 +136,18 @@ pub fn discover(root: &Path) -> io::Result<Vec<Project>> {
     }
     projects.sort_by_key(|project| project.name.to_lowercase());
     Ok(projects)
+}
+
+fn absolute_or_canonical(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
 }
 
 /// Parse `git status --porcelain=v1 --branch` output.
@@ -377,6 +418,112 @@ pub fn create_project(
     Ok(path)
 }
 
+/// Expand a leading `~` in a path typed into the TUI or a config file.
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    let Some(home) = dirs::home_dir() else {
+        return path.to_path_buf();
+    };
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        home
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Import an existing directory into the project picker without moving it.
+///
+/// The import is a symlink inside `root`; the project keeps living at its
+/// original path. This is deliberately the only host-side mutation, so a large
+/// or already-versioned project is never copied or rewritten.
+///
+/// Safety checks reject the filesystem root, the home directory, anything
+/// inside `root` (it is already discoverable), any ancestor of `root`, and any
+/// path that overlaps hegn's own state (`protected`).
+pub fn import_project(
+    root: &Path,
+    source: &Path,
+    name: Option<&str>,
+    protected: &[PathBuf],
+) -> Result<PathBuf> {
+    let source = expand_tilde(source);
+    if !source.exists() {
+        bail!("{} does not exist", source.display());
+    }
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", source.display()))?;
+    if !source.is_dir() {
+        bail!("{} is not a directory", source.display());
+    }
+    if source == Path::new("/") {
+        bail!("refusing to import the filesystem root");
+    }
+    if let Some(home) = dirs::home_dir().and_then(|home| home.canonicalize().ok())
+        && source == home
+    {
+        bail!("refusing to import the home directory");
+    }
+
+    fs::create_dir_all(root).with_context(|| format!("failed to create {}", root.display()))?;
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", root.display()))?;
+    if source == root {
+        bail!("refusing to import the projects root itself");
+    }
+    if root.starts_with(&source) {
+        bail!(
+            "{} is an ancestor of the projects root; import a single project instead",
+            source.display()
+        );
+    }
+    if source.starts_with(&root) {
+        bail!(
+            "{} is already inside the projects root; no import needed",
+            source.display()
+        );
+    }
+    for protected in protected {
+        let protected = absolute_or_canonical(protected);
+        if source.starts_with(&protected) || protected.starts_with(&source) {
+            bail!(
+                "refusing to import {}: it overlaps hegn state at {}",
+                source.display(),
+                protected.display()
+            );
+        }
+    }
+
+    let name = match name {
+        Some(name) => name.trim().to_string(),
+        None => source
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .with_context(|| {
+                format!(
+                    "{} has no usable directory name; pass --name",
+                    source.display()
+                )
+            })?,
+    };
+    let name = validate_project_name(&name)?.to_string();
+    let link = root.join(&name);
+    match fs::symlink_metadata(&link) {
+        Ok(_) => bail!("{} already exists", link.display()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", link.display()));
+        }
+    }
+    std::os::unix::fs::symlink(&source, &link)
+        .with_context(|| format!("failed to create {}", link.display()))?;
+    Ok(link)
+}
+
 /// Create a transient safety branch that snapshots the *working tree*.
 ///
 /// A plain `git branch` only points at `HEAD`, so uncommitted changes would not
@@ -643,6 +790,86 @@ mod tests {
         assert!(path.join("README.md").is_file());
         assert!(path.join(".git").exists());
         assert!(create_project(root.path(), "demo", None, crate::config::Harness::Shell).is_err());
+    }
+
+    #[test]
+    fn imports_an_existing_directory_without_moving_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let source = dir.path().join("elsewhere/demo");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let link = import_project(&root, &source, None, &[]).unwrap();
+        assert_eq!(link, root.canonicalize().unwrap().join("demo"));
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(link.canonicalize().unwrap(), source.canonicalize().unwrap());
+        assert!(source.is_dir(), "the original directory must stay in place");
+
+        let projects = discover(&root).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "demo");
+
+        let err = import_project(&root, &source, None, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn import_rejects_roots_ancestors_and_hegn_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+
+        assert!(import_project(&root, Path::new("/"), None, &[]).is_err());
+        assert!(import_project(&root, dir.path(), None, &[]).is_err());
+        assert!(import_project(&root, &root, None, &[]).is_err());
+        assert!(import_project(&root, &state, None, std::slice::from_ref(&state)).is_err());
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let err = import_project(&root, &root.join("nested"), None, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already inside"), "{err}");
+        let err = import_project(&root, &source, Some("../escape"), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("separator"), "{err}");
+    }
+
+    #[test]
+    fn discover_skips_links_to_dangerous_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::os::unix::fs::symlink("/", root.join("rootfs")).unwrap();
+        std::os::unix::fs::symlink(&state, root.join("state-link")).unwrap();
+        assert!(
+            discover_protected(&root, std::slice::from_ref(&state))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn expands_a_leading_tilde() {
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(expand_tilde(Path::new("~/demo")), home.join("demo"));
+            assert_eq!(expand_tilde(Path::new("~")), home);
+        }
+        assert_eq!(
+            expand_tilde(Path::new("relative")),
+            PathBuf::from("relative")
+        );
     }
 
     #[test]

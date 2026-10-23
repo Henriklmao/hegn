@@ -793,6 +793,23 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 action: ActionId::Close,
             },
         ],
+        Some(Modal::ImportProject(_)) => vec![
+            FooterDef {
+                key: "Tab",
+                label: "Next field",
+                action: ActionId::NextField,
+            },
+            FooterDef {
+                key: "Enter",
+                label: "Import",
+                action: ActionId::SubmitImport,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Cancel",
+                action: ActionId::Close,
+            },
+        ],
         Some(Modal::Doctor(modal)) => {
             let mut buttons = vec![FooterDef {
                 key: "r",
@@ -865,6 +882,11 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                     key: "c",
                     label: "Create",
                     action: ActionId::Create,
+                },
+                FooterDef {
+                    key: "h",
+                    label: "Import",
+                    action: ActionId::Import,
                 },
                 FooterDef {
                     key: "e",
@@ -941,6 +963,7 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
             );
         }
         Modal::CreateProject(form) => render_create_form(frame, app, form, area),
+        Modal::ImportProject(form) => render_import_form(frame, app, form, area),
         Modal::Doctor(modal) => render_doctor(frame, modal, area),
         Modal::Security(prompt) => render_security(frame, prompt, area),
     }
@@ -1011,6 +1034,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("/", "fuzzy filter projects"),
                 ("Tab", "switch projects / snapshots"),
                 ("c", "create project"),
+                ("h / ←", "import existing project"),
                 ("e", "open in $EDITOR"),
                 ("g", "open in lazygit"),
                 ("r", "refresh git status"),
@@ -1220,6 +1244,133 @@ fn render_create_form(
     };
     bottom.push(Line::from(Span::styled(
         "   [ Create project ]",
+        submit_style,
+    )));
+    frame.render_widget(Paragraph::new(bottom), chunks[3]);
+}
+
+fn render_import_form(
+    frame: &mut Frame,
+    app: &App,
+    form: &crate::app::ImportProjectForm,
+    area: Rect,
+) {
+    let rect = centered(area, 78, 56);
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            " import project ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .spacing(1)
+        .split(inner);
+
+    let field_style = |focus: bool| {
+        if focus {
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        }
+    };
+
+    let path_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(field_style(form.focus == crate::app::ImportFocus::Path))
+        .title(Span::styled(
+            " existing directory (~ allowed) ",
+            field_style(form.focus == crate::app::ImportFocus::Path),
+        ))
+        .style(Style::default());
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(form.path.clone(), Style::default().fg(TEXT)),
+            Span::styled(
+                if form.focus == crate::app::ImportFocus::Path {
+                    "▌"
+                } else {
+                    ""
+                },
+                Style::default().fg(CYAN),
+            ),
+        ]))
+        .block(path_block),
+        chunks[0],
+    );
+
+    let name_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(field_style(form.focus == crate::app::ImportFocus::Name))
+        .title(Span::styled(
+            " picker name (optional) ",
+            field_style(form.focus == crate::app::ImportFocus::Name),
+        ))
+        .style(Style::default());
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(form.name.clone(), Style::default().fg(TEXT)),
+            Span::styled(
+                if form.focus == crate::app::ImportFocus::Name {
+                    "▌"
+                } else {
+                    ""
+                },
+                Style::default().fg(CYAN),
+            ),
+        ]))
+        .block(name_block),
+        chunks[1],
+    );
+
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                " Creates a symlink; the project stays where it is.",
+                Style::default().fg(TEXT),
+            )),
+            Line::from(Span::styled(
+                format!(" Import target: {}", app.config.projects_root.display()),
+                Style::default().fg(MUTED),
+            )),
+            Line::from(Span::styled(
+                " Refuses /, $HOME, ancestors of the root and hegn state paths.",
+                Style::default().fg(MUTED),
+            )),
+        ]),
+        chunks[2],
+    );
+
+    let mut bottom = Vec::new();
+    if let Some(error) = &form.error {
+        bottom.push(Line::from(Span::styled(
+            format!(" error: {error}"),
+            Style::default().fg(RED),
+        )));
+    }
+    let submit_style = if form.focus == crate::app::ImportFocus::Name {
+        Style::default().fg(ACCENT)
+    } else {
+        Style::default()
+            .fg(ON_ACCENT)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    };
+    bottom.push(Line::from(Span::styled(
+        "   [ Import project ]",
         submit_style,
     )));
     frame.render_widget(Paragraph::new(bottom), chunks[3]);
@@ -1594,6 +1745,20 @@ mod tests {
         assert!(text.contains("Open"));
         assert!(!hits.footer.is_empty());
         assert_eq!(hits.projects.len(), 1);
+    }
+
+    #[test]
+    fn import_modal_renders_the_symlink_explanation() {
+        let (_dir, mut app) = app();
+        app.modal = Some(Modal::ImportProject(crate::app::ImportProjectForm::new()));
+        let (text, hits) = render(&app);
+        assert!(text.contains("import project"), "{text}");
+        assert!(text.contains("Creates a symlink"), "{text}");
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::SubmitImport)
+        );
     }
 
     #[test]
