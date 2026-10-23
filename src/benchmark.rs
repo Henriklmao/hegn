@@ -202,7 +202,7 @@ fn build_session(
     notes: &mut Vec<String>,
 ) -> SessionCost {
     let vm = config.vm_binary();
-    let virtiofsd = config.virtiofsd_bin.clone();
+    let virtiofsd = &config.virtiofsd_bin;
     let mut processes = Vec::new();
     for (role, pid, binary, fallback) in [
         (
@@ -214,7 +214,7 @@ fn build_session(
         (
             "virtiofsd",
             session.virtiofs_pid,
-            Some(&virtiofsd),
+            Some(virtiofsd),
             "virtiofsd",
         ),
         ("console-relay", session.relay_pid, None, "__console-relay"),
