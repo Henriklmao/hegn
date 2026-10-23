@@ -33,7 +33,7 @@ worst case ≈ memory_mib + ~50 MiB (virtiofsd + relay + VMM bookkeeping)
              + ~26 MiB if the TUI stays open
 ```
 
-| `memory_mib` | Host worst case | Typical idle (measured scaling) |
+| `memory_mib` | Host worst case | Typical idle (estimate) |
 | --- | --- | --- |
 | 1024 | ~1.1 GiB | ~0.3–0.5 GiB |
 | 2048 (default) | ~2.1 GiB | ~0.4–0.6 GiB |
