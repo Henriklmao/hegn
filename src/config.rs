@@ -561,6 +561,14 @@ impl Config {
         {
             return Some(found);
         }
+        if self.cloud_hypervisor_bin.components().count() > 1 {
+            // An explicit path can still point at the non-static name while
+            // the package installed only the static sibling.
+            let file_name = self.cloud_hypervisor_bin.file_name()?;
+            let alternate = alternate_cloud_hypervisor_name(Path::new(file_name))?;
+            let sibling = self.cloud_hypervisor_bin.with_file_name(alternate);
+            return sibling.is_file().then_some(sibling);
+        }
         let alternate = alternate_cloud_hypervisor_name(&self.cloud_hypervisor_bin)?;
         resolve_binary(Path::new(alternate), CLOUD_HYPERVISOR_FALLBACKS)
     }
@@ -754,6 +762,16 @@ root_device = "/dev/vda"
             alternate_cloud_hypervisor_name(Path::new("/opt/custom/ch")),
             None
         );
+    }
+
+    #[test]
+    fn resolves_the_static_sibling_of_an_explicit_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let static_binary = dir.path().join("cloud-hypervisor-static");
+        fs::write(&static_binary, b"").unwrap();
+        let mut config = Config::default();
+        config.cloud_hypervisor_bin = dir.path().join("cloud-hypervisor");
+        assert_eq!(config.resolved_cloud_hypervisor(), Some(static_binary));
     }
 
     #[test]

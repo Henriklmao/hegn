@@ -69,8 +69,8 @@ pub fn run(config: &Config) -> DoctorReport {
             false,
             true,
             format!(
-                "{} not found on PATH or as `cloud-hypervisor-static`; install \
-                 cloud-hypervisor-bin or set `cloud_hypervisor_bin`",
+                "{} not found; install cloud-hypervisor (or cloud-hypervisor-static) \
+                 or set `cloud_hypervisor_bin`",
                 config.cloud_hypervisor_bin.display()
             ),
         ),

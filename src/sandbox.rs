@@ -282,7 +282,7 @@ impl SandboxManager {
         // console) behind.
         let vm_binary = self.config.resolved_cloud_hypervisor().with_context(|| {
             format!(
-                "cloud-hypervisor binary {} was not found (also tried `{}`); run `hegn doctor`",
+                "cloud-hypervisor binary {} was not found; hegn also accepts `{}`; run `hegn doctor`",
                 self.config.cloud_hypervisor_bin.display(),
                 crate::config::CLOUD_HYPERVISOR_STATIC
             )
@@ -721,7 +721,7 @@ impl SandboxManager {
         // the configuration does not cost the user their current sandbox.
         let vm_binary = self.config.resolved_cloud_hypervisor().with_context(|| {
             format!(
-                "cloud-hypervisor binary {} was not found (also tried `{}`)",
+                "cloud-hypervisor binary {} was not found; hegn also accepts `{}`",
                 self.config.cloud_hypervisor_bin.display(),
                 crate::config::CLOUD_HYPERVISOR_STATIC
             )
