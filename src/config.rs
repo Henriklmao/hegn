@@ -152,6 +152,12 @@ pub struct Config {
     pub virtiofsd_bin: PathBuf,
     pub kernel_image: PathBuf,
     pub rootfs_image: PathBuf,
+    /// Upstream kernel URL and pinned SHA-256 used by `hegn images download`.
+    pub kernel_url: String,
+    pub kernel_sha256: String,
+    /// Upstream root filesystem URL and pinned SHA-256.
+    pub rootfs_url: String,
+    pub rootfs_sha256: String,
     /// vCPUs assigned to a MicroVM.
     pub vcpus: u8,
     /// Guest memory in MiB.
@@ -186,6 +192,10 @@ impl Default for Config {
             virtiofsd_bin: PathBuf::from("virtiofsd"),
             kernel_image: data_dir.join("hegn/images/vmlinux.bin"),
             rootfs_image: data_dir.join("hegn/images/rootfs.ext4"),
+            kernel_url: crate::images::KERNEL_URL.to_string(),
+            kernel_sha256: crate::images::KERNEL_SHA256.to_string(),
+            rootfs_url: crate::images::ROOTFS_URL.to_string(),
+            rootfs_sha256: crate::images::ROOTFS_SHA256.to_string(),
             vcpus: 2,
             memory_mib: 2048,
             shared_tag: "workspace".to_string(),
@@ -268,6 +278,18 @@ impl Config {
         if let Some(value) = path_var("HEGN_ROOTFS_IMAGE") {
             self.rootfs_image = value;
         }
+        if let Ok(value) = std::env::var("HEGN_KERNEL_URL") {
+            self.kernel_url = value;
+        }
+        if let Ok(value) = std::env::var("HEGN_KERNEL_SHA256") {
+            self.kernel_sha256 = value;
+        }
+        if let Ok(value) = std::env::var("HEGN_ROOTFS_URL") {
+            self.rootfs_url = value;
+        }
+        if let Ok(value) = std::env::var("HEGN_ROOTFS_SHA256") {
+            self.rootfs_sha256 = value;
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -289,6 +311,22 @@ impl Config {
         }
         if !self.guest_mount.starts_with('/') {
             bail!("guest_mount must be an absolute guest path");
+        }
+        for (name, sha) in [
+            ("kernel_sha256", &self.kernel_sha256),
+            ("rootfs_sha256", &self.rootfs_sha256),
+        ] {
+            if !sha.trim().is_empty() && !crate::images::is_sha256(sha.trim()) {
+                bail!("{name} must be a 64 character SHA-256 hex digest");
+            }
+        }
+        for (name, url) in [
+            ("kernel_url", &self.kernel_url),
+            ("rootfs_url", &self.rootfs_url),
+        ] {
+            if !url.trim().is_empty() && !url.starts_with("https://") {
+                bail!("{name} must use https://");
+            }
         }
         Ok(())
     }
@@ -342,7 +380,8 @@ impl Config {
 
     /// Static assets are only usable when both images exist.
     pub fn firecracker_ready(&self) -> bool {
-        self.kernel_image.is_file() && self.rootfs_image.is_file()
+        crate::images::is_regular_file(&self.kernel_image)
+            && crate::images::is_regular_file(&self.rootfs_image)
     }
 
     /// The backend actually used for work. hegn never falls back to a host

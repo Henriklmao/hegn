@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::app::PACKAGE_CHOICES;
 use crate::config::{Config, Harness};
+use crate::images::{self, AssetStatus};
 use crate::logs::{self, DEFAULT_KEEP, LogStore};
 use crate::project::{self, ProjectMeta};
 use crate::sandbox::{SandboxManager, SandboxReport, process_alive, process_matches, same_project};
@@ -89,6 +90,11 @@ pub enum Commands {
     Logs {
         #[command(subcommand)]
         command: Option<LogCommands>,
+    },
+    /// Inspect, download and verify the pinned upstream VM images.
+    Images {
+        #[command(subcommand)]
+        command: ImageCommands,
     },
     /// Manage the Firecracker sandbox lifecycle.
     Sandbox {
@@ -206,6 +212,23 @@ pub enum LogCommands {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum ImageCommands {
+    /// Download missing kernel and rootfs images (checksums pinned).
+    Download {
+        /// Replace existing files after verifying the new download.
+        #[arg(long)]
+        force: bool,
+        /// Permit downloads when no SHA-256 is configured (unsafe).
+        #[arg(long)]
+        allow_unverified: bool,
+    },
+    /// Show configured image URLs, paths and sizes.
+    Status,
+    /// Hash installed images and compare them with the pinned SHA-256.
+    Verify,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ConfigCommands {
     /// Print the effective configuration as TOML.
     Show,
@@ -282,6 +305,7 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
         Commands::Snapshot { command } => snapshot_command(command, config, json),
         Commands::Check { command, cwd } => check(&command.join(" "), cwd.as_deref(), config, json),
         Commands::Config { command } => config_command(command, config, json),
+        Commands::Images { command } => image_command(command, config, json),
         Commands::Doctor => doctor(config, json),
     }
 }
@@ -586,6 +610,87 @@ fn config_command(command: ConfigCommands, config: Config, json: bool) -> Result
             Ok(0)
         }
     }
+}
+
+fn image_command(command: ImageCommands, config: Config, json: bool) -> Result<i32> {
+    match command {
+        ImageCommands::Download {
+            force,
+            allow_unverified,
+        } => {
+            let assets = images::download_all(&config, force, allow_unverified)?;
+            print_assets(&assets, json)?;
+            Ok(0)
+        }
+        ImageCommands::Status => {
+            print_assets(&images::status(&config), json)?;
+            Ok(0)
+        }
+        ImageCommands::Verify => {
+            let mut results = Vec::new();
+            let mut failed = false;
+            for asset in images::status(&config) {
+                let result = if !asset.exists {
+                    Err("missing".to_string())
+                } else {
+                    images::verify_file(&asset.path, &asset.sha256)
+                        .map(|_| ())
+                        .map_err(|err| err.to_string())
+                };
+                if result.is_err() {
+                    failed = true;
+                }
+                results.push(serde_json::json!({
+                    "name": asset.name,
+                    "path": asset.path,
+                    "sha256": asset.sha256,
+                    "ok": result.is_ok(),
+                    "error": result.err(),
+                }));
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                for result in &results {
+                    let ok = result["ok"].as_bool().unwrap_or(false);
+                    println!(
+                        "{} {:<8} {}",
+                        if ok { "✓" } else { "✗" },
+                        result["name"].as_str().unwrap_or("asset"),
+                        result["path"].as_str().unwrap_or("")
+                    );
+                    if let Some(error) = result["error"].as_str() {
+                        println!("  {error}");
+                    }
+                }
+            }
+            Ok(if failed { 1 } else { 0 })
+        }
+    }
+}
+
+fn print_assets(assets: &[AssetStatus], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(assets)?);
+        return Ok(());
+    }
+    println!("{:<8} {:<8} {:>12}  PATH", "NAME", "STATE", "SIZE");
+    for asset in assets {
+        println!(
+            "{:<8} {:<8} {:>12}  {}",
+            asset.name,
+            if asset.exists { "present" } else { "missing" },
+            asset
+                .size_bytes
+                .map(human_size)
+                .unwrap_or_else(|| "-".into()),
+            asset.path.display()
+        );
+    }
+    if assets.iter().any(AssetStatus::missing) {
+        println!("\nDownload with: hegn images download");
+    }
+    Ok(())
 }
 
 fn doctor(config: Config, json: bool) -> Result<i32> {

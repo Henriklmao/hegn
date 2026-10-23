@@ -10,6 +10,8 @@
 //! - [`sandbox`] — MicroVM lifecycle orchestration
 //! - [`snapshot`] — on-disk snapshot metadata
 //! - [`logs`] — private, persistent serial-console logs
+//! - [`images`] — pinned upstream VM assets, downloads and checksum checks
+//! - [`doctor`] — shared host prerequisite checks for CLI and TUI
 //! - [`console`] — Firecracker serial-console transport (no host fallback)
 //! - [`terminal`] — ANSI-aware scrollback buffer
 //! - [`state`] — persisted recent-project state
@@ -24,6 +26,7 @@ pub mod config;
 pub mod console;
 pub mod firecracker;
 pub mod logs;
+pub mod images;
 pub mod project;
 pub mod sandbox;
 pub mod security;
