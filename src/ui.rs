@@ -101,10 +101,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
         ),
     ]);
-    frame.render_widget(
-        Paragraph::new(left).style(Style::default()),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(left).style(Style::default()), inner);
 
     let status = match app.sandbox.state {
         SandboxState::Running => ("● running", GREEN),
@@ -437,10 +434,7 @@ fn render_project_panel(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(YELLOW),
         )));
     }
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default()),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(lines).style(Style::default()), inner);
 }
 
 fn render_sandbox_panel(frame: &mut Frame, app: &App, area: Rect) {
@@ -504,10 +498,7 @@ fn render_sandbox_panel(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(MUTED),
         )),
     ];
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default()),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(lines).style(Style::default()), inner);
 }
 
 fn render_snapshot_detail(frame: &mut Frame, app: &App, area: Rect) {
@@ -577,10 +568,7 @@ fn render_snapshot_detail(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(MUTED),
         )),
     ];
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default()),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(lines).style(Style::default()), inner);
 }
 
 fn render_terminal(frame: &mut Frame, app: &App, area: Rect) -> (Vec<RowHit>, Vec<RowHit>) {
@@ -607,7 +595,10 @@ fn render_terminal(frame: &mut Frame, app: &App, area: Rect) -> (Vec<RowHit>, Ve
     let mode = if app.raw_mode {
         Span::styled(
             " RAW ",
-            Style::default().fg(ON_ACCENT).bg(RED).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(ON_ACCENT)
+                .bg(RED)
+                .add_modifier(Modifier::BOLD),
         )
     } else {
         Span::styled(
@@ -802,6 +793,26 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 action: ActionId::Close,
             },
         ],
+        Some(Modal::Doctor(modal)) => {
+            let mut buttons = vec![FooterDef {
+                key: "r",
+                label: "Re-run",
+                action: ActionId::Doctor,
+            }];
+            if modal.report.can_download() && !modal.downloading {
+                buttons.push(FooterDef {
+                    key: "d",
+                    label: "Download images",
+                    action: ActionId::DownloadImages,
+                });
+            }
+            buttons.push(FooterDef {
+                key: "Esc",
+                label: "Close",
+                action: ActionId::Close,
+            });
+            buttons
+        }
         Some(Modal::Confirm(_)) => vec![
             FooterDef {
                 key: "y",
@@ -870,6 +881,11 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                     label: "Refresh",
                     action: ActionId::Refresh,
                 },
+                FooterDef {
+                    key: "F3",
+                    label: "Doctor",
+                    action: ActionId::Doctor,
+                },
             ];
             if app.focus == Focus::Snapshots {
                 buttons.push(FooterDef {
@@ -925,6 +941,7 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
             );
         }
         Modal::CreateProject(form) => render_create_form(frame, app, form, area),
+        Modal::Doctor(modal) => render_doctor(frame, modal, area),
         Modal::Security(prompt) => render_security(frame, prompt, area),
     }
 }
@@ -997,6 +1014,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("e", "open in $EDITOR"),
                 ("g", "open in lazygit"),
                 ("r", "refresh git status"),
+                ("F3", "doctor (host checks, image download)"),
             ],
         ),
         (
@@ -1046,10 +1064,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         " All actions are also available non-interactively: hegn --help",
         Style::default().fg(MUTED),
     )));
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default()),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(lines).style(Style::default()), inner);
 }
 
 fn render_create_form(
@@ -1208,6 +1223,108 @@ fn render_create_form(
         submit_style,
     )));
     frame.render_widget(Paragraph::new(bottom), chunks[3]);
+}
+
+fn render_doctor(frame: &mut Frame, modal: &crate::app::DoctorModal, area: Rect) {
+    let rect = centered(area, 92, 82);
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if modal.report.ok { GREEN } else { YELLOW }))
+        .title(Span::styled(
+            " doctor ",
+            Style::default()
+                .fg(if modal.report.ok { GREEN } else { YELLOW })
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let mut lines = Vec::new();
+    for check in &modal.report.checks {
+        let color = if check.ok {
+            GREEN
+        } else if check.required {
+            RED
+        } else {
+            YELLOW
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", if check.ok { "✓" } else { "✗" }),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{:<18}", check.name), Style::default().fg(TEXT)),
+            Span::styled(
+                check.detail.clone(),
+                Style::default().fg(if check.ok { MUTED } else { color }),
+            ),
+            Span::styled(
+                if check.required { "" } else { "  (optional)" },
+                Style::default().fg(MUTED),
+            ),
+        ]));
+    }
+
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        " VM images",
+        Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+    )));
+    for asset in &modal.report.assets {
+        let size = asset
+            .size_bytes
+            .map(|bytes| format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0)))
+            .unwrap_or_else(|| "missing".into());
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:<8}", asset.name),
+                Style::default().fg(if asset.exists { GREEN } else { RED }),
+            ),
+            Span::styled(
+                format!("{size:<12} "),
+                Style::default().fg(if asset.exists { MUTED } else { RED }),
+            ),
+            Span::styled(asset.path.display().to_string(), Style::default().fg(TEXT)),
+        ]));
+        if !asset.exists && !asset.url.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("          {}", asset.url),
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+    if modal.downloading {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            " Downloading and verifying VM images…",
+            Style::default().fg(CYAN),
+        )));
+    }
+
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(2)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default())
+            .wrap(Wrap { trim: false }),
+        inner_chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            if modal.report.can_download() {
+                " d download missing images · r re-run · Esc close "
+            } else {
+                " r re-run · Esc close "
+            },
+            Style::default().fg(MUTED),
+        ))),
+        inner_chunks[1],
+    );
 }
 
 fn render_security(frame: &mut Frame, prompt: &crate::app::SecurityPrompt, area: Rect) {
@@ -1477,6 +1594,36 @@ mod tests {
         assert!(text.contains("Open"));
         assert!(!hits.footer.is_empty());
         assert_eq!(hits.projects.len(), 1);
+    }
+
+    #[test]
+    fn doctor_modal_renders_failures_and_missing_images() {
+        let (_dir, mut app) = app();
+        let report = crate::doctor::DoctorReport {
+            ok: false,
+            checks: vec![
+                crate::doctor::Check::new("kernel image", false, true, "missing"),
+                crate::doctor::Check::new("lazygit", false, false, "optional"),
+            ],
+            assets: vec![crate::images::AssetStatus {
+                name: "kernel",
+                path: PathBuf::from("/images/vmlinux.bin"),
+                url: "https://example.com/vmlinux".into(),
+                sha256: "0".repeat(64),
+                exists: false,
+                size_bytes: None,
+            }],
+        };
+        app.modal = Some(Modal::Doctor(crate::app::DoctorModal::new(report)));
+        let (text, hits) = render(&app);
+        assert!(text.contains("doctor"), "{text}");
+        assert!(text.contains("kernel image"), "{text}");
+        assert!(text.contains("Download images"), "{text}");
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::DownloadImages)
+        );
     }
 
     #[test]

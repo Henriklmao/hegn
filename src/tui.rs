@@ -18,6 +18,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::app::{App, Effect, ToastLevel};
 use crate::config::Config;
+use crate::doctor::DoctorReport;
 use crate::project;
 use crate::ui;
 
@@ -25,6 +26,10 @@ const TICK: Duration = Duration::from_millis(50);
 
 enum ScanMessage {
     Projects(Vec<project::Project>),
+    Doctor {
+        report: DoctorReport,
+        note: Option<String>,
+    },
     Error(String),
 }
 
@@ -99,6 +104,7 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
     loop {
         match scan_rx.try_recv() {
             Ok(ScanMessage::Projects(projects)) => app.set_projects(projects),
+            Ok(ScanMessage::Doctor { report, note }) => app.show_doctor(report, note),
             Ok(ScanMessage::Error(err)) => {
                 app.loading = false;
                 app.toast(format!("project scan failed: {err}"), ToastLevel::Error);
@@ -127,6 +133,26 @@ fn spawn_scan(config: Config, tx: mpsc::Sender<ScanMessage>) {
     }
 }
 
+fn spawn_image_download(config: Config, tx: mpsc::Sender<ScanMessage>) {
+    let thread_tx = tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("hegn-images".into())
+        .spawn(move || {
+            let result = crate::images::download_missing(&config, false);
+            let report = crate::doctor::run(&config);
+            let note = Some(match result {
+                Ok(_) => "VM images downloaded and verified".to_string(),
+                Err(err) => format!("image download failed: {err:#}"),
+            });
+            let _ = thread_tx.send(ScanMessage::Doctor { report, note });
+        });
+    if let Err(err) = spawned {
+        let _ = tx.send(ScanMessage::Error(format!(
+            "could not start image download: {err}"
+        )));
+    }
+}
+
 fn handle_effects(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -141,6 +167,10 @@ fn handle_effects(
                 app.loading = true;
                 app.toast("refreshing projects…", ToastLevel::Info);
                 spawn_scan(app.config.clone(), scan_tx.clone());
+            }
+            Effect::DownloadImages => {
+                app.toast("downloading VM images…", ToastLevel::Info);
+                spawn_image_download(app.config.clone(), scan_tx.clone());
             }
             Effect::OpenEditor(path) => {
                 match with_suspended_terminal(terminal, || open_editor(&path)) {

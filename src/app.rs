@@ -12,6 +12,7 @@ use ratatui::layout::Rect;
 
 use crate::config::{Config, Harness, SecurityMode};
 use crate::console::TerminalConsole;
+use crate::doctor::DoctorReport;
 use crate::project::{self, GitSummary, Project, ProjectMeta};
 use crate::security::{Decision, Inspection, SecurityEngine};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
@@ -42,6 +43,7 @@ pub enum Effect {
     OpenLazygit(PathBuf),
     RefreshProjects,
     RestoreSnapshot(SnapshotMeta),
+    DownloadImages,
     /// Boot (or attach to) a Firecracker VM. A failure is a hard error; there is
     /// no host-process fallback.
     StartSandbox {
@@ -157,6 +159,8 @@ pub enum ActionId {
     NewSnapshot,
     DeleteSnapshot,
     Restore,
+    Doctor,
+    DownloadImages,
     Allow,
     Checkpoint,
     Deny,
@@ -276,8 +280,24 @@ pub struct ConfirmPrompt {
 }
 
 #[derive(Debug, Clone)]
+pub struct DoctorModal {
+    pub report: DoctorReport,
+    pub downloading: bool,
+}
+
+impl DoctorModal {
+    pub fn new(report: DoctorReport) -> Self {
+        Self {
+            report,
+            downloading: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Modal {
     CreateProject(CreateProjectForm),
+    Doctor(DoctorModal),
     Security(SecurityPrompt),
     Confirm(ConfirmPrompt),
     Help,
@@ -558,6 +578,12 @@ impl App {
                 self.modal = Some(Modal::Help);
                 Vec::new()
             }
+            KeyCode::F(3) => {
+                self.modal = Some(Modal::Doctor(DoctorModal::new(crate::doctor::run(
+                    &self.config,
+                ))));
+                Vec::new()
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.select_next(1);
                 Vec::new()
@@ -814,6 +840,24 @@ impl App {
             }
             Modal::Error { .. } => Vec::new(),
             Modal::Confirm(prompt) => self.handle_confirm_key(key, prompt),
+            Modal::Doctor(mut modal) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => Vec::new(),
+                KeyCode::Char('r') => {
+                    modal.report = crate::doctor::run(&self.config);
+                    modal.downloading = false;
+                    self.modal = Some(Modal::Doctor(modal));
+                    Vec::new()
+                }
+                KeyCode::Char('d') if modal.report.can_download() && !modal.downloading => {
+                    modal.downloading = true;
+                    self.modal = Some(Modal::Doctor(modal));
+                    vec![Effect::DownloadImages]
+                }
+                _ => {
+                    self.modal = Some(Modal::Doctor(modal));
+                    Vec::new()
+                }
+            },
             Modal::Security(prompt) => self.handle_security_key(key, prompt),
             Modal::CreateProject(mut form) => {
                 if key.code == KeyCode::Esc {
@@ -1111,6 +1155,9 @@ impl App {
     }
 
     /// Report a hard VM start/attach failure. No host fallback is attempted.
+    ///
+    /// The doctor modal opens automatically so the missing prerequisite and the
+    /// image download hint are visible without leaving the TUI.
     pub fn fail_start(&mut self, error: impl Into<String>) {
         let error = error.into();
         self.session = None;
@@ -1118,6 +1165,22 @@ impl App {
         self.sandbox.started_at = None;
         self.sandbox.note = Some(error.clone());
         self.toast(format!("VM start failed: {error}"), ToastLevel::Error);
+        self.modal = Some(Modal::Doctor(DoctorModal::new(crate::doctor::run(
+            &self.config,
+        ))));
+    }
+
+    /// Install a fresh doctor report, e.g. after a background image download.
+    pub fn show_doctor(&mut self, report: DoctorReport, note: Option<String>) {
+        if let Some(note) = note {
+            let level = if note.contains("failed") {
+                ToastLevel::Error
+            } else {
+                ToastLevel::Info
+            };
+            self.toast(note, level);
+        }
+        self.modal = Some(Modal::Doctor(DoctorModal::new(report)));
     }
 
     /// Dispatch a footer click or a direct action (mouse support).
@@ -1162,6 +1225,24 @@ impl App {
             ActionId::Edit => self.effect_for_selected(Effect::OpenEditor),
             ActionId::Lazygit => self.effect_for_selected(Effect::OpenLazygit),
             ActionId::Refresh => vec![Effect::RefreshProjects],
+            ActionId::Doctor => {
+                self.modal = Some(Modal::Doctor(DoctorModal::new(crate::doctor::run(
+                    &self.config,
+                ))));
+                Vec::new()
+            }
+            ActionId::DownloadImages => match self.modal.take() {
+                Some(Modal::Doctor(mut modal)) if modal.report.can_download() => {
+                    modal.downloading = true;
+                    self.modal = Some(Modal::Doctor(modal));
+                    vec![Effect::DownloadImages]
+                }
+                Some(other) => {
+                    self.modal = Some(other);
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
             ActionId::Help => {
                 self.modal = Some(Modal::Help);
                 Vec::new()
@@ -1823,6 +1904,32 @@ mod tests {
             }
             other => panic!("expected StartSandbox, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn failures_open_the_doctor_modal_and_d_requests_a_download() {
+        let (_dir, mut app) = test_app();
+        app.fail_start("missing VM assets");
+        match &app.modal {
+            Some(Modal::Doctor(modal)) => {
+                assert!(!modal.report.ok);
+                assert!(modal.report.can_download());
+            }
+            other => panic!("expected doctor modal, got {other:?}"),
+        }
+        let effects = app.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(effects.as_slice(), [Effect::DownloadImages]));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Doctor(DoctorModal {
+                downloading: true,
+                ..
+            }))
+        ));
+
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_action(ActionId::Doctor);
+        assert!(matches!(app.modal, Some(Modal::Doctor(_))));
     }
 
     #[test]

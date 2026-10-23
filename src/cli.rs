@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::app::PACKAGE_CHOICES;
 use crate::config::{Config, Harness};
+use crate::doctor;
 use crate::images::{self, AssetStatus};
 use crate::logs::{self, DEFAULT_KEEP, LogStore};
 use crate::project::{self, ProjectMeta};
@@ -694,64 +695,11 @@ fn print_assets(assets: &[AssetStatus], json: bool) -> Result<()> {
 }
 
 fn doctor(config: Config, json: bool) -> Result<i32> {
-    let mut checks = Vec::new();
-    checks.push(check_tool(
-        "firecracker",
-        &config.firecracker_bin,
-        &["--version"],
-    ));
-    checks.push(check_tool(
-        "virtiofsd",
-        &config.virtiofsd_bin,
-        &["--version"],
-    ));
-    checks.push(check_tool("git", Path::new("git"), &["--version"]));
-    checks.push(check_tool("lazygit", Path::new("lazygit"), &["--version"]));
-    checks.push(Check {
-        name: "kvm".into(),
-        ok: Path::new("/dev/kvm").exists(),
-        detail: if Path::new("/dev/kvm").exists() {
-            "/dev/kvm available".into()
-        } else {
-            "/dev/kvm missing (enable KVM / add user to kvm group)".into()
-        },
-    });
-    checks.push(Check {
-        name: "kernel image".into(),
-        ok: config.kernel_image.is_file(),
-        detail: config.kernel_image.display().to_string(),
-    });
-    checks.push(Check {
-        name: "rootfs image".into(),
-        ok: config.rootfs_image.is_file(),
-        detail: config.rootfs_image.display().to_string(),
-    });
-    checks.push(Check {
-        name: "projects root".into(),
-        ok: config.projects_root.is_dir(),
-        detail: config.projects_root.display().to_string(),
-    });
-    checks.push(Check {
-        name: "backend".into(),
-        ok: config.firecracker_ready(),
-        detail: format!(
-            "{} (configured {}); a VM is mandatory",
-            config.effective_backend().label(),
-            config.backend.label()
-        ),
-    });
-    checks.push(Check {
-        name: "editor".into(),
-        ok: std::env::var_os("EDITOR").is_some() || std::env::var_os("VISUAL").is_some(),
-        detail: std::env::var("VISUAL")
-            .or_else(|_| std::env::var("EDITOR"))
-            .unwrap_or_else(|_| "$EDITOR is unset".into()),
-    });
-
+    let report = doctor::run(&config);
     if json {
-        println!("{}", serde_json::to_string_pretty(&checks)?);
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        for check in &checks {
+        for check in &report.checks {
             println!(
                 "{} {:<18} {}",
                 if check.ok { "✓" } else { "✗" },
@@ -759,44 +707,12 @@ fn doctor(config: Config, json: bool) -> Result<i32> {
                 check.detail
             );
         }
+        if report.can_download() {
+            println!("\nMissing VM images. Download with: hegn images download");
+        }
         println!("\nConfig: {}", Config::config_path().display());
     }
-    Ok(0)
-}
-
-#[derive(Debug, Serialize)]
-struct Check {
-    name: String,
-    ok: bool,
-    detail: String,
-}
-
-fn check_tool(name: &str, binary: &Path, args: &[&str]) -> Check {
-    match Command::new(binary).args(args).output() {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let version = stdout.lines().next().unwrap_or("").trim();
-            Check {
-                name: name.into(),
-                ok: true,
-                detail: if version.is_empty() {
-                    output.status.to_string()
-                } else {
-                    version.to_string()
-                },
-            }
-        }
-        Ok(output) => Check {
-            name: name.into(),
-            ok: false,
-            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        },
-        Err(err) => Check {
-            name: name.into(),
-            ok: false,
-            detail: err.to_string(),
-        },
-    }
+    Ok(if report.ok { 0 } else { 1 })
 }
 
 fn open(
