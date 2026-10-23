@@ -1,0 +1,75 @@
+name: VM images
+
+# hegn uses upstream Firecracker CI images; it never builds its own guest
+# image. This scheduled job refreshes the pinned URLs/SHA-256 and opens a PR so
+# a human can review the new kernel/rootfs before it becomes the default.
+on:
+  schedule:
+    # Daily, 04:17 UTC (off the top of the hour).
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: vm-images
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Refresh pinned kernel and rootfs
+        run: |
+          python3 scripts/update_vm_images.py --arch x86_64
+          python3 scripts/update_vm_images.py --arch aarch64
+
+      - name: Open or update pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/images.rs; then
+            echo "VM image pins are current."
+            exit 0
+          fi
+
+          branch="chore/vm-images"
+          git config user.name "hegn-vm-images[bot]"
+          git config user.email "hegn-vm-images@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add src/images.rs
+          git commit -m "chore(images): refresh pinned Firecracker VM assets"
+          git push --force origin "$branch"
+
+          body=$(cat <<'EOF'
+          Weekly automated refresh of the upstream Firecracker CI VM assets.
+
+          The update script downloads the selected kernel and ext4 rootfs,
+          computes SHA-256 from the actual bytes, and rewrites the architecture
+          blocks in `src/images.rs`. Review the URLs and checksums before
+          merging; the next Rust CI run verifies the code still builds.
+          EOF
+          )
+
+          if gh pr view "$branch" --json number >/dev/null 2>&1; then
+            gh pr edit "$branch" \
+              --title "chore(images): refresh pinned Firecracker VM assets" \
+              --body "$body"
+          else
+            gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "chore(images): refresh pinned Firecracker VM assets" \
+              --body "$body"
+          fi
