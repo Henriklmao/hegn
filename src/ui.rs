@@ -12,16 +12,17 @@ use crate::app::{
     ActionId, App, CreateFocus, Focus, FooterHit, Modal, RowHit, SandboxState, Screen, ToastLevel,
 };
 
-const BG: Color = Color::Rgb(13, 17, 23);
-const PANEL: Color = Color::Rgb(22, 27, 34);
-const BORDER: Color = Color::Rgb(48, 54, 61);
-const TEXT: Color = Color::Rgb(192, 197, 213);
-const MUTED: Color = Color::Rgb(110, 118, 145);
-const ACCENT: Color = Color::Rgb(122, 162, 247);
-const CYAN: Color = Color::Rgb(125, 207, 255);
-const GREEN: Color = Color::Rgb(158, 206, 106);
-const YELLOW: Color = Color::Rgb(224, 175, 104);
-const RED: Color = Color::Rgb(247, 118, 142);
+// Use the terminal's own palette and default background. Only ANSI colors
+// are selected here; the user's terminal theme decides how they look.
+const ON_ACCENT: Color = Color::Black;
+const BORDER: Color = Color::DarkGray;
+const TEXT: Color = Color::Reset;
+const MUTED: Color = Color::DarkGray;
+const ACCENT: Color = Color::Cyan;
+const CYAN: Color = Color::LightCyan;
+const GREEN: Color = Color::Green;
+const YELLOW: Color = Color::Yellow;
+const RED: Color = Color::Red;
 
 #[derive(Debug, Default)]
 pub struct UiHits {
@@ -39,7 +40,7 @@ struct FooterDef {
 
 pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
     let area = frame.area();
-    frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
+    frame.render_widget(Block::default().style(Style::default()), area);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -72,7 +73,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(PANEL));
+        .style(Style::default());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -85,7 +86,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             " hegn ",
             Style::default()
-                .fg(BG)
+                .fg(ON_ACCENT)
                 .bg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
@@ -101,7 +102,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ]);
     frame.render_widget(
-        Paragraph::new(left).style(Style::default().bg(PANEL)),
+        Paragraph::new(left).style(Style::default()),
         inner,
     );
 
@@ -197,7 +198,7 @@ fn render_projects(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
         query_spans.push(Span::styled("▌", Style::default().fg(CYAN)));
     }
     frame.render_widget(
-        Paragraph::new(Line::from(query_spans)).style(Style::default().bg(PANEL)),
+        Paragraph::new(Line::from(query_spans)).style(Style::default()),
         query_line[0],
     );
 
@@ -245,11 +246,11 @@ fn render_projects(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
         let selected = row == app.selected && active;
         let base = if selected {
             Style::default()
-                .fg(BG)
+                .fg(ON_ACCENT)
                 .bg(ACCENT)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(TEXT).bg(PANEL)
+            Style::default().fg(TEXT)
         };
         let marker = if project.git.is_repo {
             if project.git.is_dirty() { "●" } else { "◆" }
@@ -260,7 +261,7 @@ fn render_projects(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
             Span::styled(
                 format!(" {marker} "),
                 base.fg(if selected {
-                    BG
+                    ON_ACCENT
                 } else {
                     branch_color(&project.git)
                 }),
@@ -271,9 +272,9 @@ fn render_projects(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
         let detail = Line::from(Span::styled(
             format!("   {}", project.git.badge()),
             if selected {
-                Style::default().fg(BG).bg(ACCENT)
+                Style::default().fg(ON_ACCENT).bg(ACCENT)
             } else {
-                Style::default().fg(MUTED).bg(PANEL)
+                Style::default().fg(MUTED)
             },
         ));
         lines.push(detail);
@@ -288,7 +289,7 @@ fn render_projects(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
         });
     }
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).style(Style::default().bg(PANEL)),
+        Paragraph::new(Text::from(lines)).style(Style::default()),
         list_area,
     );
     hits
@@ -341,22 +342,22 @@ fn render_snapshots(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
         let selected = row == app.selected_snapshot && active;
         let style = if selected {
             Style::default()
-                .fg(BG)
+                .fg(ON_ACCENT)
                 .bg(CYAN)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(TEXT).bg(PANEL)
+            Style::default().fg(TEXT)
         };
         let prefix = if row == offset { " ▾ " } else { "   " };
         lines.push(Line::from(vec![
-            Span::styled(prefix, style.fg(if selected { BG } else { CYAN })),
+            Span::styled(prefix, style.fg(if selected { ON_ACCENT } else { CYAN })),
             Span::styled(truncate(&snapshot.name, 20), style),
             Span::styled(
                 format!("  {}", snapshot.size_label()),
                 if selected {
-                    Style::default().fg(BG).bg(CYAN)
+                    Style::default().fg(ON_ACCENT).bg(CYAN)
                 } else {
-                    Style::default().fg(MUTED).bg(PANEL)
+                    Style::default().fg(MUTED)
                 },
             ),
         ]));
@@ -371,7 +372,7 @@ fn render_snapshots(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
         });
     }
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).style(Style::default().bg(PANEL)),
+        Paragraph::new(Text::from(lines)).style(Style::default()),
         inner,
     );
     hits
@@ -437,7 +438,7 @@ fn render_project_panel(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(PANEL)),
+        Paragraph::new(lines).style(Style::default()),
         inner,
     );
 }
@@ -504,7 +505,7 @@ fn render_sandbox_panel(frame: &mut Frame, app: &App, area: Rect) {
         )),
     ];
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(PANEL)),
+        Paragraph::new(lines).style(Style::default()),
         inner,
     );
 }
@@ -577,7 +578,7 @@ fn render_snapshot_detail(frame: &mut Frame, app: &App, area: Rect) {
         )),
     ];
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(PANEL)),
+        Paragraph::new(lines).style(Style::default()),
         inner,
     );
 }
@@ -606,13 +607,13 @@ fn render_terminal(frame: &mut Frame, app: &App, area: Rect) -> (Vec<RowHit>, Ve
     let mode = if app.raw_mode {
         Span::styled(
             " RAW ",
-            Style::default().fg(BG).bg(RED).add_modifier(Modifier::BOLD),
+            Style::default().fg(ON_ACCENT).bg(RED).add_modifier(Modifier::BOLD),
         )
     } else {
         Span::styled(
             " INTERCEPT ",
             Style::default()
-                .fg(BG)
+                .fg(ON_ACCENT)
                 .bg(GREEN)
                 .add_modifier(Modifier::BOLD),
         )
@@ -645,7 +646,7 @@ fn render_terminal(frame: &mut Frame, app: &App, area: Rect) -> (Vec<RowHit>, Ve
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(Text::from(visible)).style(Style::default().bg(PANEL)),
+        Paragraph::new(Text::from(visible)).style(Style::default()),
         out,
     );
 
@@ -708,7 +709,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(PANEL));
+        .style(Style::default());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -731,7 +732,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
         spans.push(Span::styled(
             format!(" {text} "),
             Style::default()
-                .fg(BG)
+                .fg(ON_ACCENT)
                 .bg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         ));
@@ -949,7 +950,7 @@ fn render_message(
             format!(" {title} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
-        .style(Style::default().bg(PANEL));
+        .style(Style::default());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     let chunks = Layout::default()
@@ -980,7 +981,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
             " hegn help ",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ))
-        .style(Style::default().bg(PANEL));
+        .style(Style::default());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -1046,7 +1047,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Style::default().fg(MUTED),
     )));
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(PANEL)),
+        Paragraph::new(lines).style(Style::default()),
         inner,
     );
 }
@@ -1067,7 +1068,7 @@ fn render_create_form(
             " new project ",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ))
-        .style(Style::default().bg(PANEL));
+        .style(Style::default());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -1098,7 +1099,7 @@ fn render_create_form(
             " name ",
             field_style(form.focus == CreateFocus::Name),
         ))
-        .style(Style::default().bg(PANEL));
+        .style(Style::default());
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(form.name.clone(), Style::default().fg(TEXT)),
@@ -1123,7 +1124,7 @@ fn render_create_form(
             " harness (←/→) ",
             field_style(form.focus == CreateFocus::Harness),
         ))
-        .style(Style::default().bg(PANEL));
+        .style(Style::default());
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("◀ ", Style::default().fg(MUTED)),
@@ -1149,7 +1150,7 @@ fn render_create_form(
             " packages (space toggles) ",
             field_style(form.focus == CreateFocus::Packages),
         ))
-        .style(Style::default().bg(PANEL));
+        .style(Style::default());
     let pkg_inner = pkg_block.inner(chunks[2]);
     frame.render_widget(pkg_block, chunks[2]);
     let mut pkg_lines = Vec::new();
@@ -1157,7 +1158,7 @@ fn render_create_form(
         let cursor = index == form.package_cursor && form.focus == CreateFocus::Packages;
         let marker = if package.selected { "[x]" } else { "[ ]" };
         let style = if cursor {
-            Style::default().fg(BG).bg(CYAN)
+            Style::default().fg(ON_ACCENT).bg(CYAN)
         } else if package.selected {
             Style::default().fg(GREEN)
         } else {
@@ -1196,7 +1197,7 @@ fn render_create_form(
     }
     let submit_style = if form.focus == CreateFocus::Create {
         Style::default()
-            .fg(BG)
+            .fg(ON_ACCENT)
             .bg(ACCENT)
             .add_modifier(Modifier::BOLD)
     } else {
@@ -1222,7 +1223,7 @@ fn render_security(frame: &mut Frame, prompt: &crate::app::SecurityPrompt, area:
             " security alert · tirith-core ",
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
-        .style(Style::default().bg(PANEL));
+        .style(Style::default());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -1269,7 +1270,7 @@ fn render_security(frame: &mut Frame, prompt: &crate::app::SecurityPrompt, area:
             Span::styled(
                 format!(" [{}] ", finding.severity.label()),
                 Style::default()
-                    .fg(BG)
+                    .fg(ON_ACCENT)
                     .bg(severity_color)
                     .add_modifier(Modifier::BOLD),
             ),
@@ -1332,7 +1333,7 @@ fn render_toast(frame: &mut Frame, app: &App, area: Rect) {
                 truncate(&toast.text, width.saturating_sub(2) as usize)
             ),
             Style::default()
-                .fg(BG)
+                .fg(ON_ACCENT)
                 .bg(color)
                 .add_modifier(Modifier::BOLD),
         )))
@@ -1341,7 +1342,7 @@ fn render_toast(frame: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(color))
-                .style(Style::default().bg(PANEL)),
+                .style(Style::default()),
         ),
         rect,
     );
@@ -1358,7 +1359,7 @@ fn panel_block(title: String, active: bool) -> Block<'static> {
                 .fg(if active { ACCENT } else { MUTED })
                 .add_modifier(Modifier::BOLD),
         ))
-        .style(Style::default().bg(PANEL))
+        .style(Style::default())
 }
 
 fn spinner(tick: u64) -> &'static str {
