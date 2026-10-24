@@ -109,7 +109,13 @@ impl VmConsole {
             vm_pid: session.vm_pid,
             relay_pid: session.relay_pid,
             sandbox: sandbox.name.clone(),
-            project: session.project.clone(),
+            // Clones live in their own workspace; older records only have the
+            // original project.
+            project: if session.workspace.as_os_str().is_empty() {
+                session.project.clone()
+            } else {
+                session.workspace.clone()
+            },
             harness: session.harness.label().to_string(),
             label: format!("{} · {} · serial", sandbox.name, session.harness.label()),
             serial_log,

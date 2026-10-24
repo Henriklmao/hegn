@@ -1326,7 +1326,7 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
         }
         Modal::MultiAgent(form) => {
             let body = format!(
-                "Create temporary clones for parallel agents.\n\nProject terminal: {}\nClones:  {}\nHarness: {}\nStart:   {}\n\nEach clone gets its own workspace; commits cannot collide.",
+                "Create temporary clones for parallel agents.\n\nSandbox: {}\nClones:  {}\nHarness: {}\nStart:   {}\n\nEach clone gets its own workspace; commits cannot collide.",
                 form.source,
                 form.count,
                 form.harness.label(),

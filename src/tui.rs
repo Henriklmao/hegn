@@ -33,6 +33,7 @@ enum ScanMessage {
     },
     StartFailed(String),
     SandboxesChanged(String),
+    SandboxError(String),
     Doctor {
         report: DoctorReport,
         note: Option<String>,
@@ -127,6 +128,10 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
             Ok(ScanMessage::SandboxesChanged(note)) => {
                 app.refresh_sandboxes();
                 app.toast(note, ToastLevel::Info);
+            }
+            Ok(ScanMessage::SandboxError(err)) => {
+                app.refresh_sandboxes();
+                app.toast(err, ToastLevel::Error);
             }
             Ok(ScanMessage::Doctor { report, note }) => app.show_doctor(report, note),
             Ok(ScanMessage::Error(err)) => {
@@ -223,9 +228,10 @@ fn spawn_clones(
             let registry = crate::sandbox::SandboxRegistry::new(config.clone());
             let source = match registry.resolve(&source) {
                 Ok(source) => source,
-                Err(_) => {
-                    let _ = thread_tx.send(ScanMessage::StartFailed(format!(
-                        "no sandbox or project named '{source}'"
+                Err(err) => {
+                    // Clone failures must not tear down the attached VM.
+                    let _ = thread_tx.send(ScanMessage::SandboxError(format!(
+                        "could not create clones: {err}"
                     )));
                     return;
                 }
@@ -263,7 +269,7 @@ fn spawn_clones(
             let _ = thread_tx.send(ScanMessage::SandboxesChanged(note));
         });
     if let Err(err) = spawned {
-        let _ = tx.send(ScanMessage::StartFailed(format!(
+        let _ = tx.send(ScanMessage::SandboxError(format!(
             "could not start the clone thread: {err}"
         )));
     }

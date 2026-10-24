@@ -141,7 +141,10 @@ impl SandboxPaths {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub project: PathBuf,
+    /// Workspace exported to the guest. Empty in records from older versions.
+    #[serde(default)]
     pub workspace: PathBuf,
+    #[serde(default)]
     pub sandbox: String,
     pub harness: Harness,
     pub started_at: DateTime<Utc>,
@@ -224,9 +227,14 @@ impl SandboxManager {
     }
 
     pub fn is_running(&self) -> bool {
-        let binary = self.config.vm_binary();
         self.session()
-            .map(|session| process_matches(session.vm_pid, &binary))
+            .map(|session| {
+                let binary = session
+                    .vm_binary
+                    .clone()
+                    .unwrap_or_else(|| self.config.vm_binary());
+                process_matches(session.vm_pid, &binary)
+            })
             .unwrap_or(false)
     }
 
@@ -509,9 +517,13 @@ impl SandboxManager {
         if vm_pid.is_none() && relay_pid.is_none() && virtiofs_pid.is_none() {
             bail!("no sandbox session found in {}", paths.run_dir.display());
         }
+        let vm_binary = session
+            .as_ref()
+            .and_then(|session| session.vm_binary.clone())
+            .unwrap_or_else(|| self.config.vm_binary());
 
         if let Some(pid) = vm_pid {
-            terminate(pid, &self.config.vm_binary());
+            terminate(pid, &vm_binary);
         }
         if let Some(pid) = relay_pid {
             terminate_relay(pid, &hegn);
@@ -698,6 +710,29 @@ impl SandboxManager {
     /// project so the restored guest finds a healthy backend on the same
     /// socket path.
     pub async fn restore_snapshot(&self, snapshot: &SnapshotMeta) -> Result<()> {
+        // The snapshot config embeds the disk paths from the sandbox that
+        // created it. Restoring it elsewhere would make two sandboxes share one
+        // writable rootfs, so only the owning sandbox may load it.
+        if let Some(owner) = &snapshot.sandbox
+            && owner != &self.sandbox.name
+        {
+            bail!(
+                "snapshot '{}' belongs to sandbox '{}'; restore it into that sandbox",
+                snapshot.name,
+                owner
+            );
+        }
+        // The name alone is not enough: a deleted sandbox can be recreated for
+        // a different project, and its old snapshot must not be loaded there.
+        if let Some(project) = &snapshot.project
+            && !same_project(project, &self.sandbox.project)
+        {
+            bail!(
+                "snapshot '{}' belongs to {}; restore it into a sandbox for that project",
+                snapshot.name,
+                project.display()
+            );
+        }
         let paths = self.paths();
         paths.ensure()?;
         self.config.ensure_dirs()?;
@@ -750,13 +785,17 @@ impl SandboxManager {
 
         // Stop the old VM, relay and filesystem daemon. The sockets are freed
         // and recreated below with the same paths the snapshot expects.
+        let existing_vm_binary = existing
+            .as_ref()
+            .and_then(|session| session.vm_binary.clone())
+            .unwrap_or_else(|| self.config.vm_binary());
         if let Some(session) = &existing {
-            terminate(session.vm_pid, &self.config.vm_binary());
+            terminate(session.vm_pid, &existing_vm_binary);
             terminate_relay(session.relay_pid, &hegn);
             terminate(session.virtiofs_pid, &self.config.virtiofsd_bin);
         }
         if let Some(pid) = read_pid(&paths.vm_pid) {
-            terminate(pid, &self.config.vm_binary());
+            terminate(pid, &existing_vm_binary);
         }
         if let Some(pid) = read_pid(&paths.relay_pid) {
             terminate_relay(pid, &hegn);
@@ -1845,7 +1884,7 @@ mod tests {
             vm_state: "Paused".into(),
             dir: dir.path().join("missing"),
             sandbox: Some("demo".into()),
-            project: Some(dir.path().join("projects")),
+            project: Some(dir.path().join("project")),
             size_bytes: 0,
             note: None,
         };
@@ -1896,6 +1935,73 @@ mod tests {
     }
 
     #[test]
+    fn restore_refuses_a_snapshot_from_another_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(config_with_assets(dir.path()), dir.path());
+        let snapshot = SnapshotMeta {
+            name: "shared".into(),
+            created_at: Utc::now(),
+            vm_state: "Paused".into(),
+            dir: dir.path().join("snap"),
+            sandbox: Some("someone-else".into()),
+            project: Some(dir.path().join("project")),
+            size_bytes: 0,
+            note: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(manager.restore_snapshot(&snapshot))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("belongs to sandbox 'someone-else'"), "{err}");
+    }
+
+    #[test]
+    fn session_records_from_before_multi_sandbox_still_load() {
+        let legacy = serde_json::json!({
+            "project": "/projects/demo",
+            "harness": "shell",
+            "started_at": "2026-01-01T00:00:00Z",
+            "vm_pid": 123,
+            "relay_pid": 456,
+            "virtiofs_pid": 789,
+            "boot_args": "console=ttyS0",
+        });
+        let record: SessionRecord = serde_json::from_value(legacy).unwrap();
+        assert!(record.workspace.as_os_str().is_empty());
+        assert!(record.sandbox.is_empty());
+        assert_eq!(record.vm_pid, 123);
+    }
+
+    #[test]
+    fn running_state_uses_the_recorded_vm_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.cloud_hypervisor_bin = PathBuf::from("/definitely/missing/cloud-hypervisor");
+        let manager = manager(config, dir.path());
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        let record = SessionRecord {
+            project: dir.path().join("project"),
+            workspace: dir.path().join("project"),
+            sandbox: "demo".into(),
+            harness: Harness::Shell,
+            started_at: Utc::now(),
+            vm_pid: std::process::id(),
+            vm_binary: Some(std::env::current_exe().unwrap()),
+            relay_pid: 0,
+            virtiofs_pid: 0,
+            boot_args: String::new(),
+            serial_log: None,
+        };
+        std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
+        assert!(manager.is_running());
+    }
+
+    #[test]
     fn restore_refuses_an_unreadable_session() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
@@ -1916,7 +2022,7 @@ mod tests {
             vm_state: "Paused".into(),
             dir: snap_dir,
             sandbox: Some("demo".into()),
-            project: Some(dir.path().join("projects")),
+            project: Some(dir.path().join("project")),
             size_bytes: 0,
             note: None,
         };
@@ -1953,7 +2059,7 @@ mod tests {
             vm_state: "Paused".into(),
             dir: snap_dir,
             sandbox: Some("demo".into()),
-            project: Some(dir.path().join("projects")),
+            project: Some(dir.path().join("project")),
             size_bytes: 0,
             note: None,
         };

@@ -190,10 +190,14 @@ impl SandboxConfig {
         if self.workspace.as_os_str().is_empty() || !self.workspace.is_absolute() {
             bail!("sandbox workspace must be an absolute path");
         }
-        if let Some(rootfs) = &self.rootfs_image
-            && (rootfs.as_os_str().is_empty() || !rootfs.is_absolute())
-        {
-            bail!("sandbox rootfs_image must be an absolute path");
+        if let Some(rootfs) = &self.rootfs_image {
+            if rootfs.as_os_str().is_empty() || !rootfs.is_absolute() {
+                bail!("sandbox rootfs_image must be an absolute path");
+            }
+            // Cloud Hypervisor packs this path into `path=...,image_type=...`.
+            if rootfs.to_string_lossy().contains(',') {
+                bail!("sandbox rootfs_image must not contain a comma");
+            }
         }
         if self.vcpus == 0 || self.vcpus > 32 {
             bail!("sandbox vcpus must be between 1 and 32");
@@ -390,7 +394,12 @@ impl SandboxStore {
         }
         let workspace = if clone {
             let workspace = dir.join(WORKSPACE_DIR);
-            self.clone_workspace(&project, &workspace)?;
+            if let Err(err) = self.clone_workspace(&project, &workspace) {
+                // A failed clone must not leave a half-initialised sandbox
+                // behind that blocks the next attempt with "already exists".
+                let _ = fs::remove_dir_all(&dir);
+                return Err(err);
+            }
             workspace
         } else {
             project.clone()
@@ -417,7 +426,10 @@ impl SandboxStore {
             bail!("sandbox '{name}' already exists");
         }
         let workspace = dir.join(WORKSPACE_DIR);
-        self.clone_workspace(&source.workspace, &workspace)?;
+        if let Err(err) = self.clone_workspace(&source.workspace, &workspace) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(err);
+        }
         let config = self.build_config(
             name,
             &source.project,
@@ -502,11 +514,15 @@ impl SandboxStore {
                 kept_workspace: None,
             });
         }
-        // Keep the clone workspace, but unregister the sandbox.
+        // Keep the clone workspace, but unregister the sandbox. Rename first:
+        // if that fails, the original sandbox (with its hegn.toml) is still
+        // intact and the delete can be retried.
         let kept = unique_kept_path(&self.root, name);
-        remove_runtime(&dir)?;
         fs::rename(&dir, &kept)
             .with_context(|| format!("failed to move {} to {}", dir.display(), kept.display()))?;
+        // The kept directory is no longer listed as a sandbox once hegn.toml
+        // is gone; runtime sockets are removed best-effort.
+        let _ = remove_runtime(&kept);
         Ok(DeleteOutcome {
             removed: true,
             kept_workspace: Some(kept.join(WORKSPACE_DIR)),
@@ -833,6 +849,21 @@ mod tests {
             git_config_get(&clone.workspace, "user.email").as_deref(),
             Some("demo@example.com")
         );
+    }
+
+    #[test]
+    fn failed_clone_does_not_leave_a_partial_sandbox_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SandboxStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        // A `.git` entry that is not a repository makes `git clone` fail.
+        fs::create_dir(project.join(".git")).unwrap();
+        let err = store
+            .create_from_project(&project, Some("broken"), None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("git clone"), "{err}");
+        assert!(!store.dir("broken").unwrap().exists());
     }
 
     #[test]

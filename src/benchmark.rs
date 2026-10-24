@@ -262,8 +262,10 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
     let mut sandbox = None;
     let started = (|| -> Result<BenchmarkReport> {
         let created = registry.ensure_for_project(&path, config.harness)?;
-        registry.manager(created.clone()).start()?;
-        sandbox = Some(created);
+        // Record the sandbox before booting: if the start fails, the cleanup
+        // below still has to unregister it.
+        sandbox = Some(created.clone());
+        registry.manager(created).start()?;
         let mut report = collect(config);
         report.started = true;
         Ok(report)
@@ -272,6 +274,10 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
     let stopped = sandbox
         .as_ref()
         .map(|sandbox| registry.manager(sandbox.clone()).stop().is_ok())
+        .unwrap_or(false);
+    let sandbox_removed = sandbox
+        .as_ref()
+        .map(|sandbox| registry.delete(&sandbox.name, true).is_ok())
         .unwrap_or(false);
     let removed = match remove_temp_project(config, &path) {
         Ok(()) => true,
@@ -292,6 +298,11 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
                 report
                     .notes
                     .push("the temporary sandbox could not be stopped".to_string());
+            }
+            if !sandbox_removed {
+                report
+                    .notes
+                    .push("the temporary sandbox could not be removed".to_string());
             }
             if !removed {
                 report.notes.push(format!(
@@ -537,9 +548,7 @@ fn session_candidates(config: &Config) -> Vec<PathBuf> {
     if legacy.is_file() {
         paths.push(legacy);
     }
-    if let Some(root) = data_root(config)
-        && let Ok(entries) = fs::read_dir(root.join("sandboxes"))
-    {
+    if let Ok(entries) = fs::read_dir(&config.sandboxes_dir) {
         for entry in entries.flatten() {
             let candidate = entry.path().join("run").join("session.json");
             if candidate.is_file() {
@@ -549,12 +558,6 @@ fn session_candidates(config: &Config) -> Vec<PathBuf> {
     }
     paths.sort();
     paths
-}
-
-/// `~/.local/share/hegn`, derived from `snapshots_dir` so the command also
-/// works with a config written before sandboxes existed.
-fn data_root(config: &Config) -> Option<PathBuf> {
-    config.snapshots_dir.parent().map(Path::to_path_buf)
 }
 
 /// Read per-sandbox limits from the sibling `hegn.toml`, if there is one.
@@ -603,9 +606,7 @@ fn disk_costs(config: &Config) -> Vec<DiskCost> {
     dirs.push(("snapshots".to_string(), config.snapshots_dir.clone()));
     dirs.push(("logs".to_string(), config.logs_dir()));
     dirs.push(("state".to_string(), config.state_dir.clone()));
-    if let Some(root) = data_root(config) {
-        dirs.push(("sandboxes".to_string(), root.join("sandboxes")));
-    }
+    dirs.push(("sandboxes".to_string(), config.sandboxes_dir.clone()));
 
     dirs.into_iter()
         .map(|(name, path)| {
@@ -988,28 +989,14 @@ mod tests {
         let config = Config {
             state_dir: dir.path().join("state"),
             snapshots_dir: dir.path().join("data/snapshots"),
+            sandboxes_dir: dir.path().join("data/sandboxes"),
             ..Config::default()
         };
 
         fs::create_dir_all(config.state_dir.join("run")).unwrap();
         fs::write(config.state_dir.join("run/session.json"), b"{}").unwrap();
-        fs::create_dir_all(
-            config
-                .snapshots_dir
-                .parent()
-                .unwrap()
-                .join("sandboxes/a/run"),
-        )
-        .unwrap();
-        fs::write(
-            config
-                .snapshots_dir
-                .parent()
-                .unwrap()
-                .join("sandboxes/a/run/session.json"),
-            b"{}",
-        )
-        .unwrap();
+        fs::create_dir_all(config.sandboxes_dir.join("a/run")).unwrap();
+        fs::write(config.sandboxes_dir.join("a/run/session.json"), b"{}").unwrap();
 
         let candidates = session_candidates(&config);
         assert_eq!(candidates.len(), 2);
@@ -1031,6 +1018,7 @@ mod tests {
         let config = Config {
             state_dir: dir.path().join("state"),
             snapshots_dir: dir.path().join("data/snapshots"),
+            sandboxes_dir: dir.path().join("data/sandboxes"),
             kernel_image: dir.path().join("data/images/kernel"),
             vcpus: 4,
             memory_mib: 1024,
@@ -1143,6 +1131,7 @@ mod tests {
         let config = Config {
             state_dir: dir.path().join("state"),
             snapshots_dir: dir.path().join("data/snapshots"),
+            sandboxes_dir: dir.path().join("data/sandboxes"),
             ..Config::default()
         };
         fs::create_dir_all(config.state_dir.join("run")).unwrap();

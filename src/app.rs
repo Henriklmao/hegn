@@ -630,11 +630,15 @@ impl App {
         if let Some(summary) = selected {
             self.sandbox.vcpus = summary.vcpus;
             self.sandbox.memory_mib = summary.memory_mib;
-            self.sandbox.state = match summary.state.as_str() {
-                "running" => SandboxState::Running,
-                "paused" => SandboxState::Paused,
-                _ => SandboxState::Stopped,
-            };
+            // Do not overwrite the optimistic Starting state while the attach
+            // thread is still booting; it would re-enable double starts.
+            if self.sandbox.state != SandboxState::Starting {
+                self.sandbox.state = match summary.state.as_str() {
+                    "running" => SandboxState::Running,
+                    "paused" => SandboxState::Paused,
+                    _ => SandboxState::Stopped,
+                };
+            }
         }
     }
 
@@ -850,9 +854,9 @@ impl App {
                 self.refresh_sandboxes();
                 Vec::new()
             }
-            KeyCode::Char('S') => self.stop_selected_sandbox(),
+            KeyCode::Char('S') if self.focus == Focus::Sandboxes => self.stop_selected_sandbox(),
             KeyCode::F(4) => self.open_global_config(),
-            KeyCode::F(5) => self.open_sandbox_config(),
+            KeyCode::F(5) if self.focus == Focus::Sandboxes => self.open_sandbox_config(),
             KeyCode::Char('t') => {
                 if self.session.is_some() {
                     self.screen = Screen::Terminal;
@@ -1801,7 +1805,7 @@ impl App {
             },
             ActionId::Edit => self.effect_for_selected(Effect::OpenEditor),
             ActionId::Lazygit => self.effect_for_selected(Effect::OpenLazygit),
-            ActionId::Refresh => vec![Effect::RefreshProjects],
+            ActionId::Refresh => vec![Effect::RefreshProjects, Effect::RefreshSandboxes],
             ActionId::Doctor => {
                 self.modal = Some(Modal::Doctor(DoctorModal::new(crate::doctor::run(
                     &self.config,
@@ -2711,6 +2715,33 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn stop_shortcut_only_works_with_sandbox_focus() {
+        let (_dir, mut app) = test_app();
+        let inside = app.config.sandboxes_dir.join("demo").join("workspace");
+        app.sandboxes = vec![fake_sandbox(&app, "demo", inside)];
+        app.focus = Focus::Projects;
+        let effects = app.handle_key(key(KeyCode::Char('S')));
+        assert!(
+            effects.is_empty(),
+            "S must not stop a sandbox from projects"
+        );
+        app.focus = Focus::Sandboxes;
+        let effects = app.handle_key(key(KeyCode::Char('S')));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StopSandbox { sandbox }] if sandbox == "demo"
+        ));
+    }
+
+    #[test]
+    fn refresh_does_not_clear_the_starting_state() {
+        let (_dir, mut app) = test_app();
+        app.sandbox.state = SandboxState::Starting;
+        app.refresh_sandboxes();
+        assert_eq!(app.sandbox.state, SandboxState::Starting);
     }
 
     #[test]
