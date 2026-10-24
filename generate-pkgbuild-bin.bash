@@ -15,7 +15,7 @@ url=$(aur_repo_url)
 asset="hegn-${tag}-x86_64-linux-gnu"
 
 cat >PKGBUILD <<EOF
-# Maintainer: hegn maintainers
+Maintainer: Henrik Bernhardt <57109108+Henriklmao@users.noreply.github.com>
 pkgname=hegn-bin
 pkgver=${pkgver}
 pkgrel=1
@@ -26,6 +26,9 @@ license=('MIT' 'Apache-2.0')
 # cloud-hypervisor-bin provides 'cloud-hypervisor', so either AUR package
 # satisfies this dependency.
 depends=('gcc-libs' 'cloud-hypervisor' 'virtiofsd')
+optdepends=(
+  'lazygit: open git with the g shortcut'
+)
 provides=('hegn')
 conflicts=('hegn' 'hegn-git')
 source=("\$pkgname-\$pkgver::${url}/releases/download/${tag}/${asset}")

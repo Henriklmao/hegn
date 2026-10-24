@@ -11,10 +11,10 @@ cd "$(dirname "$0")"
 source ./aur-pkgbuild-common.bash
 
 for file in Cargo.toml hegn.desktop hegn.install; do
-    if [[ ! -f "$file" ]]; then
-        echo "missing $file" >&2
-        exit 1
-    fi
+  if [[ ! -f "$file" ]]; then
+    echo "missing $file" >&2
+    exit 1
+  fi
 done
 
 url=$(aur_repo_url)
@@ -23,7 +23,7 @@ pkgver=$(aur_git_pkgver "$version")
 desktop_sha256=$(aur_file_sha256 hegn.desktop)
 
 cat >PKGBUILD <<EOF
-# Maintainer: hegn maintainers
+Maintainer: Henrik Bernhardt <57109108+Henriklmao@users.noreply.github.com>
 pkgname=hegn-git
 pkgver=${pkgver}
 pkgrel=1
