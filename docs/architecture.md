@@ -8,7 +8,8 @@ cost and storage figures live in [`resources.md`](resources.md).
 `hegn` is a Linux-only Rust application that runs coding agents inside
 Cloud Hypervisor VMs. The host process never runs project work itself. Every
 terminal, shell and agent session is attached to a real Cloud Hypervisor guest
-serial console.
+serial console. Multiple sandboxes can run at the same time; each one owns its
+configuration, runtime directory, serial log and private root filesystem.
 
 ---
 
@@ -44,6 +45,7 @@ serial console.
 │    │     ├── virtiofs.rs    ── virtiofsd argv/process                     │
 │    │     ├── relay.rs       ── detached serial relay + persistent log     │
 │    │     ├── cloud_init.rs  ── NoCloud seed for official images           │
+│    │     ├── sandbox_config.rs ── hegn.toml, clones, rootfs copies        │
 │    │     ├── console.rs     ── relay socket + attach bar                  │
 │    │     ├── snapshot.rs    ── snapshot metadata                          │
 │    │     └── logs.rs        ── private logs, tail and pruning             │
@@ -89,6 +91,9 @@ A running session consists of:
 | `cloud-hypervisor` | KVM VMM | Until `sandbox stop` / restore / guest exit |
 | `hegn __console-relay` | Serial socket client, persistent log, attach socket | Until the VMM exits or `sandbox stop` |
 
+There is one `virtiofsd`, one `cloud-hypervisor` and one relay per sandbox. The
+registry in `sandbox.rs` starts, lists, stops and deletes independent instances.
+
 The CLI deliberately lets `virtiofsd`, Cloud Hypervisor and the console relay
 outlive itself. It forgets the `Child` handles only after the session record is
 written; on any error before that point it kills the children and removes the
@@ -96,7 +101,8 @@ run files.
 
 ### 3.2 Run directory
 
-`SandboxPaths` derives everything from `state_dir/run`:
+Each sandbox has its own runtime directory below `sandboxes_dir/<name>/run`; the
+legacy single-session `state_dir/run` is only used for pre-multi-sandbox state:
 
 ```text
 <state>/run/
@@ -111,7 +117,7 @@ run files.
   cloud-hypervisor.log   VMM log
   hegn.log               lifecycle/start diagnostics (timestamped, mode 0600)
   hegn.lock              flock for lifecycle operations
-  cloud-init.img         generated NoCloud seed (no secrets)
+  cloud-init.img         per-sandbox NoCloud seed (no secrets)
 ```
 
 `run/` is created with mode `0700`. All sockets live inside it; the relay
@@ -147,6 +153,8 @@ never the log of the running session.
 | `~/.local/state/hegn/state.json` | Recent projects / last project | user default |
 | `~/.local/share/hegn/snapshots/` | Completed snapshots (`config.json`, `state.json`, `memory-ranges`, `snapshot.json`) | `0700`, files `0600` |
 | `~/.local/share/hegn/snapshots/.staging/` | The only snapshot path the VMM may write | `0700` |
+| `~/.local/share/hegn/sandboxes/<name>/` | `hegn.toml`, `run/`, private rootfs, clone workspace | `0700` |
+| `~/.local/share/hegn/sandboxes/<name>/hegn.toml` | Per-sandbox settings | `0600` |
 | `~/.local/share/hegn/images/` | Kernel and rootfs | files `0600` |
 | `~/Projects/hegn/` | Projects and import symlinks | user default |
 
@@ -167,14 +175,15 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `cloud_init.rs` | NoCloud seed generation | FAT volume labelled `CIDATA`; serial root autologin; no secrets; `0600` and `O_NOFOLLOW` |
 | `relay.rs` | Detached serial relay | Sole VMM serial client; append-only log; replays the log tail on attach; bounded buffers; refuses to replace non-socket paths |
 | `virtiofs.rs` | virtiofsd argv/process construction | Shared dir canonicalized; always sandboxed; `--cache=never` by default; sockets scoped to run dir |
-| `sandbox.rs` | VM lifecycle, lock, session record, status, snapshots | Exclusive flock for start/stop/restore; preflight before spawn; hardened VMM argv; cleanup on every error path |
+| `sandbox_config.rs` | Per-sandbox `hegn.toml`, clone/copy workspaces, rootfs copies | Names validated; source project never deleted; git identity copied; reflink rootfs with copy fallback |
+| `sandbox.rs` | VM lifecycle, registry, lock, session record, status, snapshots | One lifecycle lock per sandbox; preflight before spawn; hardened VMM argv; cleanup on every error path; registry lists/starts/deletes independent sandboxes |
 | `snapshot.rs` | Snapshot metadata store | Sanitized names; private dirs/files; atomic-ish metadata writes |
 | `images.rs` | Upstream asset pins, streaming download, SHA-256 install/verify | HTTPS only by config validation; checksum before rename; no overwrite without `--force` |
 | `doctor.rs` | Shared host checks for CLI and TUI | Required vs optional checks; missing images are downloadable |
 | `benchmark.rs` | Measured host cost: process RSS, disk usage, snapshot estimate; boots a VM only when asked | Refuses to delete anything outside its own `hegn-benchmark-*` projects; sparse-aware accounting; JSON output |
 | `console.rs` | Serial transport over the relay socket, tmux-style attach, status bar | Never pretends a VM exists; verifies VMM and relay; bar content sanitized; `--no-bar` for full-screen guests |
 | `logs.rs` | Log naming, listing, resolve, tail, prune | `O_NOFOLLOW`, regular files only, no foreign files deleted, active log protected |
-| `terminal.rs` | ANSI-aware scrollback | Strips CSI/OSC; caps line bytes and scrollback |
+| `terminal.rs` | ANSI-aware scrollback | Strips CSI/OSC; handles CRLF without losing lines; caps line bytes and scrollback |
 | `state.rs` | Recent-project persistence | Atomic tmp+rename |
 | `app.rs` | TUI state machine, modals, key/mouse handling, effects | Pure state transitions; side effects returned as `Effect` |
 | `ui.rs` | Ratatui rendering | Pure renderer; footer hit rectangles; all modals testable with `TestBackend` |
@@ -186,13 +195,15 @@ All state paths can be overridden in `config.toml` or by environment variables
 
 ### 5.1 Boot (`hegn open`, `hegn sandbox start`, TUI open)
 
-1. Load and validate config.
-2. Preflight: project exists, kernel/rootfs exist, Cloud Hypervisor and
+1. Load and validate config and the sandbox's `hegn.toml`.
+2. Preflight: workspace exists, base kernel/rootfs exist, Cloud Hypervisor and
    virtiofsd binaries resolve, KVM and Landlock available.
-3. Take the exclusive `hegn.lock`. A second lifecycle operation fails fast.
+3. Take the sandbox's exclusive `run/hegn.lock`. A second lifecycle operation on
+   the same sandbox fails fast; other sandboxes are independent.
 4. If a stale session exists, clean up its run files and any verified children.
 5. Create the session log (`LogStore::create_session`); prune old logs
-   best-effort.
+   best-effort. Give the sandbox a private rootfs copy on first start (reflink or
+   full copy).
 6. Spawn `virtiofsd` with the canonical project path and wait for its socket.
 7. Write the NoCloud seed when `cloud_init = true`. It enables serial root
    autologin and mounts the virtio-fs tag at `guest_mount` (`/workspace` by
@@ -335,8 +346,10 @@ These are product requirements, not implementation details.
    children and remove run files; the session serial log is kept for diagnosis.
 3. **Single lifecycle writer.** `start`, `stop` and snapshot restore hold an
    exclusive `flock` on `run/hegn.lock`.
-4. **One project per VM.** Only `session.project` is exported. virtiofsd
-   canonicalizes the shared directory and always uses a sandbox mode.
+4. **One workspace per VM.** Only the sandbox's `workspace` is exported.
+   Normal sandboxes point at the original project; multi-agent clones point at a
+   private clone. virtiofsd canonicalizes the shared directory and always uses a
+   sandbox mode. Cloned sandboxes never share a workspace or a writable rootfs.
 5. **Attach is read/verify, not recovery.** It checks the recorded VMM pid,
    binary and relay and refuses no-session/dead/mismatched cases.
 6. **Least privilege on disk.** Run/log dirs `0700`; locks, logs, sessions,
@@ -346,9 +359,10 @@ These are product requirements, not implementation details.
    explicit unsafe opt-in.
 8. **Logs are private but may contain secrets.** No upload/transmission; only
    hegn's own session logs are pruned; the active log is protected.
-9. **Direct input is visible.** `RAW` / `INPUT DIRECT` labels are mandatory.
-   `tirith-core` interception is the TUI default; raw passthrough is a deliberate
-   user action.
+9. **Direct input is visible.** `NORMAL` / `INSERT` / `RAW` and `INPUT DIRECT`
+   labels are mandatory. The TUI terminal opens in normal mode and forwards
+   nothing; insert mode is inspected by `tirith-core`; raw passthrough is a
+   deliberate user action.
 10. **Images are pinned, not trusted blindly.** HTTPS URL + SHA-256; unverified
     downloads require `--allow-unverified`; existing files require `--force` to
     replace; temporary files never become visible as final images.
@@ -356,6 +370,9 @@ These are product requirements, not implementation details.
     ancestors/state paths refused, discovery filters dangerous links.
 12. **No own guest image.** Kernel and rootfs come from upstream Cloud
     Hypervisor releases; CI only refreshes pins and opens a reviewable PR.
+13. **Delete is bounded.** Deleting a sandbox stops it first and asks twice. A
+    normal sandbox's source project is never deleted; cloning files are deleted
+    only after explicit confirmation.
 
 ### 6.1 Threat notes
 
@@ -425,7 +442,7 @@ and `root_device`; the official qcow2 image uses `/dev/vda1`.
 - `app.rs` owns all state: projects, selection, focus, modal, sandbox status,
   snapshots, terminal scrollback, input mode, toasts and footer hit rectangles.
 - `ui.rs` is a pure renderer. It returns hit rectangles for footer buttons and
-  project/snapshot rows; mouse handling lives in `app.rs`.
+  project/sandbox/snapshot rows; mouse handling lives in `app.rs`.
 - `tui.rs` owns the terminal, the 50 ms tick, crossterm events and effects.
 - Effects that must release or block the terminal (editor, lazygit) or run
   async work (snapshots, image downloads) are returned to `tui.rs`.
@@ -482,7 +499,8 @@ from the host.
 | Status | header/sidebar | `hegn sandbox status` |
 | Snapshots | snapshot panel | `hegn snapshot list/create/restore/delete` |
 | Logs | — | `hegn logs list/path/show/prune` |
-| Security check | modal + intercepted input | `hegn check` |
+| Security check | modal + insert-mode input | `hegn check` |
+| Multi-agent clones | `M` in the project terminal | `hegn sandbox clone` |
 | Doctor | `F3` + automatic on failure | `hegn doctor` |
 | Image download | doctor modal `d` | `hegn images download` |
 | Image verification | doctor report | `hegn images verify` |
@@ -666,7 +684,8 @@ changes to the guest tty anyway.
 
 **Consequence:** full-screen guests see one fewer usable row (or can be attached
 with `--no-bar`); cursor save/restore and SGR state can interact with the bar.
-The TUI remains the line-intercepted view.
+The TUI remains the modal, line-intercepted view: `i`/`a` enters insert mode and
+`Esc` returns to normal mode.
 
 ---
 
@@ -708,7 +727,8 @@ src/
   cloud_init.rs   NoCloud seed generation
   relay.rs        detached serial relay
   virtiofs.rs    hardened virtiofsd process construction
-  sandbox.rs     MicroVM lifecycle, lock, session, report
+  sandbox_config.rs per-sandbox config, clones, rootfs copies
+  sandbox.rs     sandbox registry, lifecycle, lock, session, report
   snapshot.rs    snapshot metadata store
   images.rs      upstream image pins, downloads, SHA-256
   doctor.rs      shared host checks

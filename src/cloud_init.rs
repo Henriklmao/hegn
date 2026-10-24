@@ -19,7 +19,13 @@ use fatfs::{FileSystem, FormatVolumeOptions, FsOptions};
 /// 4 MiB is enough for the two tiny files and keeps the seed cheap.
 const SEED_BYTES: u64 = 4 * 1024 * 1024;
 
-const META_DATA: &str = "instance-id: hegn-sandbox\nlocal-hostname: hegn\n";
+/// Increment when the seed's user-data changes so existing sandboxes re-run
+/// cloud-init on their next boot.
+pub const SEED_VERSION: u32 = 3;
+
+fn meta_data(instance_id: &str) -> String {
+    format!("instance-id: {instance_id}\nlocal-hostname: hegn\n")
+}
 
 fn user_data(shared_tag: &str, guest_mount: &str) -> String {
     format!(
@@ -31,7 +37,14 @@ users:
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: true
+mounts:
+  - [ '{shared_tag}', '{guest_mount}', virtiofs, "defaults,nofail", "0", "0" ]
 write_files:
+  - path: /etc/gitconfig
+    permissions: '0644'
+    content: |
+      [safe]
+          directory = {guest_mount}
   - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
     permissions: '0644'
     content: |
@@ -51,7 +64,7 @@ runcmd:
   - systemctl enable serial-getty@ttyAMA0.service || true
   - systemctl restart serial-getty@ttyAMA0.service || true
   - mkdir -p '{guest_mount}' || true
-  - mount -t virtiofs '{shared_tag}' '{guest_mount}' || true
+  - mountpoint -q '{guest_mount}' || mount -t virtiofs '{shared_tag}' '{guest_mount}' || true
 "#
     )
 }
@@ -76,14 +89,23 @@ pub(crate) fn safe_mount(value: &str) -> bool {
 ///
 /// The image is created with mode `0600` and `O_NOFOLLOW`; a planted symlink
 /// cannot redirect the write.
-pub fn write_seed(path: &Path, shared_tag: &str, guest_mount: &str) -> Result<()> {
+pub fn write_seed(
+    path: &Path,
+    shared_tag: &str,
+    guest_mount: &str,
+    instance_id: &str,
+) -> Result<()> {
     if !safe_token(shared_tag) {
         anyhow::bail!("unsafe virtio-fs tag for the cloud-init seed: {shared_tag:?}");
     }
     if !safe_mount(guest_mount) {
         anyhow::bail!("unsafe guest mount path for the cloud-init seed: {guest_mount:?}");
     }
+    if !safe_token(instance_id) {
+        anyhow::bail!("unsafe cloud-init instance id: {instance_id:?}");
+    }
     let user_data = user_data(shared_tag, guest_mount);
+    let meta_data = meta_data(instance_id);
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -108,7 +130,7 @@ pub fn write_seed(path: &Path, shared_tag: &str, guest_mount: &str) -> Result<()
             .with_context(|| format!("failed to open cloud-init seed {}", path.display()))?;
         let root = fs.root_dir();
         write_file(&root, "user-data", &user_data)?;
-        write_file(&root, "meta-data", META_DATA)?;
+        write_file(&root, "meta-data", &meta_data)?;
     }
     file.sync_all()?;
     Ok(())
@@ -144,7 +166,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cloud-init.img");
-        write_seed(&path, "workspace", "/workspace").unwrap();
+        write_seed(&path, "workspace", "/workspace", "hegn-demo").unwrap();
 
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -165,15 +187,13 @@ mod tests {
             user_data.contains("mount -t virtiofs 'workspace' '/workspace'"),
             "{user_data}"
         );
+        assert!(user_data.contains("directory = /workspace"), "{user_data}");
         let mut meta_data = String::new();
         root.open_file("meta-data")
             .unwrap()
             .read_to_string(&mut meta_data)
             .unwrap();
-        assert!(
-            meta_data.contains("instance-id: hegn-sandbox"),
-            "{meta_data}"
-        );
+        assert!(meta_data.contains("instance-id: hegn-demo"), "{meta_data}");
     }
 
     #[test]
@@ -184,7 +204,7 @@ mod tests {
         let link = dir.path().join("cloud-init.img");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        assert!(write_seed(&link, "workspace", "/workspace").is_err());
+        assert!(write_seed(&link, "workspace", "/workspace", "hegn-demo").is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
     }
 
@@ -192,10 +212,10 @@ mod tests {
     fn rejects_values_that_could_break_the_cloud_init_shell() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cloud-init.img");
-        assert!(write_seed(&path, "bad tag", "/workspace").is_err());
-        assert!(write_seed(&path, "workspace", "/work space").is_err());
-        assert!(write_seed(&path, "workspace;reboot", "/workspace").is_err());
-        assert!(write_seed(&path, "workspace", "/workspace;reboot").is_err());
+        assert!(write_seed(&path, "bad tag", "/workspace", "hegn-demo").is_err());
+        assert!(write_seed(&path, "workspace", "/work space", "hegn-demo").is_err());
+        assert!(write_seed(&path, "workspace;reboot", "/workspace", "hegn-demo").is_err());
+        assert!(write_seed(&path, "workspace", "/workspace;reboot", "hegn-demo").is_err());
     }
 
     #[test]
@@ -203,7 +223,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cloud-init.img");
         std::fs::write(&path, vec![0u8; 1024]).unwrap();
-        write_seed(&path, "workspace", "/workspace").unwrap();
+        write_seed(&path, "workspace", "/workspace", "hegn-demo").unwrap();
         assert!(std::fs::metadata(&path).unwrap().len() >= SEED_BYTES);
     }
 }

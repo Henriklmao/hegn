@@ -2,6 +2,8 @@
 
 **Cloud Hypervisor sandbox manager and TUI for agentic coding.**
 
+>***hegn*** *is Norwegian/Danish for "fence" or "enclosure" – and that is exactly what this project provides: a secure, hardware-isolated enclosure for all your coding agents and research projects.*
+
 `hegn` runs coding agents (OpenCode, Claude Code, Codex, pi, prime-agent, Aider,
 Antigravity Cli) inside hardware-isolated Cloud Hypervisor VMs. Each session gets a
 dedicated `virtiofsd` share containing exactly one project directory, command
@@ -37,6 +39,18 @@ fix.
   directly, so no patched hypervisor build is needed for workspace sharing.
   The generated cloud-init seed mounts the tag at `/workspace` (configurable via
   `guest_mount`).
+- **Multiple sandboxes** — run several VMs at the same time. Every sandbox has
+  its own `hegn.toml`, runtime sockets, serial log and private rootfs copy under
+  `sandboxes_dir`.
+- **Multi-agent clones** — clone a sandbox into independent git workspaces so
+  parallel agents cannot overwrite each other's commits; merge or open pull
+  requests when they finish.
+- **Config menus** — `F4` edits the global config, `F5` edits the selected
+  sandbox's `hegn.toml`; both reload after `$EDITOR`.
+- **Modal terminal** — Vim-style `i`/`a` insert mode and `Esc` to return to
+  normal mode, so scrolling and shortcuts never leak keystrokes into the guest.
+- **Safe deletion** — deleting a sandbox asks twice, offers to keep clone
+  files, and never deletes the original project of a normal sandbox.
 - **Defence in depth** — Cloud Hypervisor runs with seccomp filters and
   Landlock filesystem sandboxing; `virtiofsd` always runs with
   `--sandbox=namespace` (or `chroot`).
@@ -204,9 +218,11 @@ hegn
 
 # 6. Or drive it non-interactively
 hegn ls # alternatively `hegn projects`
+hegn sandbox list
 hegn sandbox start my-app
 hegn attach my-app
-hegn sandbox status --json
+hegn sandbox clone my-app --count 2   # multi-agent clones
+hegn sandbox status my-app --json
 hegn snapshot create before-refactor
 hegn logs
 hegn project import /path/to/existing/repo
@@ -231,8 +247,9 @@ hegn attach --no-bar # give full-screen guest programs the whole terminal
 ```
 
 `hegn attach` never boots or restarts a VM. It fails if there is no running
-session, if the recorded pid is no longer the configured Cloud Hypervisor binary, or
-if the optional project argument does not match the running session. The
+sandbox. With several VMs running, pass the sandbox name (or a project name that
+uniquely identifies the base sandbox); without an argument it attaches only when
+exactly one sandbox is running. The
 bottom line is reserved for a status bar:
 
 ```
@@ -246,6 +263,57 @@ in scripts. The guest console geometry cannot be changed over the legacy
 serial port, so the bar uses one host row and full-screen guest programs keep
 their own size; pass `--no-bar` (also accepted by `hegn open`) when a guest TUI
 needs every row.
+
+### Multiple sandboxes and multi-agent mode
+
+hegn can run several Cloud Hypervisor VMs at the same time. Each sandbox has its
+own directory below `sandboxes_dir`:
+
+```text
+~/.local/share/hegn/sandboxes/<name>/
+  hegn.toml     per-sandbox settings
+  run/          API/serial/relay/virtiofs sockets, pids, lock
+  rootfs.qcow2  private rootfs copy (created on first start)
+  workspace/    only for cloned sandboxes
+```
+
+A normal sandbox exports the original project through virtiofs. A **clone**
+(`hegn sandbox clone`, or `M` in the project's terminal view) gets an independent
+git clone and its own rootfs copy, so multiple agents can work on the same
+repository without overwriting each other's commits. Merge or open pull requests
+from the clones when they are done. Multi-agent clones are intentionally scoped
+to the project: open the project in the TUI and press `M` in its terminal.
+
+```bash
+hegn sandbox create ~/Projects/hegn/my-app --name my-app
+hegn sandbox start my-app
+hegn sandbox list
+hegn sandbox clone my-app --count 3          # my-app-agent-1..3, booted
+hegn sandbox clone my-app --name review --no-start
+hegn sandbox stop my-app
+hegn sandbox delete my-app-agent-1 --delete-files
+```
+
+`hegn sandbox delete` asks twice: first whether to delete the sandbox, then
+whether to delete its cloned workspace files. A normal sandbox's workspace is
+the original project and is **never** deleted. `--keep-files` unregisters the
+sandbox and keeps the clone under `<sandboxes_dir>/<name>-files-<timestamp>/`.
+`--delete-files` removes the clone.
+
+Per-sandbox settings live in `<sandbox>/hegn.toml`. In the TUI, `F4` opens the
+global config menu and `F5` opens the selected sandbox's config menu; both offer
+edit-in-`$EDITOR` and reload. From the CLI:
+
+```bash
+hegn sandbox config my-app          # print hegn.toml
+hegn sandbox config my-app --path   # print the path
+hegn sandbox config my-app --edit   # open it in $EDITOR
+```
+
+Every sandbox gets a private rootfs copy on first start (reflink on btrfs/XFS,
+otherwise a full copy). This is required for concurrent VMs: sharing one
+writable disk would corrupt it. Existing sandboxes keep their copy until they
+are deleted; `hegn images download` only refreshes the base image.
 
 ### Importing an existing project
 
@@ -372,13 +440,20 @@ hegn [--config PATH] [--json] [COMMAND]
   project info PROJECT             Show metadata and git status
   open PROJECT                     Boot/attach the VM serial console
           [--editor | --lazygit] [--no-branch] [--no-bar]
-  attach [PROJECT] [--no-bar]      Attach to the running VM (alias: a), tmux-style
+  attach [PROJECT|SANDBOX] [--no-bar]  Attach to a running VM (alias: a)
   logs [list|path|show|prune]      Manage persistent serial logs (alias: log)
-  sandbox start PROJECT [--harness H]   Boot virtiofsd + Cloud Hypervisor
-  sandbox stop | status | pause | resume
+  sandbox list                     List sandboxes (alias: ls)
+  sandbox create PROJECT [--name N] [--harness H] [--clone]
+  sandbox clone SOURCE [--name N] [--count N] [--harness H] [--no-start]
+  sandbox start SANDBOX [--harness H] [--clone]
+  sandbox stop [SANDBOX]
+  sandbox status [SANDBOX]
+  sandbox pause | resume SANDBOX
+  sandbox config SANDBOX [--path | --edit]
+  sandbox delete SANDBOX [--delete-files | --keep-files] [--yes]
   snapshot list                    List snapshots (alias: ls)
-  snapshot create [NAME] [--project PATH]
-  snapshot restore NAME | delete NAME | show NAME
+  snapshot create [NAME] [--sandbox SANDBOX]
+  snapshot restore NAME [--sandbox SANDBOX] | delete NAME | show NAME
   check [--cwd PATH] CMD...        Inspect a command with tirith-core
   config show | path | init
   images download [--force]        Fetch missing pinned kernel/rootfs images
@@ -393,7 +468,7 @@ Global flags: `--config <PATH>` (or `HEGN_CONFIG`), `--json`.
 ### Environment variables
 
 `HEGN_CONFIG`, `HEGN_PROJECTS_ROOT`, `HEGN_STATE_DIR`, `HEGN_SNAPSHOTS_DIR`,
-`HEGN_TEMPLATES_DIR`, `HEGN_CLOUD_HYPERVISOR_BIN`, `HEGN_VIRTIOFSD_BIN`,
+`HEGN_TEMPLATES_DIR`, `HEGN_SANDBOXES_DIR`, `HEGN_CLOUD_HYPERVISOR_BIN`, `HEGN_VIRTIOFSD_BIN`,
 `HEGN_KERNEL_IMAGE`, `HEGN_ROOTFS_IMAGE`, `HEGN_ROOTFS_FORMAT`,
 `HEGN_ROOT_DEVICE`, `HEGN_KERNEL_URL`,
 `HEGN_KERNEL_SHA256`, `HEGN_ROOTFS_URL`, `HEGN_ROOTFS_SHA256` override the
@@ -411,6 +486,7 @@ rejected, so typos surface immediately. Defaults:
 projects_root   = "~/Projects/hegn"
 state_dir       = "~/.local/state/hegn"
 snapshots_dir   = "~/.local/share/hegn/snapshots"
+sandboxes_dir   = "~/.local/share/hegn/sandboxes"
 templates_dir   = "~/.config/hegn/templates"
 cloud_hypervisor_bin = "cloud-hypervisor"
 # Bare names are resolved via PATH. cloud-hypervisor-static (AUR) is accepted
@@ -460,14 +536,19 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 | Key | Action |
 | --- | --- |
 | `↑`/`↓`, `j`/`k` | Move selection |
-| `Enter` / `o` | Open project in sandbox (or restore snapshot when snapshots are focused) |
+| `Enter` / `o` | Open project (projects), attach/start sandbox (sandboxes), restore snapshot |
 | `/` | Fuzzy filter projects |
-| `Tab` | Switch focus between projects and snapshots |
-| `c` | Create project |
+| `Tab` | Switch projects → sandboxes → snapshots |
+| `b` | Focus the sandbox list |
+| `c` | Create project (projects focus) |
 | `h` / `←` | Import an existing directory (symlink, no copy) |
+| `S` | Stop the selected sandbox |
+| `d` | Delete sandbox (sandboxes) or snapshot (snapshots) |
+| `F4` | Global config menu (edit/reload) |
+| `F5` | Sandbox config menu (edit/reload) |
 | `e` | Open selected project in `$EDITOR` |
 | `g` | Open selected project in lazygit |
-| `r` | Refresh git status |
+| `r` | Refresh projects and sandboxes |
 | `F3` | Doctor modal (host checks, image download) |
 | `?` / `F1` | Help |
 | `q` | Quit |
@@ -482,13 +563,24 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 
 ### Terminal (guest serial console)
 
+The terminal view is modal, like Vim. It opens in **normal** mode, where keys are
+hegn shortcuts and nothing reaches the guest. Press `i` or `a` to enter
+**insert** mode and type commands; `Esc` leaves insert mode again.
+
 | Key | Action |
 | --- | --- |
-| `Enter` | Inspect the assembled command, then send it to the VM |
-| `F2` | Toggle raw passthrough (no interception) |
-| `Ctrl-B` / `Esc` | Return to dashboard |
+| `i` / `a` | Enter insert mode and write in the guest terminal |
+| `Esc` | Leave insert mode (in normal mode: return to dashboard) |
+| `M` | Multi-agent clones for the project in this terminal |
+| `Enter` | In insert mode: inspect the command with tirith-core, then send it |
+| `F2` | Toggle raw passthrough (every key goes to the guest) |
+| `Ctrl-B` | Return to dashboard |
 | `PgUp` / `PgDn` | Scroll output |
 | `Ctrl-L` | Clear scrollback |
+
+The output pane shows the live scrollback. Serial CRLF endings are handled
+correctly, so every line the guest printed remains visible; `PgUp` scrolls back
+through it.
 
 ### Doctor modal
 
@@ -656,6 +748,10 @@ See [`AGENTS.md`](AGENTS.md) for the repository working agreement.
 
 ## License
 
-Licensed under either of MIT or Apache-2.0 at your option
-(`license = "MIT OR Apache-2.0"` in `Cargo.toml`). Contributions are accepted
-under the same terms.
+Licensed under GPLv3. Contributions are accepted under the same terms.
+
+---
+
+## Contributions
+
+Contributions are always welcome! If you have any ideas for new features, improvements, or bug fixes, feel free to open an issue or submit a pull request.

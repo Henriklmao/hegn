@@ -29,6 +29,9 @@ pub struct SnapshotMeta {
     pub vm_state: String,
     /// Directory passed to Cloud Hypervisor as `file://<dir>`.
     pub dir: PathBuf,
+    /// Sandbox that owns this snapshot. Optional for older metadata.
+    #[serde(default)]
+    pub sandbox: Option<String>,
     pub project: Option<PathBuf>,
     #[serde(default)]
     pub size_bytes: u64,
@@ -316,6 +319,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: paths.final_dir.clone(),
+            sandbox: Some("demo".into()),
             project: Some(PathBuf::from("/workspace/demo")),
             size_bytes: 0,
             note: None,
@@ -453,6 +457,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: PathBuf::from("/snapshots/demo"),
+            sandbox: None,
             project: None,
             size_bytes: 0,
             note: None,
@@ -468,6 +473,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: dir.path().join("missing"),
+            sandbox: None,
             project: None,
             size_bytes: 0,
             note: None,

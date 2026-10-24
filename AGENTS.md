@@ -56,6 +56,7 @@ is the minimum bar.
 - `src/cloud_hypervisor.rs` / `src/sandbox.rs` / `src/virtiofs.rs` — VM lifecycle.
 - `src/relay.rs` / `src/console.rs` — detached serial relay and attach transport.
 - `src/cloud_init.rs` — NoCloud seed for the official cloud images.
+- `src/sandbox_config.rs` — per-sandbox `hegn.toml`, cloning and rootfs copies.
 - `src/snapshot.rs` / `src/state.rs` — persisted metadata under XDG dirs.
 - `src/images.rs` / `src/doctor.rs` — pinned upstream VM assets and shared
   prerequisite checks.

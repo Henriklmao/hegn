@@ -36,6 +36,7 @@ pub mod logs;
 pub mod project;
 pub mod relay;
 pub mod sandbox;
+pub mod sandbox_config;
 pub mod security;
 pub mod snapshot;
 pub mod state;

@@ -226,6 +226,9 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Snapshot metadata and memory files. Defaults to `~/.local/share/hegn/snapshots`.
     pub snapshots_dir: PathBuf,
+    /// Per-sandbox configuration, runtime and cloned workspaces.
+    /// Defaults to `~/.local/share/hegn/sandboxes`.
+    pub sandboxes_dir: PathBuf,
     /// Directory containing project templates (`agents.md`, language skeletons).
     pub templates_dir: PathBuf,
     pub cloud_hypervisor_bin: PathBuf,
@@ -279,6 +282,7 @@ impl Default for Config {
             projects_root: home.join("Projects/hegn"),
             state_dir: state_dir.join("hegn"),
             snapshots_dir: data_dir.join("hegn/snapshots"),
+            sandboxes_dir: data_dir.join("hegn/sandboxes"),
             templates_dir: config_dir.join("hegn/templates"),
             cloud_hypervisor_bin: PathBuf::from("cloud-hypervisor"),
             virtiofsd_bin: PathBuf::from("virtiofsd"),
@@ -328,6 +332,7 @@ impl Config {
     /// Selected environment variables override the file so `hegn` can be
     /// exercised in CI without touching the user's real directories:
     /// `HEGN_PROJECTS_ROOT`, `HEGN_STATE_DIR`, `HEGN_SNAPSHOTS_DIR`,
+    /// `HEGN_SANDBOXES_DIR`,
     /// `HEGN_TEMPLATES_DIR`, `HEGN_CLOUD_HYPERVISOR_BIN`, `HEGN_VIRTIOFSD_BIN`,
     /// `HEGN_KERNEL_IMAGE` and `HEGN_ROOTFS_IMAGE`.
     pub fn load() -> Result<Self> {
@@ -363,6 +368,9 @@ impl Config {
         }
         if let Some(value) = path_var("HEGN_SNAPSHOTS_DIR") {
             self.snapshots_dir = value;
+        }
+        if let Some(value) = path_var("HEGN_SANDBOXES_DIR") {
+            self.sandboxes_dir = value;
         }
         if let Some(value) = path_var("HEGN_TEMPLATES_DIR") {
             self.templates_dir = value;
@@ -434,6 +442,7 @@ impl Config {
         for (name, path) in [
             ("state_dir", &self.state_dir),
             ("snapshots_dir", &self.snapshots_dir),
+            ("sandboxes_dir", &self.sandboxes_dir),
             ("kernel_image", &self.kernel_image),
             ("rootfs_image", &self.rootfs_image),
         ] {
@@ -462,7 +471,7 @@ impl Config {
 
     /// Create runtime and config directories. Safe to call repeatedly.
     pub fn ensure_dirs(&self) -> Result<()> {
-        for dir in [&self.state_dir, &self.snapshots_dir] {
+        for dir in [&self.state_dir, &self.snapshots_dir, &self.sandboxes_dir] {
             if let Ok(metadata) = fs::symlink_metadata(dir)
                 && metadata.file_type().is_symlink()
             {
@@ -524,6 +533,7 @@ impl Config {
         let mut protected = vec![
             self.state_dir.clone(),
             self.snapshots_dir.clone(),
+            self.sandboxes_dir.clone(),
             self.templates_dir.clone(),
         ];
         if let Some(parent) = Self::config_path().parent() {

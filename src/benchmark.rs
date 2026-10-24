@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Harness};
 use crate::project;
-use crate::sandbox::SandboxManager;
+use crate::sandbox::SandboxRegistry;
 
 const MIB: u64 = 1024 * 1024;
 /// Prefix for throwaway projects created by `benchmark --clean`.
@@ -208,7 +208,9 @@ fn measure_project(config: &Config, project: &str, json: bool) -> Result<i32> {
     }
 
     let harness = project::read_meta(&path).harness.unwrap_or(config.harness);
-    SandboxManager::new(config.clone()).start(&path, harness)?;
+    let registry = SandboxRegistry::new(config.clone());
+    let sandbox = registry.ensure_for_project(&path, harness)?;
+    registry.manager(sandbox).start()?;
 
     let mut report = collect(config);
     report.started = true;
@@ -256,14 +258,21 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
         );
     }
 
+    let registry = SandboxRegistry::new(config.clone());
+    let mut sandbox = None;
     let started = (|| -> Result<BenchmarkReport> {
-        SandboxManager::new(config.clone()).start(&path, config.harness)?;
+        let created = registry.ensure_for_project(&path, config.harness)?;
+        registry.manager(created.clone()).start()?;
+        sandbox = Some(created);
         let mut report = collect(config);
         report.started = true;
         Ok(report)
     })();
 
-    let stopped = SandboxManager::new(config.clone()).stop().is_ok();
+    let stopped = sandbox
+        .as_ref()
+        .map(|sandbox| registry.manager(sandbox.clone()).stop().is_ok())
+        .unwrap_or(false);
     let removed = match remove_temp_project(config, &path) {
         Ok(()) => true,
         Err(err) => {

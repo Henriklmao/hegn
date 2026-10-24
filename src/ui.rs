@@ -9,7 +9,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    ActionId, App, CreateFocus, Focus, FooterHit, Modal, RowHit, SandboxState, Screen, ToastLevel,
+    ActionId, App, CreateFocus, DeleteSandboxStage, Focus, FooterHit, Modal, RowHit, SandboxState,
+    Screen, TerminalMode, ToastLevel,
 };
 
 // Use the terminal's own palette and default background. Only ANSI colors
@@ -28,6 +29,7 @@ const RED: Color = Color::Red;
 pub struct UiHits {
     pub footer: Vec<FooterHit>,
     pub projects: Vec<RowHit>,
+    pub sandboxes: Vec<RowHit>,
     pub snapshots: Vec<RowHit>,
 }
 
@@ -65,7 +67,8 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
     UiHits {
         footer,
         projects: hits.0,
-        snapshots: hits.1,
+        sandboxes: hits.1,
+        snapshots: hits.2,
     }
 }
 
@@ -130,7 +133,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) -> (Vec<RowHit>, Vec<RowHit>) {
+fn render_dashboard(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+) -> (Vec<RowHit>, Vec<RowHit>, Vec<RowHit>) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(34), Constraint::Min(20)])
@@ -153,15 +160,24 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) -> (Vec<RowHit>, V
     sidebar
 }
 
-fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) -> (Vec<RowHit>, Vec<RowHit>) {
+fn render_sidebar(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+) -> (Vec<RowHit>, Vec<RowHit>, Vec<RowHit>) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .constraints([
+            Constraint::Percentage(42),
+            Constraint::Percentage(30),
+            Constraint::Percentage(28),
+        ])
         .spacing(1)
         .split(area);
     let projects = render_projects(frame, app, sections[0]);
-    let snapshots = render_snapshots(frame, app, sections[1]);
-    (projects, snapshots)
+    let sandboxes = render_sandboxes(frame, app, sections[1]);
+    let snapshots = render_snapshots(frame, app, sections[2]);
+    (projects, sandboxes, snapshots)
 }
 
 fn render_projects(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
@@ -300,6 +316,105 @@ fn branch_color(git: &crate::project::GitSummary) -> Color {
     } else {
         GREEN
     }
+}
+
+fn render_sandboxes(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
+    let active = app.focus == Focus::Sandboxes;
+    let title = format!(" sandboxes ({}) ", app.sandboxes.len());
+    let block = panel_block(title, active);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut hits = Vec::new();
+    if app.sandboxes.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(Span::styled(" ▾ no sandboxes", Style::default().fg(MUTED))),
+                Line::from(Span::styled(
+                    "   open a project to start agent clones",
+                    Style::default().fg(MUTED),
+                )),
+            ])),
+            inner,
+        );
+        return hits;
+    }
+
+    let visible_rows = inner.height as usize;
+    let offset = app
+        .sandbox_selected
+        .saturating_sub(visible_rows.saturating_sub(1));
+    let mut lines = Vec::new();
+    for (row, sandbox) in app
+        .sandboxes
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_rows)
+    {
+        let selected = row == app.sandbox_selected && active;
+        let base = if selected {
+            Style::default()
+                .fg(ON_ACCENT)
+                .bg(CYAN)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        let state_color = match sandbox.state.as_str() {
+            "running" => GREEN,
+            "paused" => YELLOW,
+            "failed" => RED,
+            _ => MUTED,
+        };
+        let marker = if sandbox.state == "running" {
+            "●"
+        } else {
+            "○"
+        };
+        let badge = if sandbox.ephemeral { " clone" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {marker} "),
+                if selected {
+                    Style::default().fg(ON_ACCENT).bg(CYAN)
+                } else {
+                    Style::default().fg(state_color)
+                },
+            ),
+            Span::styled(truncate(&sandbox.name, 18), base),
+            Span::styled(
+                badge,
+                if selected {
+                    Style::default().fg(ON_ACCENT).bg(CYAN)
+                } else {
+                    Style::default().fg(ACCENT)
+                },
+            ),
+            Span::styled(
+                format!(" {}", sandbox.harness.label()),
+                if selected {
+                    Style::default().fg(ON_ACCENT).bg(CYAN)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+            ),
+        ]));
+        hits.push(RowHit {
+            rect: Rect {
+                x: inner.x,
+                y: inner.y + (row - offset) as u16,
+                width: inner.width,
+                height: 1,
+            },
+            index: row,
+        });
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(Style::default()),
+        inner,
+    );
+    hits
 }
 
 fn render_snapshots(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
@@ -442,28 +557,53 @@ fn render_sandbox_panel(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let (state_label, state_color) = match app.sandbox.state {
-        SandboxState::Running => ("RUNNING".to_string(), GREEN),
-        SandboxState::Starting => (format!("STARTING {}", spinner(app.tick())), YELLOW),
-        SandboxState::Paused => ("PAUSED".to_string(), YELLOW),
-        SandboxState::Failed => ("FAILED".to_string(), RED),
-        SandboxState::Stopped => ("STOPPED".to_string(), MUTED),
+    let Some(sandbox) = app.selected_sandbox() else {
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(Span::styled(
+                    "No sandbox selected.",
+                    Style::default().fg(TEXT),
+                )),
+                Line::from(Span::styled(
+                    "Open a project (Enter) or create clones with m.",
+                    Style::default().fg(MUTED),
+                )),
+                Line::from(Span::styled(
+                    "F4 global config · F5 sandbox config",
+                    Style::default().fg(MUTED),
+                )),
+            ]))
+            .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
     };
-    let uptime = app
-        .sandbox
-        .uptime()
-        .map(|d| format!("{}s", d.as_secs()))
-        .unwrap_or_else(|| "—".into());
-    let socket = app
-        .sandbox
-        .socket
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "none".into());
 
+    let (state_color, state_label) = match sandbox.state.as_str() {
+        "running" => (GREEN, "RUNNING"),
+        "paused" => (YELLOW, "PAUSED"),
+        "failed" => (RED, "FAILED"),
+        _ => (MUTED, "STOPPED"),
+    };
+    let mode = if sandbox.ephemeral {
+        "clone"
+    } else {
+        "project"
+    };
     let lines = vec![
         Line::from(vec![
-            Span::styled(" state    ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!(" {} ", sandbox.name),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {mode} "),
+                if sandbox.ephemeral {
+                    Style::default().fg(ON_ACCENT).bg(ACCENT)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+            ),
             Span::styled(
                 format!("● {state_label}"),
                 Style::default()
@@ -472,29 +612,41 @@ fn render_sandbox_panel(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::styled(" backend  ", Style::default().fg(MUTED)),
-            Span::styled(app.sandbox.backend, Style::default().fg(TEXT)),
-            Span::styled("   virtiofs ", Style::default().fg(MUTED)),
-            Span::styled(app.sandbox.virtiofs, Style::default().fg(TEXT)),
-        ]),
-        Line::from(vec![
-            Span::styled(" resources ", Style::default().fg(MUTED)),
+            Span::styled(" project  ", Style::default().fg(MUTED)),
             Span::styled(
-                format!(
-                    "{} vCPU · {} MiB RAM · up {uptime}",
-                    app.sandbox.vcpus, app.sandbox.memory_mib
-                ),
+                truncate(&sandbox.project.display().to_string(), 48),
                 Style::default().fg(TEXT),
             ),
         ]),
         Line::from(vec![
-            Span::styled(" socket   ", Style::default().fg(MUTED)),
-            Span::styled(truncate(&socket, 52), Style::default().fg(TEXT)),
+            Span::styled(" workspace", Style::default().fg(MUTED)),
+            Span::styled(
+                truncate(&sandbox.workspace.display().to_string(), 48),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" harness  ", Style::default().fg(MUTED)),
+            Span::styled(sandbox.harness.label(), Style::default().fg(TEXT)),
+            Span::styled("   resources ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{} vCPU · {} MiB", sandbox.vcpus, sandbox.memory_mib),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" config   ", Style::default().fg(MUTED)),
+            Span::styled(
+                truncate(&sandbox.config_path.display().to_string(), 46),
+                Style::default().fg(TEXT),
+            ),
         ]),
         Line::from(Span::styled(
-            app.sandbox.note.clone().unwrap_or_else(|| {
-                "No active sandbox. Press Enter to launch the selected project.".into()
-            }),
+            sandbox
+                .source_sandbox
+                .as_ref()
+                .map(|source| format!("clone of {source}"))
+                .unwrap_or_else(|| "Enter attach/start · S stop · d delete · F5 config".into()),
             Style::default().fg(MUTED),
         )),
     ];
@@ -571,7 +723,11 @@ fn render_snapshot_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).style(Style::default()), inner);
 }
 
-fn render_terminal(frame: &mut Frame, app: &App, area: Rect) -> (Vec<RowHit>, Vec<RowHit>) {
+fn render_terminal(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+) -> (Vec<RowHit>, Vec<RowHit>, Vec<RowHit>) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(34), Constraint::Min(20)])
@@ -592,22 +748,28 @@ fn render_terminal(frame: &mut Frame, app: &App, area: Rect) -> (Vec<RowHit>, Ve
         .as_ref()
         .map(|s| format!("{} · {}", s.label(), s.project().display()))
         .unwrap_or_else(|| "no session".into());
-    let mode = if app.raw_mode {
-        Span::styled(
+    let mode = match app.terminal_mode {
+        TerminalMode::Normal => Span::styled(
+            " NORMAL ",
+            Style::default()
+                .fg(ON_ACCENT)
+                .bg(CYAN)
+                .add_modifier(Modifier::BOLD),
+        ),
+        TerminalMode::Insert => Span::styled(
+            " INSERT ",
+            Style::default()
+                .fg(ON_ACCENT)
+                .bg(GREEN)
+                .add_modifier(Modifier::BOLD),
+        ),
+        TerminalMode::Raw => Span::styled(
             " RAW ",
             Style::default()
                 .fg(ON_ACCENT)
                 .bg(RED)
                 .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(
-            " INTERCEPT ",
-            Style::default()
-                .fg(ON_ACCENT)
-                .bg(GREEN)
-                .add_modifier(Modifier::BOLD),
-        )
+        ),
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -642,20 +804,28 @@ fn render_terminal(frame: &mut Frame, app: &App, area: Rect) -> (Vec<RowHit>, Ve
     );
 
     let input_block = panel_block(
-        if app.raw_mode {
-            " raw passthrough ".to_string()
-        } else {
-            " command (tirith-core) ".to_string()
+        match app.terminal_mode {
+            TerminalMode::Normal => " normal mode ".to_string(),
+            TerminalMode::Insert => " insert · command (tirith-core) ".to_string(),
+            TerminalMode::Raw => " raw passthrough ".to_string(),
         },
         true,
     );
     let input_inner = input_block.inner(right[2]);
     frame.render_widget(input_block, right[2]);
-    if app.raw_mode {
+    if app.terminal_mode == TerminalMode::Raw {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "Keys are forwarded directly. F2 re-enables interception, Esc returns.",
+                "Every key goes to the guest. F2 returns to normal, Esc leaves the project.",
                 Style::default().fg(YELLOW),
+            ))),
+            input_inner,
+        );
+    } else if app.terminal_mode == TerminalMode::Normal {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "i or a to type · M multi-agent · PgUp/PgDn scroll · F2 raw · Ctrl-B dashboard",
+                Style::default().fg(MUTED),
             ))),
             input_inner,
         );
@@ -849,6 +1019,66 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 action: ActionId::Cancel,
             },
         ],
+        Some(Modal::Config(_)) => vec![
+            FooterDef {
+                key: "e",
+                label: "Edit",
+                action: ActionId::EditConfig,
+            },
+            FooterDef {
+                key: "r",
+                label: "Reload",
+                action: ActionId::ReloadConfig,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Close",
+                action: ActionId::Close,
+            },
+        ],
+        Some(Modal::DeleteSandbox(modal)) => match modal.stage {
+            DeleteSandboxStage::Confirm => vec![
+                FooterDef {
+                    key: "y",
+                    label: "Continue",
+                    action: ActionId::Confirm,
+                },
+                FooterDef {
+                    key: "n",
+                    label: "Cancel",
+                    action: ActionId::Cancel,
+                },
+            ],
+            DeleteSandboxStage::Files => vec![
+                FooterDef {
+                    key: "y",
+                    label: "Delete files",
+                    action: ActionId::Confirm,
+                },
+                FooterDef {
+                    key: "n",
+                    label: "Keep files",
+                    action: ActionId::KeepFiles,
+                },
+                FooterDef {
+                    key: "Esc",
+                    label: "Cancel",
+                    action: ActionId::Cancel,
+                },
+            ],
+        },
+        Some(Modal::MultiAgent(_)) => vec![
+            FooterDef {
+                key: "Enter",
+                label: "Create clones",
+                action: ActionId::Confirm,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Cancel",
+                action: ActionId::Cancel,
+            },
+        ],
         Some(Modal::Help | Modal::Error { .. }) => {
             vec![FooterDef {
                 key: "Esc",
@@ -857,9 +1087,31 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
             }]
         }
         None if app.screen == Screen::Terminal => vec![
+            if app.terminal_mode == TerminalMode::Insert {
+                FooterDef {
+                    key: "Esc",
+                    label: "Normal",
+                    action: ActionId::NormalMode,
+                }
+            } else {
+                FooterDef {
+                    key: "i",
+                    label: "Type",
+                    action: ActionId::InsertMode,
+                }
+            },
+            FooterDef {
+                key: "M",
+                label: "Multi-agent",
+                action: ActionId::MultiAgent,
+            },
             FooterDef {
                 key: "F2",
-                label: if app.raw_mode { "Intercept" } else { "Raw" },
+                label: if app.terminal_mode == TerminalMode::Raw {
+                    "Normal"
+                } else {
+                    "Raw"
+                },
                 action: ActionId::ToggleRaw,
             },
             FooterDef {
@@ -879,55 +1131,79 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
             },
         ],
         None => {
-            let mut buttons = vec![
-                FooterDef {
-                    key: "Enter",
-                    label: "Open",
-                    action: ActionId::Open,
-                },
-                FooterDef {
-                    key: "c",
-                    label: "Create",
-                    action: ActionId::Create,
-                },
-                FooterDef {
-                    key: "h",
-                    label: "Import",
-                    action: ActionId::Import,
-                },
-                FooterDef {
-                    key: "e",
-                    label: "Editor",
-                    action: ActionId::Edit,
-                },
-                FooterDef {
-                    key: "g",
-                    label: "Lazygit",
-                    action: ActionId::Lazygit,
-                },
-                FooterDef {
-                    key: "r",
-                    label: "Refresh",
-                    action: ActionId::Refresh,
-                },
-                FooterDef {
-                    key: "F3",
-                    label: "Doctor",
-                    action: ActionId::Doctor,
-                },
-            ];
-            if app.focus == Focus::Snapshots {
-                buttons.push(FooterDef {
-                    key: "n",
-                    label: "New snapshot",
-                    action: ActionId::NewSnapshot,
-                });
-                buttons.push(FooterDef {
-                    key: "d",
-                    label: "Delete",
-                    action: ActionId::DeleteSnapshot,
-                });
-            }
+            let mut buttons = match app.focus {
+                Focus::Projects => vec![
+                    FooterDef {
+                        key: "Enter",
+                        label: "Open",
+                        action: ActionId::Open,
+                    },
+                    FooterDef {
+                        key: "c",
+                        label: "Create",
+                        action: ActionId::Create,
+                    },
+                    FooterDef {
+                        key: "h",
+                        label: "Import",
+                        action: ActionId::Import,
+                    },
+                    FooterDef {
+                        key: "e",
+                        label: "Editor",
+                        action: ActionId::Edit,
+                    },
+                ],
+                Focus::Sandboxes => vec![
+                    FooterDef {
+                        key: "Enter",
+                        label: "Attach",
+                        action: ActionId::StartSandbox,
+                    },
+                    FooterDef {
+                        key: "S",
+                        label: "Stop",
+                        action: ActionId::StopSandbox,
+                    },
+                    FooterDef {
+                        key: "d",
+                        label: "Delete",
+                        action: ActionId::DeleteSandbox,
+                    },
+                    FooterDef {
+                        key: "F5",
+                        label: "Sandbox config",
+                        action: ActionId::SandboxConfig,
+                    },
+                ],
+                Focus::Snapshots => vec![
+                    FooterDef {
+                        key: "n",
+                        label: "New snapshot",
+                        action: ActionId::NewSnapshot,
+                    },
+                    FooterDef {
+                        key: "d",
+                        label: "Delete",
+                        action: ActionId::DeleteSnapshot,
+                    },
+                ],
+            };
+            buttons.push(FooterDef {
+                key: "F4",
+                label: "Config",
+                action: ActionId::GlobalConfig,
+            });
+            buttons.push(FooterDef {
+                key: "F3",
+                label: "Doctor",
+                action: ActionId::Doctor,
+            });
+            buttons.push(FooterDef {
+                key: "r",
+                label: "Refresh",
+                action: ActionId::Refresh,
+            });
             buttons.push(FooterDef {
                 key: "?",
                 label: "Help",
@@ -973,6 +1249,112 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
         Modal::ImportProject(form) => render_import_form(frame, app, form, area),
         Modal::Doctor(modal) => render_doctor(frame, modal, area),
         Modal::Security(prompt) => render_security(frame, prompt, area),
+        Modal::Config(modal) => {
+            let rect = centered(area, 86, 82);
+            frame.render_widget(Clear, rect);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT))
+                .title(Span::styled(
+                    format!(" {} ", modal.title),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ))
+                .style(Style::default());
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(2)])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new(modal.content.as_str())
+                    .style(Style::default().fg(TEXT))
+                    .wrap(Wrap { trim: false }),
+                chunks[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::from(Span::styled(
+                        format!(" {}", modal.path.display()),
+                        Style::default().fg(MUTED),
+                    )),
+                    Line::from(Span::styled(
+                        " e/Enter edit · r reload · Esc close",
+                        Style::default().fg(CYAN),
+                    )),
+                ])),
+                chunks[1],
+            );
+        }
+        Modal::DeleteSandbox(modal) => {
+            let (body, color) = match modal.stage {
+                DeleteSandboxStage::Confirm => (
+                    format!(
+                        "Delete sandbox '{}'?\n\nProject: {}\nWorkspace: {}\n\nThe VM is stopped first.",
+                        modal.sandbox.name,
+                        modal.sandbox.project.display(),
+                        modal.sandbox.workspace.display()
+                    ),
+                    YELLOW,
+                ),
+                DeleteSandboxStage::Files => (
+                    format!(
+                        "Also delete the cloned workspace files?\n\n{}\n\nChoose 'Keep files' to unregister the sandbox but keep the clone.",
+                        modal.sandbox.workspace.display()
+                    ),
+                    RED,
+                ),
+            };
+            let hint = match modal.stage {
+                DeleteSandboxStage::Confirm => "y/Enter continue · n/Esc cancel",
+                DeleteSandboxStage::Files => "y/Enter delete files · n keep files · Esc cancel",
+            };
+            render_message(frame, area, 72, 42, "delete sandbox", &body, color, hint);
+            if let Some(error) = &modal.error {
+                let rect = centered(area, 72, 42);
+                frame.render_widget(
+                    Paragraph::new(Span::styled(format!(" {error}"), Style::default().fg(RED))),
+                    Rect {
+                        x: rect.x + 2,
+                        y: rect.y + rect.height.saturating_sub(3),
+                        width: rect.width.saturating_sub(4),
+                        height: 1,
+                    },
+                );
+            }
+        }
+        Modal::MultiAgent(form) => {
+            let body = format!(
+                "Create temporary clones for parallel agents.\n\nProject terminal: {}\nClones:  {}\nHarness: {}\nStart:   {}\n\nEach clone gets its own workspace; commits cannot collide.",
+                form.source,
+                form.count,
+                form.harness.label(),
+                if form.start { "yes" } else { "no" }
+            );
+            render_message(
+                frame,
+                area,
+                72,
+                50,
+                "multi-agent clones",
+                &body,
+                CYAN,
+                "↑/↓ clones · ←/→ harness · Space start · Enter create · Esc cancel",
+            );
+            if let Some(error) = &form.error {
+                let rect = centered(area, 72, 50);
+                frame.render_widget(
+                    Paragraph::new(Span::styled(format!(" {error}"), Style::default().fg(RED))),
+                    Rect {
+                        x: rect.x + 2,
+                        y: rect.y + rect.height.saturating_sub(3),
+                        width: rect.width.saturating_sub(4),
+                        height: 1,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -1039,23 +1421,42 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("↑/↓ j/k", "move selection"),
                 ("Enter", "open project in sandbox"),
                 ("/", "fuzzy filter projects"),
-                ("Tab", "switch projects / snapshots"),
+                ("Tab", "switch projects → sandboxes → snapshots"),
                 ("c", "create project"),
                 ("h / ←", "import existing project"),
+                ("F4", "global config"),
                 ("e", "open in $EDITOR"),
                 ("g", "open in lazygit"),
-                ("r", "refresh git status"),
+                ("r", "refresh projects + sandboxes"),
                 ("F3", "doctor (host checks, image download)"),
+            ],
+        ),
+        (
+            "Sandboxes",
+            &[
+                ("b", "focus sandbox list"),
+                ("Enter", "attach/start selected sandbox"),
+                ("S", "stop selected sandbox"),
+                ("d", "delete sandbox (double confirmation)"),
+                ("F5", "sandbox config (edit/reload)"),
+                ("F4", "global config"),
             ],
         ),
         (
             "Terminal",
             &[
-                ("Enter", "inspect command with tirith-core, then send"),
+                ("i / a", "insert mode — write in the guest terminal"),
+                ("Esc", "leave insert mode (dashboard in normal mode)"),
+                ("M", "multi-agent clones for this project"),
+                (
+                    "Enter",
+                    "in insert mode: inspect with tirith-core, then send",
+                ),
                 ("F2", "toggle raw passthrough (no interception)"),
-                ("Ctrl-B / Esc", "return to dashboard"),
+                ("Ctrl-B", "return to dashboard"),
                 ("PgUp/PgDn", "scroll output"),
                 ("Ctrl-L", "clear scrollback"),
+                ("security", "a allow · c checkpoint + allow · d deny"),
             ],
         ),
         (
@@ -1849,12 +2250,34 @@ mod tests {
     fn terminal_view_renders_buffer_and_prompt() {
         let (_dir, mut app) = app();
         app.screen = Screen::Terminal;
-        app.terminal.push_bytes(b"hello from the sandbox\n");
+        app.terminal
+            .push_bytes(b"first output line\r\nsecond output line\r\n");
+        let (text, _) = render(&app);
+        assert!(text.contains("first output line"), "{text}");
+        assert!(text.contains("second output line"), "{text}");
+        assert!(text.contains("NORMAL"));
+        assert!(text.contains("i or a to type"));
+
+        app.terminal_mode = TerminalMode::Insert;
         app.input = "cargo test".into();
         let (text, _) = render(&app);
-        assert!(text.contains("hello from the sandbox"));
         assert!(text.contains("cargo test"));
-        assert!(text.contains("INTERCEPT"));
+        assert!(text.contains("INSERT"));
+    }
+
+    #[test]
+    fn terminal_renders_the_full_scrollback_window() {
+        let (_dir, mut app) = app();
+        app.screen = Screen::Terminal;
+        for index in 0..40 {
+            app.terminal
+                .push_bytes(format!("scrollback line {index}\r\n").as_bytes());
+        }
+        let (text, _) = render(&app);
+        // The newest lines are visible; earlier lines scrolled out of the pane.
+        assert!(text.contains("scrollback line 39"), "{text}");
+        assert!(text.contains("scrollback line 38"), "{text}");
+        assert!(!text.contains("scrollback line 0\n"), "{text}");
     }
 
     #[test]
@@ -1885,6 +2308,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             vm_state: "Paused".into(),
             dir: PathBuf::from("/snap/demo"),
+            sandbox: None,
             project: Some(PathBuf::from("/projects/demo")),
             size_bytes: 1024 * 1024,
             note: None,

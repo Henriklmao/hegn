@@ -14,6 +14,7 @@ use crate::config::{Config, Harness, SecurityMode};
 use crate::console::TerminalConsole;
 use crate::doctor::DoctorReport;
 use crate::project::{self, GitSummary, Project, ProjectMeta};
+use crate::sandbox::SandboxSummary;
 use crate::security::{Decision, Inspection, SecurityEngine};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
 use crate::state::StateStore;
@@ -28,9 +29,21 @@ pub enum Screen {
     Terminal,
 }
 
+/// Vim-style input mode for the terminal view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalMode {
+    /// Navigation and hegn shortcuts. Keys are not sent to the guest.
+    Normal,
+    /// Command line, inspected by tirith-core before it is submitted.
+    Insert,
+    /// Every key is forwarded to the guest unchanged.
+    Raw,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Projects,
+    Sandboxes,
     Snapshots,
 }
 
@@ -44,12 +57,29 @@ pub enum Effect {
     RefreshProjects,
     RestoreSnapshot(SnapshotMeta),
     DownloadImages,
-    /// Boot (or attach to) a Cloud Hypervisor VM. A failure is a hard error;
-    /// there is no host-process fallback.
-    StartSandbox {
+    /// Ensure a sandbox for a project and attach its console.
+    StartProjectSandbox {
         project: PathBuf,
         harness: Harness,
     },
+    /// Start (if needed) and attach an existing sandbox.
+    AttachSandbox {
+        sandbox: String,
+    },
+    StopSandbox {
+        sandbox: String,
+    },
+    DeleteSandbox {
+        sandbox: String,
+        delete_files: bool,
+    },
+    CloneSandbox {
+        source: String,
+        count: usize,
+        harness: Harness,
+        start: bool,
+    },
+    RefreshSandboxes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,10 +187,23 @@ pub enum ActionId {
     Quit,
     Back,
     ToggleRaw,
+    InsertMode,
+    NormalMode,
     ScrollUp,
     NewSnapshot,
     DeleteSnapshot,
     Restore,
+    FocusSandboxes,
+    StartSandbox,
+    StopSandbox,
+    CloneSandbox,
+    DeleteSandbox,
+    SandboxConfig,
+    GlobalConfig,
+    MultiAgent,
+    KeepFiles,
+    EditConfig,
+    ReloadConfig,
     Doctor,
     DownloadImages,
     Allow,
@@ -345,6 +388,54 @@ impl DoctorModal {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigKind {
+    Global,
+    Sandbox,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigModal {
+    pub title: String,
+    pub kind: ConfigKind,
+    pub path: PathBuf,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteSandboxStage {
+    Confirm,
+    Files,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteSandboxModal {
+    pub sandbox: SandboxSummary,
+    pub stage: DeleteSandboxStage,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultiAgentForm {
+    pub source: String,
+    pub count: usize,
+    pub harness: Harness,
+    pub start: bool,
+    pub error: Option<String>,
+}
+
+impl MultiAgentForm {
+    pub fn new(source: String, harness: Harness) -> Self {
+        Self {
+            source,
+            count: 2,
+            harness,
+            start: true,
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Modal {
     CreateProject(CreateProjectForm),
@@ -352,6 +443,9 @@ pub enum Modal {
     Doctor(DoctorModal),
     Security(SecurityPrompt),
     Confirm(ConfirmPrompt),
+    Config(ConfigModal),
+    DeleteSandbox(DeleteSandboxModal),
+    MultiAgent(MultiAgentForm),
     Help,
     Error { title: String, message: String },
 }
@@ -372,11 +466,14 @@ pub struct App {
     pub snapshots: Vec<SnapshotMeta>,
     pub selected_snapshot: usize,
     pub snapshot_rows: Vec<RowHit>,
+    pub sandboxes: Vec<SandboxSummary>,
+    pub sandbox_selected: usize,
+    pub sandbox_rows: Vec<RowHit>,
     pub project_rows: Vec<RowHit>,
     pub session: Option<Box<dyn TerminalConsole>>,
     pub terminal: TerminalBuffer,
     pub input: String,
-    pub raw_mode: bool,
+    pub terminal_mode: TerminalMode,
     pub scroll: usize,
     pub toast: Option<Toast>,
     pub footer_hits: Vec<FooterHit>,
@@ -397,6 +494,9 @@ impl App {
         let snapshots = SnapshotStore::new(&config.snapshots_dir)
             .list()
             .unwrap_or_default();
+        let sandboxes = crate::sandbox::SandboxRegistry::new(config.clone())
+            .summaries()
+            .unwrap_or_default();
         let sandbox = SandboxStatus::from_config(&config);
         let security_engine = SecurityEngine::new(config.security);
         Self {
@@ -414,11 +514,14 @@ impl App {
             snapshots,
             selected_snapshot: 0,
             snapshot_rows: Vec::new(),
+            sandboxes,
+            sandbox_selected: 0,
+            sandbox_rows: Vec::new(),
             project_rows: Vec::new(),
             session: None,
             terminal: TerminalBuffer::default(),
             input: String::new(),
-            raw_mode: false,
+            terminal_mode: TerminalMode::Normal,
             scroll: 0,
             toast: None,
             footer_hits: Vec::new(),
@@ -500,9 +603,45 @@ impl App {
         self.snapshots.get(self.selected_snapshot)
     }
 
+    pub fn selected_sandbox(&self) -> Option<&SandboxSummary> {
+        self.sandboxes.get(self.sandbox_selected)
+    }
+
+    /// Refresh the sandbox list from disk/process state. Cheap enough for the
+    /// UI tick; it only reads files and `/proc`.
+    pub fn refresh_sandboxes(&mut self) {
+        let selected = self.selected_sandbox().map(|sandbox| sandbox.name.clone());
+        let registry = crate::sandbox::SandboxRegistry::new(self.config.clone());
+        if let Ok(sandboxes) = registry.summaries() {
+            self.sandboxes = sandboxes;
+        }
+        if let Some(name) = selected
+            && let Some(index) = self
+                .sandboxes
+                .iter()
+                .position(|sandbox| sandbox.name == name)
+        {
+            self.sandbox_selected = index;
+        }
+        self.sandbox_selected = self
+            .sandbox_selected
+            .min(self.sandboxes.len().saturating_sub(1));
+        let selected = self.selected_sandbox().cloned();
+        if let Some(summary) = selected {
+            self.sandbox.vcpus = summary.vcpus;
+            self.sandbox.memory_mib = summary.memory_mib;
+            self.sandbox.state = match summary.state.as_str() {
+                "running" => SandboxState::Running,
+                "paused" => SandboxState::Paused,
+                _ => SandboxState::Stopped,
+            };
+        }
+    }
+
     pub fn focus_next(&mut self) {
         self.focus = match self.focus {
-            Focus::Projects => Focus::Snapshots,
+            Focus::Projects => Focus::Sandboxes,
+            Focus::Sandboxes => Focus::Snapshots,
             Focus::Snapshots => Focus::Projects,
         };
     }
@@ -515,6 +654,13 @@ impl App {
                 }
                 let max = self.visible.len() - 1;
                 self.selected = clamp_index(self.selected, delta, max);
+            }
+            Focus::Sandboxes => {
+                if self.sandboxes.is_empty() {
+                    return;
+                }
+                let max = self.sandboxes.len() - 1;
+                self.sandbox_selected = clamp_index(self.sandbox_selected, delta, max);
             }
             Focus::Snapshots => {
                 if self.snapshots.is_empty() {
@@ -539,6 +685,9 @@ impl App {
 
     pub fn poll(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        if self.tick.is_multiple_of(40) {
+            self.refresh_sandboxes();
+        }
         let mut closed = false;
         if let Some(session) = &mut self.session {
             for bytes in session.drain() {
@@ -667,7 +816,7 @@ impl App {
                     self.open_selected()
                 }
             }
-            KeyCode::Char('c') => {
+            KeyCode::Char('c') if self.focus == Focus::Projects => {
                 self.modal = Some(Modal::CreateProject(CreateProjectForm::new(
                     self.config.harness,
                 )));
@@ -679,14 +828,12 @@ impl App {
             }
             KeyCode::Char('e') => self.effect_for_selected(Effect::OpenEditor),
             KeyCode::Char('g') => self.effect_for_selected(Effect::OpenLazygit),
-            KeyCode::Char('r') => vec![Effect::RefreshProjects],
-            KeyCode::Char('d') => {
-                if self.focus == Focus::Snapshots {
-                    self.confirm_delete_snapshot()
-                } else {
-                    Vec::new()
-                }
-            }
+            KeyCode::Char('r') => vec![Effect::RefreshProjects, Effect::RefreshSandboxes],
+            KeyCode::Char('d') => match self.focus {
+                Focus::Snapshots => self.confirm_delete_snapshot(),
+                Focus::Sandboxes => self.confirm_delete_sandbox(),
+                Focus::Projects => Vec::new(),
+            },
             KeyCode::Char('n') if self.focus == Focus::Snapshots => {
                 self.handle_action(ActionId::NewSnapshot)
             }
@@ -698,6 +845,14 @@ impl App {
                 self.focus = Focus::Projects;
                 Vec::new()
             }
+            KeyCode::Char('b') => {
+                self.focus = Focus::Sandboxes;
+                self.refresh_sandboxes();
+                Vec::new()
+            }
+            KeyCode::Char('S') => self.stop_selected_sandbox(),
+            KeyCode::F(4) => self.open_global_config(),
+            KeyCode::F(5) => self.open_sandbox_config(),
             KeyCode::Char('t') => {
                 if self.session.is_some() {
                     self.screen = Screen::Terminal;
@@ -719,19 +874,7 @@ impl App {
 
     fn handle_terminal_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         if key.code == KeyCode::F(2) {
-            self.raw_mode = !self.raw_mode;
-            self.toast(
-                if self.raw_mode {
-                    "raw passthrough enabled — input interception off"
-                } else {
-                    "intercepted input enabled"
-                },
-                if self.raw_mode {
-                    ToastLevel::Warn
-                } else {
-                    ToastLevel::Info
-                },
-            );
+            self.toggle_raw_mode();
             return Vec::new();
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
@@ -739,65 +882,112 @@ impl App {
             return Vec::new();
         }
 
-        if self.raw_mode {
-            if key.code == KeyCode::Esc {
-                self.screen = Screen::Dashboard;
-                return Vec::new();
-            }
-            if let Some(bytes) = encode_key(key) {
-                self.write_bytes(&bytes);
+        if key.code == KeyCode::Esc {
+            match self.terminal_mode {
+                TerminalMode::Insert => {
+                    self.terminal_mode = TerminalMode::Normal;
+                    self.toast("normal mode — press i or a to type", ToastLevel::Info);
+                }
+                // Esc in normal/raw mode leaves the project terminal.
+                _ => self.screen = Screen::Dashboard,
             }
             return Vec::new();
         }
 
-        match key.code {
-            KeyCode::Esc => {
-                self.screen = Screen::Dashboard;
-            }
-            KeyCode::Enter => {
-                return self.submit_input();
-            }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.input.clear();
-                self.write_bytes(b"\x03");
-            }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.write_bytes(b"\x04");
-            }
-            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.terminal.clear();
-                self.scroll = 0;
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.input.clear();
-            }
-            KeyCode::Char(c)
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                if self.input.len() < 8192 {
-                    self.input.push(c);
+        match self.terminal_mode {
+            TerminalMode::Raw => {
+                if let Some(bytes) = encode_key(key) {
+                    self.write_bytes(&bytes);
                 }
             }
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Tab => self.write_bytes(b"\t"),
-            KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_add(5).min(self.terminal.len());
-            }
-            KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_sub(5);
-            }
-            KeyCode::Home => {
-                self.scroll = self.terminal.len().saturating_sub(1);
-            }
-            KeyCode::End => {
-                self.scroll = 0;
-            }
-            _ => {}
+            TerminalMode::Normal => match key.code {
+                KeyCode::Char('i') | KeyCode::Char('a') => {
+                    self.terminal_mode = TerminalMode::Insert;
+                    self.toast("insert mode — Esc returns to normal", ToastLevel::Info);
+                }
+                KeyCode::Char('M') => return self.open_multi_agent(),
+                KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.terminal.clear();
+                    self.scroll = 0;
+                }
+                KeyCode::PageUp => {
+                    self.scroll = self.scroll.saturating_add(5).min(self.terminal.len());
+                }
+                KeyCode::PageDown => {
+                    self.scroll = self.scroll.saturating_sub(5);
+                }
+                KeyCode::Home => {
+                    self.scroll = self.terminal.len().saturating_sub(1);
+                }
+                KeyCode::End => {
+                    self.scroll = 0;
+                }
+                _ => {}
+            },
+            TerminalMode::Insert => match key.code {
+                KeyCode::Enter => {
+                    return self.submit_input();
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.input.clear();
+                    self.write_bytes(b"\x03");
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.write_bytes(b"\x04");
+                }
+                KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.terminal.clear();
+                    self.scroll = 0;
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.input.clear();
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if self.input.len() < 8192 {
+                        self.input.push(c);
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.input.pop();
+                }
+                KeyCode::Tab => self.write_bytes(b"\t"),
+                KeyCode::PageUp => {
+                    self.scroll = self.scroll.saturating_add(5).min(self.terminal.len());
+                }
+                KeyCode::PageDown => {
+                    self.scroll = self.scroll.saturating_sub(5);
+                }
+                KeyCode::Home => {
+                    self.scroll = self.terminal.len().saturating_sub(1);
+                }
+                KeyCode::End => {
+                    self.scroll = 0;
+                }
+                _ => {}
+            },
         }
         Vec::new()
+    }
+
+    fn toggle_raw_mode(&mut self) {
+        self.terminal_mode = match self.terminal_mode {
+            TerminalMode::Raw => TerminalMode::Normal,
+            _ => TerminalMode::Raw,
+        };
+        self.toast(
+            match self.terminal_mode {
+                TerminalMode::Raw => "raw passthrough — every key goes to the guest",
+                _ => "normal mode — press i or a to type",
+            },
+            if self.terminal_mode == TerminalMode::Raw {
+                ToastLevel::Warn
+            } else {
+                ToastLevel::Info
+            },
+        );
     }
 
     /// Inspect and submit the terminal input buffer.
@@ -809,7 +999,7 @@ impl App {
         }
         self.input.clear();
 
-        if self.raw_mode {
+        if self.terminal_mode == TerminalMode::Raw {
             self.write_line(&command);
             return Vec::new();
         }
@@ -900,6 +1090,94 @@ impl App {
             }
             Modal::Error { .. } => Vec::new(),
             Modal::Confirm(prompt) => self.handle_confirm_key(key, prompt),
+            Modal::Config(modal) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => Vec::new(),
+                KeyCode::Char('e') | KeyCode::Enter => vec![Effect::OpenEditor(modal.path)],
+                KeyCode::Char('r') => match modal.kind {
+                    ConfigKind::Global => self.open_global_config(),
+                    ConfigKind::Sandbox => self.open_sandbox_config(),
+                },
+                _ => {
+                    self.modal = Some(Modal::Config(modal));
+                    Vec::new()
+                }
+            },
+            Modal::DeleteSandbox(mut modal) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => Vec::new(),
+                KeyCode::Char('y') | KeyCode::Enter => match modal.stage {
+                    DeleteSandboxStage::Confirm => {
+                        if self.workspace_is_inside_sandbox(&modal.sandbox) {
+                            modal.stage = DeleteSandboxStage::Files;
+                            self.modal = Some(Modal::DeleteSandbox(modal));
+                            Vec::new()
+                        } else {
+                            vec![Effect::DeleteSandbox {
+                                sandbox: modal.sandbox.name,
+                                delete_files: false,
+                            }]
+                        }
+                    }
+                    DeleteSandboxStage::Files => vec![Effect::DeleteSandbox {
+                        sandbox: modal.sandbox.name,
+                        delete_files: true,
+                    }],
+                },
+                KeyCode::Char('n') | KeyCode::Char('k')
+                    if modal.stage == DeleteSandboxStage::Files =>
+                {
+                    vec![Effect::DeleteSandbox {
+                        sandbox: modal.sandbox.name,
+                        delete_files: false,
+                    }]
+                }
+                KeyCode::Char('n') => Vec::new(),
+                _ => {
+                    self.modal = Some(Modal::DeleteSandbox(modal));
+                    Vec::new()
+                }
+            },
+            Modal::MultiAgent(mut form) => match key.code {
+                KeyCode::Esc => Vec::new(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    form.count = form.count.saturating_add(1).min(8);
+                    self.modal = Some(Modal::MultiAgent(form));
+                    Vec::new()
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    form.count = form.count.saturating_sub(1).max(1);
+                    self.modal = Some(Modal::MultiAgent(form));
+                    Vec::new()
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    let index = Harness::ALL
+                        .iter()
+                        .position(|harness| *harness == form.harness)
+                        .unwrap_or(0);
+                    let next = if key.code == KeyCode::Left {
+                        (index + Harness::ALL.len() - 1) % Harness::ALL.len()
+                    } else {
+                        (index + 1) % Harness::ALL.len()
+                    };
+                    form.harness = Harness::ALL[next];
+                    self.modal = Some(Modal::MultiAgent(form));
+                    Vec::new()
+                }
+                KeyCode::Char(' ') => {
+                    form.start = !form.start;
+                    self.modal = Some(Modal::MultiAgent(form));
+                    Vec::new()
+                }
+                KeyCode::Enter => vec![Effect::CloneSandbox {
+                    source: form.source,
+                    count: form.count,
+                    harness: form.harness,
+                    start: form.start,
+                }],
+                _ => {
+                    self.modal = Some(Modal::MultiAgent(form));
+                    Vec::new()
+                }
+            },
             Modal::Doctor(mut modal) => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => Vec::new(),
                 KeyCode::Char('r') => {
@@ -1221,6 +1499,126 @@ impl App {
         Vec::new()
     }
 
+    fn attach_selected_sandbox(&mut self) -> Vec<Effect> {
+        let Some(sandbox) = self.selected_sandbox().cloned() else {
+            self.toast("no sandbox selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        if self.sandbox.state == SandboxState::Starting {
+            self.toast("a VM is already starting…", ToastLevel::Warn);
+            return Vec::new();
+        }
+        self.session = None;
+        self.terminal.clear();
+        self.scroll = 0;
+        self.input.clear();
+        self.terminal_mode = TerminalMode::Normal;
+        self.session_closed_reported = false;
+        self.sandbox.state = SandboxState::Starting;
+        self.sandbox.started_at = None;
+        self.sandbox.note = Some(format!("attaching to sandbox {}", sandbox.name));
+        vec![Effect::AttachSandbox {
+            sandbox: sandbox.name,
+        }]
+    }
+
+    fn stop_selected_sandbox(&mut self) -> Vec<Effect> {
+        let Some(sandbox) = self.selected_sandbox().cloned() else {
+            self.toast("no sandbox selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        vec![Effect::StopSandbox {
+            sandbox: sandbox.name,
+        }]
+    }
+
+    fn confirm_delete_sandbox(&mut self) -> Vec<Effect> {
+        let Some(sandbox) = self.selected_sandbox().cloned() else {
+            self.toast("no sandbox selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        self.modal = Some(Modal::DeleteSandbox(DeleteSandboxModal {
+            sandbox,
+            stage: DeleteSandboxStage::Confirm,
+            error: None,
+        }));
+        Vec::new()
+    }
+
+    fn workspace_is_inside_sandbox(&self, sandbox: &SandboxSummary) -> bool {
+        let dir = self.config.sandboxes_dir.join(&sandbox.name);
+        let dir = dir.canonicalize().unwrap_or(dir);
+        let workspace = sandbox
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| sandbox.workspace.clone());
+        workspace.starts_with(&dir)
+    }
+
+    fn open_global_config(&mut self) -> Vec<Effect> {
+        let path = Config::config_path();
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| toml::to_string_pretty(&self.config).unwrap_or_default());
+        self.modal = Some(Modal::Config(ConfigModal {
+            title: "global config".into(),
+            kind: ConfigKind::Global,
+            path,
+            content,
+        }));
+        Vec::new()
+    }
+
+    fn open_sandbox_config(&mut self) -> Vec<Effect> {
+        let Some(sandbox) = self.selected_sandbox().cloned() else {
+            self.toast("select a sandbox first", ToastLevel::Warn);
+            return Vec::new();
+        };
+        let store = crate::sandbox_config::SandboxStore::new(self.config.clone());
+        let content = store
+            .load(&sandbox.name)
+            .and_then(|config| toml::to_string_pretty(&config).map_err(Into::into))
+            .unwrap_or_else(|err| format!("# failed to load config: {err}\n"));
+        self.modal = Some(Modal::Config(ConfigModal {
+            title: format!("sandbox {} config", sandbox.name),
+            kind: ConfigKind::Sandbox,
+            path: sandbox.config_path,
+            content,
+        }));
+        Vec::new()
+    }
+
+    fn open_multi_agent(&mut self) -> Vec<Effect> {
+        let Some(session) = self.session.as_ref() else {
+            self.toast(
+                "open a project first — multi-agent clones live inside its terminal",
+                ToastLevel::Warn,
+            );
+            return Vec::new();
+        };
+        let sandbox = session.sandbox_name().to_string();
+        let harness = self
+            .sandboxes
+            .iter()
+            .find(|entry| entry.name == sandbox)
+            .map(|entry| entry.harness)
+            .unwrap_or(self.config.harness);
+        self.modal = Some(Modal::MultiAgent(MultiAgentForm::new(sandbox, harness)));
+        Vec::new()
+    }
+
+    /// Reload global and sandbox configuration after an editor round-trip.
+    pub fn reload_after_edit(&mut self) {
+        match Config::load() {
+            Ok(config) => {
+                self.security_engine = SecurityEngine::new(config.security);
+                self.config = config;
+            }
+            Err(err) => self.toast(format!("config reload failed: {err}"), ToastLevel::Error),
+        }
+        self.refresh_sandboxes();
+        self.refresh_snapshots();
+    }
+
     /// Open the selected project in a Cloud Hypervisor VM.
     ///
     /// This only *requests* the VM start; the terminal loop owns the runtime and
@@ -1228,6 +1626,9 @@ impl App {
     pub fn open_selected(&mut self) -> Vec<Effect> {
         if self.focus == Focus::Snapshots {
             return self.confirm_restore_snapshot();
+        }
+        if self.focus == Focus::Sandboxes {
+            return self.attach_selected_sandbox();
         }
         if self.sandbox.state == SandboxState::Starting {
             self.toast("a VM is already starting…", ToastLevel::Warn);
@@ -1261,7 +1662,7 @@ impl App {
         self.terminal.clear();
         self.scroll = 0;
         self.input.clear();
-        self.raw_mode = false;
+        self.terminal_mode = TerminalMode::Normal;
         self.session_closed_reported = false;
         self.sandbox.state = SandboxState::Starting;
         self.sandbox.started_at = None;
@@ -1269,7 +1670,7 @@ impl App {
             "booting Cloud Hypervisor VM for {}",
             project.display_path()
         ));
-        vec![Effect::StartSandbox {
+        vec![Effect::StartProjectSandbox {
             project: project.path.clone(),
             harness,
         }]
@@ -1285,12 +1686,28 @@ impl App {
             console.project().display()
         ));
         self.sandbox.started_at = Some(Instant::now());
-        self.sandbox.socket = Some(self.config.run_dir().join("cloud-hypervisor.sock"));
+        self.sandbox.socket = Some(
+            self.config
+                .sandboxes_dir
+                .join(console.sandbox_name())
+                .join("run/cloud-hypervisor.sock"),
+        );
+        if let Some(index) = self
+            .sandboxes
+            .iter()
+            .position(|sandbox| sandbox.name == console.sandbox_name())
+        {
+            self.sandbox_selected = index;
+        }
         self.session = Some(console);
         self.screen = Screen::Terminal;
-        self.raw_mode = false;
+        self.terminal_mode = TerminalMode::Normal;
         self.session_closed_reported = false;
-        self.toast("attached to VM serial console", ToastLevel::Info);
+        self.toast(
+            "attached — normal mode, press i or a to type",
+            ToastLevel::Info,
+        );
+        self.refresh_sandboxes();
     }
 
     /// Report a hard VM start/attach failure. No host fallback is attempted.
@@ -1337,15 +1754,20 @@ impl App {
                 self.modal = Some(Modal::ImportProject(ImportProjectForm::new()));
                 Vec::new()
             }
-            ActionId::Confirm => {
-                if matches!(self.modal, Some(Modal::Confirm(_))) {
-                    self.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-                } else {
-                    Vec::new()
+            ActionId::Confirm => match self.modal {
+                Some(Modal::MultiAgent(_)) => {
+                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 }
-            }
+                Some(Modal::Confirm(_) | Modal::DeleteSandbox(_)) => {
+                    self.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+                }
+                _ => Vec::new(),
+            },
             ActionId::Cancel => {
-                if matches!(self.modal, Some(Modal::Confirm(_))) {
+                if matches!(
+                    self.modal,
+                    Some(Modal::Confirm(_) | Modal::DeleteSandbox(_) | Modal::MultiAgent(_))
+                ) {
                     self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
                 } else {
                     Vec::new()
@@ -1413,6 +1835,20 @@ impl App {
             ActionId::ToggleRaw => {
                 self.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
             }
+            ActionId::InsertMode => {
+                if self.screen == Screen::Terminal {
+                    self.terminal_mode = TerminalMode::Insert;
+                    self.toast("insert mode — Esc returns to normal", ToastLevel::Info);
+                }
+                Vec::new()
+            }
+            ActionId::NormalMode => {
+                if self.screen == Screen::Terminal {
+                    self.terminal_mode = TerminalMode::Normal;
+                    self.toast("normal mode — press i or a to type", ToastLevel::Info);
+                }
+                Vec::new()
+            }
             ActionId::ScrollUp => {
                 if self.screen == Screen::Terminal {
                     self.scroll = self.scroll.saturating_add(5).min(self.terminal.len());
@@ -1421,6 +1857,42 @@ impl App {
             }
             ActionId::Restore => self.confirm_restore_snapshot(),
             ActionId::DeleteSnapshot => self.confirm_delete_snapshot(),
+            ActionId::FocusSandboxes => {
+                self.focus = Focus::Sandboxes;
+                self.refresh_sandboxes();
+                Vec::new()
+            }
+            ActionId::StartSandbox => self.open_selected(),
+            ActionId::StopSandbox => self.stop_selected_sandbox(),
+            ActionId::DeleteSandbox => self.confirm_delete_sandbox(),
+            ActionId::SandboxConfig => self.open_sandbox_config(),
+            ActionId::GlobalConfig => self.open_global_config(),
+            ActionId::CloneSandbox | ActionId::MultiAgent => self.open_multi_agent(),
+            ActionId::KeepFiles => {
+                self.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            }
+            ActionId::EditConfig => match self.modal.take() {
+                Some(Modal::Config(modal)) => {
+                    self.modal = None;
+                    vec![Effect::OpenEditor(modal.path)]
+                }
+                Some(other) => {
+                    self.modal = Some(other);
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
+            ActionId::ReloadConfig => {
+                let kind = match &self.modal {
+                    Some(Modal::Config(modal)) => Some(modal.kind),
+                    _ => None,
+                };
+                match kind {
+                    Some(ConfigKind::Global) => self.open_global_config(),
+                    Some(ConfigKind::Sandbox) => self.open_sandbox_config(),
+                    None => Vec::new(),
+                }
+            }
             ActionId::NewSnapshot => {
                 self.toast(
                     "create snapshots with: hegn snapshot create",
@@ -1511,6 +1983,28 @@ impl App {
                         self.last_click = Some((now, path));
                         if double {
                             return self.open_selected();
+                        }
+                    }
+                }
+                if let Some(row) = self
+                    .sandbox_rows
+                    .iter()
+                    .find(|row| rect_contains(row.rect, pos))
+                    .copied()
+                {
+                    self.focus = Focus::Sandboxes;
+                    self.sandbox_selected = row.index;
+                    let path = self
+                        .selected_sandbox()
+                        .map(|sandbox| sandbox.config_path.clone());
+                    if let Some(path) = path {
+                        let now = Instant::now();
+                        let double = self.last_click.as_ref().is_some_and(|(at, p)| {
+                            p == &path && now.duration_since(*at) < DOUBLE_CLICK
+                        });
+                        self.last_click = Some((now, path));
+                        if double {
+                            return self.attach_selected_sandbox();
                         }
                     }
                 }
@@ -1640,6 +2134,7 @@ mod tests {
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
         config.templates_dir = dir.path().join("templates");
+        config.sandboxes_dir = dir.path().join("sandboxes");
         config.backend = crate::config::BackendKind::Auto;
         config.auto_branch = false;
         std::fs::create_dir_all(&config.projects_root).unwrap();
@@ -1686,6 +2181,10 @@ mod tests {
 
         fn label(&self) -> &str {
             "fake · serial"
+        }
+
+        fn sandbox_name(&self) -> &str {
+            "fake"
         }
     }
 
@@ -1753,6 +2252,8 @@ mod tests {
     fn tab_toggles_focus() {
         let (_dir, mut app) = test_app();
         assert_eq!(app.focus, Focus::Projects);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Sandboxes);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Snapshots);
         app.handle_key(key(KeyCode::Tab));
@@ -1857,6 +2358,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 vm_state: "Paused".into(),
                 dir: paths.dir,
+                sandbox: None,
                 project: None,
                 size_bytes: 0,
                 note: None,
@@ -1883,6 +2385,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 vm_state: "Paused".into(),
                 dir: paths.dir,
+                sandbox: None,
                 project: None,
                 size_bytes: 0,
                 note: None,
@@ -1965,6 +2468,7 @@ mod tests {
     fn terminal_input_collects_and_clears_on_empty_submit() {
         let (_dir, mut app) = test_app();
         app.screen = Screen::Terminal;
+        app.handle_key(key(KeyCode::Char('i')));
         app.handle_key(key(KeyCode::Char('l')));
         app.handle_key(key(KeyCode::Char('s')));
         assert_eq!(app.input, "ls");
@@ -1979,6 +2483,7 @@ mod tests {
     fn benign_submit_without_session_warns_instead_of_crashing() {
         let (_dir, mut app) = test_app();
         app.screen = Screen::Terminal;
+        app.handle_key(key(KeyCode::Char('i')));
         for c in "ls".chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
@@ -1991,6 +2496,7 @@ mod tests {
     fn destructive_submit_opens_security_modal() {
         let (_dir, mut app) = test_app();
         app.screen = Screen::Terminal;
+        app.handle_key(key(KeyCode::Char('i')));
         for c in "rm -rf /workspace".chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
@@ -2009,9 +2515,51 @@ mod tests {
         let (_dir, mut app) = test_app();
         app.screen = Screen::Terminal;
         app.handle_key(key(KeyCode::F(2)));
-        assert!(app.raw_mode);
+        assert_eq!(app.terminal_mode, TerminalMode::Raw);
         app.handle_key(key(KeyCode::F(2)));
-        assert!(!app.raw_mode);
+        assert_eq!(app.terminal_mode, TerminalMode::Normal);
+    }
+
+    #[test]
+    fn terminal_starts_in_normal_mode_and_i_enters_insert() {
+        let (_dir, mut app) = test_app();
+        app.screen = Screen::Terminal;
+        // Normal mode swallows printable keys instead of forwarding them.
+        app.handle_key(key(KeyCode::Char('x')));
+        assert!(app.input.is_empty());
+        app.handle_key(key(KeyCode::Char('i')));
+        assert_eq!(app.terminal_mode, TerminalMode::Insert);
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(app.input, "x");
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.terminal_mode, TerminalMode::Normal);
+        assert_eq!(app.screen, Screen::Terminal);
+        // Esc in normal mode leaves the terminal.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Dashboard);
+    }
+
+    #[test]
+    fn insert_mode_esc_does_not_leave_the_terminal() {
+        let (_dir, mut app) = test_app();
+        app.screen = Screen::Terminal;
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(app.terminal_mode, TerminalMode::Insert);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Terminal);
+    }
+
+    #[test]
+    fn multi_agent_is_reachable_from_the_project_terminal() {
+        let (_dir, mut app) = test_app();
+        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
+        assert_eq!(app.screen, Screen::Terminal);
+        let effects = app.handle_key(key(KeyCode::Char('M')));
+        assert!(effects.is_empty());
+        match &app.modal {
+            Some(Modal::MultiAgent(form)) => assert_eq!(form.source, "fake"),
+            other => panic!("expected multi-agent form, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2052,6 +2600,119 @@ mod tests {
         assert_eq!(encode_key(ctrl_bracket), Some(vec![0x1b]));
     }
 
+    fn fake_sandbox(app: &App, name: &str, workspace: PathBuf) -> SandboxSummary {
+        SandboxSummary {
+            name: name.into(),
+            project: app.config.projects_root.join("demo"),
+            workspace,
+            harness: Harness::Shell,
+            ephemeral: false,
+            source_sandbox: None,
+            state: "stopped".into(),
+            vm_pid: None,
+            serial_log: None,
+            config_path: app.config.sandboxes_dir.join(name).join("hegn.toml"),
+            vcpus: 2,
+            memory_mib: 2048,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn sandbox_focus_and_delete_double_confirmation() {
+        let (_dir, mut app) = test_app();
+        let inside = app.config.sandboxes_dir.join("demo").join("workspace");
+        app.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(app.focus, Focus::Sandboxes);
+        app.sandboxes = vec![fake_sandbox(&app, "demo", inside)];
+
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::DeleteSandbox(crate::app::DeleteSandboxModal {
+                stage: crate::app::DeleteSandboxStage::Confirm,
+                ..
+            }))
+        ));
+        // First confirmation moves to the file question.
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::DeleteSandbox(crate::app::DeleteSandboxModal {
+                stage: crate::app::DeleteSandboxStage::Files,
+                ..
+            }))
+        ));
+        let effects = app.handle_key(key(KeyCode::Char('y')));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::DeleteSandbox {
+                sandbox,
+                delete_files: true
+            }] if sandbox == "demo"
+        ));
+    }
+
+    #[test]
+    fn keeping_files_emits_a_keep_effect() {
+        let (_dir, mut app) = test_app();
+        let inside = app.config.sandboxes_dir.join("demo").join("workspace");
+        app.focus = Focus::Sandboxes;
+        app.sandboxes = vec![fake_sandbox(&app, "demo", inside)];
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('y')));
+        let effects = app.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::DeleteSandbox {
+                sandbox,
+                delete_files: false
+            }] if sandbox == "demo"
+        ));
+    }
+
+    #[test]
+    fn config_menus_open_for_global_and_sandbox() {
+        let (_dir, mut app) = test_app();
+        app.handle_key(key(KeyCode::F(4)));
+        match &app.modal {
+            Some(Modal::Config(modal)) => {
+                assert_eq!(modal.kind, crate::app::ConfigKind::Global);
+                assert!(modal.content.contains("cloud_hypervisor_bin"));
+            }
+            other => panic!("expected global config, got {other:?}"),
+        }
+        app.modal = None;
+        let inside = app.config.sandboxes_dir.join("demo").join("workspace");
+        app.focus = Focus::Sandboxes;
+        app.sandboxes = vec![fake_sandbox(&app, "demo", inside)];
+        app.handle_key(key(KeyCode::F(5)));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Config(crate::app::ConfigModal {
+                kind: crate::app::ConfigKind::Sandbox,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn multi_agent_form_submits_clone_effect() {
+        let (_dir, mut app) = test_app();
+        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
+        app.handle_key(key(KeyCode::Char('M')));
+        assert!(matches!(app.modal, Some(Modal::MultiAgent(_))));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::CloneSandbox {
+                count: 2,
+                start: true,
+                ..
+            }]
+        ));
+    }
+
     #[test]
     fn sandbox_status_reflects_config() {
         let (_dir, app) = test_app();
@@ -2071,20 +2732,24 @@ mod tests {
     }
 
     #[test]
-    fn open_requests_a_sandbox_and_resets_raw_mode() {
+    fn open_requests_a_sandbox_and_resets_the_terminal_mode() {
         let (_dir, mut app) = test_app();
         let mut project = fake_project("demo");
         project.path = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project.path).unwrap();
         app.set_projects(vec![project.clone()]);
-        app.raw_mode = true;
+        app.terminal_mode = TerminalMode::Raw;
         let effects = app.open_selected();
-        assert!(!app.raw_mode, "raw mode must reset for each VM");
+        assert_eq!(
+            app.terminal_mode,
+            TerminalMode::Normal,
+            "the terminal mode must reset for each VM"
+        );
         assert_eq!(app.sandbox.state, SandboxState::Starting);
         assert!(app.session.is_none());
         match effects.as_slice() {
             [
-                Effect::StartSandbox {
+                Effect::StartProjectSandbox {
                     project: p,
                     harness,
                 },
@@ -2092,7 +2757,7 @@ mod tests {
                 assert_eq!(p, &project.path);
                 assert_eq!(*harness, app.config.harness);
             }
-            other => panic!("expected StartSandbox, got {other:?}"),
+            other => panic!("expected StartProjectSandbox, got {other:?}"),
         }
     }
 

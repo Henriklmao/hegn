@@ -24,6 +24,10 @@ pub struct TerminalBuffer {
     /// Bytes of a UTF-8 sequence split across serial reads.
     pending: Vec<u8>,
     state: AnsiState,
+    /// A carriage return arrived. The next printable character overwrites the
+    /// current line. Serial consoles emit CRLF, so CR on its own must not
+    /// discard the line before LF commits it.
+    pending_cr: bool,
     max_lines: usize,
 }
 
@@ -40,6 +44,7 @@ impl TerminalBuffer {
             partial: String::new(),
             pending: Vec::new(),
             state: AnsiState::Ground,
+            pending_cr: false,
             max_lines: max_lines.max(1),
         }
     }
@@ -81,18 +86,24 @@ impl TerminalBuffer {
             AnsiState::Ground => match ch {
                 '\x1b' => self.state = AnsiState::Escape,
                 '\n' => self.commit_line(),
-                '\r' => self.partial.clear(),
+                '\r' => self.pending_cr = true,
                 '\t' => {
+                    self.overwrite_after_cr();
                     let width = 4 - (self.partial.chars().count() % 4);
                     for _ in 0..width {
                         self.partial.push(' ');
                     }
                 }
                 '\x08' => {
-                    self.partial.pop();
+                    if self.pending_cr {
+                        self.overwrite_after_cr();
+                    } else {
+                        self.partial.pop();
+                    }
                 }
                 c if c.is_control() => {}
                 c => {
+                    self.overwrite_after_cr();
                     if self.partial.len() < MAX_LINE_BYTES {
                         self.partial.push(c);
                     }
@@ -128,7 +139,15 @@ impl TerminalBuffer {
         }
     }
 
+    fn overwrite_after_cr(&mut self) {
+        if self.pending_cr {
+            self.partial.clear();
+            self.pending_cr = false;
+        }
+    }
+
     fn commit_line(&mut self) {
+        self.pending_cr = false;
         let line = std::mem::take(&mut self.partial);
         self.lines.push_back(line);
         while self.lines.len() > self.max_lines {
@@ -182,6 +201,7 @@ impl TerminalBuffer {
         self.partial.clear();
         self.pending.clear();
         self.state = AnsiState::Ground;
+        self.pending_cr = false;
     }
 
     pub fn set_max_lines(&mut self, max: usize) {
@@ -201,6 +221,32 @@ mod tests {
         let mut buf = TerminalBuffer::default();
         buf.push_bytes(b"line one\nline two\rrewritten\n");
         assert_eq!(buf.lines(), vec!["line one", "rewritten", ""]);
+    }
+
+    #[test]
+    fn buffer_keeps_every_line_from_crlf_serial_output() {
+        let mut buf = TerminalBuffer::default();
+        buf.push_bytes(b"[    0.000000] boot one\r\n[    0.000000] boot two\r\n");
+        assert_eq!(
+            buf.lines(),
+            vec!["[    0.000000] boot one", "[    0.000000] boot two", ""]
+        );
+    }
+
+    #[test]
+    fn buffer_keeps_the_last_rewrite_of_a_carriage_return_line() {
+        let mut buf = TerminalBuffer::default();
+        buf.push_bytes(b"progress 10%\rprogress 99%\rdone\nnext\r\n");
+        assert_eq!(buf.lines(), vec!["done", "next", ""]);
+    }
+
+    #[test]
+    fn buffer_handles_a_carriage_return_split_across_reads() {
+        let mut buf = TerminalBuffer::default();
+        buf.push_bytes(b"first\r");
+        buf.push_bytes(b"\nsecond\r");
+        buf.push_bytes(b"\n");
+        assert_eq!(buf.lines(), vec!["first", "second", ""]);
     }
 
     #[test]

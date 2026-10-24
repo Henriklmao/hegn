@@ -1,7 +1,7 @@
 //! Non-interactive CLI. Every TUI capability has a CLI counterpart so hegn can
 //! be scripted in CI, used over SSH, or driven by an agent.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -16,7 +16,7 @@ use crate::doctor;
 use crate::images::{self, AssetStatus};
 use crate::logs::{self, DEFAULT_KEEP, LogStore};
 use crate::project::{self, ProjectMeta};
-use crate::sandbox::{SandboxManager, SandboxReport, process_alive, process_matches, same_project};
+use crate::sandbox::{SandboxRegistry, SandboxReport, SandboxSummary, process_alive};
 use crate::security::{Decision, SecurityEngine};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
 use crate::terminal::TerminalBuffer;
@@ -167,21 +167,78 @@ pub enum ProjectCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum SandboxCommands {
-    /// Boot virtiofsd + Cloud Hypervisor for a project.
-    Start {
+    /// List all sandboxes and their state.
+    #[command(visible_alias = "ls")]
+    List,
+    /// Create a sandbox for a project.
+    Create {
         project: String,
-        /// Harness recorded in the session metadata.
+        /// Sandbox name (defaults to the project directory name).
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long, value_enum)]
         harness: Option<Harness>,
+        /// Copy the project into the sandbox instead of exporting it directly.
+        #[arg(long)]
+        clone: bool,
     },
-    /// Stop Cloud Hypervisor, the console relay and virtiofsd.
-    Stop,
-    /// Show VM, virtiofs and pid status.
-    Status,
-    /// Pause the VM.
-    Pause,
-    /// Resume the VM.
-    Resume,
+    /// Clone a sandbox for parallel agent work.
+    Clone {
+        /// Sandbox or project to clone.
+        source: String,
+        /// Base name for the clone(s).
+        #[arg(long)]
+        name: Option<String>,
+        /// Number of clones to create.
+        #[arg(long, default_value_t = 1)]
+        count: usize,
+        #[arg(long, value_enum)]
+        harness: Option<Harness>,
+        /// Only create the clones; do not boot them.
+        #[arg(long)]
+        no_start: bool,
+    },
+    /// Boot a sandbox, creating it from a project if necessary.
+    Start {
+        /// Sandbox name, project name or project path.
+        name: String,
+        #[arg(long, value_enum)]
+        harness: Option<Harness>,
+        /// Start a temporary clone instead of the project itself.
+        #[arg(long)]
+        clone: bool,
+    },
+    /// Stop one sandbox, or the only running sandbox.
+    Stop { name: Option<String> },
+    /// Show one sandbox, or all sandboxes.
+    Status { name: Option<String> },
+    /// Pause a sandbox.
+    Pause { name: String },
+    /// Resume a sandbox.
+    Resume { name: String },
+    /// Show or edit a sandbox's hegn.toml.
+    Config {
+        name: String,
+        /// Open the config in $EDITOR.
+        #[arg(long)]
+        edit: bool,
+        /// Print only the config path.
+        #[arg(long)]
+        path: bool,
+    },
+    /// Stop and delete a sandbox.
+    Delete {
+        name: String,
+        /// Delete an in-sandbox clone workspace.
+        #[arg(long, conflicts_with = "keep_files")]
+        delete_files: bool,
+        /// Keep an in-sandbox clone workspace.
+        #[arg(long, conflicts_with = "delete_files")]
+        keep_files: bool,
+        /// Skip interactive prompts (a file policy flag is still required).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -193,12 +250,17 @@ pub enum SnapshotCommands {
     Create {
         /// Name for the snapshot (defaults to a timestamp).
         name: Option<String>,
-        /// Project path recorded in metadata (defaults to the session project).
+        /// Sandbox to snapshot (defaults to the only running sandbox).
         #[arg(long)]
-        project: Option<String>,
+        sandbox: Option<String>,
     },
     /// Load a snapshot (boots a fresh Cloud Hypervisor process).
-    Restore { name: String },
+    Restore {
+        name: String,
+        /// Sandbox to restore into (defaults to the snapshot metadata).
+        #[arg(long)]
+        sandbox: Option<String>,
+    },
     /// Delete a snapshot directory.
     Delete { name: String },
     /// Show snapshot metadata.
@@ -466,54 +528,259 @@ fn project_command(command: ProjectCommands, config: Config, json: bool) -> Resu
 }
 
 fn sandbox_command(command: SandboxCommands, config: Config, json: bool) -> Result<i32> {
-    let manager = SandboxManager::new(config.clone());
+    let registry = SandboxRegistry::new(config.clone());
     match command {
-        SandboxCommands::Start { project, harness } => {
+        SandboxCommands::List => {
+            print_sandboxes(&registry.summaries()?, json)?;
+            Ok(0)
+        }
+        SandboxCommands::Create {
+            project,
+            name,
+            harness,
+            clone,
+        } => {
             let path = resolve_project(&config, &project)?;
-            let meta = project::read_meta(&path);
-            let harness = harness.or(meta.harness).unwrap_or(config.harness);
-            let report = manager.start(&path, harness)?;
+            let harness = harness.or_else(|| project::read_meta(&path).harness);
+            let sandbox = registry.create(&path, name.as_deref(), harness, clone)?;
+            print_sandbox(&registry.summary(&sandbox), json)?;
+            Ok(0)
+        }
+        SandboxCommands::Clone {
+            source,
+            name,
+            count,
+            harness,
+            no_start,
+        } => {
+            if count == 0 || count > 64 {
+                bail!("--count must be between 1 and 64");
+            }
+            let source = registry.resolve(&source)?;
+            let base = name.unwrap_or_else(|| format!("{}-agent", source.name));
+            let mut created = Vec::new();
+            for index in 1..=count {
+                let clone_name = if count == 1 {
+                    registry.unique_name(&base)?
+                } else {
+                    registry.unique_name(&format!("{base}-{index}"))?
+                };
+                let clone = registry.clone_from(&source, &clone_name, harness)?;
+                if !no_start {
+                    registry.manager(clone.clone()).start()?;
+                }
+                created.push(registry.summary(&clone));
+            }
+            print_sandboxes(&created, json)?;
+            Ok(0)
+        }
+        SandboxCommands::Start {
+            name,
+            harness,
+            clone,
+        } => {
+            let sandbox = match registry.resolve(&name) {
+                Ok(sandbox) => {
+                    if clone {
+                        let clone_name =
+                            registry.unique_name(&format!("{}-agent", sandbox.name))?;
+                        registry.clone_from(&sandbox, &clone_name, harness)?
+                    } else {
+                        sandbox
+                    }
+                }
+                Err(_) => {
+                    let path = resolve_project(&config, &name)?;
+                    let meta = project::read_meta(&path);
+                    let harness = harness.or(meta.harness).unwrap_or(config.harness);
+                    if clone {
+                        registry.create(&path, None, Some(harness), true)?
+                    } else {
+                        registry.ensure_for_project(&path, harness)?
+                    }
+                }
+            };
+            let manager = registry.manager(sandbox);
+            let report = manager.start()?;
             print_report(&report, json)?;
             Ok(0)
         }
-        SandboxCommands::Stop => {
-            manager.stop()?;
+        SandboxCommands::Stop { name } => {
+            let sandbox = match name {
+                Some(selector) => registry.resolve(&selector)?,
+                None => only_running_sandbox(&registry)?,
+            };
+            registry.manager(sandbox.clone()).stop()?;
             if json {
-                println!("{}", serde_json::json!({"stopped": true}));
+                println!("{}", serde_json::json!({"stopped": sandbox.name}));
             } else {
-                println!("Sandbox stopped.");
+                println!("Sandbox '{}' stopped.", sandbox.name);
             }
             Ok(0)
         }
-        SandboxCommands::Status => {
-            let report = manager.status()?;
-            print_report(&report, json)?;
-            Ok(0)
-        }
-        SandboxCommands::Pause => {
-            runtime()?.block_on(manager.pause())?;
-            if json {
-                println!("{}", serde_json::json!({"paused": true}));
-            } else {
-                println!("Sandbox paused.");
+        SandboxCommands::Status { name } => {
+            match name {
+                Some(selector) => {
+                    let sandbox = registry.resolve(&selector)?;
+                    let report = registry.manager(sandbox).status()?;
+                    print_report(&report, json)?;
+                }
+                None => print_sandboxes(&registry.summaries()?, json)?,
             }
             Ok(0)
         }
-        SandboxCommands::Resume => {
-            runtime()?.block_on(manager.resume())?;
+        SandboxCommands::Pause { name } => {
+            let sandbox = registry.resolve(&name)?;
+            let sandbox_name = sandbox.name.clone();
+            runtime()?.block_on(registry.manager(sandbox).pause())?;
             if json {
-                println!("{}", serde_json::json!({"resumed": true}));
+                println!("{}", serde_json::json!({"paused": sandbox_name}));
             } else {
-                println!("Sandbox resumed.");
+                println!("Sandbox '{sandbox_name}' paused.");
+            }
+            Ok(0)
+        }
+        SandboxCommands::Resume { name } => {
+            let sandbox = registry.resolve(&name)?;
+            let sandbox_name = sandbox.name.clone();
+            runtime()?.block_on(registry.manager(sandbox).resume())?;
+            if json {
+                println!("{}", serde_json::json!({"resumed": sandbox_name}));
+            } else {
+                println!("Sandbox '{sandbox_name}' resumed.");
+            }
+            Ok(0)
+        }
+        SandboxCommands::Config { name, edit, path } => {
+            let sandbox = registry.store().load(&name)?;
+            let config_path = registry.store().config_path(&name)?;
+            if path {
+                println!("{}", config_path.display());
+            } else if edit {
+                run_editor(&config_path)?;
+            } else if json {
+                println!("{}", serde_json::to_string_pretty(&sandbox)?);
+            } else {
+                println!("{}", toml::to_string_pretty(&sandbox)?);
+            }
+            Ok(0)
+        }
+        SandboxCommands::Delete {
+            name,
+            delete_files,
+            keep_files,
+            yes,
+        } => {
+            let sandbox = registry.store().load(&name)?;
+            let workspace_inside = sandbox
+                .workspace
+                .canonicalize()
+                .map(|workspace| {
+                    sandbox
+                        .dir(registry.store().root())
+                        .canonicalize()
+                        .map(|dir| workspace.starts_with(&dir))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if !yes && !prompt_yes(&format!("Delete sandbox '{}'?", sandbox.name))? {
+                println!("Cancelled.");
+                return Ok(0);
+            }
+            let delete_files = if workspace_inside {
+                if delete_files {
+                    true
+                } else if keep_files {
+                    false
+                } else {
+                    if !std::io::stdin().is_terminal() {
+                        bail!("workspace files require an explicit --delete-files or --keep-files");
+                    }
+                    prompt_yes("Also delete the cloned workspace files?")?
+                }
+            } else {
+                false
+            };
+            let outcome = registry.delete(&sandbox.name, delete_files)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "deleted": sandbox.name,
+                        "delete_files": delete_files,
+                        "kept_workspace": outcome.kept_workspace,
+                    })
+                );
+            } else if let Some(kept) = outcome.kept_workspace {
+                println!(
+                    "Sandbox '{}' removed. Workspace kept at {}",
+                    sandbox.name,
+                    kept.display()
+                );
+            } else if workspace_inside && delete_files {
+                println!("Sandbox '{}' and its workspace deleted.", sandbox.name);
+            } else {
+                println!(
+                    "Sandbox '{}' removed. Source project {} was not touched.",
+                    sandbox.name,
+                    sandbox.project.display()
+                );
             }
             Ok(0)
         }
     }
 }
 
+fn only_running_sandbox(
+    registry: &SandboxRegistry,
+) -> Result<crate::sandbox_config::SandboxConfig> {
+    let mut running: Vec<_> = registry
+        .summaries()?
+        .into_iter()
+        .filter(|sandbox| sandbox.state == "running")
+        .collect();
+    match running.len() {
+        0 => bail!("no running sandbox; start one with `hegn sandbox start <name>`"),
+        1 => registry.store().load(&running.remove(0).name),
+        _ => {
+            let names: Vec<String> = running.into_iter().map(|sandbox| sandbox.name).collect();
+            bail!(
+                "multiple sandboxes are running ({}); pass a sandbox name",
+                names.join(", ")
+            )
+        }
+    }
+}
+
+fn prompt_yes(question: &str) -> Result<bool> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        bail!("confirmation required; pass --yes and a file policy flag in non-interactive mode");
+    }
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn snapshot_sandbox(
+    registry: &SandboxRegistry,
+    requested: Option<String>,
+) -> Result<crate::sandbox_config::SandboxConfig> {
+    match requested {
+        Some(selector) => registry.resolve(&selector),
+        None => only_running_sandbox(registry),
+    }
+}
+
 fn snapshot_command(command: SnapshotCommands, config: Config, json: bool) -> Result<i32> {
     let store = SnapshotStore::new(&config.snapshots_dir);
-    let manager = SandboxManager::new(config.clone());
+    let registry = SandboxRegistry::new(config.clone());
     match command {
         SnapshotCommands::List => {
             let snapshots = store.list()?;
@@ -522,11 +789,15 @@ fn snapshot_command(command: SnapshotCommands, config: Config, json: bool) -> Re
             } else if snapshots.is_empty() {
                 println!("No snapshots in {}.", store.root().display());
             } else {
-                println!("{:<32} {:<22} {:>10}", "NAME", "CREATED", "SIZE");
+                println!(
+                    "{:<32} {:<20} {:<18} {:>10}",
+                    "NAME", "SANDBOX", "CREATED", "SIZE"
+                );
                 for snapshot in snapshots {
                     println!(
-                        "{:<32} {:<22} {:>10}",
+                        "{:<32} {:<20} {:<18} {:>10}",
                         snapshot.name,
+                        snapshot.sandbox.as_deref().unwrap_or("-"),
                         snapshot.created_at.format("%Y-%m-%d %H:%M:%S"),
                         snapshot.size_label()
                     );
@@ -534,31 +805,36 @@ fn snapshot_command(command: SnapshotCommands, config: Config, json: bool) -> Re
             }
             Ok(0)
         }
-        SnapshotCommands::Create { name, project } => {
-            if !manager.running() {
-                bail!("the sandbox is not running; start it with `hegn sandbox start <project>`");
-            }
-            let project = match project {
-                Some(project) => resolve_project(&config, &project)?,
-                None => manager
-                    .session()
-                    .map(|session| session.project)
-                    .context("no session project; pass --project")?,
-            };
+        SnapshotCommands::Create { name, sandbox } => {
+            let sandbox = snapshot_sandbox(&registry, sandbox)?;
             let suggested = SnapshotStore::suggested_name(
-                project
+                sandbox
+                    .project
                     .file_name()
-                    .and_then(|n| n.to_str())
+                    .and_then(|name| name.to_str())
                     .unwrap_or("snapshot"),
             );
             let name = name.unwrap_or(suggested);
-            let meta = runtime()?.block_on(manager.create_snapshot(&project, &name))?;
+            let meta = runtime()?.block_on(registry.manager(sandbox).create_snapshot(&name))?;
             print_snapshot(&meta, json)?;
             Ok(0)
         }
-        SnapshotCommands::Restore { name } => {
+        SnapshotCommands::Restore { name, sandbox } => {
             let meta = store.load(&name)?;
-            runtime()?.block_on(manager.restore_snapshot(&meta))?;
+            let sandbox = match sandbox {
+                Some(selector) => registry.resolve(&selector)?,
+                None => match meta.sandbox.as_deref() {
+                    Some(name) => registry.store().load(name)?,
+                    None => {
+                        let project = meta
+                            .project
+                            .as_deref()
+                            .context("snapshot has no sandbox/project metadata")?;
+                        registry.resolve(project.to_string_lossy().as_ref())?
+                    }
+                },
+            };
+            runtime()?.block_on(registry.manager(sandbox).restore_snapshot(&meta))?;
             if json {
                 println!("{}", serde_json::json!({"restored": meta.name}));
             } else {
@@ -787,13 +1063,16 @@ fn open(
 
     let meta = project::read_meta(&path);
     let harness = meta.harness.unwrap_or(config.harness);
-    let manager = SandboxManager::new(config.clone());
-    let console = manager.ensure_console(&path, harness)?;
+    let registry = SandboxRegistry::new(config.clone());
+    let sandbox = registry.ensure_for_project(&path, harness)?;
+    let manager = registry.manager(sandbox.clone());
+    let console = manager.ensure_console()?;
 
-    // Only mutate the host repository once a VM is actually available.
-    let git = project::read_git_summary(&path);
-    if config.auto_branch && git.is_repo && !no_branch {
-        match project::create_session_branch(&path) {
+    // Only mutate the workspace repository once a VM is actually available.
+    let workspace = sandbox.workspace.clone();
+    let git = project::read_git_summary(&workspace);
+    if sandbox.auto_branch && git.is_repo && !no_branch {
+        match project::create_session_branch(&workspace) {
             Ok(branch) => println!("Session branch: {branch}"),
             Err(err) => eprintln!("warning: could not create session branch: {err}"),
         }
@@ -804,32 +1083,13 @@ fn open(
 }
 
 fn attach(project: Option<String>, no_bar: bool, config: Config) -> Result<i32> {
-    let manager = SandboxManager::new(config.clone());
-    let session = manager.session().with_context(|| {
-        format!(
-            "no VM session in {}; start one with `hegn open <project>` or `hegn sandbox start <project>`",
-            manager.paths().run_dir.display()
-        )
-    })?;
-    if !process_matches(session.vm_pid, &config.vm_binary()) {
-        bail!(
-            "the VM recorded in {} is not running; start it with `hegn sandbox start`",
-            manager.paths().session.display()
-        );
-    }
-    if let Some(arg) = project {
-        let path = resolve_project(&config, &arg)?;
-        if !same_project(&path, &session.project) {
-            bail!(
-                "the running VM belongs to {}; stop it with `hegn sandbox stop` before attaching {}",
-                session.project.display(),
-                path.display()
-            );
-        }
-    }
-    // VmConsole::attach re-verifies that the recorded pid is still the
-    // configured Cloud Hypervisor binary and that the console relay exists.
-    let console = manager.attach_console()?;
+    let registry = SandboxRegistry::new(config.clone());
+    let sandbox = match project {
+        Some(selector) => registry.resolve(&selector)?,
+        None => only_running_sandbox(&registry)?,
+    };
+    // VmConsole::attach re-verifies the recorded pid, VM binary and relay.
+    let console = registry.manager(sandbox).attach_console()?;
     crate::console::run_interactive(console, !no_bar)?;
     Ok(0)
 }
@@ -894,11 +1154,14 @@ fn logs_command(command: LogCommands, config: Config, json: bool) -> Result<i32>
             Ok(0)
         }
         LogCommands::Prune { keep } => {
-            // Never unlink the log the running VM is still writing to.
-            let protected = SandboxManager::new(config.clone())
-                .session()
-                .and_then(|session| session.serial_log);
-            let removed = store.prune_except(keep, protected.as_deref())?;
+            // Never unlink a log a running sandbox is still writing to.
+            let registry = SandboxRegistry::new(config.clone());
+            let protected: Vec<PathBuf> = registry
+                .summaries()?
+                .into_iter()
+                .filter_map(|sandbox| sandbox.serial_log)
+                .collect();
+            let removed = store.prune_except_many(keep, &protected)?;
             if json {
                 println!(
                     "{}",
@@ -981,13 +1244,83 @@ fn print_findings(inspection: &crate::security::Inspection) {
     }
 }
 
+fn print_sandboxes(sandboxes: &[SandboxSummary], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(sandboxes)?);
+        return Ok(());
+    }
+    if sandboxes.is_empty() {
+        println!("No sandboxes. Create one with: hegn sandbox create <project>");
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<12} {:<10} {:<12} PROJECT",
+        "SANDBOX", "STATE", "MODE", "HARNESS"
+    );
+    for sandbox in sandboxes {
+        println!(
+            "{:<24} {:<12} {:<10} {:<12} {}",
+            sandbox.name,
+            sandbox.state,
+            if sandbox.ephemeral {
+                "clone"
+            } else {
+                "project"
+            },
+            sandbox.harness.label(),
+            sandbox.project.display()
+        );
+    }
+    Ok(())
+}
+
+fn print_sandbox(sandbox: &SandboxSummary, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(sandbox)?);
+        return Ok(());
+    }
+    println!("sandbox      {}", sandbox.name);
+    println!("state        {}", sandbox.state);
+    println!(
+        "mode         {}",
+        if sandbox.ephemeral {
+            "clone"
+        } else {
+            "project"
+        }
+    );
+    println!("project      {}", sandbox.project.display());
+    println!("workspace    {}", sandbox.workspace.display());
+    println!("harness      {}", sandbox.harness.label());
+    println!(
+        "resources    {} vCPU · {} MiB",
+        sandbox.vcpus, sandbox.memory_mib
+    );
+    println!("config       {}", sandbox.config_path.display());
+    if let Some(source) = &sandbox.source_sandbox {
+        println!("source       {source}");
+    }
+    if let Some(pid) = sandbox.vm_pid {
+        println!("vm           pid {pid}");
+    }
+    if let Some(log) = &sandbox.serial_log {
+        println!("serial log   {}", log.display());
+    }
+    if let Some(error) = &sandbox.error {
+        println!("error        {error}");
+    }
+    Ok(())
+}
+
 fn print_report(report: &SandboxReport, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
+    println!("sandbox      {}", report.sandbox);
     println!("state        {}", report.state);
     println!("backend      {}", report.backend);
+    println!("workspace    {}", report.workspace.display());
     if let Some(project) = &report.project {
         println!("project      {}", project.display());
     }
@@ -1047,6 +1380,9 @@ fn print_snapshot(meta: &SnapshotMeta, json: bool) -> Result<()> {
         println!("  size    {}", meta.size_label());
         println!("  dir     {}", meta.dir.display());
         println!("  source  {}", meta.source_url());
+        if let Some(sandbox) = &meta.sandbox {
+            println!("  sandbox {sandbox}");
+        }
         if let Some(project) = &meta.project {
             println!("  project  {}", project.display());
         }
@@ -1078,6 +1414,7 @@ mod tests {
         config.projects_root = dir.path().join("projects");
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
+        config.sandboxes_dir = dir.path().join("sandboxes");
         config.templates_dir = dir.path().join("templates");
         config.backend = BackendKind::Auto;
         std::fs::create_dir_all(&config.projects_root).unwrap();
@@ -1229,8 +1566,85 @@ mod tests {
     #[test]
     fn sandbox_status_json_works_without_vm() {
         let (_dir, config) = config();
-        let code = sandbox_command(SandboxCommands::Status, config, true).unwrap();
+        let code = sandbox_command(SandboxCommands::Status { name: None }, config, true).unwrap();
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn sandbox_create_clone_list_config_and_delete() {
+        let (_dir, config) = config();
+        let project = config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("README.md"), b"demo").unwrap();
+
+        let code = sandbox_command(
+            SandboxCommands::Create {
+                project: project.display().to_string(),
+                name: Some("base".into()),
+                harness: Some(Harness::Codex),
+                clone: false,
+            },
+            config.clone(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(config.sandboxes_dir.join("base/hegn.toml").is_file());
+
+        let code = sandbox_command(
+            SandboxCommands::Clone {
+                source: "base".into(),
+                name: Some("agent1".into()),
+                count: 1,
+                harness: None,
+                no_start: true,
+            },
+            config.clone(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(config.sandboxes_dir.join("agent1/hegn.toml").is_file());
+        assert!(
+            config
+                .sandboxes_dir
+                .join("agent1/workspace/README.md")
+                .is_file()
+        );
+
+        assert_eq!(
+            sandbox_command(SandboxCommands::List, config.clone(), true).unwrap(),
+            0
+        );
+        assert_eq!(
+            sandbox_command(
+                SandboxCommands::Config {
+                    name: "base".into(),
+                    edit: false,
+                    path: true,
+                },
+                config.clone(),
+                true,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sandbox_command(
+                SandboxCommands::Delete {
+                    name: "agent1".into(),
+                    delete_files: true,
+                    keep_files: false,
+                    yes: true,
+                },
+                config.clone(),
+                true,
+            )
+            .unwrap(),
+            0
+        );
+        assert!(!config.sandboxes_dir.join("agent1").exists());
+        assert!(project.join("README.md").is_file());
     }
 
     #[test]
@@ -1263,7 +1677,7 @@ mod tests {
     fn attach_without_a_session_is_a_hard_error() {
         let (_dir, config) = config();
         let err = attach(None, false, config).unwrap_err().to_string();
-        assert!(err.contains("no VM session"), "{err}");
+        assert!(err.contains("no running sandbox"), "{err}");
     }
 
     #[test]

@@ -223,11 +223,17 @@ impl LogStore {
     /// The running session's log is protected so a manual `hegn logs prune`
     /// cannot unlink the file the console relay is still writing to.
     pub fn prune_except(&self, keep: usize, protected: Option<&Path>) -> Result<usize> {
+        let protected: Vec<PathBuf> = protected.map(Path::to_path_buf).into_iter().collect();
+        self.prune_except_many(keep, &protected)
+    }
+
+    /// Like [`Self::prune_except`], but protects several running sessions.
+    pub fn prune_except_many(&self, keep: usize, protected: &[PathBuf]) -> Result<usize> {
         let keep = keep.max(1);
         let logs = self.list()?;
         let mut removed = 0;
         for (index, entry) in logs.iter().enumerate() {
-            let is_protected = protected.is_some_and(|path| path == entry.path);
+            let is_protected = protected.iter().any(|path| path == &entry.path);
             if index < keep || is_protected {
                 continue;
             }
