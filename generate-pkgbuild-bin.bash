@@ -15,7 +15,7 @@ url=$(aur_repo_url)
 asset="hegn-${tag}-x86_64-linux-gnu"
 
 cat >PKGBUILD <<EOF
-Maintainer: Henrik Bernhardt <57109108+Henriklmao@users.noreply.github.com>
+# Maintainer: Henrik Bernhardt <57109108+Henriklmao@users.noreply.github.com>
 pkgname=hegn-bin
 pkgver=${pkgver}
 pkgrel=1

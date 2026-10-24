@@ -23,7 +23,7 @@ pkgver=$(aur_git_pkgver "$version")
 desktop_sha256=$(aur_file_sha256 hegn.desktop)
 
 cat >PKGBUILD <<EOF
-Maintainer: Henrik Bernhardt <57109108+Henriklmao@users.noreply.github.com>
+# Maintainer: Henrik Bernhardt <57109108+Henriklmao@users.noreply.github.com>
 pkgname=hegn-git
 pkgver=${pkgver}
 pkgrel=1

@@ -13,7 +13,7 @@ pkgver=$(aur_tag_pkgver "$tag")
 url=$(aur_repo_url)
 
 cat >PKGBUILD <<EOF
-Maintainer: Henrik Bernhardt <57109108+Henriklmao@users.noreply.github.com>
+# Maintainer: Henrik Bernhardt <57109108+Henriklmao@users.noreply.github.com>
 pkgname=hegn
 pkgver=${pkgver}
 pkgrel=1
