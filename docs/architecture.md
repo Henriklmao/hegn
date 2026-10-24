@@ -468,6 +468,15 @@ The three focusable dashboard tabs are also addressable by number: `1` for
 projects, `2` for sandboxes and `3` for snapshots. Each panel title carries a
 colored `[n]` badge in its top-right corner.
 
+The sandbox tab is scoped to the project selected in the projects tab. Switching
+projects rebuilds the list from the already-loaded sandboxes (no extra disk
+scan), preferring a running sandbox. Clones created for multi-agent work share
+the source project, so they stay in the list and are attached with one `Enter`.
+
+In the terminal view, `←` and `Esc` (normal mode) return to the dashboard;
+`Ctrl-B`/`Ctrl-]` do so from every mode. Raw mode still forwards `←` to the
+guest like every other key.
+
 VM starts run on a named worker thread (`hegn-start-vm`) and report through the
 same channel as project scans. The UI therefore keeps drawing an animated
 `STARTING` spinner, the sandbox note and a toast immediately after Enter;

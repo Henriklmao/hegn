@@ -320,20 +320,27 @@ fn branch_color(git: &crate::project::GitSummary) -> Color {
 
 fn render_sandboxes(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
     let active = app.focus == Focus::Sandboxes;
-    let title = format!(" sandboxes ({}) ", app.sandboxes.len());
+    let title = format!(" sandboxes ({}) ", app.sandbox_visible.len());
     let block = tab_block(title, 2, active);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let mut hits = Vec::new();
-    if app.sandboxes.is_empty() {
+    if app.sandbox_visible.is_empty() {
+        let (headline, hint) = match app.selected_project() {
+            Some(project) => (
+                format!(" ▾ no sandboxes for {}", truncate(&project.name, 18)),
+                "   Enter on project boots one",
+            ),
+            None => (
+                " ▾ no project selected".to_string(),
+                "   pick a project to scope it",
+            ),
+        };
         frame.render_widget(
             Paragraph::new(Text::from(vec![
-                Line::from(Span::styled(" ▾ no sandboxes", Style::default().fg(MUTED))),
-                Line::from(Span::styled(
-                    "   open a project to start agent clones",
-                    Style::default().fg(MUTED),
-                )),
+                Line::from(Span::styled(headline, Style::default().fg(MUTED))),
+                Line::from(Span::styled(hint, Style::default().fg(MUTED))),
             ])),
             inner,
         );
@@ -345,13 +352,14 @@ fn render_sandboxes(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
         .sandbox_selected
         .saturating_sub(visible_rows.saturating_sub(1));
     let mut lines = Vec::new();
-    for (row, sandbox) in app
-        .sandboxes
+    for (row, &index) in app
+        .sandbox_visible
         .iter()
         .enumerate()
         .skip(offset)
         .take(visible_rows)
     {
+        let sandbox = &app.sandboxes[index];
         let selected = row == app.sandbox_selected && active;
         let base = if selected {
             Style::default()
@@ -558,14 +566,22 @@ fn render_sandbox_panel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
 
     let Some(sandbox) = app.selected_sandbox() else {
+        let (headline, hint) = match app.selected_project() {
+            Some(project) => (
+                format!("No sandbox for {}.", project.name),
+                "Press Enter on the project to boot one.",
+            ),
+            None => (
+                "No project selected.".to_string(),
+                "Select a project to see its sandboxes.",
+            ),
+        };
         frame.render_widget(
             Paragraph::new(Text::from(vec![
+                Line::from(Span::styled(headline, Style::default().fg(TEXT))),
+                Line::from(Span::styled(hint.to_string(), Style::default().fg(MUTED))),
                 Line::from(Span::styled(
-                    "No sandbox selected.",
-                    Style::default().fg(TEXT),
-                )),
-                Line::from(Span::styled(
-                    "Open a project (Enter) or create clones with m.",
+                    "Multi-agent clones appear in this list too.",
                     Style::default().fg(MUTED),
                 )),
                 Line::from(Span::styled(
@@ -917,7 +933,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
         let hint = if app.searching {
             " typing filter · ↑↓ select · Enter open · Esc cancel ".to_string()
         } else if app.screen == Screen::Terminal {
-            " Esc dashboard · Ctrl-B/^] dashboard · PgUp/PgDn scroll · Ctrl-L clear ".to_string()
+            " Esc/← dashboard · Ctrl-B/^] dashboard · PgUp/PgDn scroll · Ctrl-L clear ".to_string()
         } else {
             " / filter · 1-3 focus · Tab cycle · Enter open · c create · ? help ".to_string()
         };
@@ -1614,8 +1630,8 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
         (
             "Sandboxes",
             &[
-                ("b", "focus sandbox list"),
-                ("Enter", "attach/start selected sandbox"),
+                ("b", "focus sandbox list (selected project only)"),
+                ("Enter", "attach/start selected sandbox or clone"),
                 ("S", "stop selected sandbox"),
                 ("d", "delete sandbox (double confirmation)"),
                 ("F5", "sandbox config (edit/reload)"),
@@ -1627,13 +1643,14 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
             &[
                 ("i / a", "insert mode — write in the guest terminal"),
                 ("Esc", "leave insert mode (dashboard in normal mode)"),
+                ("←", "return to dashboard (normal mode)"),
                 ("M", "multi-agent clones for this project"),
                 (
                     "Enter",
                     "in insert mode: inspect with tirith-core, then send",
                 ),
                 ("F2", "toggle raw passthrough (no interception)"),
-                ("Ctrl-B", "return to dashboard"),
+                ("Ctrl-B / Ctrl-]", "return to dashboard"),
                 ("PgUp/PgDn", "scroll output"),
                 ("Ctrl-L", "clear scrollback"),
                 ("security", "a allow · c checkpoint + allow · d deny"),

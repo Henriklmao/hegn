@@ -472,7 +472,10 @@ pub struct App {
     pub selected_snapshot: usize,
     pub snapshot_rows: Vec<RowHit>,
     pub sandboxes: Vec<SandboxSummary>,
+    /// Indices into [`App::sandboxes`] for the selected project.
+    pub sandbox_visible: Vec<usize>,
     pub sandbox_selected: usize,
+    sandbox_project: Option<PathBuf>,
     pub sandbox_rows: Vec<RowHit>,
     pub project_rows: Vec<RowHit>,
     pub session: Option<Box<dyn TerminalConsole>>,
@@ -520,7 +523,9 @@ impl App {
             selected_snapshot: 0,
             snapshot_rows: Vec::new(),
             sandboxes,
+            sandbox_visible: Vec::new(),
             sandbox_selected: 0,
+            sandbox_project: None,
             sandbox_rows: Vec::new(),
             project_rows: Vec::new(),
             session: None,
@@ -560,6 +565,7 @@ impl App {
         {
             self.selected = index;
         }
+        self.refresh_sandbox_filter();
     }
 
     pub fn add_project(&mut self, project: Project) {
@@ -578,6 +584,7 @@ impl App {
         {
             self.selected = index;
         }
+        self.refresh_sandbox_filter();
     }
 
     pub fn refresh_snapshots(&mut self) {
@@ -596,6 +603,7 @@ impl App {
         } else if self.selected >= self.visible.len() {
             self.selected = self.visible.len() - 1;
         }
+        self.refresh_sandbox_filter();
     }
 
     pub fn selected_project(&self) -> Option<&Project> {
@@ -609,7 +617,62 @@ impl App {
     }
 
     pub fn selected_sandbox(&self) -> Option<&SandboxSummary> {
-        self.sandboxes.get(self.sandbox_selected)
+        self.sandbox_visible
+            .get(self.sandbox_selected)
+            .and_then(|&index| self.sandboxes.get(index))
+    }
+
+    /// Rebuild the sandbox list so it only contains sandboxes for the project
+    /// selected in the project list. Multi-agent clones share their source
+    /// project, so they stay visible and are one `Enter` away.
+    ///
+    /// The previous selection is preserved while the project stays the same;
+    /// switching projects selects a running sandbox when one exists.
+    pub fn refresh_sandbox_filter(&mut self) {
+        let selected = self.selected_sandbox().map(|sandbox| sandbox.name.clone());
+        self.refresh_sandbox_filter_named(selected);
+    }
+
+    /// Rebuild the filter while preserving `selected` by name. The name must be
+    /// captured before [`App::sandboxes`] is replaced: the visible indices point
+    /// into the old vector.
+    fn refresh_sandbox_filter_named(&mut self, selected: Option<String>) {
+        let project = self.selected_project().map(|project| project.path.clone());
+        let project_changed = self.sandbox_project != project;
+        self.sandbox_project = project.clone();
+
+        self.sandbox_visible = match project {
+            Some(project) => self
+                .sandboxes
+                .iter()
+                .enumerate()
+                .filter(|(_, sandbox)| crate::sandbox::same_project(&sandbox.project, &project))
+                .map(|(index, _)| index)
+                .collect(),
+            None => Vec::new(),
+        };
+
+        if !project_changed
+            && let Some(name) = selected
+            && let Some(index) = self
+                .sandbox_visible
+                .iter()
+                .position(|&index| self.sandboxes[index].name == name)
+        {
+            self.sandbox_selected = index;
+            return;
+        }
+        if project_changed {
+            self.sandbox_selected = self
+                .sandbox_visible
+                .iter()
+                .position(|&index| self.sandboxes[index].state == "running")
+                .unwrap_or(0);
+        } else {
+            self.sandbox_selected = self
+                .sandbox_selected
+                .min(self.sandbox_visible.len().saturating_sub(1));
+        }
     }
 
     /// Refresh the sandbox list from disk/process state. Cheap enough for the
@@ -620,17 +683,7 @@ impl App {
         if let Ok(sandboxes) = registry.summaries() {
             self.sandboxes = sandboxes;
         }
-        if let Some(name) = selected
-            && let Some(index) = self
-                .sandboxes
-                .iter()
-                .position(|sandbox| sandbox.name == name)
-        {
-            self.sandbox_selected = index;
-        }
-        self.sandbox_selected = self
-            .sandbox_selected
-            .min(self.sandboxes.len().saturating_sub(1));
+        self.refresh_sandbox_filter_named(selected);
         let selected = self.selected_sandbox().cloned();
         if let Some(summary) = selected {
             self.sandbox.vcpus = summary.vcpus;
@@ -663,12 +716,13 @@ impl App {
                 }
                 let max = self.visible.len() - 1;
                 self.selected = clamp_index(self.selected, delta, max);
+                self.refresh_sandbox_filter();
             }
             Focus::Sandboxes => {
-                if self.sandboxes.is_empty() {
+                if self.sandbox_visible.is_empty() {
                     return;
                 }
-                let max = self.sandboxes.len() - 1;
+                let max = self.sandbox_visible.len() - 1;
                 self.sandbox_selected = clamp_index(self.sandbox_selected, delta, max);
             }
             Focus::Snapshots => {
@@ -900,6 +954,13 @@ impl App {
             return Vec::new();
         }
         if crate::attach_bar::detach_requested(key) {
+            self.screen = Screen::Dashboard;
+            return Vec::new();
+        }
+        // Left leaves the project terminal in normal mode. Raw mode still
+        // forwards it to the guest; insert mode is for typing, where Esc
+        // returns to normal mode.
+        if key.code == KeyCode::Left && self.terminal_mode == TerminalMode::Normal {
             self.screen = Screen::Dashboard;
             return Vec::new();
         }
@@ -1718,9 +1779,9 @@ impl App {
                 .join("run/cloud-hypervisor.sock"),
         );
         if let Some(index) = self
-            .sandboxes
+            .sandbox_visible
             .iter()
-            .position(|sandbox| sandbox.name == console.sandbox_name())
+            .position(|&index| self.sandboxes[index].name == console.sandbox_name())
         {
             self.sandbox_selected = index;
         }
@@ -2013,6 +2074,7 @@ impl App {
                 {
                     self.focus = Focus::Projects;
                     self.selected = row.index;
+                    self.refresh_sandbox_filter();
                     let path = self.selected_project().map(|p| p.path.clone());
                     if let Some(path) = path {
                         let now = Instant::now();
@@ -2316,7 +2378,8 @@ mod tests {
         let (_dir, mut app) = test_app();
         let inside = app.config.sandboxes_dir.join("demo").join("workspace");
         app.focus = Focus::Sandboxes;
-        app.sandboxes = vec![fake_sandbox(&app, "demo", inside)];
+        let sandbox = fake_sandbox(&app, "demo", inside);
+        install_sandboxes(&mut app, vec![sandbox]);
         app.handle_key(key(KeyCode::Char('d')));
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(
@@ -2654,6 +2717,30 @@ mod tests {
     }
 
     #[test]
+    fn left_arrow_leaves_the_project_terminal_in_normal_mode() {
+        let (_dir, mut app) = test_app();
+        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
+        assert_eq!(app.screen, Screen::Terminal);
+
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.screen, Screen::Dashboard);
+    }
+
+    #[test]
+    fn left_arrow_in_insert_or_raw_mode_does_not_leave_the_terminal() {
+        let (_dir, mut app) = test_app();
+        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
+
+        app.terminal_mode = TerminalMode::Insert;
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.screen, Screen::Terminal);
+
+        app.terminal_mode = TerminalMode::Raw;
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.screen, Screen::Terminal);
+    }
+
+    #[test]
     fn multi_agent_is_reachable_from_the_project_terminal() {
         let (_dir, mut app) = test_app();
         app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
@@ -2722,13 +2809,36 @@ mod tests {
         }
     }
 
+    /// Install a sandbox list and select the matching fake project, so the
+    /// project-scoped sandbox filter has something to work with.
+    fn install_sandboxes(app: &mut App, sandboxes: Vec<SandboxSummary>) {
+        if let Some(project) = sandboxes.first().map(|sandbox| sandbox.project.clone()) {
+            let name = project
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| project.display().to_string());
+            app.projects = vec![Project {
+                name,
+                path: project,
+                git: GitSummary::default(),
+                last_opened: None,
+            }];
+            app.visible = vec![0];
+            app.selected = 0;
+            app.sandbox_project = None;
+        }
+        app.sandboxes = sandboxes;
+        app.refresh_sandbox_filter();
+    }
+
     #[test]
     fn sandbox_focus_and_delete_double_confirmation() {
         let (_dir, mut app) = test_app();
         let inside = app.config.sandboxes_dir.join("demo").join("workspace");
         app.handle_key(key(KeyCode::Char('b')));
         assert_eq!(app.focus, Focus::Sandboxes);
-        app.sandboxes = vec![fake_sandbox(&app, "demo", inside)];
+        let sandbox = fake_sandbox(&app, "demo", inside);
+        install_sandboxes(&mut app, vec![sandbox]);
 
         app.handle_key(key(KeyCode::Char('d')));
         assert!(matches!(
@@ -2762,7 +2872,8 @@ mod tests {
         let (_dir, mut app) = test_app();
         let inside = app.config.sandboxes_dir.join("demo").join("workspace");
         app.focus = Focus::Sandboxes;
-        app.sandboxes = vec![fake_sandbox(&app, "demo", inside)];
+        let sandbox = fake_sandbox(&app, "demo", inside);
+        install_sandboxes(&mut app, vec![sandbox]);
         app.handle_key(key(KeyCode::Char('d')));
         app.handle_key(key(KeyCode::Char('y')));
         let effects = app.handle_key(key(KeyCode::Char('n')));
@@ -2789,7 +2900,8 @@ mod tests {
         app.modal = None;
         let inside = app.config.sandboxes_dir.join("demo").join("workspace");
         app.focus = Focus::Sandboxes;
-        app.sandboxes = vec![fake_sandbox(&app, "demo", inside)];
+        let sandbox = fake_sandbox(&app, "demo", inside);
+        install_sandboxes(&mut app, vec![sandbox]);
         app.handle_key(key(KeyCode::F(5)));
         assert!(matches!(
             app.modal,
@@ -2835,10 +2947,70 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_list_is_scoped_to_the_selected_project_and_includes_clones() {
+        let (_dir, mut app) = test_app();
+        let demo = app.config.projects_root.join("demo");
+        let other = app.config.projects_root.join("other");
+
+        let mut base = fake_sandbox(&app, "demo", demo.join("workspace"));
+        base.project = demo.clone();
+        let mut clone = fake_sandbox(&app, "demo-1", demo.join("clone-1"));
+        clone.project = demo.clone();
+        clone.ephemeral = true;
+        clone.source_sandbox = Some("demo".into());
+        let mut other_sandbox = fake_sandbox(&app, "other", other.join("workspace"));
+        other_sandbox.project = other.clone();
+
+        let demo_project = Project {
+            name: "demo".into(),
+            path: demo.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        };
+        let other_project = Project {
+            name: "other".into(),
+            path: other.clone(),
+            ..demo_project.clone()
+        };
+        app.set_projects(vec![demo_project, other_project]);
+        app.sandboxes = vec![base, clone, other_sandbox];
+
+        app.selected = app
+            .visible
+            .iter()
+            .position(|&index| app.projects[index].path == demo)
+            .unwrap();
+        app.refresh_sandbox_filter();
+        assert_eq!(app.sandbox_visible.len(), 2);
+        let names: Vec<&str> = app
+            .sandbox_visible
+            .iter()
+            .map(|&index| app.sandboxes[index].name.as_str())
+            .collect();
+        assert_eq!(names, ["demo", "demo-1"]);
+        assert!(
+            app.sandbox_visible
+                .iter()
+                .any(|&index| app.sandboxes[index].ephemeral),
+            "multi-agent clones must be attachable from the list"
+        );
+
+        app.selected = app
+            .visible
+            .iter()
+            .position(|&index| app.projects[index].path == other)
+            .unwrap();
+        app.refresh_sandbox_filter();
+        assert_eq!(app.sandbox_visible.len(), 1);
+        assert_eq!(app.selected_sandbox().unwrap().name, "other");
+    }
+
+    #[test]
     fn stop_shortcut_only_works_with_sandbox_focus() {
         let (_dir, mut app) = test_app();
         let inside = app.config.sandboxes_dir.join("demo").join("workspace");
-        app.sandboxes = vec![fake_sandbox(&app, "demo", inside)];
+        let sandbox = fake_sandbox(&app, "demo", inside);
+        install_sandboxes(&mut app, vec![sandbox]);
         app.focus = Focus::Projects;
         let effects = app.handle_key(key(KeyCode::Char('S')));
         assert!(

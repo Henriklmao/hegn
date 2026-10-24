@@ -287,7 +287,10 @@ A normal sandbox exports the original project through virtiofs. A **clone**
 git clone and its own rootfs copy, so multiple agents can work on the same
 repository without overwriting each other's commits. Merge or open pull requests
 from the clones when they are done. Multi-agent clones are intentionally scoped
-to the project: open the project in the TUI and press `M` in its terminal.
+to the project: open the project in the TUI and press `M` in its terminal. They
+then appear in the sandbox list, which is filtered to the project currently
+selected in the projects tab, and are attached with `Enter` like any other
+sandbox.
 
 ```bash
 hegn sandbox create ~/Projects/hegn/my-app --name my-app
@@ -560,7 +563,10 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 | `q` | Quit |
 
 Each focusable tab shows its number shortcut as a coloured `[1]`, `[2]`, `[3]`
-badge in the top-right corner of the panel.
+badge in the top-right corner of the panel. The sandbox tab is scoped to the
+project selected in the projects tab: switching projects rebuilds the list, and
+multi-agent clones created for that project appear there for one-`Enter`
+attachment.
 
 Destructive actions are never confirmed with `Enter`. Deleting a sandbox or
 snapshot and allowing a flagged command require the explicit `y` (or `a` for
@@ -588,6 +594,7 @@ hegn shortcuts and nothing reaches the guest. Press `i` or `a` to enter
 | --- | --- |
 | `i` / `a` | Enter insert mode and write in the guest terminal |
 | `Esc` | Leave insert mode (in normal mode: return to dashboard) |
+| `←` | Return to dashboard (normal mode) |
 | `M` | Multi-agent clones for the project in this terminal |
 | `Enter` | In insert mode: inspect the command with tirith-core, then send it |
 | `F2` | Toggle raw passthrough (every key goes to the guest) |
