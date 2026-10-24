@@ -2117,7 +2117,7 @@ fn render_doctor(
         inner_chunks[0],
     );
     let mut buttons = Vec::new();
-    if modal.report.can_download() {
+    if modal.report.can_download() && !modal.downloading {
         buttons.push(FooterDef {
             key: "d",
             label: "Download images",
@@ -2516,6 +2516,18 @@ mod tests {
             hits.footer
                 .iter()
                 .any(|hit| hit.action == ActionId::DownloadImages)
+        );
+
+        if let Some(Modal::Doctor(modal)) = &mut app.modal {
+            modal.downloading = true;
+        }
+        let (_, hits) = render(&app);
+        assert!(
+            !hits
+                .footer
+                .iter()
+                .any(|hit| hit.action == ActionId::DownloadImages),
+            "the download button must disappear while a download is in flight"
         );
     }
 
