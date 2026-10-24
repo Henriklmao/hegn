@@ -35,7 +35,7 @@ license=('MIT' 'Apache-2.0')
 # satisfies this dependency. hegn cannot start without the VMM or virtiofsd.
 depends=('gcc-libs' 'git' 'cloud-hypervisor' 'virtiofsd')
 optdepends=(
-  'lazygit: open projects with the g shortcut'
+  'lazygit: open git with the g shortcut'
 )
 provides=('hegn')
 conflicts=('hegn' 'hegn-bin')

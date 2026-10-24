@@ -24,6 +24,9 @@ license=('MIT' 'Apache-2.0')
 # cloud-hypervisor-bin provides 'cloud-hypervisor', so either AUR package
 # satisfies this dependency.
 depends=('gcc-libs' 'cloud-hypervisor' 'virtiofsd')
+optdepends=(
+  'lazygit: open git with the g shortcut'
+)
 conflicts=('hegn-bin' 'hegn-git')
 makedepends=('git' 'rust')
 source=("\$pkgname::git+${url}.git#tag=${tag}")
