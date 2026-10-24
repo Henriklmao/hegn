@@ -203,8 +203,11 @@ fn measure_project(config: &Config, project: &str, json: bool) -> Result<i32> {
             .as_ref()
             .is_some_and(|running| same_project(running, &path))
     }) {
-        let name = session.sandbox.clone().unwrap_or_default();
-        let mut report = collect_for_sandbox(config, &name);
+        // Prefer the recorded sandbox name; legacy records predate it.
+        let mut report = match session.sandbox.as_deref().filter(|name| !name.is_empty()) {
+            Some(name) => collect_for_sandbox(config, name),
+            None => collect_for_project(config, &path),
+        };
         report
             .notes
             .push("the sandbox was already running; nothing was started".to_string());
@@ -372,6 +375,15 @@ fn collect_for_sandbox(config: &Config, name: &str) -> BenchmarkReport {
     })
 }
 
+fn collect_for_project(config: &Config, project: &Path) -> BenchmarkReport {
+    collect_with(config, |session, _| {
+        session
+            .project
+            .as_ref()
+            .is_some_and(|running| same_project(running, project))
+    })
+}
+
 fn collect_with(config: &Config, keep: impl Fn(&SessionFile, &Path) -> bool) -> BenchmarkReport {
     let mut notes = Vec::new();
     let sessions = session_costs(config, &mut notes, keep);
@@ -514,7 +526,7 @@ fn session_costs(
     costs
 }
 
-/// Unreadable session metadata cannot be matched against a selector.
+/// Turn one live `session.json` into its measured host cost.
 fn build_session(
     session: &SessionFile,
     config: &Config,
