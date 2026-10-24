@@ -155,12 +155,21 @@ glibc distribution, VM images, `hegn doctor` and a smoke test.
 ```bash
 # build from source
 paru -S hegn
-
-# latest git snapshot
-paru -S hegn-git
+# or
+yay -S hegn
 
 # pre-built binary
 paru -S hegn-bin
+# or 
+yay -S hegn-bin
+```
+
+latest git snapshot is available via
+
+```bash
+paru -S hegn-git
+# or
+yay -S hegn-git
 ```
 
 ### AppImage / pre-built binary

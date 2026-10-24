@@ -71,6 +71,8 @@ paru -S hegn-bin    # pre-built release binary, x86_64
 paru -S hegn-git    # latest git snapshot, x86_64 + aarch64
 ```
 
+alternatively, use `yay` instead of `paru`.
+
 All three depend on `virtiofsd` (official `extra`) and on `cloud-hypervisor`.
 That dependency is satisfied by either AUR package:
 
@@ -79,6 +81,7 @@ That dependency is satisfied by either AUR package:
   `cloud-hypervisor-static` (no symlink). hegn resolves that name
   automatically; no config change is needed.
 
+Check the PKGBUILD and all files from the AUR for malicious code before installing.
 Accept the AUR dependency prompt the helper shows. Do not bypass dependency
 checks with `makepkg -d`.
 
