@@ -290,7 +290,10 @@ from the clones when they are done. Multi-agent clones are intentionally scoped
 to the project: open the project in the TUI and press `M` in its terminal. They
 then appear in the sandbox list, which is filtered to the project currently
 selected in the projects tab, and are attached with `Enter` like any other
-sandbox.
+sandbox. Clones are real git clones and contain committed history only: commit
+or stash uncommitted work before creating them. Cloning a repository with no
+commits yields an empty clone; hegn surfaces git's warning as a toast instead of
+letting it corrupt the TUI.
 
 ```bash
 hegn sandbox create ~/Projects/hegn/my-app --name my-app

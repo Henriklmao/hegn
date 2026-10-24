@@ -32,7 +32,10 @@ enum ScanMessage {
         branch: Option<Result<String, String>>,
     },
     StartFailed(String),
-    SandboxesChanged(String),
+    SandboxesChanged {
+        note: String,
+        level: ToastLevel,
+    },
     SandboxError(String),
     Doctor {
         report: DoctorReport,
@@ -125,9 +128,9 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 }
             }
             Ok(ScanMessage::StartFailed(err)) => app.fail_start(err),
-            Ok(ScanMessage::SandboxesChanged(note)) => {
+            Ok(ScanMessage::SandboxesChanged { note, level }) => {
                 app.refresh_sandboxes();
-                app.toast(note, ToastLevel::Info);
+                app.toast(note, level);
             }
             Ok(ScanMessage::SandboxError(err)) => {
                 app.refresh_sandboxes();
@@ -238,6 +241,7 @@ fn spawn_clones(
             };
             let mut created = 0;
             let mut failures = Vec::new();
+            let mut warnings = Vec::new();
             for index in 1..=count {
                 let base = format!("{}-agent", source.name);
                 let name = match registry.unique_name(&format!("{base}-{index}")) {
@@ -248,8 +252,14 @@ fn spawn_clones(
                     }
                 };
                 match registry.clone_from(&source, &name, Some(harness)) {
-                    Ok(clone) => {
-                        if start && let Err(err) = registry.manager(clone.clone()).start() {
+                    Ok(outcome) => {
+                        for warning in &outcome.warnings {
+                            if !warnings.iter().any(|existing| existing == warning) {
+                                warnings.push(warning.clone());
+                            }
+                        }
+                        if start && let Err(err) = registry.manager(outcome.sandbox.clone()).start()
+                        {
                             failures.push(format!("{name}: {err}"));
                         }
                         created += 1;
@@ -257,7 +267,7 @@ fn spawn_clones(
                     Err(err) => failures.push(format!("{name}: {err}")),
                 }
             }
-            let note = if failures.is_empty() {
+            let mut note = if failures.is_empty() {
                 format!("created {created} clone(s) for parallel agents")
             } else {
                 format!(
@@ -266,7 +276,16 @@ fn spawn_clones(
                     failures.join("; ")
                 )
             };
-            let _ = thread_tx.send(ScanMessage::SandboxesChanged(note));
+            if !warnings.is_empty() {
+                note.push_str("; warning: ");
+                note.push_str(&warnings.join("; "));
+            }
+            let level = if failures.is_empty() && warnings.is_empty() {
+                ToastLevel::Info
+            } else {
+                ToastLevel::Warn
+            };
+            let _ = thread_tx.send(ScanMessage::SandboxesChanged { note, level });
         });
     if let Err(err) = spawned {
         let _ = tx.send(ScanMessage::SandboxError(format!(

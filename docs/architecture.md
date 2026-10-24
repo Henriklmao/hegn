@@ -176,7 +176,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `cloud_init.rs` | NoCloud seed generation | FAT volume labelled `CIDATA`; serial root autologin; no secrets; `0600` and `O_NOFOLLOW` |
 | `relay.rs` | Detached serial relay | Sole VMM serial client; append-only log; replays the log tail on attach; bounded buffers; refuses to replace non-socket paths |
 | `virtiofs.rs` | virtiofsd argv/process construction | Shared dir canonicalized; always sandboxed; `--cache=never` by default; sockets scoped to run dir |
-| `sandbox_config.rs` | Per-sandbox `hegn.toml`, clone/copy workspaces, rootfs copies | Names validated; source project never deleted; git identity copied; reflink rootfs with copy fallback |
+| `sandbox_config.rs` | Per-sandbox `hegn.toml`, clone/copy workspaces, rootfs copies | Names validated; source project never deleted; git identity copied; clone child output is captured (warnings go to the UI, never the terminal); reflink rootfs with copy fallback |
 | `sandbox.rs` | VM lifecycle, registry, lock, session record, status, snapshots | One lifecycle lock per sandbox; preflight before spawn; hardened VMM argv; cleanup on every error path; registry lists/starts/deletes independent sandboxes |
 | `snapshot.rs` | Snapshot metadata store | Sanitized names; private dirs/files; atomic-ish metadata writes |
 | `images.rs` | Upstream asset pins, streaming download, SHA-256 install/verify | HTTPS only by config validation; checksum before rename; no overwrite without `--force` |
@@ -472,6 +472,9 @@ The sandbox tab is scoped to the project selected in the projects tab. Switching
 projects rebuilds the list from the already-loaded sandboxes (no extra disk
 scan), preferring a running sandbox. Clones created for multi-agent work share
 the source project, so they stay in the list and are attached with one `Enter`.
+Clone workspace commands (`git clone`, `git config`) capture stdout/stderr
+instead of inheriting the TUI's terminal; git warnings such as an empty
+repository are reported as a warning toast.
 
 In the terminal view, `←` and `Esc` (normal mode) return to the dashboard;
 `Ctrl-B`/`Ctrl-]` do so from every mode. Raw mode still forwards `←` to the

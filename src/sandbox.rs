@@ -45,7 +45,7 @@ use crate::cloud_init;
 use crate::config::{Config, Harness, VIRTIOFSD_FALLBACKS};
 use crate::logs::{DEFAULT_KEEP, LogStore};
 use crate::relay::{self, RelayArgs};
-use crate::sandbox_config::{DeleteOutcome, SandboxConfig, SandboxStore};
+use crate::sandbox_config::{CloneOutcome, DeleteOutcome, SandboxConfig, SandboxStore};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
 use crate::virtiofs::{VirtiofsConfig, VirtiofsProcess};
 
@@ -347,7 +347,10 @@ impl SandboxManager {
         let started_at = Utc::now();
         let logs = LogStore::new(self.config.logs_dir());
         if let Err(err) = logs.prune(DEFAULT_KEEP) {
-            eprintln!("warning: could not prune old serial logs: {err:#}");
+            append_event_log(
+                &paths.event_log,
+                &format!("warning: could not prune old serial logs: {err:#}"),
+            );
         }
         let serial_log = logs.create_session(project, started_at, std::process::id())?;
 
@@ -835,7 +838,10 @@ impl SandboxManager {
         let started_at = Utc::now();
         let logs = LogStore::new(self.config.logs_dir());
         if let Err(err) = logs.prune(DEFAULT_KEEP) {
-            eprintln!("warning: could not prune old serial logs: {err:#}");
+            append_event_log(
+                &paths.event_log,
+                &format!("warning: could not prune old serial logs: {err:#}"),
+            );
         }
         let serial_log = match logs.create_session(&project, started_at, std::process::id()) {
             Ok(path) => path,
@@ -1037,12 +1043,25 @@ impl SandboxRegistry {
             .create_from_project(project, name, harness, clone)
     }
 
+    /// Like [`Self::create`], but returns non-fatal clone warnings for callers
+    /// that can surface them (for example, git's empty-repository notice).
+    pub fn create_with_warnings(
+        &self,
+        project: &Path,
+        name: Option<&str>,
+        harness: Option<Harness>,
+        clone: bool,
+    ) -> Result<CloneOutcome> {
+        self.store
+            .create_from_project_with_warnings(project, name, harness, clone)
+    }
+
     pub fn clone_from(
         &self,
         source: &SandboxConfig,
         name: &str,
         harness: Option<Harness>,
-    ) -> Result<SandboxConfig> {
+    ) -> Result<CloneOutcome> {
         self.store.clone_from(source, name, harness)
     }
 
@@ -2272,7 +2291,8 @@ mod tests {
         );
         let clone = registry
             .clone_from(&base, "demo-agent-1", Some(Harness::Codex))
-            .unwrap();
+            .unwrap()
+            .sandbox;
         assert!(clone.ephemeral);
         assert_eq!(registry.list().unwrap().len(), 2);
         let summaries = registry.summaries().unwrap();

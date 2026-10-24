@@ -257,6 +257,17 @@ pub struct DeleteOutcome {
     pub kept_workspace: Option<PathBuf>,
 }
 
+/// Result of cloning a sandbox workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneOutcome {
+    pub sandbox: SandboxConfig,
+    /// Non-fatal diagnostics from workspace creation, such as git's "cloned an
+    /// empty repository" warning. Callers surface these instead of letting a
+    /// child process write directly to the terminal (which would corrupt the
+    /// TUI's alternate screen).
+    pub warnings: Vec<String>,
+}
+
 impl SandboxStore {
     pub fn new(config: Config) -> Self {
         Self {
@@ -377,6 +388,20 @@ impl SandboxStore {
         harness: Option<Harness>,
         clone: bool,
     ) -> Result<SandboxConfig> {
+        Ok(self
+            .create_from_project_with_warnings(project, name, harness, clone)?
+            .sandbox)
+    }
+
+    /// Like [`Self::create_from_project`], but also returns non-fatal workspace
+    /// warnings such as git's "cloned an empty repository" notice.
+    pub fn create_from_project_with_warnings(
+        &self,
+        project: &Path,
+        name: Option<&str>,
+        harness: Option<Harness>,
+        clone: bool,
+    ) -> Result<CloneOutcome> {
         let project = project
             .canonicalize()
             .with_context(|| format!("project {} does not exist", project.display()))?;
@@ -392,24 +417,29 @@ impl SandboxStore {
         if dir.exists() {
             bail!("sandbox '{name}' already exists");
         }
-        let workspace = if clone {
+        let (workspace, warnings) = if clone {
             let workspace = dir.join(WORKSPACE_DIR);
-            if let Err(err) = self.clone_workspace(&project, &workspace) {
-                // A failed clone must not leave a half-initialised sandbox
-                // behind that blocks the next attempt with "already exists".
-                let _ = fs::remove_dir_all(&dir);
-                return Err(err);
+            match self.clone_workspace(&project, &workspace) {
+                Ok(warnings) => (workspace, warnings),
+                Err(err) => {
+                    // A failed clone must not leave a half-initialised sandbox
+                    // behind that blocks the next attempt with "already exists".
+                    let _ = fs::remove_dir_all(&dir);
+                    return Err(err);
+                }
             }
-            workspace
         } else {
-            project.clone()
+            (project.clone(), Vec::new())
         };
         let config = self.build_config(&name, &project, workspace, harness, clone, None, None);
         if let Err(err) = self.save(&config) {
             let _ = fs::remove_dir_all(&dir);
             return Err(err);
         }
-        Ok(config)
+        Ok(CloneOutcome {
+            sandbox: config,
+            warnings,
+        })
     }
 
     /// Clone an existing sandbox into a new ephemeral workspace.
@@ -418,7 +448,7 @@ impl SandboxStore {
         source: &SandboxConfig,
         name: &str,
         harness: Option<Harness>,
-    ) -> Result<SandboxConfig> {
+    ) -> Result<CloneOutcome> {
         validate_name(name)?;
         self.ensure_root()?;
         let dir = self.root.join(name);
@@ -426,10 +456,13 @@ impl SandboxStore {
             bail!("sandbox '{name}' already exists");
         }
         let workspace = dir.join(WORKSPACE_DIR);
-        if let Err(err) = self.clone_workspace(&source.workspace, &workspace) {
-            let _ = fs::remove_dir_all(&dir);
-            return Err(err);
-        }
+        let warnings = match self.clone_workspace(&source.workspace, &workspace) {
+            Ok(warnings) => warnings,
+            Err(err) => {
+                let _ = fs::remove_dir_all(&dir);
+                return Err(err);
+            }
+        };
         let config = self.build_config(
             name,
             &source.project,
@@ -443,7 +476,10 @@ impl SandboxStore {
             let _ = fs::remove_dir_all(&dir);
             return Err(err);
         }
-        Ok(config)
+        Ok(CloneOutcome {
+            sandbox: config,
+            warnings,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -529,7 +565,7 @@ impl SandboxStore {
         })
     }
 
-    fn clone_workspace(&self, source: &Path, dest: &Path) -> Result<()> {
+    fn clone_workspace(&self, source: &Path, dest: &Path) -> Result<Vec<String>> {
         if !source.is_dir() {
             bail!("workspace source {} is not a directory", source.display());
         }
@@ -542,24 +578,53 @@ impl SandboxStore {
         }
         create_private_dir(dest.parent().unwrap_or(dest))?;
         if is_git_repo(source) {
-            let status = Command::new("git")
+            // Capture stdout/stderr: a child process must never write to the
+            // terminal while the TUI owns the alternate screen. Even a
+            // successful `git clone --quiet` can emit warnings (for example,
+            // "cloned an empty repository"), which would corrupt the UI.
+            let output = Command::new("git")
                 .arg("clone")
                 .arg("--no-hardlinks")
                 .arg("--quiet")
                 .arg("--")
                 .arg(source)
                 .arg(dest)
-                .status()
+                .output()
                 .context("failed to run git clone (is git installed?)")?;
-            if !status.success() {
+            if !output.status.success() {
                 let _ = fs::remove_dir_all(dest);
-                bail!("git clone from {} failed with {status}", source.display());
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = stderr.trim();
+                if stderr.is_empty() {
+                    bail!(
+                        "git clone from {} failed with {}",
+                        source.display(),
+                        output.status
+                    );
+                }
+                bail!(
+                    "git clone from {} failed with {}: {stderr}",
+                    source.display(),
+                    output.status
+                );
             }
             copy_git_identity(source, dest);
-            return Ok(());
+            let warning = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                // git prefixes diagnostics with "warning:"; callers add their
+                // own label, so avoid "warning: warning: ...".
+                .map(|line| line.strip_prefix("warning:").map(str::trim).unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Ok((!warning.is_empty())
+                .then_some(warning)
+                .into_iter()
+                .collect());
         }
         copy_tree(source, dest)?;
-        Ok(())
+        Ok(Vec::new())
     }
 }
 
@@ -603,14 +668,21 @@ fn git_config_get(repo: &Path, key: &str) -> Option<String> {
 }
 
 fn git_config_set(repo: &Path, key: &str, value: &str) -> Result<()> {
-    let status = Command::new("git")
+    // Capture output for the same reason as `git clone`: this runs while the
+    // TUI owns the terminal.
+    let output = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(["config", "--local", key, value])
-        .status()
+        .output()
         .context("failed to run git config")?;
-    if !status.success() {
-        bail!("git config {key} failed with {status}");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!("git config {key} failed with {}", output.status);
+        }
+        bail!("git config {key} failed with {}: {stderr}", output.status);
     }
     Ok(())
 }
@@ -749,7 +821,10 @@ mod tests {
         let base = store
             .create_from_project(&project, None, None, false)
             .unwrap();
-        let clone = store.clone_from(&base, "demo-agent-1", None).unwrap();
+        let clone = store
+            .clone_from(&base, "demo-agent-1", None)
+            .unwrap()
+            .sandbox;
         assert!(clone.ephemeral);
         assert_eq!(clone.source_sandbox.as_deref(), Some("demo"));
         assert!(clone.workspace.starts_with(store.root()));
@@ -783,7 +858,10 @@ mod tests {
         let base = store
             .create_from_project(&project, None, None, false)
             .unwrap();
-        let clone = store.clone_from(&base, "demo-agent-1", None).unwrap();
+        let clone = store
+            .clone_from(&base, "demo-agent-1", None)
+            .unwrap()
+            .sandbox;
         let outcome = store.delete("demo-agent-1", false).unwrap();
         let kept = outcome.kept_workspace.unwrap();
         assert!(kept.join("README.md").is_file());
@@ -840,7 +918,10 @@ mod tests {
         let base = store
             .create_from_project(&project, None, None, false)
             .unwrap();
-        let clone = store.clone_from(&base, "demo-agent-2", None).unwrap();
+        let clone = store
+            .clone_from(&base, "demo-agent-2", None)
+            .unwrap()
+            .sandbox;
         assert_eq!(
             git_config_get(&clone.workspace, "user.name").as_deref(),
             Some("Demo Agent")
@@ -849,6 +930,32 @@ mod tests {
             git_config_get(&clone.workspace, "user.email").as_deref(),
             Some("demo@example.com")
         );
+    }
+
+    #[test]
+    fn cloning_an_empty_repository_returns_the_git_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SandboxStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        // Initialised, but no commits: `git clone --quiet` still warns. The
+        // warning must be captured instead of written to the TUI's terminal.
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let base = store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+        let outcome = store.clone_from(&base, "demo-agent-1", None).unwrap();
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        let warning = outcome.warnings[0].to_lowercase();
+        assert!(warning.contains("empty"), "{:?}", outcome.warnings);
     }
 
     #[test]
@@ -880,7 +987,8 @@ mod tests {
                 "copy",
                 None,
             )
-            .unwrap();
+            .unwrap()
+            .sandbox;
         assert!(clone.workspace.join("README.md").is_file());
         assert!(clone.workspace.join("link").is_symlink());
     }

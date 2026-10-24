@@ -542,7 +542,16 @@ fn sandbox_command(command: SandboxCommands, config: Config, json: bool) -> Resu
         } => {
             let path = resolve_project(&config, &project)?;
             let harness = harness.or_else(|| project::read_meta(&path).harness);
-            let sandbox = registry.create(&path, name.as_deref(), harness, clone)?;
+            let sandbox = if clone {
+                let outcome =
+                    registry.create_with_warnings(&path, name.as_deref(), harness, true)?;
+                for warning in &outcome.warnings {
+                    eprintln!("warning: {warning}");
+                }
+                outcome.sandbox
+            } else {
+                registry.create(&path, name.as_deref(), harness, false)?
+            };
             print_sandbox(&registry.summary(&sandbox), json)?;
             Ok(0)
         }
@@ -565,11 +574,14 @@ fn sandbox_command(command: SandboxCommands, config: Config, json: bool) -> Resu
                 } else {
                     registry.unique_name(&format!("{base}-{index}"))?
                 };
-                let clone = registry.clone_from(&source, &clone_name, harness)?;
-                if !no_start {
-                    registry.manager(clone.clone()).start()?;
+                let outcome = registry.clone_from(&source, &clone_name, harness)?;
+                for warning in &outcome.warnings {
+                    eprintln!("warning: {warning}");
                 }
-                created.push(registry.summary(&clone));
+                if !no_start {
+                    registry.manager(outcome.sandbox.clone()).start()?;
+                }
+                created.push(registry.summary(&outcome.sandbox));
             }
             print_sandboxes(&created, json)?;
             Ok(0)
@@ -584,7 +596,11 @@ fn sandbox_command(command: SandboxCommands, config: Config, json: bool) -> Resu
                     if clone {
                         let clone_name =
                             registry.unique_name(&format!("{}-agent", sandbox.name))?;
-                        registry.clone_from(&sandbox, &clone_name, harness)?
+                        let outcome = registry.clone_from(&sandbox, &clone_name, harness)?;
+                        for warning in &outcome.warnings {
+                            eprintln!("warning: {warning}");
+                        }
+                        outcome.sandbox
                     } else {
                         sandbox
                     }
@@ -594,7 +610,12 @@ fn sandbox_command(command: SandboxCommands, config: Config, json: bool) -> Resu
                     let meta = project::read_meta(&path);
                     let harness = harness.or(meta.harness).unwrap_or(config.harness);
                     if clone {
-                        registry.create(&path, None, Some(harness), true)?
+                        let outcome =
+                            registry.create_with_warnings(&path, None, Some(harness), true)?;
+                        for warning in &outcome.warnings {
+                            eprintln!("warning: {warning}");
+                        }
+                        outcome.sandbox
                     } else {
                         registry.ensure_for_project(&path, harness)?
                     }
