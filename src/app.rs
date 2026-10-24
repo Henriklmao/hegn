@@ -209,6 +209,11 @@ pub enum ActionId {
     Allow,
     Checkpoint,
     Deny,
+    MultiAgentMore,
+    MultiAgentFewer,
+    HarnessPrev,
+    HarnessNext,
+    ToggleCloneStart,
     Close,
 }
 
@@ -820,6 +825,19 @@ impl App {
                     self.open_selected()
                 }
             }
+            KeyCode::Char('1') => {
+                self.focus = Focus::Projects;
+                Vec::new()
+            }
+            KeyCode::Char('2') => {
+                self.focus = Focus::Sandboxes;
+                self.refresh_sandboxes();
+                Vec::new()
+            }
+            KeyCode::Char('3') => {
+                self.focus = Focus::Snapshots;
+                Vec::new()
+            }
             KeyCode::Char('c') if self.focus == Focus::Projects => {
                 self.modal = Some(Modal::CreateProject(CreateProjectForm::new(
                     self.config.harness,
@@ -1108,7 +1126,7 @@ impl App {
             },
             Modal::DeleteSandbox(mut modal) => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => Vec::new(),
-                KeyCode::Char('y') | KeyCode::Enter => match modal.stage {
+                KeyCode::Char('y') => match modal.stage {
                     DeleteSandboxStage::Confirm => {
                         if self.workspace_is_inside_sandbox(&modal.sandbox) {
                             modal.stage = DeleteSandboxStage::Files;
@@ -1402,7 +1420,8 @@ impl App {
     }
 
     fn handle_confirm_key(&mut self, key: KeyEvent, prompt: ConfirmPrompt) -> Vec<Effect> {
-        let confirmed = matches!(key.code, KeyCode::Char('y') | KeyCode::Enter);
+        // Destructive confirmation must be explicit: Enter never confirms.
+        let confirmed = matches!(key.code, KeyCode::Char('y'));
         let cancelled = matches!(key.code, KeyCode::Char('n') | KeyCode::Esc);
         if cancelled {
             return Vec::new();
@@ -1428,7 +1447,9 @@ impl App {
 
     fn handle_security_key(&mut self, key: KeyEvent, prompt: SecurityPrompt) -> Vec<Effect> {
         match key.code {
-            KeyCode::Char('a') | KeyCode::Enter => {
+            // Allowing a flagged command is destructive; Enter deliberately
+            // falls through to the catch-all and leaves the prompt open.
+            KeyCode::Char('a') => {
                 if self.write_line(&prompt.command) {
                     self.toast("command approved once", ToastLevel::Warn);
                 }
@@ -1744,6 +1765,15 @@ impl App {
         self.modal = Some(Modal::Doctor(DoctorModal::new(report)));
     }
 
+    /// Feed a synthetic key to the multi-agent modal (used by clickable hints).
+    fn multi_agent_key(&mut self, code: KeyCode) -> Vec<Effect> {
+        if matches!(self.modal, Some(Modal::MultiAgent(_))) {
+            self.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Dispatch a footer click or a direct action (mouse support).
     pub fn handle_action(&mut self, action: ActionId) -> Vec<Effect> {
         match action {
@@ -1925,6 +1955,11 @@ impl App {
                     Vec::new()
                 }
             }
+            ActionId::MultiAgentMore => self.multi_agent_key(KeyCode::Up),
+            ActionId::MultiAgentFewer => self.multi_agent_key(KeyCode::Down),
+            ActionId::HarnessPrev => self.multi_agent_key(KeyCode::Left),
+            ActionId::HarnessNext => self.multi_agent_key(KeyCode::Right),
+            ActionId::ToggleCloneStart => self.multi_agent_key(KeyCode::Char(' ')),
             ActionId::Close => {
                 self.modal = None;
                 Vec::new()
@@ -2262,6 +2297,71 @@ mod tests {
         assert_eq!(app.focus, Focus::Snapshots);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Projects);
+    }
+
+    #[test]
+    fn number_keys_jump_to_the_matching_tab() {
+        let (_dir, mut app) = test_app();
+        assert_eq!(app.focus, Focus::Projects);
+        app.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(app.focus, Focus::Sandboxes);
+        app.handle_key(key(KeyCode::Char('3')));
+        assert_eq!(app.focus, Focus::Snapshots);
+        app.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(app.focus, Focus::Projects);
+    }
+
+    #[test]
+    fn enter_never_confirms_a_deletion() {
+        let (_dir, mut app) = test_app();
+        let inside = app.config.sandboxes_dir.join("demo").join("workspace");
+        app.focus = Focus::Sandboxes;
+        app.sandboxes = vec![fake_sandbox(&app, "demo", inside)];
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::DeleteSandbox(crate::app::DeleteSandboxModal {
+                stage: crate::app::DeleteSandboxStage::Confirm,
+                ..
+            }))
+        ));
+
+        app.handle_key(key(KeyCode::Char('y')));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert!(effects.is_empty(), "Enter must not delete files");
+        assert!(matches!(
+            app.modal,
+            Some(Modal::DeleteSandbox(crate::app::DeleteSandboxModal {
+                stage: crate::app::DeleteSandboxStage::Files,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn enter_never_confirms_destructive_prompts() {
+        let (_dir, mut app) = test_app();
+        app.modal = Some(Modal::Confirm(ConfirmPrompt {
+            title: "Delete snapshot".into(),
+            message: "Delete 'demo'?".into(),
+            confirm_label: "Delete".into(),
+            action: ConfirmAction::DeleteSnapshot("demo".into()),
+        }));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.modal, Some(Modal::Confirm(_))));
+
+        app.modal = Some(Modal::Security(SecurityPrompt {
+            command: "rm -rf /workspace".into(),
+            project: PathBuf::from("/tmp"),
+            inspection: app.security_engine().inspect("rm -rf /workspace", None),
+            error: None,
+        }));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(app.modal, Some(Modal::Security(_))),
+            "Enter must not allow a flagged command"
+        );
     }
 
     #[test]
@@ -2715,6 +2815,23 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn multi_agent_hint_actions_drive_the_form() {
+        let (_dir, mut app) = test_app();
+        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
+        app.handle_key(key(KeyCode::Char('M')));
+        app.handle_action(ActionId::MultiAgentMore);
+        match &app.modal {
+            Some(Modal::MultiAgent(form)) => assert_eq!(form.count, 3),
+            other => panic!("expected multi-agent modal, got {other:?}"),
+        }
+        app.handle_action(ActionId::ToggleCloneStart);
+        match &app.modal {
+            Some(Modal::MultiAgent(form)) => assert!(!form.start),
+            other => panic!("expected multi-agent modal, got {other:?}"),
+        }
     }
 
     #[test]

@@ -453,9 +453,16 @@ and `root_device`; the official qcow2 image uses `/dev/vda1`.
   region on normal exit and on panic unwinding.
 
 Modals: create project, import project, doctor, security prompt, confirm,
-help and error. Every footer button has an `ActionId` and is clicked through the
-same `handle_action` path as its keybinding. Footer buttons invert their colors
-while `MouseEventKind::Moved` reports the pointer inside their rectangle.
+help and error. Every footer button and every keybinding hint drawn inside a
+modal has an `ActionId` and is clicked through the same `handle_action` path as
+its keybinding. Both invert their colors while `MouseEventKind::Moved` reports
+the pointer inside their rectangle. Destructive confirmations (delete sandbox,
+delete/restore snapshot, allow a flagged command) accept only their explicit
+key — `Enter` deliberately leaves the modal open.
+
+The three focusable dashboard tabs are also addressable by number: `1` for
+projects, `2` for sandboxes and `3` for snapshots. Each panel title carries a
+colored `[n]` badge in its top-right corner.
 
 VM starts run on a named worker thread (`hegn-start-vm`) and report through the
 same channel as project scans. The UI therefore keeps drawing an animated

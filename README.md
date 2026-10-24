@@ -538,6 +538,7 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 | `↑`/`↓`, `j`/`k` | Move selection |
 | `Enter` / `o` | Open project (projects), attach/start sandbox (sandboxes), restore snapshot |
 | `/` | Fuzzy filter projects |
+| `1` / `2` / `3` | Jump to the projects / sandboxes / snapshots tab |
 | `Tab` | Switch projects → sandboxes → snapshots |
 | `b` | Focus the sandbox list |
 | `c` | Create project (projects focus) |
@@ -552,6 +553,17 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 | `F3` | Doctor modal (host checks, image download) |
 | `?` / `F1` | Help |
 | `q` | Quit |
+
+Each focusable tab shows its number shortcut as a coloured `[1]`, `[2]`, `[3]`
+badge in the top-right corner of the panel.
+
+Destructive actions are never confirmed with `Enter`. Deleting a sandbox or
+snapshot and allowing a flagged command require the explicit `y` (or `a` for
+the security prompt) key; `Enter` leaves the confirmation modal open.
+
+Every keybinding hint inside a modal is rendered as a clickable button, just
+like the footer buttons. Hovering one inverts its colors for immediate feedback;
+keyboard input clears the hover state.
 
 ### Snapshot panel
 
@@ -599,11 +611,12 @@ tools (lazygit, `$EDITOR`) never make the report fail.
 | --- | --- |
 | `a` | Allow flagged command once |
 | `c` | Create a git checkpoint, then allow |
-| `d` | Deny command |
+| `d` / `Esc` | Deny command |
 
-Every action is also clickable in the footer. Hovering a footer button with the
-mouse inverts its colors for immediate feedback; keyboard input clears the hover
-state.
+`Enter` never allows a flagged command; it leaves the prompt open. Every action
+is clickable both as a button inside the modal and in the footer. Hovering a
+button with the mouse inverts its colors for immediate feedback; keyboard input
+clears the hover state.
 
 ### Theming
 

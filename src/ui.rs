@@ -58,9 +58,9 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
         Screen::Dashboard => render_dashboard(frame, app, chunks[1]),
         Screen::Terminal => render_terminal(frame, app, chunks[1]),
     };
-    let footer = render_footer(frame, app, chunks[2]);
+    let mut footer = render_footer(frame, app, chunks[2]);
     if let Some(modal) = &app.modal {
-        render_modal(frame, app, modal, area);
+        footer.extend(render_modal(frame, app, modal, area));
     }
     render_toast(frame, app, chunks[1]);
 
@@ -183,7 +183,7 @@ fn render_sidebar(
 fn render_projects(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
     let active = app.focus == Focus::Projects;
     let title = format!(" projects ({}) ", app.projects.len());
-    let block = panel_block(title, active);
+    let block = tab_block(title, 1, active);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -321,7 +321,7 @@ fn branch_color(git: &crate::project::GitSummary) -> Color {
 fn render_sandboxes(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
     let active = app.focus == Focus::Sandboxes;
     let title = format!(" sandboxes ({}) ", app.sandboxes.len());
-    let block = panel_block(title, active);
+    let block = tab_block(title, 2, active);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -420,7 +420,7 @@ fn render_sandboxes(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
 fn render_snapshots(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
     let active = app.focus == Focus::Snapshots;
     let title = format!(" snapshots ({}) ", app.snapshots.len());
-    let block = panel_block(title, active);
+    let block = tab_block(title, 3, active);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -919,7 +919,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
         } else if app.screen == Screen::Terminal {
             " Esc dashboard · Ctrl-B dashboard · PgUp/PgDn scroll · Ctrl-L clear ".to_string()
         } else {
-            " / filter · Tab focus · Enter open · c create · ? help ".to_string()
+            " / filter · 1-3 focus · Tab cycle · Enter open · c create · ? help ".to_string()
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(MUTED)))),
@@ -1219,36 +1219,114 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
     }
 }
 
-fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
+/// Draw a row of clickable keybinding hints. The buttons use the same hover
+/// treatment as the footer and wrap onto following rows when space runs out.
+/// The returned hit boxes are merged with the footer hits so mouse clicks
+/// dispatch exactly the same action as the keyboard shortcut.
+fn hint_buttons(frame: &mut Frame, app: &App, area: Rect, buttons: &[FooterDef]) -> Vec<FooterHit> {
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let widths: Vec<u16> = buttons
+        .iter()
+        .map(|button| (format!("<{}> {}", button.key, button.label).width() as u16) + 2)
+        .collect();
+    let total = widths.iter().sum::<u16>() + buttons.len().saturating_sub(1) as u16;
+    let mut x = area.x + area.width.saturating_sub(total) / 2;
+    let mut y = area.y;
+    let mut hits = Vec::new();
+    for (button, width) in buttons.iter().zip(widths) {
+        if x.saturating_add(width) > area.x + area.width {
+            y += 1;
+            x = area.x;
+            if y >= area.y + area.height {
+                break;
+            }
+        }
+        let style = if app.hovered == Some(button.action) {
+            // Inverted: the terminal accent becomes the text color and the
+            // default background becomes the button background.
+            Style::default()
+                .fg(ACCENT)
+                .bg(ON_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(ON_ACCENT)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        };
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" <{}> {} ", button.key, button.label),
+                style,
+            ))),
+            rect,
+        );
+        hits.push(FooterHit {
+            rect,
+            action: button.action,
+        });
+        x += width + 1;
+    }
+    hits
+}
+
+fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Vec<FooterHit> {
     match modal {
-        Modal::Help => render_help(frame, area),
+        Modal::Help => render_help(frame, app, area),
         Modal::Error { title, message } => render_message(
             frame,
+            app,
             area,
             60,
             30,
+            1,
             title,
             message,
             RED,
-            "Press any key to close",
+            &[FooterDef {
+                key: "Esc",
+                label: "Close",
+                action: ActionId::Close,
+            }],
         ),
         Modal::Confirm(prompt) => {
             let body = format!("{}\n\nConfirm: {}", prompt.message, prompt.confirm_label);
             render_message(
                 frame,
+                app,
                 area,
                 64,
                 34,
+                1,
                 &prompt.title,
                 &body,
                 YELLOW,
-                "y confirm · n/Esc cancel",
-            );
+                &[
+                    FooterDef {
+                        key: "y",
+                        label: "Confirm",
+                        action: ActionId::Confirm,
+                    },
+                    FooterDef {
+                        key: "n",
+                        label: "Cancel",
+                        action: ActionId::Cancel,
+                    },
+                ],
+            )
         }
         Modal::CreateProject(form) => render_create_form(frame, app, form, area),
         Modal::ImportProject(form) => render_import_form(frame, app, form, area),
-        Modal::Doctor(modal) => render_doctor(frame, modal, area),
-        Modal::Security(prompt) => render_security(frame, prompt, area),
+        Modal::Doctor(modal) => render_doctor(frame, app, modal, area),
+        Modal::Security(prompt) => render_security(frame, app, prompt, area),
         Modal::Config(modal) => {
             let rect = centered(area, 86, 82);
             frame.render_widget(Clear, rect);
@@ -1274,21 +1352,44 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                 chunks[0],
             );
             frame.render_widget(
-                Paragraph::new(Text::from(vec![
-                    Line::from(Span::styled(
-                        format!(" {}", modal.path.display()),
-                        Style::default().fg(MUTED),
-                    )),
-                    Line::from(Span::styled(
-                        " e/Enter edit · r reload · Esc close",
-                        Style::default().fg(CYAN),
-                    )),
-                ])),
-                chunks[1],
+                Paragraph::new(Span::styled(
+                    format!(" {}", modal.path.display()),
+                    Style::default().fg(MUTED),
+                )),
+                Rect {
+                    height: 1,
+                    ..chunks[1]
+                },
             );
+            hint_buttons(
+                frame,
+                app,
+                Rect {
+                    y: chunks[1].y + 1,
+                    height: 1,
+                    ..chunks[1]
+                },
+                &[
+                    FooterDef {
+                        key: "e",
+                        label: "Edit",
+                        action: ActionId::EditConfig,
+                    },
+                    FooterDef {
+                        key: "r",
+                        label: "Reload",
+                        action: ActionId::ReloadConfig,
+                    },
+                    FooterDef {
+                        key: "Esc",
+                        label: "Close",
+                        action: ActionId::Close,
+                    },
+                ],
+            )
         }
         Modal::DeleteSandbox(modal) => {
-            let (body, color) = match modal.stage {
+            let (body, color, buttons): (String, Color, &[FooterDef]) = match modal.stage {
                 DeleteSandboxStage::Confirm => (
                     format!(
                         "Delete sandbox '{}'?\n\nProject: {}\nWorkspace: {}\n\nThe VM is stopped first.",
@@ -1297,6 +1398,18 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                         modal.sandbox.workspace.display()
                     ),
                     YELLOW,
+                    &[
+                        FooterDef {
+                            key: "y",
+                            label: "Continue",
+                            action: ActionId::Confirm,
+                        },
+                        FooterDef {
+                            key: "n",
+                            label: "Cancel",
+                            action: ActionId::Cancel,
+                        },
+                    ],
                 ),
                 DeleteSandboxStage::Files => (
                     format!(
@@ -1304,13 +1417,37 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                         modal.sandbox.workspace.display()
                     ),
                     RED,
+                    &[
+                        FooterDef {
+                            key: "y",
+                            label: "Delete files",
+                            action: ActionId::Confirm,
+                        },
+                        FooterDef {
+                            key: "n",
+                            label: "Keep files",
+                            action: ActionId::KeepFiles,
+                        },
+                        FooterDef {
+                            key: "Esc",
+                            label: "Cancel",
+                            action: ActionId::Cancel,
+                        },
+                    ],
                 ),
             };
-            let hint = match modal.stage {
-                DeleteSandboxStage::Confirm => "y/Enter continue · n/Esc cancel",
-                DeleteSandboxStage::Files => "y/Enter delete files · n keep files · Esc cancel",
-            };
-            render_message(frame, area, 72, 42, "delete sandbox", &body, color, hint);
+            let hits = render_message(
+                frame,
+                app,
+                area,
+                72,
+                42,
+                1,
+                "delete sandbox",
+                &body,
+                color,
+                buttons,
+            );
             if let Some(error) = &modal.error {
                 let rect = centered(area, 72, 42);
                 frame.render_widget(
@@ -1323,6 +1460,7 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                     },
                 );
             }
+            hits
         }
         Modal::MultiAgent(form) => {
             let body = format!(
@@ -1332,15 +1470,53 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                 form.harness.label(),
                 if form.start { "yes" } else { "no" }
             );
-            render_message(
+            let hits = render_message(
                 frame,
+                app,
                 area,
                 72,
                 50,
+                2,
                 "multi-agent clones",
                 &body,
                 CYAN,
-                "↑/↓ clones · ←/→ harness · Space start · Enter create · Esc cancel",
+                &[
+                    FooterDef {
+                        key: "↑",
+                        label: "clones",
+                        action: ActionId::MultiAgentMore,
+                    },
+                    FooterDef {
+                        key: "↓",
+                        label: "clones",
+                        action: ActionId::MultiAgentFewer,
+                    },
+                    FooterDef {
+                        key: "←",
+                        label: "harness",
+                        action: ActionId::HarnessPrev,
+                    },
+                    FooterDef {
+                        key: "→",
+                        label: "harness",
+                        action: ActionId::HarnessNext,
+                    },
+                    FooterDef {
+                        key: "Space",
+                        label: "start",
+                        action: ActionId::ToggleCloneStart,
+                    },
+                    FooterDef {
+                        key: "Enter",
+                        label: "Create clones",
+                        action: ActionId::Confirm,
+                    },
+                    FooterDef {
+                        key: "Esc",
+                        label: "Cancel",
+                        action: ActionId::Cancel,
+                    },
+                ],
             );
             if let Some(error) = &form.error {
                 let rect = centered(area, 72, 50);
@@ -1348,12 +1524,13 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                     Paragraph::new(Span::styled(format!(" {error}"), Style::default().fg(RED))),
                     Rect {
                         x: rect.x + 2,
-                        y: rect.y + rect.height.saturating_sub(3),
+                        y: rect.y + rect.height.saturating_sub(4),
                         width: rect.width.saturating_sub(4),
                         height: 1,
                     },
                 );
             }
+            hits
         }
     }
 }
@@ -1361,14 +1538,16 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
 #[allow(clippy::too_many_arguments)]
 fn render_message(
     frame: &mut Frame,
+    app: &App,
     area: Rect,
     width_pct: u16,
     height_pct: u16,
+    hint_rows: u16,
     title: &str,
     body: &str,
     color: Color,
-    hint: &str,
-) {
+    buttons: &[FooterDef],
+) -> Vec<FooterHit> {
     let rect = centered(area, width_pct, height_pct);
     frame.render_widget(Clear, rect);
     let block = Block::default()
@@ -1384,7 +1563,7 @@ fn render_message(
     frame.render_widget(block, rect);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(2), Constraint::Length(1)])
+        .constraints([Constraint::Min(2), Constraint::Length(hint_rows.max(1))])
         .split(inner);
     frame.render_widget(
         Paragraph::new(body)
@@ -1392,15 +1571,11 @@ fn render_message(
             .wrap(Wrap { trim: false }),
         chunks[0],
     );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(MUTED))))
-            .alignment(Alignment::Center),
-        chunks[1],
-    );
+    hint_buttons(frame, app, chunks[1], buttons)
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
-    let rect = centered(area, 72, 82);
+fn render_help(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
+    let rect = centered(area, 72, 90);
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1413,6 +1588,10 @@ fn render_help(frame: &mut Frame, area: Rect) {
         .style(Style::default());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
 
     let sections: Vec<(&str, &[(&str, &str)])> = vec![
         (
@@ -1422,6 +1601,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("Enter", "open project in sandbox"),
                 ("/", "fuzzy filter projects"),
                 ("Tab", "switch projects → sandboxes → snapshots"),
+                ("1 / 2 / 3", "jump to projects / sandboxes / snapshots"),
                 ("c", "create project"),
                 ("h / ←", "import existing project"),
                 ("F4", "global config"),
@@ -1496,7 +1676,17 @@ fn render_help(frame: &mut Frame, area: Rect) {
         " All actions are also available non-interactively: hegn --help",
         Style::default().fg(MUTED),
     )));
-    frame.render_widget(Paragraph::new(lines).style(Style::default()), inner);
+    frame.render_widget(Paragraph::new(lines).style(Style::default()), chunks[0]);
+    hint_buttons(
+        frame,
+        app,
+        chunks[1],
+        &[FooterDef {
+            key: "Esc",
+            label: "Close",
+            action: ActionId::Close,
+        }],
+    )
 }
 
 fn render_create_form(
@@ -1504,7 +1694,7 @@ fn render_create_form(
     app: &App,
     form: &crate::app::CreateProjectForm,
     area: Rect,
-) {
+) -> Vec<FooterHit> {
     let rect = centered(area, 74, 84);
     frame.render_widget(Clear, rect);
     let block = Block::default()
@@ -1634,7 +1824,7 @@ fn render_create_form(
     )));
     frame.render_widget(Paragraph::new(pkg_lines), pkg_inner);
 
-    // Errors + submit.
+    // Errors + clickable keybinding hints.
     let mut bottom = Vec::new();
     if let Some(error) = &form.error {
         bottom.push(Line::from(Span::styled(
@@ -1642,19 +1832,39 @@ fn render_create_form(
             Style::default().fg(RED),
         )));
     }
-    let submit_style = if form.focus == CreateFocus::Create {
-        Style::default()
-            .fg(ON_ACCENT)
-            .bg(ACCENT)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(ACCENT)
-    };
-    bottom.push(Line::from(Span::styled(
-        "   [ Create project ]",
-        submit_style,
-    )));
-    frame.render_widget(Paragraph::new(bottom), chunks[3]);
+    frame.render_widget(
+        Paragraph::new(bottom),
+        Rect {
+            height: 1,
+            ..chunks[3]
+        },
+    );
+    hint_buttons(
+        frame,
+        app,
+        Rect {
+            y: chunks[3].y + 1,
+            height: 1,
+            ..chunks[3]
+        },
+        &[
+            FooterDef {
+                key: "Tab",
+                label: "Next field",
+                action: ActionId::NextField,
+            },
+            FooterDef {
+                key: "Enter",
+                label: "Create",
+                action: ActionId::SubmitCreate,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Cancel",
+                action: ActionId::Close,
+            },
+        ],
+    )
 }
 
 fn render_import_form(
@@ -1662,7 +1872,7 @@ fn render_import_form(
     app: &App,
     form: &crate::app::ImportProjectForm,
     area: Rect,
-) {
+) -> Vec<FooterHit> {
     let rect = centered(area, 78, 56);
     frame.render_widget(Clear, rect);
     let block = Block::default()
@@ -1762,6 +1972,7 @@ fn render_import_form(
         chunks[2],
     );
 
+    // Errors + clickable keybinding hints.
     let mut bottom = Vec::new();
     if let Some(error) = &form.error {
         bottom.push(Line::from(Span::styled(
@@ -1769,22 +1980,47 @@ fn render_import_form(
             Style::default().fg(RED),
         )));
     }
-    let submit_style = if form.focus == crate::app::ImportFocus::Name {
-        Style::default().fg(ACCENT)
-    } else {
-        Style::default()
-            .fg(ON_ACCENT)
-            .bg(ACCENT)
-            .add_modifier(Modifier::BOLD)
-    };
-    bottom.push(Line::from(Span::styled(
-        "   [ Import project ]",
-        submit_style,
-    )));
-    frame.render_widget(Paragraph::new(bottom), chunks[3]);
+    frame.render_widget(
+        Paragraph::new(bottom),
+        Rect {
+            height: 1,
+            ..chunks[3]
+        },
+    );
+    hint_buttons(
+        frame,
+        app,
+        Rect {
+            y: chunks[3].y + 1,
+            height: 1,
+            ..chunks[3]
+        },
+        &[
+            FooterDef {
+                key: "Tab",
+                label: "Next field",
+                action: ActionId::NextField,
+            },
+            FooterDef {
+                key: "Enter",
+                label: "Import",
+                action: ActionId::SubmitImport,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Cancel",
+                action: ActionId::Close,
+            },
+        ],
+    )
 }
 
-fn render_doctor(frame: &mut Frame, modal: &crate::app::DoctorModal, area: Rect) {
+fn render_doctor(
+    frame: &mut Frame,
+    app: &App,
+    modal: &crate::app::DoctorModal,
+    area: Rect,
+) -> Vec<FooterHit> {
     let rect = centered(area, 92, 82);
     frame.render_widget(Clear, rect);
     let block = Block::default()
@@ -1880,20 +2116,33 @@ fn render_doctor(frame: &mut Frame, modal: &crate::app::DoctorModal, area: Rect)
             .wrap(Wrap { trim: false }),
         inner_chunks[0],
     );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            if modal.report.can_download() {
-                " d download missing images · r re-run · Esc close "
-            } else {
-                " r re-run · Esc close "
-            },
-            Style::default().fg(MUTED),
-        ))),
-        inner_chunks[1],
-    );
+    let mut buttons = Vec::new();
+    if modal.report.can_download() {
+        buttons.push(FooterDef {
+            key: "d",
+            label: "Download images",
+            action: ActionId::DownloadImages,
+        });
+    }
+    buttons.push(FooterDef {
+        key: "r",
+        label: "Re-run",
+        action: ActionId::Doctor,
+    });
+    buttons.push(FooterDef {
+        key: "Esc",
+        label: "Close",
+        action: ActionId::Close,
+    });
+    hint_buttons(frame, app, inner_chunks[1], &buttons)
 }
 
-fn render_security(frame: &mut Frame, prompt: &crate::app::SecurityPrompt, area: Rect) {
+fn render_security(
+    frame: &mut Frame,
+    app: &App,
+    prompt: &crate::app::SecurityPrompt,
+    area: Rect,
+) -> Vec<FooterHit> {
     let rect = centered(area, 82, 80);
     frame.render_widget(Clear, rect);
     let blocked = prompt.inspection.decision == crate::security::Decision::Block;
@@ -1982,14 +2231,28 @@ fn render_security(frame: &mut Frame, prompt: &crate::app::SecurityPrompt, area:
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[1]);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "a allow once   c checkpoint + allow   d / Esc deny",
-            Style::default().fg(MUTED),
-        )))
-        .alignment(Alignment::Center),
+    hint_buttons(
+        frame,
+        app,
         chunks[2],
-    );
+        &[
+            FooterDef {
+                key: "a",
+                label: "Allow once",
+                action: ActionId::Allow,
+            },
+            FooterDef {
+                key: "c",
+                label: "Checkpoint + allow",
+                action: ActionId::Checkpoint,
+            },
+            FooterDef {
+                key: "d",
+                label: "Deny",
+                action: ActionId::Deny,
+            },
+        ],
+    )
 }
 
 fn render_toast(frame: &mut Frame, app: &App, area: Rect) {
@@ -2036,13 +2299,27 @@ fn panel_block(title: String, active: bool) -> Block<'static> {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if active { ACCENT } else { BORDER }))
-        .title(Span::styled(
+        .title_top(Span::styled(
             title,
             Style::default()
                 .fg(if active { ACCENT } else { MUTED })
                 .add_modifier(Modifier::BOLD),
         ))
         .style(Style::default())
+}
+
+/// A focusable sidebar tab: like [`panel_block`], but with a coloured
+/// `[n]` shortcut badge in the top-right corner.
+fn tab_block(title: String, number: usize, active: bool) -> Block<'static> {
+    panel_block(title, active).title_top(
+        Line::from(Span::styled(
+            format!("[{number}] "),
+            Style::default()
+                .fg(if active { GREEN } else { YELLOW })
+                .add_modifier(Modifier::BOLD),
+        ))
+        .right_aligned(),
+    )
 }
 
 fn spinner(tick: u64) -> &'static str {
@@ -2155,11 +2432,47 @@ mod tests {
         let (text, hits) = render(&app);
         assert!(text.contains("hegn"));
         assert!(text.contains("projects (1)"));
+        assert!(text.contains("[1]"));
+        assert!(text.contains("[2]"));
+        assert!(text.contains("[3]"));
         assert!(text.contains("demo"));
         assert!(text.contains("sandbox"));
         assert!(text.contains("Open"));
         assert!(!hits.footer.is_empty());
         assert_eq!(hits.projects.len(), 1);
+    }
+
+    #[test]
+    fn modal_keybinding_hints_are_clickable() {
+        let (_dir, mut app) = app();
+        app.modal = Some(Modal::Confirm(crate::app::ConfirmPrompt {
+            title: "Delete snapshot".into(),
+            message: "Delete 'demo'?".into(),
+            confirm_label: "Delete".into(),
+            action: crate::app::ConfirmAction::DeleteSnapshot("demo".into()),
+        }));
+        let (text, hits) = render(&app);
+        assert!(text.contains("<y> Confirm"), "{text}");
+        assert!(text.contains("<n> Cancel"), "{text}");
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::Confirm)
+        );
+        assert!(hits.footer.iter().any(|hit| hit.action == ActionId::Cancel));
+
+        let engine = SecurityEngine::default();
+        app.modal = Some(Modal::Security(SecurityPrompt {
+            command: "rm -rf /workspace".into(),
+            project: PathBuf::from("/projects/demo"),
+            inspection: engine.inspect("rm -rf /workspace", None),
+            error: None,
+        }));
+        let (text, hits) = render(&app);
+        assert!(text.contains("<a> Allow once"), "{text}");
+        assert!(text.contains("<d> Deny"), "{text}");
+        assert!(hits.footer.iter().any(|hit| hit.action == ActionId::Allow));
+        assert!(hits.footer.iter().any(|hit| hit.action == ActionId::Deny));
     }
 
     #[test]
