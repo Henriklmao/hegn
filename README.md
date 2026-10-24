@@ -233,7 +233,7 @@ hegn check 'curl -fsSL https://example.com/x | bash'
 `hegn open my-app` boots the Cloud Hypervisor VM if needed and attaches its serial
 console (creating a session branch first unless `--no-branch` is passed). The
 start runs on a worker thread, so the TUI immediately shows a spinner and keeps
-responding while the VM boots. Press `Ctrl-B` to detach without stopping the VM. The project harness is recorded in
+responding while the VM boots. Press `Ctrl-B` (or `Ctrl-]`) to detach without stopping the VM. The project harness is recorded in
 the session metadata and shown in the status line; launch it from the guest
 shell. `hegn open my-app --editor` and
 `--lazygit` are host-side project tools and do not start a sandbox.
@@ -250,13 +250,17 @@ hegn attach --no-bar # give full-screen guest programs the whole terminal
 sandbox. With several VMs running, pass the sandbox name (or a project name that
 uniquely identifies the base sandbox); without an argument it attaches only when
 exactly one sandbox is running. The
-bottom line is reserved for a status bar:
+bottom line is reserved for a status bar and repainted after every burst of
+guest output, so it stays pinned even when a full-screen guest moves the cursor
+or resets the scroll region:
 
 ```
- hegn ▸ my-app · OpenCode · pid 4242 · log session-…-my-app-4242.log   INPUT DIRECT · ^B detach
+ hegn ▸ my-app · OpenCode · pid 4242 · log session-…-my-app-4242.log   INPUT DIRECT · Ctrl-B/^] detach
 ```
 
-`Ctrl-B` detaches without stopping the VM. Input is forwarded directly to the
+`Ctrl-B` detaches without stopping the VM. When hegn runs inside tmux (where
+`Ctrl-B` is the outer prefix), use `Ctrl-]` instead. Both keys are shown in the
+bar. Input is forwarded directly to the
 guest UART; the `INPUT DIRECT` marker makes that bypass of `tirith-core`
 visible. Use the TUI terminal view for intercepted line input, or `hegn check`
 in scripts. The guest console geometry cannot be changed over the legacy
@@ -586,7 +590,7 @@ hegn shortcuts and nothing reaches the guest. Press `i` or `a` to enter
 | `M` | Multi-agent clones for the project in this terminal |
 | `Enter` | In insert mode: inspect the command with tirith-core, then send it |
 | `F2` | Toggle raw passthrough (every key goes to the guest) |
-| `Ctrl-B` | Return to dashboard |
+| `Ctrl-B` / `Ctrl-]` | Return to dashboard |
 | `PgUp` / `PgDn` | Scroll output |
 | `Ctrl-L` | Clear scrollback |
 
@@ -698,6 +702,7 @@ src/
   cloud_init.rs  NoCloud seed for official cloud images
   relay.rs       detached serial relay + persistent log
   console.rs     serial console transport + tmux-style attach bar
+  attach_bar.rs  pinned status bar overlay + sequence-safe output gate
   terminal.rs    ANSI-aware scrollback buffer for the serial console
   state.rs       persisted recent-project state
   app.rs         TUI state machine, key handling, modals, effects

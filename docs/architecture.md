@@ -47,6 +47,7 @@ configuration, runtime directory, serial log and private root filesystem.
 │    │     ├── cloud_init.rs  ── NoCloud seed for official images           │
 │    │     ├── sandbox_config.rs ── hegn.toml, clones, rootfs copies        │
 │    │     ├── console.rs     ── relay socket + attach bar                  │
+│    │     ├── attach_bar.rs  ── pinned status bar + output gate            │
 │    │     ├── snapshot.rs    ── snapshot metadata                          │
 │    │     └── logs.rs        ── private logs, tail and pruning             │
 │    ├── images.rs ── upstream kernel/rootfs download + SHA-256             │
@@ -182,6 +183,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `doctor.rs` | Shared host checks for CLI and TUI | Required vs optional checks; missing images are downloadable |
 | `benchmark.rs` | Measured host cost: process RSS, disk usage, snapshot estimate; boots a VM only when asked | Refuses to delete anything outside its own `hegn-benchmark-*` projects; sparse-aware accounting; JSON output |
 | `console.rs` | Serial transport over the relay socket, tmux-style attach, status bar | Never pretends a VM exists; verifies VMM and relay; bar content sanitized; `--no-bar` for full-screen guests |
+| `attach_bar.rs` | Bottom status bar overlay and sequence-safe output gate | Clamps DECSTBM so the bar stays pinned; repaints after every output burst; never injects into a split escape sequence or UTF-8 character |
 | `logs.rs` | Log naming, listing, resolve, tail, prune | `O_NOFOLLOW`, regular files only, no foreign files deleted, active log protected |
 | `terminal.rs` | ANSI-aware scrollback | Strips CSI/OSC; handles CRLF without losing lines; caps line bytes and scrollback |
 | `state.rs` | Recent-project persistence | Atomic tmp+rename |
@@ -235,8 +237,10 @@ remain available.
 5. Connect to `console.sock`. The relay replays the log tail, then forwards
    input and live output.
 6. Enter the alternate screen, reserve the bottom line with DECSTBM, and
-   forward input. `Ctrl-B` detaches; the VM keeps running. `--no-bar` uses the full terminal
-   for full-screen guest programs.
+   forward input. The bar is repainted after every output burst and the region
+   is re-reserved after a terminal reset. `Ctrl-B` (or `Ctrl-]`) detaches; the
+   VM keeps running. `--no-bar` uses the full terminal for full-screen guest
+   programs.
 
 Attach never boots, restarts or repairs a VM.
 
@@ -486,11 +490,22 @@ button chips, toast badges and status markers.
 
 The CLI attach view is not a full terminal emulator. It reserves the bottom host
 row with a DECSTBM scroll region and paints a reverse-video status line
-containing project, harness, VM pid and log. It uses DECSC/DECRC around bar
-repaints and refreshes only after the guest has been quiet for ten seconds.
+containing project, harness, VM pid, log and the detach keys. Unlike a one-shot
+overlay, the bar is repainted after every burst of guest output and the scroll
+region is re-reserved after a terminal reset. DECSTBM sequences from the guest
+are clamped so the reserved row can never enter the guest's scrolling region,
+which keeps line feeds from scrolling the bar up into the guest output.
 `--no-bar` disables the reservation for guest programs that need every row.
 The guest tty geometry is fixed by the serial console and cannot be resized
 from the host.
+
+An `OutputGate` sits between the relay socket and the terminal. It holds
+incomplete escape sequences and reports whether the stream ends on a UTF-8
+character boundary; the bar is only injected at such a boundary so a repaint
+can never split a guest sequence or character.
+
+`Ctrl-B` detaches without stopping the VM. `Ctrl-]` is accepted as well, which
+matters when hegn runs inside tmux and `Ctrl-B` is consumed as the tmux prefix.
 
 ---
 
@@ -691,8 +706,11 @@ changes to the guest tty anyway.
 
 **Consequence:** full-screen guests see one fewer usable row (or can be attached
 with `--no-bar`); cursor save/restore and SGR state can interact with the bar.
-The TUI remains the modal, line-intercepted view: `i`/`a` enters insert mode and
-`Esc` returns to normal mode.
+The overlay repaints after each output burst rather than relying on a one-shot
+paint, clamps guest DECSTBM sequences so the reserved row stays outside their
+scroll region, and re-reserves the region after RIS/DECSTR. The TUI remains the
+modal, line-intercepted view: `i`/`a` enters insert mode and `Esc` returns to
+normal mode.
 
 ---
 
@@ -740,6 +758,7 @@ src/
   images.rs      upstream image pins, downloads, SHA-256
   doctor.rs      shared host checks
   console.rs     serial transport over the relay, attach bar
+  attach_bar.rs  status bar overlay + sequence-safe output gate
   logs.rs        persistent logs, tail, prune
   terminal.rs    ANSI-aware scrollback
   state.rs       recent-project state

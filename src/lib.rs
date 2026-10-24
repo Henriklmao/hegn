@@ -15,6 +15,7 @@
 //! - [`images`] — pinned upstream VM assets, downloads and checksum checks
 //! - [`doctor`] — shared host prerequisite checks for CLI and TUI
 //! - [`console`] — Cloud Hypervisor serial-console transport (no host fallback)
+//! - [`attach_bar`] — bottom status bar and sequence-safe output gate for attach
 //! - [`terminal`] — ANSI-aware scrollback buffer
 //! - [`state`] — persisted recent-project state
 //! - [`app`] — TUI application state and event handling
@@ -24,6 +25,7 @@
 //! - [`cli`] — non-interactive command surface
 
 pub mod app;
+pub mod attach_bar;
 pub mod benchmark;
 pub mod cli;
 pub mod cloud_hypervisor;

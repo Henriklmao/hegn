@@ -917,7 +917,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
         let hint = if app.searching {
             " typing filter · ↑↓ select · Enter open · Esc cancel ".to_string()
         } else if app.screen == Screen::Terminal {
-            " Esc dashboard · Ctrl-B dashboard · PgUp/PgDn scroll · Ctrl-L clear ".to_string()
+            " Esc dashboard · Ctrl-B/^] dashboard · PgUp/PgDn scroll · Ctrl-L clear ".to_string()
         } else {
             " / filter · 1-3 focus · Tab cycle · Enter open · c create · ? help ".to_string()
         };

@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::attach_bar::{OutputGate, StatusBar, detach_requested};
 use crate::config::Config;
 use crate::logs::sanitize_label;
 use crate::relay;
@@ -241,23 +241,21 @@ impl TerminalConsole for VmConsole {
 /// the status bar, and the guest needs at least a few lines above it.
 const MIN_COLS: u16 = 32;
 const MIN_ROWS: u16 = 4;
-/// Redraw the bar after the guest has been quiet this long. This repairs a bar
-/// removed by a guest clear-screen without constantly resetting SGR state, and
-/// input/output is never interleaved with escape sequences while output flows.
-const BAR_REFRESH: Duration = Duration::from_secs(10);
 
 /// Attaches the process terminal to the console and restores it on drop,
 /// including when the console loop unwinds with a panic.
 struct TerminalGuard {
     cols: u16,
     rows: u16,
-    bar: bool,
 }
 
 impl TerminalGuard {
-    fn enter(bar: bool) -> Result<Self> {
+    fn enter() -> Result<Self> {
+        use crossterm::cursor::Show;
         use crossterm::execute;
-        use crossterm::terminal::{EnterAlternateScreen, disable_raw_mode, enable_raw_mode};
+        use crossterm::terminal::{
+            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        };
 
         let (cols, rows) =
             crossterm::terminal::size().context("failed to read the terminal size")?;
@@ -273,19 +271,21 @@ impl TerminalGuard {
             disable_raw_mode().ok();
             return Err(err).context("failed to enter the serial console");
         }
-        let mut guard = Self { cols, rows, bar };
-        if let Err(err) = guard.reset_region(&mut out) {
-            drop(guard);
+        // Clear the alternate screen for both bar modes and start from a known
+        // margin/origin state.
+        if let Err(err) = write!(out, "\x1b[2J\x1b[?6l\x1b[r\x1b[H").and_then(|()| out.flush()) {
+            disable_raw_mode().ok();
+            let _ = execute!(out, LeaveAlternateScreen, Show);
             return Err(err).context("failed to initialize the serial console");
         }
-        Ok(guard)
+        Ok(Self { cols, rows })
     }
 
     fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }
 
-    fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+    fn update_size(&mut self, cols: u16, rows: u16) -> Result<()> {
         if cols < MIN_COLS || rows < MIN_ROWS {
             bail!(
                 "terminal is too small to attach ({cols}x{rows}); need at least {MIN_COLS}x{MIN_ROWS}"
@@ -293,27 +293,7 @@ impl TerminalGuard {
         }
         self.cols = cols;
         self.rows = rows;
-        let mut out = std::io::stdout();
-        // Keep the guest scrollback; only move the scroll region and restore
-        // the guest cursor. The status bar is redrawn by the caller.
-        write!(out, "\x1b7{}r\x1b8", self.region())?;
-        out.flush()?;
         Ok(())
-    }
-
-    /// Scroll region argument: the whole screen, or everything but the bar.
-    fn region(&self) -> String {
-        if self.bar {
-            format!("[1;{}", self.rows - 1)
-        } else {
-            "[".to_string()
-        }
-    }
-
-    /// Clear the alternate screen and reserve the bottom line when needed.
-    fn reset_region(&mut self, out: &mut impl Write) -> std::io::Result<()> {
-        write!(out, "\x1b[2J\x1b[0m{}r\x1b[H", self.region())?;
-        out.flush()
     }
 }
 
@@ -325,61 +305,14 @@ impl Drop for TerminalGuard {
 
         disable_raw_mode().ok();
         let mut out = std::io::stdout();
-        // Reset the scroll region on both screens; a stale region would break
-        // the user's shell after hegn exits.
-        let _ = write!(out, "\x1b[r\x1b[0m");
+        // Reset margins and origin mode on both screens; a stale region or
+        // origin mode would break the user's shell after hegn exits.
+        let _ = write!(out, "\x1b[?6l\x1b[r\x1b[0m");
         let _ = out.flush();
         let _ = execute!(out, LeaveAlternateScreen, Show);
-        let _ = write!(out, "\x1b[r\x1b[0m");
+        let _ = write!(out, "\x1b[?6l\x1b[r\x1b[0m");
         let _ = out.flush();
     }
-}
-
-/// Draw the reserved bottom line without disturbing the guest cursor.
-fn draw_bar(out: &mut impl Write, rows: u16, line: &str) -> std::io::Result<()> {
-    // DECSC/DECRC: save the guest cursor, paint the bar, restore the cursor.
-    write!(out, "\x1b7\x1b[{};1H\x1b[0m\x1b[7m{line}\x1b[0m\x1b8", rows)?;
-    out.flush()
-}
-
-/// Build a status line exactly `cols` display columns wide.
-///
-/// The project name is untrusted filesystem data, so control and bidi
-/// override characters are replaced before they reach the terminal. The
-/// detach hint keeps its space; the left side is truncated first.
-fn bar_line(project: &str, harness: &str, pid: u32, log: Option<&Path>, cols: u16) -> String {
-    let cols = cols as usize;
-    let tail = " INPUT DIRECT · ^B detach";
-    if cols <= tail.width() {
-        return fit_width(tail, cols);
-    }
-    let mut left = format!(
-        " hegn ▸ {} · {} · pid {}",
-        sanitize_label(project),
-        sanitize_label(harness),
-        pid
-    );
-    if let Some(log) = log.and_then(|path| path.file_name()) {
-        left.push_str(" · log ");
-        left.push_str(&sanitize_label(&log.to_string_lossy()));
-    }
-    format!("{}{}", fit_width(&left, cols - tail.width()), tail)
-}
-
-/// Truncate or pad `input` to exactly `width` display columns.
-fn fit_width(input: &str, width: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in input.chars() {
-        let char_width = ch.width().unwrap_or(0);
-        if used + char_width > width {
-            break;
-        }
-        out.push(ch);
-        used += char_width;
-    }
-    out.push_str(&" ".repeat(width.saturating_sub(used)));
-    out
 }
 
 /// Attach an interactive terminal to a VM serial console.
@@ -387,65 +320,59 @@ fn fit_width(input: &str, width: usize) -> String {
 /// This is the CLI equivalent of the TUI terminal view. Input is passed
 /// straight to the guest UART (the status bar marks this as `INPUT DIRECT`); use
 /// `hegn check` for pre-execution guardrails or the TUI for line-buffered
-/// interception. `Ctrl-B` detaches without stopping the VM.
+/// interception. `Ctrl-B` (or `Ctrl-]`) detaches without stopping the VM.
 ///
 /// When `bar` is set, the bottom line shows the project, harness, VM pid and
-/// persistent serial log while the guest uses the lines above it. The guest tty
-/// size cannot be changed through the legacy serial port, so full-screen guest
-/// programs keep their own geometry; pass `bar = false` to give them the whole
-/// host terminal.
+/// persistent serial log while the guest uses the lines above it. The guest has
+/// no window-size channel, so full-screen guest programs keep their own
+/// geometry; pass `bar = false` to give them the whole host terminal.
 pub fn run_interactive(mut console: VmConsole, bar: bool) -> Result<()> {
-    use crossterm::event::{self, Event, KeyEventKind, KeyModifiers};
+    use crossterm::event::{self, Event, KeyEventKind};
 
-    let mut guard = TerminalGuard::enter(bar)?;
+    let mut guard = TerminalGuard::enter()?;
     let project = console.project_name();
     let harness = console.harness().to_string();
     let pid = console.pid();
     let log = console.serial_log().map(Path::to_path_buf);
+    let sandbox = console.sandbox_name().to_string();
+    let (cols, rows) = guard.size();
+    let mut status = bar.then(|| {
+        StatusBar::new(
+            project.clone(),
+            harness.clone(),
+            pid,
+            log.clone(),
+            cols,
+            rows,
+        )
+    });
+    let mut gate = OutputGate::new();
+    let mut pending_resize: Option<(u16, u16)> = None;
+    let mut vm_exited = false;
 
     let result = (|| -> Result<()> {
         let mut out = std::io::stdout();
-        if bar {
-            let (cols, rows) = guard.size();
-            draw_bar(
-                &mut out,
-                rows,
-                &bar_line(&project, &harness, pid, log.as_deref(), cols),
-            )?;
+        if let Some(status) = &status {
+            status.reserve_region(&mut out)?;
+            status.paint(&mut out)?;
         }
-        let mut last_bar = Instant::now();
+
         loop {
             let chunks = console.drain();
-            let had_output = !chunks.is_empty();
+            let mut dirty = !chunks.is_empty();
             for chunk in chunks {
-                out.write_all(&chunk)?;
+                gate.feed(&chunk, status.as_ref().map(StatusBar::rows), &mut out)?;
             }
             out.flush()?;
             if console.is_exited() {
+                vm_exited = true;
                 break;
-            }
-
-            // Never inject the bar between two chunks of a possibly split
-            // escape sequence. While output flows, the scroll region keeps the
-            // bar intact; when the guest goes quiet, refresh it.
-            if had_output {
-                last_bar = Instant::now();
-            } else if bar && last_bar.elapsed() >= BAR_REFRESH {
-                let (cols, rows) = guard.size();
-                draw_bar(
-                    &mut out,
-                    rows,
-                    &bar_line(&project, &harness, pid, log.as_deref(), cols),
-                )?;
-                last_bar = Instant::now();
             }
 
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && key.code == crossterm::event::KeyCode::Char('b')
-                        {
+                        if detach_requested(key) {
                             break;
                         }
                         if let Some(bytes) = crate::app::encode_key(key) {
@@ -453,32 +380,59 @@ pub fn run_interactive(mut console: VmConsole, bar: bool) -> Result<()> {
                         }
                     }
                     Event::Resize(cols, rows) => {
-                        guard.resize(cols, rows)?;
-                        if bar {
-                            draw_bar(
-                                &mut out,
-                                rows,
-                                &bar_line(&project, &harness, pid, log.as_deref(), cols),
-                            )?;
+                        guard.update_size(cols, rows)?;
+                        if let Some(status) = status.as_mut() {
+                            if gate.safe_to_inject() {
+                                status.resize(cols, rows, &mut out)?;
+                                dirty = true;
+                            } else {
+                                // Do not split a half-received escape sequence.
+                                // Apply the resize after the next clean batch.
+                                pending_resize = Some((cols, rows));
+                            }
                         }
-                        last_bar = Instant::now();
                     }
                     _ => {}
+                }
+            }
+
+            // Repaint after every output burst. A full-screen guest can move
+            // the cursor onto the reserved row, and a reset can drop the
+            // scroll region; only an immediate repaint keeps the bar pinned to
+            // the bottom. Skip it while a split escape sequence or multi-byte
+            // character is in flight: injecting there would corrupt the guest
+            // stream. The next batch that ends cleanly repaints.
+            if let Some(status) = status.as_mut()
+                && gate.safe_to_inject()
+            {
+                if let Some((cols, rows)) = pending_resize.take() {
+                    status.resize(cols, rows, &mut out)?;
+                    dirty = true;
+                }
+                if dirty {
+                    status.paint(&mut out)?;
                 }
             }
         }
         Ok(())
     })();
 
+    // Terminate a partial escape sequence even when the loop unwound with an
+    // error, so the terminal reset on drop is not swallowed by an open string.
+    let _ = gate.finish(&mut std::io::stdout());
     drop(guard);
     result?;
     let project = sanitize_label(&project);
-    match &log {
-        Some(log) => println!(
-            "Detached from {project}. Serial log: {}",
-            sanitize_label(&log.display().to_string())
-        ),
-        None => println!("Detached from {project}."),
+    let sandbox = sanitize_label(&sandbox);
+    if vm_exited {
+        println!("Serial console closed: the VM for {project} exited.");
+    } else {
+        println!(
+            "Detached from {project}. The VM keeps running; re-attach with `hegn attach {sandbox}`."
+        );
+    }
+    if let Some(log) = &log {
+        println!("Serial log: {}", sanitize_label(&log.display().to_string()));
     }
     Ok(())
 }
@@ -623,40 +577,5 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not running"), "{err}");
-    }
-
-    #[test]
-    fn bar_line_fills_the_terminal_and_keeps_the_detach_hint() {
-        let line = bar_line("demo", "OpenCode", 1234, None, 80);
-        assert_eq!(line.width(), 80);
-        assert!(line.contains("demo"), "{line}");
-        assert!(line.contains("OpenCode"), "{line}");
-        assert!(line.contains("INPUT DIRECT"), "{line}");
-        assert!(line.contains("^B detach"), "{line}");
-    }
-
-    #[test]
-    fn bar_line_truncates_the_project_first() {
-        let long = "x".repeat(200);
-        let line = bar_line(&long, "Codex", 7, Some(Path::new("/x/session-a.log")), 40);
-        assert_eq!(line.width(), 40);
-        assert!(line.ends_with(" INPUT DIRECT · ^B detach"), "{line}");
-        assert!(!line.contains("session-a.log"), "{line}");
-    }
-
-    #[test]
-    fn bar_line_strips_control_characters_from_project_names() {
-        let line = bar_line("evil\x1b[31mname\u{202e}", "shell", 1, None, 60);
-        assert!(!line.contains('\x1b'), "{line:?}");
-        assert!(!line.contains('\u{202e}'), "{line:?}");
-        assert!(line.contains("evil?[31mname?"), "{line}");
-    }
-
-    #[test]
-    fn fit_width_handles_wide_characters() {
-        assert_eq!(fit_width("日本", 4), "日本");
-        assert_eq!(fit_width("日本", 3), "日 ");
-        assert_eq!(fit_width("abc", 2), "ab");
-        assert_eq!(fit_width("abc", 5), "abc  ");
     }
 }

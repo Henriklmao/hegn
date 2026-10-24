@@ -899,7 +899,7 @@ impl App {
             self.toggle_raw_mode();
             return Vec::new();
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
+        if crate::attach_bar::detach_requested(key) {
             self.screen = Screen::Dashboard;
             return Vec::new();
         }
