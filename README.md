@@ -125,7 +125,8 @@ is no local PTY fallback.
 
 A running session costs the configured `memory_mib` (default 2 GiB) plus roughly
 50 MiB for `virtiofsd`, the console relay and VMM bookkeeping, and ~26 MiB more
-while the TUI is open. Only one VM runs at a time. On disk, the pinned images
+while the TUI is open. Base sandboxes and clones can run concurrently, so the
+cost scales per sandbox. On disk, the pinned images
 take ~2.2 GiB (shared by every project), the binary ~19 MiB, and a snapshot
 about as much as the guest RAM; session logs are pruned by count.
 

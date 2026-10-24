@@ -26,22 +26,25 @@ The VMM maps the configured guest memory up front, so its virtual size is
 less than its configured RAM; a guest that runs a full build converges on
 `memory_mib`.
 
-Practical sizing rule for the host:
+Practical sizing rule for each running sandbox:
 
 ```text
-worst case ≈ memory_mib + ~50 MiB (virtiofsd + relay + VMM bookkeeping)
-             + ~26 MiB if the TUI stays open
+per sandbox ≈ memory_mib + ~50 MiB (virtiofsd + relay + VMM bookkeeping)
+              + ~26 MiB if the TUI stays open
 ```
 
-| `memory_mib` | Host worst case | Typical idle (estimate) |
+| `memory_mib` | Host cost per sandbox (worst case) | Typical idle (estimate) |
 | --- | --- | --- |
 | 1024 | ~1.1 GiB | ~0.3–0.5 GiB |
 | 2048 (default) | ~2.1 GiB | ~0.4–0.6 GiB |
 | 4096 | ~4.1 GiB | grows with guest use |
 | 8192 | ~8.1 GiB | grows with guest use |
 
-Only **one** sandbox can run at a time. `hegn sandbox start` refuses to start a
-second VM, so the footprint above is the whole host cost of a session.
+Several sandboxes can run concurrently: the base sandbox of a project plus any
+clones created for parallel agents (a clone gets its own workspace copy and,
+unless configured otherwise, its own rootfs). The cost multiplies per sandbox,
+so two default guests need roughly 4.2 GiB of host RAM in the worst case.
+`hegn benchmark` lists every running sandbox and totals their RAM.
 
 ## CPU overhead
 
@@ -153,7 +156,10 @@ agents get the passive report instead.
 measures it, stops the sandbox and deletes the directory again; the report
 records the cleanup and refuses to delete anything that is not one of its own
 projects. `hegn benchmark <project>` leaves the sandbox running so you can
-attach to it afterwards.
+attach to it afterwards, and reports only that project's sandbox while noting
+any others that are running. With several sandboxes (clones) active, the plain
+invocation lists each one and totals their RAM; JSON exposes them as
+`sessions`.
 
 ```text
 hegn benchmark

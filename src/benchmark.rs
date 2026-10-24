@@ -1,15 +1,16 @@
-//! `hegn benchmark` — measured host cost of a sandbox session.
+//! `hegn benchmark` — measured host cost of running sandboxes.
 //!
 //! The report answers the questions behind `docs/resources.md`: how much RAM
 //! the VMM, `virtiofsd` and the console relay actually use, how much disk the
-//! images, snapshots and logs occupy, and what the configured guest would cost
-//! at most.
+//! images, snapshots and logs occupy, and what the configured guests would
+//! cost at most.
 //!
 //! Three modes:
 //!
-//! - no argument: measure the running sandbox (read-only), or ask whether to
+//! - no argument: measure every running sandbox (read-only), or ask whether to
 //!   boot a throwaway one when nothing is running;
-//! - `benchmark <project>`: boot that project's sandbox and measure it;
+//! - `benchmark <project>`: boot that project's sandbox (or reuse it) and
+//!   measure it;
 //! - `benchmark --clean`: create a temporary project, boot it, measure it, stop
 //!   it and delete the project again.
 //!
@@ -27,13 +28,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Harness};
 use crate::project;
-use crate::sandbox::SandboxRegistry;
+use crate::sandbox::{SandboxRegistry, same_project};
 
 const MIB: u64 = 1024 * 1024;
 /// Prefix for throwaway projects created by `benchmark --clean`.
 const TEMP_PREFIX: &str = "hegn-benchmark-";
 
-/// One host process that belongs to a running session.
+/// One host process that belongs to a running sandbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProcessCost {
     /// `cloud-hypervisor`, `virtiofsd` or `console-relay`.
@@ -56,14 +57,16 @@ pub struct DiskCost {
     pub files: u64,
 }
 
-/// The running session, resolved from a `session.json`.
+/// The host cost of one sandbox, resolved from its `session.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionCost {
     pub sandbox: String,
     pub project: Option<PathBuf>,
+    pub workspace: Option<PathBuf>,
     pub harness: Option<String>,
     pub vcpus: u8,
     pub memory_mib: u32,
+    pub guest_memory_bytes: u64,
     pub started_at: Option<DateTime<Utc>>,
     pub uptime_secs: Option<u64>,
     pub processes: Vec<ProcessCost>,
@@ -73,11 +76,14 @@ pub struct SessionCost {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BenchmarkReport {
     pub generated_at: DateTime<Utc>,
-    pub session: Option<SessionCost>,
-    pub vcpus: u8,
-    /// Guest RAM configured for the session (or for the next one).
+    pub sessions: Vec<SessionCost>,
+    /// vCPUs of all measured sandboxes, or the configured default when none
+    /// runs.
+    pub vcpus: u32,
+    /// Guest RAM of all measured sandboxes, or the configured default when
+    /// none runs.
     pub guest_memory_bytes: u64,
-    /// Resident memory of the session processes observed right now.
+    /// Resident memory of every measured session process right now.
     pub process_rss_bytes: u64,
     /// Whether this invocation booted a sandbox.
     pub started: bool,
@@ -95,6 +101,7 @@ pub struct BenchmarkReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Cleanup {
     pub project: PathBuf,
+    pub sandbox: String,
     pub sandbox_stopped: bool,
     pub removed: bool,
 }
@@ -108,6 +115,8 @@ pub struct Cleanup {
 struct SessionFile {
     #[serde(default)]
     project: Option<PathBuf>,
+    #[serde(default)]
+    workspace: Option<PathBuf>,
     #[serde(default)]
     sandbox: Option<String>,
     #[serde(default)]
@@ -124,9 +133,9 @@ struct SessionFile {
 
 /// Measure the current host cost and print or emit the report.
 ///
-/// - no project and no `--clean`: measure the running sandbox; if nothing runs
-///   and the terminal is interactive, offer to boot a throwaway one;
-/// - `project`: boot that project (or measure it when it is already running);
+/// - no project and no `--clean`: measure every running sandbox; if nothing
+///   runs and the terminal is interactive, offer to boot a throwaway one;
+/// - `project`: boot that project's sandbox (or reuse it) and measure it;
 /// - `clean`: create a temporary project, boot it, measure it, stop and remove
 ///   it again.
 pub fn run(config: &Config, project: Option<&str>, clean: bool, json: bool) -> Result<i32> {
@@ -136,8 +145,9 @@ pub fn run(config: &Config, project: Option<&str>, clean: bool, json: bool) -> R
     if clean {
         return measure_temporary(config, json);
     }
-    if running_session(config).is_some() {
-        return emit(collect(config), json);
+    let mut report = collect(config);
+    if !report.sessions.is_empty() {
+        return emit(report, json);
     }
     if !json && io::stdin().is_terminal() {
         let question = "No sandbox is running. Create a temporary benchmark project, boot a \
@@ -147,7 +157,6 @@ pub fn run(config: &Config, project: Option<&str>, clean: bool, json: bool) -> R
         }
     }
 
-    let mut report = collect(config);
     report.notes.push(
         "no sandbox running; pass a project name to boot one, or --clean for a throwaway \
          project"
@@ -185,22 +194,17 @@ fn confirm(question: &str) -> Result<bool> {
 /// Boot (or reuse) the sandbox of an existing project and measure it.
 fn measure_project(config: &Config, project: &str, json: bool) -> Result<i32> {
     let path = crate::cli::resolve_project(config, project)?;
-    if let Some((session, session_path)) = running_session(config) {
-        let matches_project = session
+
+    // Prefer a sandbox that is already running for this project, base or
+    // clone; otherwise create/reuse the base sandbox and start it.
+    if let Some((session, _)) = running_sessions(config).into_iter().find(|(session, _)| {
+        session
             .project
             .as_ref()
-            .is_some_and(|running| same_path(running, &path));
-        if !matches_project {
-            bail!(
-                "a sandbox is already running for {}; stop it with `hegn sandbox stop` first",
-                session
-                    .project
-                    .as_ref()
-                    .map(|running| running.display().to_string())
-                    .unwrap_or_else(|| session_path.display().to_string())
-            );
-        }
-        let mut report = collect(config);
+            .is_some_and(|running| same_project(running, &path))
+    }) {
+        let name = session.sandbox.clone().unwrap_or_default();
+        let mut report = collect_for_sandbox(config, &name);
         report
             .notes
             .push("the sandbox was already running; nothing was started".to_string());
@@ -210,31 +214,22 @@ fn measure_project(config: &Config, project: &str, json: bool) -> Result<i32> {
     let harness = project::read_meta(&path).harness.unwrap_or(config.harness);
     let registry = SandboxRegistry::new(config.clone());
     let sandbox = registry.ensure_for_project(&path, harness)?;
-    registry.manager(sandbox).start()?;
+    registry.manager(sandbox.clone()).start()?;
 
-    let mut report = collect(config);
+    let mut report = collect_for_sandbox(config, &sandbox.name);
     report.started = true;
     report.notes.push(format!(
-        "sandbox started for {}; measured right after the VMM socket came up, so guest RSS \
-         grows while the guest boots (attach with `hegn attach`, stop with `hegn sandbox stop`)",
-        path.display()
+        "sandbox '{}' started; measured right after the VMM socket came up, so guest RSS \
+         grows while the guest boots (attach with `hegn attach {}`, stop it with \
+         `hegn sandbox stop {}`)",
+        sandbox.name, sandbox.name, sandbox.name
     ));
+    note_other_sandboxes(config, &sandbox.name, &mut report.notes);
     emit(report, json)
 }
 
 /// Create a throwaway project, boot it, measure it and clean up again.
 fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
-    if let Some((session, _)) = running_session(config) {
-        bail!(
-            "a sandbox is already running for {}; stop it with `hegn sandbox stop` first",
-            session
-                .project
-                .as_ref()
-                .map(|running| running.display().to_string())
-                .unwrap_or_else(|| "an unknown project".to_string())
-        );
-    }
-
     let name = format!("{TEMP_PREFIX}{}", Utc::now().timestamp_millis());
     let template = config.templates_dir.join("AGENTS.md");
     let template = template.is_file().then_some(template);
@@ -266,8 +261,14 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
         // below still has to unregister it.
         sandbox = Some(created.clone());
         registry.manager(created).start()?;
-        let mut report = collect(config);
+        let mut report = collect_for_sandbox(config, &sandbox.as_ref().unwrap().name);
         report.started = true;
+        report.notes.push(
+            "measured right after the VMM socket came up, so guest RSS grows while the guest \
+             boots; the sandbox was stopped and removed after this snapshot"
+                .to_string(),
+        );
+        note_other_sandboxes(config, &sandbox.as_ref().unwrap().name, &mut report.notes);
         Ok(report)
     })();
 
@@ -291,6 +292,10 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
         Ok(mut report) => {
             report.cleanup = Some(Cleanup {
                 project: path.clone(),
+                sandbox: sandbox
+                    .as_ref()
+                    .map(|sandbox| sandbox.name.clone())
+                    .unwrap_or_default(),
                 sandbox_stopped: stopped,
                 removed,
             });
@@ -356,32 +361,33 @@ fn remove_temp_project(config: &Config, path: &Path) -> Result<()> {
     fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))
 }
 
-fn same_path(left: &Path, right: &Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
-    }
+/// Build the report for every running sandbox without printing anything.
+pub fn collect(config: &Config) -> BenchmarkReport {
+    collect_with(config, |_, _| true)
 }
 
-/// Build the report without printing anything.
-pub fn collect(config: &Config) -> BenchmarkReport {
+fn collect_for_sandbox(config: &Config, name: &str) -> BenchmarkReport {
+    collect_with(config, |session, _| {
+        session.sandbox.as_deref() == Some(name)
+    })
+}
+
+fn collect_with(config: &Config, keep: impl Fn(&SessionFile, &Path) -> bool) -> BenchmarkReport {
     let mut notes = Vec::new();
-    let session = session_cost(config, &mut notes);
-    let vcpus = session.as_ref().map_or(config.vcpus, |cost| cost.vcpus);
-    let memory_mib = session
-        .as_ref()
-        .map_or(config.memory_mib, |cost| cost.memory_mib);
-    let guest_memory_bytes = u64::from(memory_mib) * MIB;
+    let sessions = session_costs(config, &mut notes, keep);
+    let (vcpus, guest_memory_bytes, process_rss_bytes) = totals(config, &sessions);
+    // Snapshots are per VM; take the largest measured guest as the estimate.
+    let memory_mib = sessions
+        .iter()
+        .map(|session| session.memory_mib)
+        .max()
+        .unwrap_or(config.memory_mib);
     let (snapshots, snapshot_estimate_bytes) = snapshot_estimate(config, memory_mib);
 
     let disk = disk_costs(config);
     let disk_allocated_bytes = disk.iter().map(|cost| cost.allocated_bytes).sum();
-    let process_rss_bytes = session
-        .as_ref()
-        .map(|cost| cost.processes.iter().map(|p| p.rss_bytes).sum())
-        .unwrap_or(0);
 
-    if session.is_none() {
+    if sessions.is_empty() {
         notes.push(
             "no running sandbox session found; disk usage and the configured guest cost are \
              reported instead"
@@ -389,14 +395,15 @@ pub fn collect(config: &Config) -> BenchmarkReport {
         );
     } else {
         notes.push(format!(
-            "guest RAM is populated on demand: {vcpus} vCPU, {} configured",
-            human_bytes(guest_memory_bytes)
+            "guest RAM is populated on demand: {} in total across {} sandbox(es)",
+            human_bytes(guest_memory_bytes),
+            sessions.len()
         ));
     }
 
     BenchmarkReport {
         generated_at: Utc::now(),
-        session,
+        sessions,
         vcpus,
         guest_memory_bytes,
         process_rss_bytes,
@@ -410,8 +417,32 @@ pub fn collect(config: &Config) -> BenchmarkReport {
     }
 }
 
-/// The session that is alive right now, if any.
-fn running_session(config: &Config) -> Option<(SessionFile, PathBuf)> {
+fn totals(config: &Config, sessions: &[SessionCost]) -> (u32, u64, u64) {
+    if sessions.is_empty() {
+        return (
+            u32::from(config.vcpus),
+            u64::from(config.memory_mib) * MIB,
+            0,
+        );
+    }
+    let vcpus = sessions
+        .iter()
+        .map(|session| u32::from(session.vcpus))
+        .sum();
+    let memory = sessions
+        .iter()
+        .map(|session| session.guest_memory_bytes)
+        .sum();
+    let rss = sessions
+        .iter()
+        .map(|session| session.processes.iter().map(|p| p.rss_bytes).sum::<u64>())
+        .sum();
+    (vcpus, memory, rss)
+}
+
+/// The sandboxes that are alive right now.
+fn running_sessions(config: &Config) -> Vec<(SessionFile, PathBuf)> {
+    let mut running = Vec::new();
     for path in session_candidates(config) {
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
@@ -422,15 +453,31 @@ fn running_session(config: &Config) -> Option<(SessionFile, PathBuf)> {
         if process_alive(session.vm_pid)
             && matches_binary(session.vm_pid, &config.vm_binary(), "cloud-hypervisor")
         {
-            return Some((session, path));
+            running.push((session, path));
         }
     }
-    None
+    running
 }
 
-/// Locate the session that is actually running and read its process costs.
-fn session_cost(config: &Config, notes: &mut Vec<String>) -> Option<SessionCost> {
-    let mut stale: Option<(SessionFile, PathBuf)> = None;
+fn note_other_sandboxes(config: &Config, measured: &str, notes: &mut Vec<String>) {
+    let others = running_sessions(config)
+        .into_iter()
+        .filter(|(session, _)| session.sandbox.as_deref() != Some(measured))
+        .count();
+    if others > 0 {
+        notes.push(format!(
+            "{others} other sandbox(es) are running; their RAM is not part of this report"
+        ));
+    }
+}
+
+/// Read the costs of every session that passes `keep`.
+fn session_costs(
+    config: &Config,
+    notes: &mut Vec<String>,
+    keep: impl Fn(&SessionFile, &Path) -> bool,
+) -> Vec<SessionCost> {
+    let mut costs = Vec::new();
     for path in session_candidates(config) {
         let raw = match fs::read_to_string(&path) {
             Ok(raw) => raw,
@@ -446,25 +493,28 @@ fn session_cost(config: &Config, notes: &mut Vec<String>) -> Option<SessionCost>
                 continue;
             }
         };
-        if process_alive(session.vm_pid)
-            && matches_binary(session.vm_pid, &config.vm_binary(), "cloud-hypervisor")
-        {
-            let (vcpus, memory_mib) = sandbox_limits(&path, config);
-            return Some(build_session(&session, config, vcpus, memory_mib, notes));
+        let alive = process_alive(session.vm_pid)
+            && matches_binary(session.vm_pid, &config.vm_binary(), "cloud-hypervisor");
+        if !alive {
+            if keep(&session, &path) {
+                notes.push(format!(
+                    "session metadata {} records VM pid {} which is no longer running",
+                    path.display(),
+                    session.vm_pid
+                ));
+            }
+            continue;
         }
-        stale.get_or_insert((session, path));
+        if !keep(&session, &path) {
+            continue;
+        }
+        let (vcpus, memory_mib) = sandbox_limits(&path, config);
+        costs.push(build_session(&session, config, vcpus, memory_mib, notes));
     }
-
-    let (session, path) = stale?;
-    notes.push(format!(
-        "session metadata {} records VM pid {} which is no longer running",
-        path.display(),
-        session.vm_pid
-    ));
-    let (vcpus, memory_mib) = sandbox_limits(&path, config);
-    Some(build_session(&session, config, vcpus, memory_mib, notes))
+    costs
 }
 
+/// Unreadable session metadata cannot be matched against a selector.
 fn build_session(
     session: &SessionFile,
     config: &Config,
@@ -531,9 +581,11 @@ fn build_session(
             })
             .unwrap_or_else(|| "default".to_string()),
         project: session.project.clone(),
+        workspace: session.workspace.clone(),
         harness: session.harness.clone(),
         vcpus,
         memory_mib,
+        guest_memory_bytes: u64::from(memory_mib) * MIB,
         started_at: session.started_at,
         uptime_secs,
         processes,
@@ -571,7 +623,7 @@ fn sandbox_limits(session: &Path, config: &Config) -> (u8, u32) {
     let config_file = session
         .parent()
         .and_then(Path::parent)
-        .map(|dir| dir.join("hegn.toml"));
+        .map(|dir| dir.join(crate::sandbox_config::CONFIG_FILE));
     let limits = config_file
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|raw| toml::from_str::<Limits>(&raw).ok())
@@ -599,20 +651,22 @@ fn snapshot_estimate(config: &Config, memory_mib: u32) -> (u64, u64) {
 }
 
 fn disk_costs(config: &Config) -> Vec<DiskCost> {
-    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    let logs = config.logs_dir();
+    let mut dirs: Vec<(String, PathBuf, Option<PathBuf>)> = Vec::new();
     if let Some(dir) = config.kernel_image.parent() {
-        dirs.push(("images".to_string(), dir.to_path_buf()));
+        dirs.push(("images".to_string(), dir.to_path_buf(), None));
     }
-    dirs.push(("snapshots".to_string(), config.snapshots_dir.clone()));
-    dirs.push(("logs".to_string(), config.logs_dir()));
-    dirs.push(("state".to_string(), config.state_dir.clone()));
-    dirs.push(("sandboxes".to_string(), config.sandboxes_dir.clone()));
+    dirs.push(("snapshots".to_string(), config.snapshots_dir.clone(), None));
+    dirs.push(("sandboxes".to_string(), config.sandboxes_dir.clone(), None));
+    dirs.push(("logs".to_string(), logs.clone(), None));
+    // Session logs live inside the state directory; do not count them twice.
+    dirs.push(("state".to_string(), config.state_dir.clone(), Some(logs)));
 
     dirs.into_iter()
-        .map(|(name, path)| {
+        .map(|(name, path, exclude)| {
             let exists = path.is_dir();
             let usage = if exists {
-                usage(&path)
+                usage_excluding(&path, exclude.as_deref())
             } else {
                 Usage::default()
             };
@@ -635,11 +689,13 @@ struct Usage {
     files: u64,
 }
 
-/// Recursively sum allocated and apparent bytes without following symlinks.
-fn usage(root: &Path) -> Usage {
-    let mut total = Usage::default();
+fn usage_excluding(root: &Path, exclude: Option<&Path>) -> Usage {
+    let mut usage = Usage::default();
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
+        if exclude.is_some_and(|exclude| path == exclude) {
+            continue;
+        }
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
@@ -652,12 +708,12 @@ fn usage(root: &Path) -> Usage {
                 stack.extend(entries.flatten().map(|entry| entry.path()));
             }
         } else if kind.is_file() {
-            total.files += 1;
-            total.apparent += metadata.len();
-            total.allocated += allocated_bytes(&metadata);
+            usage.files += 1;
+            usage.apparent += metadata.len();
+            usage.allocated += allocated_bytes(&metadata);
         }
     }
-    total
+    usage
 }
 
 #[cfg(unix)]
@@ -792,53 +848,61 @@ fn human_uptime(secs: u64) -> String {
 }
 
 fn print_report(report: &BenchmarkReport) {
-    println!("hegn benchmark\n");
+    println!("hegn benchmark");
 
-    match &report.session {
-        Some(session) => {
-            let harness = session.harness.as_deref().unwrap_or("unknown harness");
-            println!("Session   {} ({harness})", session.sandbox);
-            if let Some(project) = &session.project {
-                println!("Project   {}", project.display());
-            }
-            if let Some(uptime) = session.uptime_secs {
-                println!("Uptime    {}", human_uptime(uptime));
-            }
-            println!(
-                "Guest     {} vCPU, {} configured (populated on demand)",
-                session.vcpus,
-                human_bytes(report.guest_memory_bytes)
-            );
-            println!();
+    if report.sessions.is_empty() {
+        println!("\nSession   none running");
+        println!(
+            "Guest     {} at most ({} vCPU configured)",
+            human_bytes(report.guest_memory_bytes),
+            report.vcpus
+        );
+    }
+    for session in &report.sessions {
+        let harness = session.harness.as_deref().unwrap_or("unknown harness");
+        println!("\nSession   {} ({harness})", session.sandbox);
+        if let Some(project) = &session.project {
+            println!("Project   {}", project.display());
+        }
+        if let Some(workspace) = session
+            .workspace
+            .as_ref()
+            .filter(|workspace| session.project.as_ref() != Some(workspace))
+        {
+            println!("Workspace {}", workspace.display());
+        }
+        if let Some(uptime) = session.uptime_secs {
+            println!("Uptime    {}", human_uptime(uptime));
+        }
+        println!(
+            "Guest     {} vCPU, {} configured (populated on demand)",
+            session.vcpus,
+            human_bytes(session.guest_memory_bytes)
+        );
+        println!();
+        println!(
+            "{:<18} {:>7} {:>10} {:>10}",
+            "PROCESS", "PID", "RSS", "VIRTUAL"
+        );
+        for process in &session.processes {
             println!(
                 "{:<18} {:>7} {:>10} {:>10}",
-                "PROCESS", "PID", "RSS", "VIRTUAL"
-            );
-            for process in &session.processes {
-                println!(
-                    "{:<18} {:>7} {:>10} {:>10}",
-                    process.role,
-                    process.pid,
-                    human_bytes(process.rss_bytes),
-                    human_bytes(process.virtual_bytes)
-                );
-            }
-            println!(
-                "{:<18} {:>7} {:>10} {:>10}",
-                "host total",
-                "",
-                human_bytes(report.process_rss_bytes),
-                ""
+                process.role,
+                process.pid,
+                human_bytes(process.rss_bytes),
+                human_bytes(process.virtual_bytes)
             );
         }
-        None => {
-            println!("Session   none running");
-            println!(
-                "Guest     {} at most ({} vCPU configured)",
-                human_bytes(report.guest_memory_bytes),
-                report.vcpus
-            );
-        }
+    }
+
+    if !report.sessions.is_empty() {
+        println!(
+            "\n{:<18} {:>7} {:>10} {:>10}",
+            "host total",
+            "",
+            human_bytes(report.process_rss_bytes),
+            ""
+        );
     }
 
     if report.started {
@@ -846,8 +910,9 @@ fn print_report(report: &BenchmarkReport) {
     }
     if let Some(cleanup) = &report.cleanup {
         println!(
-            "\nCleanup   {} (sandbox stopped: {}, project removed: {})",
+            "\nCleanup   {} [{}] (sandbox stopped: {}, project removed: {})",
             cleanup.project.display(),
+            cleanup.sandbox,
             cleanup.sandbox_stopped,
             cleanup.removed
         );
@@ -970,7 +1035,7 @@ mod tests {
         fs::create_dir(dir.path().join("nested")).unwrap();
         fs::write(dir.path().join("nested/other"), b"abc").unwrap();
 
-        let first = usage(dir.path());
+        let first = usage_excluding(dir.path(), None);
         assert_eq!(first.files, 2);
         assert_eq!(first.apparent, 4096 + 3);
         assert!(first.allocated > 0);
@@ -978,38 +1043,41 @@ mod tests {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(dir.path().join("file"), dir.path().join("link")).unwrap();
-            let linked = usage(dir.path());
+            let linked = usage_excluding(dir.path(), None);
             assert_eq!(linked.files, 2, "symlinks are not followed or counted");
         }
     }
 
     #[test]
-    fn session_candidates_cover_both_layouts() {
+    fn usage_can_exclude_a_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("logs")).unwrap();
+        fs::write(dir.path().join("logs/a.log"), vec![0u8; 1024]).unwrap();
+        fs::write(dir.path().join("state.json"), b"{}").unwrap();
+
+        let all = usage_excluding(dir.path(), None);
+        assert_eq!(all.files, 2);
+
+        let without_logs = usage_excluding(dir.path(), Some(&dir.path().join("logs")));
+        assert_eq!(without_logs.files, 1);
+        assert_eq!(without_logs.apparent, 2);
+    }
+
+    #[test]
+    fn session_candidates_cover_the_sandbox_layout() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            snapshots_dir: dir.path().join("data/snapshots"),
-            sandboxes_dir: dir.path().join("data/sandboxes"),
+            sandboxes_dir: dir.path().join("sandboxes"),
             ..Config::default()
         };
 
-        fs::create_dir_all(config.state_dir.join("run")).unwrap();
-        fs::write(config.state_dir.join("run/session.json"), b"{}").unwrap();
         fs::create_dir_all(config.sandboxes_dir.join("a/run")).unwrap();
         fs::write(config.sandboxes_dir.join("a/run/session.json"), b"{}").unwrap();
 
         let candidates = session_candidates(&config);
-        assert_eq!(candidates.len(), 2);
-        assert!(
-            candidates
-                .iter()
-                .any(|path| path.ends_with("state/run/session.json"))
-        );
-        assert!(
-            candidates
-                .iter()
-                .any(|path| path.ends_with("sandboxes/a/run/session.json"))
-        );
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].ends_with("sandboxes/a/run/session.json"));
     }
 
     #[test]
@@ -1026,7 +1094,7 @@ mod tests {
         };
 
         let report = collect(&config);
-        assert!(report.session.is_none());
+        assert!(report.sessions.is_empty());
         assert_eq!(report.vcpus, 4);
         assert_eq!(report.guest_memory_bytes, 1024 * MIB);
         assert!(
@@ -1036,6 +1104,35 @@ mod tests {
                 .any(|note| note.contains("no running sandbox"))
         );
         assert!(report.disk.iter().any(|cost| cost.name == "images"));
+    }
+
+    #[test]
+    fn totals_sum_all_sessions() {
+        let config = Config {
+            vcpus: 1,
+            memory_mib: 111,
+            ..Config::default()
+        };
+        let session = |vcpus: u8, memory_mib: u32, rss: u64| SessionCost {
+            sandbox: "s".into(),
+            project: None,
+            workspace: None,
+            harness: None,
+            vcpus,
+            memory_mib,
+            guest_memory_bytes: u64::from(memory_mib) * MIB,
+            started_at: None,
+            uptime_secs: None,
+            processes: vec![ProcessCost {
+                role: "virtiofsd".into(),
+                pid: 1,
+                rss_bytes: rss,
+                virtual_bytes: rss,
+            }],
+        };
+        let sessions = vec![session(2, 1024, 10), session(4, 2048, 20)];
+        assert_eq!(totals(&config, &sessions), (6, 3072 * MIB, 30));
+        assert_eq!(totals(&config, &[]), (1, 111 * MIB, 0));
     }
 
     #[test]
@@ -1076,29 +1173,6 @@ mod tests {
     }
 
     #[test]
-    fn report_serialises_to_json() {
-        let report = BenchmarkReport {
-            generated_at: Utc::now(),
-            session: None,
-            vcpus: 2,
-            guest_memory_bytes: 2048 * MIB,
-            process_rss_bytes: 0,
-            started: false,
-            cleanup: None,
-            snapshots: 0,
-            snapshot_estimate_bytes: 0,
-            disk: Vec::new(),
-            disk_allocated_bytes: 0,
-            notes: Vec::new(),
-        };
-        let json = serde_json::to_value(&report).unwrap();
-        assert_eq!(json["guest_memory_bytes"], 2048 * MIB);
-        assert_eq!(json["started"], false);
-        assert!(json["cleanup"].is_null());
-        assert!(json["session"].is_null());
-    }
-
-    #[test]
     fn remove_temp_project_only_deletes_its_own_projects() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
@@ -1126,17 +1200,17 @@ mod tests {
     }
 
     #[test]
-    fn running_session_ignores_a_recycled_pid() {
+    fn running_sessions_ignores_a_recycled_pid() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            snapshots_dir: dir.path().join("data/snapshots"),
             sandboxes_dir: dir.path().join("data/sandboxes"),
             ..Config::default()
         };
         fs::create_dir_all(config.state_dir.join("run")).unwrap();
         let session = serde_json::json!({
             "project": dir.path().join("project"),
+            "sandbox": "demo",
             "harness": "shell",
             "started_at": "2026-01-01T00:00:00Z",
             "vm_pid": std::process::id(),
@@ -1150,8 +1224,31 @@ mod tests {
         .unwrap();
 
         assert!(
-            running_session(&config).is_none(),
+            running_sessions(&config).is_empty(),
             "the test process is not a Cloud Hypervisor"
         );
+    }
+
+    #[test]
+    fn report_serialises_to_json() {
+        let report = BenchmarkReport {
+            generated_at: Utc::now(),
+            sessions: Vec::new(),
+            vcpus: 2,
+            guest_memory_bytes: 2048 * MIB,
+            process_rss_bytes: 0,
+            started: false,
+            cleanup: None,
+            snapshots: 0,
+            snapshot_estimate_bytes: 0,
+            disk: Vec::new(),
+            disk_allocated_bytes: 0,
+            notes: Vec::new(),
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["guest_memory_bytes"], 2048 * MIB);
+        assert_eq!(json["started"], false);
+        assert!(json["cleanup"].is_null());
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
     }
 }
