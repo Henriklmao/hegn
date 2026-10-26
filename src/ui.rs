@@ -1788,7 +1788,11 @@ fn render_create_form(
             ),
             Span::styled(" ▶", Style::default().fg(MUTED)),
             Span::styled(
-                format!("  preinstalls: {}", form.harness.packages().join(", ")),
+                format!(
+                    "  {} · preinstalls: {}",
+                    form.harness.preset_summary(),
+                    form.harness.packages().join(", ")
+                ),
                 Style::default().fg(MUTED),
             ),
         ]))
@@ -1801,7 +1805,7 @@ fn render_create_form(
         .borders(Borders::ALL)
         .border_style(field_style(form.focus == CreateFocus::Packages))
         .title(Span::styled(
-            " packages (space toggles) ",
+            " extra packages (space toggles) ",
             field_style(form.focus == CreateFocus::Packages),
         ))
         .style(Style::default());

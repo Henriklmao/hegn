@@ -105,21 +105,118 @@ impl Harness {
         }
     }
 
-    /// Packages installed into a freshly created VM for this harness. The
-    /// template installer is intentionally conservative; users can extend the
-    /// list in `config.toml`.
+    /// Packages installed into a freshly created VM for this harness. Every
+    /// preset starts from the same base tool set and then adds the runtime the
+    /// harness actually needs; `extra_packages` is unioned on top.
     pub fn packages(self) -> &'static [&'static str] {
+        const BASE: &[&str] = &[
+            "git",
+            "curl",
+            "ca-certificates",
+            "ripgrep",
+            "fd-find",
+            "less",
+            "jq",
+        ];
         match self {
-            Self::Shell => &["git", "curl", "ca-certificates"],
-            Self::Opencode => &["git", "curl", "nodejs", "npm"],
-            Self::ClaudeCode => &["git", "curl", "nodejs", "npm"],
-            Self::Codex => &["git", "curl", "python3"],
-            Self::Pi => &["git", "curl", "nodejs", "npm"],
-            Self::PrimeAgent => &["git", "curl", "python3"],
-            Self::Aider => &["git", "curl", "python3", "pip"],
-            Self::GeminiCli => &["git", "curl", "nodejs", "npm"],
+            Self::Shell => BASE,
+            Self::Opencode | Self::ClaudeCode | Self::Codex | Self::Pi | Self::GeminiCli => &[
+                "git",
+                "curl",
+                "ca-certificates",
+                "ripgrep",
+                "fd-find",
+                "less",
+                "jq",
+                "nodejs",
+                "build-essential",
+            ],
+            Self::PrimeAgent => &[
+                "git",
+                "curl",
+                "ca-certificates",
+                "ripgrep",
+                "fd-find",
+                "less",
+                "jq",
+                "python3",
+                "python3-pip",
+                "python3-venv",
+                "xz-utils",
+            ],
+            Self::Aider => &[
+                "git",
+                "curl",
+                "ca-certificates",
+                "ripgrep",
+                "fd-find",
+                "less",
+                "jq",
+                "python3",
+                "python3-pip",
+                "python3-venv",
+                "build-essential",
+            ],
         }
     }
+
+    /// Short description used by the create form and CLI output.
+    pub fn preset_summary(self) -> &'static str {
+        match self {
+            Self::Shell => "base CLI tools",
+            Self::Opencode => "Node 22 + OpenCode CLI",
+            Self::ClaudeCode => "Node 22 + Claude Code CLI",
+            Self::Codex => "Node 22 + Codex CLI",
+            Self::Pi => "Node 22 + Pi coding agent",
+            Self::PrimeAgent => "Python + Prime Agent installer",
+            Self::Aider => "Python + Aider",
+            Self::GeminiCli => "Node 22 + Gemini CLI",
+        }
+    }
+
+    /// Whether the preset installs Node.js from NodeSource before the harness.
+    pub fn needs_node(self) -> bool {
+        matches!(
+            self,
+            Self::Opencode | Self::ClaudeCode | Self::Codex | Self::Pi | Self::GeminiCli
+        )
+    }
+
+    /// Shell commands run by the first-boot provisioner after the apt packages
+    /// are installed. They are static, auditable strings; user-provided package
+    /// names never become shell fragments.
+    pub fn install_commands(self) -> &'static [&'static str] {
+        match self {
+            Self::Shell => &[],
+            Self::Opencode => &["npm install --global --no-fund --no-audit opencode-ai"],
+            Self::ClaudeCode => {
+                &["npm install --global --no-fund --no-audit @anthropic-ai/claude-code"]
+            }
+            Self::Codex => &["npm install --global --no-fund --no-audit @openai/codex"],
+            Self::Pi => &[
+                "npm install --global --no-fund --no-audit --ignore-scripts @earendil-works/pi-coding-agent",
+            ],
+            Self::PrimeAgent => &[
+                "curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 https://app.primeintellect.ai/prime-agent/install.sh -o /tmp/hegn-prime-agent.sh",
+                "sh /tmp/hegn-prime-agent.sh",
+            ],
+            Self::Aider => &[
+                "python3 -m pip install --upgrade pip",
+                "python3 -m pip install --upgrade aider-chat",
+            ],
+            Self::GeminiCli => &["npm install --global --no-fund --no-audit @google/gemini-cli"],
+        }
+    }
+}
+
+/// Validate a Debian package name before it reaches a root shell or YAML file.
+pub fn safe_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '_' | '-'))
+        && !name.starts_with('-')
 }
 
 /// Locations where distributions install `virtiofsd` outside `PATH`.
@@ -464,6 +561,11 @@ impl Config {
         ] {
             if !url.trim().is_empty() && !url.starts_with("https://") {
                 bail!("{name} must use https://");
+            }
+        }
+        for package in &self.extra_packages {
+            if !safe_package_name(package) {
+                bail!("invalid package name in extra_packages: {package:?}");
             }
         }
         Ok(())

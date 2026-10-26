@@ -44,6 +44,7 @@ use crate::cloud_hypervisor::{CloudHypervisorClient, SnapshotConfig, VmInfo, VmS
 use crate::cloud_init;
 use crate::config::{Config, Harness, VIRTIOFSD_FALLBACKS};
 use crate::logs::{DEFAULT_KEEP, LogStore};
+use crate::provision::ProvisionPlan;
 use crate::relay::{self, RelayArgs};
 use crate::sandbox_config::{CloneOutcome, DeleteOutcome, SandboxConfig, SandboxStore};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
@@ -365,12 +366,22 @@ impl SandboxManager {
 
         // 2. Optional NoCloud seed for the official cloud images. It contains
         // no secrets and only enables a serial root login.
+        let provision = match ProvisionPlan::new(self.sandbox.harness, &self.sandbox.extra_packages)
+        {
+            Ok(plan) => plan,
+            Err(err) => {
+                virtiofs.kill();
+                cleanup_files(&paths);
+                return Err(err);
+            }
+        };
         if self.config.cloud_init
             && let Err(err) = cloud_init::write_seed(
                 &paths.cloud_init,
                 &self.sandbox.shared_tag,
                 &self.sandbox.guest_mount,
-                &format!("hegn-{}-v{}", self.sandbox.name, cloud_init::SEED_VERSION),
+                &cloud_init::instance_id(&self.sandbox.name, &provision),
+                &provision,
             )
         {
             virtiofs.kill();
@@ -822,12 +833,22 @@ impl SandboxManager {
             return Err(err).context("failed to record the virtiofsd pid");
         }
 
+        let provision = match ProvisionPlan::new(self.sandbox.harness, &self.sandbox.extra_packages)
+        {
+            Ok(plan) => plan,
+            Err(err) => {
+                virtiofs.kill();
+                cleanup_files(&paths);
+                return Err(err);
+            }
+        };
         if self.config.cloud_init
             && let Err(err) = cloud_init::write_seed(
                 &paths.cloud_init,
                 &self.sandbox.shared_tag,
                 &self.sandbox.guest_mount,
-                &format!("hegn-{}-v{}", self.sandbox.name, cloud_init::SEED_VERSION),
+                &cloud_init::instance_id(&self.sandbox.name, &provision),
+                &provision,
             )
         {
             virtiofs.kill();

@@ -7,6 +7,7 @@
 //! - [`security`] — `tirith-core` integration and workspace guardrails
 //! - [`cloud_hypervisor`] — typed Cloud Hypervisor REST client
 //! - [`cloud_init`] — NoCloud seed for the official cloud images
+//! - [`provision`] — first-boot harness preset installers
 //! - [`virtiofs`] — hardened `virtiofsd` command construction
 //! - [`sandbox`] — MicroVM lifecycle orchestration
 //! - [`relay`] — detached serial-console relay and persistent logging
@@ -36,6 +37,7 @@ pub mod doctor;
 pub mod images;
 pub mod logs;
 pub mod project;
+pub mod provision;
 pub mod relay;
 pub mod sandbox;
 pub mod sandbox_config;

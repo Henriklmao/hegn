@@ -55,6 +55,7 @@ pub struct SandboxConfig {
     pub created_at: DateTime<Utc>,
     pub auto_branch: bool,
     pub security: SecurityMode,
+    /// Additional apt packages on top of the harness preset.
     pub extra_packages: Vec<String>,
 }
 
@@ -216,6 +217,11 @@ impl SandboxConfig {
             .context("sandbox guest_mount must be an absolute, simple path")?;
         if let Some(source) = &self.source_sandbox {
             validate_name(source)?;
+        }
+        for package in &self.extra_packages {
+            if !crate::config::safe_package_name(package) {
+                bail!("sandbox extra_packages contains an invalid name: {package:?}");
+            }
         }
         Ok(())
     }
@@ -504,6 +510,17 @@ impl SandboxStore {
             extra_packages: self.defaults.extra_packages.clone(),
             ..SandboxConfig::default()
         });
+        // Project-level package selections are data for the first-boot
+        // provisioner. The harness preset is always unioned in later, so this
+        // list stays additive.
+        let mut extra_packages = base.extra_packages;
+        for package in crate::project::read_meta(project).packages {
+            if crate::config::safe_package_name(&package)
+                && !extra_packages.iter().any(|existing| existing == &package)
+            {
+                extra_packages.push(package);
+            }
+        }
         SandboxConfig {
             version: CONFIG_VERSION,
             name: name.to_string(),
@@ -520,7 +537,7 @@ impl SandboxStore {
             created_at: Utc::now(),
             auto_branch: base.auto_branch,
             security: base.security,
-            extra_packages: base.extra_packages,
+            extra_packages,
         }
     }
 

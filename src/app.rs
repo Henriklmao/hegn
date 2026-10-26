@@ -236,7 +236,7 @@ pub struct PackageOption {
     pub selected: bool,
 }
 
-pub const PACKAGE_CHOICES: [&str; 7] = [
+pub const PACKAGE_CHOICES: [&str; 10] = [
     "git",
     "nodejs",
     "python3",
@@ -244,6 +244,9 @@ pub const PACKAGE_CHOICES: [&str; 7] = [
     "ripgrep",
     "fd-find",
     "curl",
+    "jq",
+    "less",
+    "golang",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,11 +273,13 @@ impl CreateProjectForm {
             name: String::new(),
             harness: default_harness,
             focus: CreateFocus::Name,
+            // The harness preset always provides its own runtime and base
+            // tools; these are additive convenience packages.
             packages: PACKAGE_CHOICES
                 .iter()
                 .map(|name| PackageOption {
                     name,
-                    selected: matches!(*name, "git" | "curl"),
+                    selected: false,
                 })
                 .collect(),
             package_cursor: 0,

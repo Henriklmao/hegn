@@ -404,7 +404,7 @@ fn project_command(command: ProjectCommands, config: Config, json: bool) -> Resu
             name,
             harness,
             template,
-            packages,
+            packages: package_args,
         } => {
             let harness = harness.unwrap_or(config.harness);
             let template = match template {
@@ -425,17 +425,22 @@ fn project_command(command: ProjectCommands, config: Config, json: bool) -> Resu
                 template.as_deref(),
                 harness,
             )?;
-            let explicit_packages = !packages.is_empty();
-            let packages: Vec<String> = if explicit_packages {
-                packages
-            } else {
-                harness.packages().iter().map(|p| p.to_string()).collect()
-            };
-            if explicit_packages {
-                for package in &packages {
-                    if !PACKAGE_CHOICES.contains(&package.as_str()) {
-                        eprintln!("note: '{package}' is not a built-in template package");
-                    }
+            let explicit_packages = !package_args.is_empty();
+            // `--package` adds to the harness preset; it never replaces it.
+            let mut packages: Vec<String> = harness
+                .packages()
+                .iter()
+                .map(|package| package.to_string())
+                .collect();
+            for package in package_args {
+                if !crate::config::safe_package_name(&package) {
+                    bail!("invalid package name: {package:?}");
+                }
+                if explicit_packages && !PACKAGE_CHOICES.contains(&package.as_str()) {
+                    eprintln!("note: '{package}' is not a built-in template package");
+                }
+                if !packages.iter().any(|existing| existing == &package) {
+                    packages.push(package);
                 }
             }
             let meta = ProjectMeta {
@@ -450,12 +455,18 @@ fn project_command(command: ProjectCommands, config: Config, json: bool) -> Resu
                     serde_json::to_string_pretty(&serde_json::json!({
                         "path": path,
                         "harness": harness,
+                        "preset": harness.preset_summary(),
                         "packages": packages,
                     }))?
                 );
             } else {
                 println!("Created {}", path.display());
-                println!("Harness: {} ({})", harness.label(), harness.command());
+                println!(
+                    "Harness: {} ({}) — {}",
+                    harness.label(),
+                    harness.command(),
+                    harness.preset_summary()
+                );
                 println!("Packages: {}", packages.join(", "));
                 println!("Next: hegn open {}", path.display());
             }
@@ -1506,7 +1517,21 @@ mod tests {
         assert_eq!(code, 0);
         let meta = project::read_meta(&config.projects_root.join("demo"));
         assert_eq!(meta.harness, Some(Harness::Codex));
-        assert_eq!(meta.packages, vec!["git", "python3"]);
+        // The preset stays complete; --package only adds to it.
+        for package in ["git", "nodejs", "curl", "python3"] {
+            assert!(
+                meta.packages.iter().any(|existing| existing == package),
+                "missing {package}: {:?}",
+                meta.packages
+            );
+        }
+        assert_eq!(
+            meta.packages
+                .iter()
+                .filter(|package| *package == "git")
+                .count(),
+            1
+        );
     }
 
     #[test]
