@@ -432,15 +432,18 @@ hegn snapshot delete before-refactor
 A failed start leaves diagnostics in the run directory:
 
 ```bash
-cat ~/.local/state/hegn/run/hegn.log         # lifecycle + start errors
-cat ~/.local/state/hegn/run/cloud-hypervisor.log  # VMM log
+# <sandboxes_dir> defaults to ~/.local/share/hegn/sandboxes
+cat ~/.local/share/hegn/sandboxes/<name>/run/hegn.log            # lifecycle + start errors
+cat ~/.local/share/hegn/sandboxes/<name>/run/cloud-hypervisor.log # VMM log
+cat ~/.local/share/hegn/sandboxes/<name>/run/console-relay.log    # relay stderr
 hegn logs list                               # serial logs, including failed starts
 hegn logs show <name>                        # VMM API/guest output
 ```
 
-The CLI error includes the `hegn.log` path, and failed-start serial logs are no
-longer deleted, so the Cloud Hypervisor messages that caused the failure remain
-available.
+The CLI error includes the `hegn.log` path and the last lines of the VMM or
+relay log, so a boot failure is not reported as a generic relay error. Failed
+start serial logs are not deleted, so the Cloud Hypervisor messages that caused
+the failure remain available.
 
 ### Session logs
 

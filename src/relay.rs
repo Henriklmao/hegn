@@ -89,7 +89,19 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<RelayArg
 }
 
 /// Spawn the detached relay and return its pid.
-pub fn spawn(args: &RelayArgs) -> Result<u32> {
+///
+/// The relay's stderr is redirected to `stderr_log` instead of `/dev/null`:
+/// message texts are never shown directly to the user after the detach, but a
+/// failed start needs to explain *why* the relay died.
+pub fn spawn(args: &RelayArgs, stderr_log: &Path) -> Result<u32> {
+    let stderr = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(stderr_log)
+        .with_context(|| format!("failed to open relay log {}", stderr_log.display()))?;
     let exe = std::env::current_exe().context("failed to locate the hegn executable")?;
     let mut child = std::process::Command::new(exe)
         .arg(INTERNAL_ARG)
@@ -101,7 +113,7 @@ pub fn spawn(args: &RelayArgs) -> Result<u32> {
         .arg(&args.log)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr))
         .spawn()
         .context("failed to spawn the console relay")?;
     let pid = child.id();
@@ -121,11 +133,13 @@ pub fn run(args: RelayArgs) -> Result<()> {
     backend
         .set_nonblocking(true)
         .context("failed to configure the serial backend")?;
+    // Open the log before publishing the frontend socket: a failed log open
+    // must not leave a socket behind that looks attachable.
+    let mut log = open_log(&args.log)?;
     let listener = bind_frontend(&args.frontend)?;
     listener
         .set_nonblocking(true)
         .context("failed to configure the relay socket")?;
-    let mut log = open_log(&args.log)?;
 
     // Safety: the frontend socket is owned by this process; remove it on a
     // clean exit. A SIGKILL leaves it behind and the next start cleans it up

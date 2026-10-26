@@ -74,10 +74,15 @@ Cloud Hypervisor implements virtio-fs natively. hegn passes the workspace as
 The VMM is launched with seccomp filters and, unless explicitly disabled,
 Landlock. Landlock restricts the VMM's filesystem view to the kernel, the
 disks, the serial socket, the virtio-fs socket and a dedicated snapshot
-staging directory. `virtiofsd` independently runs with `--sandbox=namespace`
-(or `chroot`) and `--cache=never`. A finished snapshot is moved out of the
-staging directory and its files are tightened to `0600`, so the VMM never gets
-write access to completed checkpoints.
+staging directory. When a guarded-network TAP is passed, hegn adds a read-only
+rule for `/sys/devices/virtual/net`: Cloud Hypervisor checks an existing TAP's
+multiqueue support through that sysfs path before opening it, and its own
+ruleset only grants `/dev/net/tun`. Without the rule the VMM fails with
+`ReadSysfsTunFlags`/`EACCES` while creating virtio-net. `virtiofsd`
+independently runs with `--sandbox=namespace` (or `chroot`) and `--cache=never`.
+A finished snapshot is moved out of the staging directory and its files are
+tightened to `0600`, so the VMM never gets write access to completed
+checkpoints.
 
 ---
 
@@ -118,6 +123,7 @@ legacy single-session `state_dir/run` is only used for pre-multi-sandbox state:
   virtiofs.pid           last known virtiofsd pid
   session.json           SessionRecord
   cloud-hypervisor.log   VMM log
+  console-relay.log      relay stderr (startup failures only)
   hegn.log               lifecycle/start diagnostics (timestamped, mode 0600)
   hegn.lock              flock for lifecycle operations
   cloud-init.img         per-sandbox NoCloud seed (no secrets)
@@ -179,7 +185,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `cloud_init.rs` | NoCloud seed generation | FAT volume labelled `CIDATA`; serial root autologin; first-boot provisioner and guest network config; no secrets; `0600` and `O_NOFOLLOW` |
 | `provision.rs` | Harness preset install plans and first-boot script | Preset packages are always unioned; package names validated; only static install commands; verifies the CLI exists before writing the marker |
 | `network.rs` | Guarded host network: TAP pool reservation, nftables rules, setup marker | Root-only marker; anti-spoof; private/IPv6/guest-to-host drop; HTTP(S)+public DNS allow-list; per-sandbox `/30` slice; stale reservations reclaimed only when the owning VM is not running |
-| `relay.rs` | Detached serial relay | Sole VMM serial client; append-only log; replays the log tail on attach; bounded buffers; refuses to replace non-socket paths |
+| `relay.rs` | Detached serial relay | Sole VMM serial client; append-only log; replays the log tail on attach; bounded buffers; refuses to replace non-socket paths; stderr goes to `run/console-relay.log` because it has no terminal |
 | `virtiofs.rs` | virtiofsd argv/process construction | Shared dir canonicalized; always sandboxed; `--cache=never` by default; sockets scoped to run dir |
 | `sandbox_config.rs` | Per-sandbox `hegn.toml`, clone/copy workspaces, rootfs copies | Names validated; source project never deleted; git identity copied; clone child output is captured (warnings go to the UI, never the terminal); reflink rootfs with copy fallback |
 | `sandbox.rs` | VM lifecycle, registry, lock, session record, status, snapshots | One lifecycle lock per sandbox; preflight before spawn; hardened VMM argv; cleanup on every error path; registry lists/starts/deletes independent sandboxes |
@@ -225,7 +231,9 @@ All state paths can be overridden in `config.toml` or by environment variables
    shared=on`, `--fs`, optional `--net tap=hegnN,mac=...`, `--serial socket=...`,
    `--console off`, `--seccomp` and `--landlock`.
 10. Spawn the detached relay; it connects to the serial socket and appends to
-    the session log.
+    the session log. Its stderr goes to `run/console-relay.log`. If the relay or
+    the VMM exits before the attach socket exists, the start error names the
+    real cause and includes the last log lines instead of blaming the relay.
 11. Wait until `/api/v1/vm.info` reports `Running`.
 12. Write the pid files and `session.json`; release the lock. The children keep
     running.

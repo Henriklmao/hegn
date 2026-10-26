@@ -13,6 +13,7 @@
 //!   virtiofs.pid
 //!   session.json
 //!   cloud-hypervisor.log    VMM log
+//!   console-relay.log       relay stderr (diagnostics only)
 //!   hegn.log                lifecycle/start diagnostics
 //!   hegn.lock               lifecycle flock
 //!   cloud-init.img          NoCloud seed for the official cloud images
@@ -98,6 +99,9 @@ pub struct SandboxPaths {
     pub virtiofs_pid: PathBuf,
     pub session: PathBuf,
     pub log: PathBuf,
+    /// Relay stderr. A detached relay has no terminal, so this file is the only
+    /// place its startup error can be read from.
+    pub relay_log: PathBuf,
     /// hegn lifecycle/start errors, kept in the run directory for post-mortems.
     pub event_log: PathBuf,
     /// Exclusive lock serializing VM lifecycle operations.
@@ -119,6 +123,7 @@ impl SandboxPaths {
             virtiofs_pid: run_dir.join("virtiofs.pid"),
             session: run_dir.join("session.json"),
             log: run_dir.join("cloud-hypervisor.log"),
+            relay_log: run_dir.join("console-relay.log"),
             event_log: run_dir.join("hegn.log"),
             lock: run_dir.join("hegn.lock"),
             cloud_init: run_dir.join("cloud-init.img"),
@@ -492,7 +497,7 @@ impl SandboxManager {
 
         // 4. The relay is Cloud Hypervisor's only serial client. Start it
         // before waiting for the API so the earliest boot output is captured.
-        let relay_pid = match start_relay(&paths, &serial_log) {
+        let relay_pid = match start_relay(&paths, &serial_log, &mut vm) {
             Ok(pid) => pid,
             Err(err) => {
                 let _ = vm.kill();
@@ -1051,7 +1056,7 @@ impl SandboxManager {
             }
         };
         let vm_pid = vm.id();
-        let relay_pid = match start_relay(&paths, &serial_log) {
+        let relay_pid = match start_relay(&paths, &serial_log, &mut vm) {
             Ok(pid) => pid,
             Err(err) => {
                 let _ = vm.kill();
@@ -1437,6 +1442,17 @@ fn cloud_hypervisor_args(
     if let Some(lease) = network {
         args.push("--net".into());
         args.push(lease.cloud_hypervisor_arg().into());
+        // Cloud Hypervisor checks an existing TAP's multiqueue support by
+        // reading `/sys/class/net/<tap>/tun_flags` (resolved through sysfs to
+        // `/sys/devices/virtual/net/<tap>/tun_flags`). Its own Landlock ruleset
+        // only grants `/dev/net/tun`, so that read fails with EACCES and the VM
+        // dies while creating the virtio-net device. Grant the narrow read-only
+        // rule needed for the check; the VMM still cannot write or enumerate
+        // anything else under /sys.
+        if config.landlock {
+            args.push("--landlock-rules".into());
+            args.push("path=/sys/devices/virtual/net,access=r".into());
+        }
     }
     args.push("--serial".into());
     args.push(format!("socket={}", paths.serial_socket.display()).into());
@@ -1514,30 +1530,63 @@ fn spawn_cloud_hypervisor(
         })
 }
 
-fn start_relay(paths: &SandboxPaths, serial_log: &Path) -> Result<u32> {
+fn start_relay(paths: &SandboxPaths, serial_log: &Path, vm: &mut Child) -> Result<u32> {
     remove_socket(&paths.console_socket)?;
     let args = RelayArgs {
         backend: paths.serial_socket.clone(),
         frontend: paths.console_socket.clone(),
         log: serial_log.to_path_buf(),
     };
-    let pid = relay::spawn(&args)?;
+    let pid = relay::spawn(&args, &paths.relay_log)?;
     let binary = hegn_binary()?;
     let deadline = Instant::now() + RELAY_START_TIMEOUT;
     while Instant::now() < deadline {
         if is_socket(&paths.console_socket) && process_alive(pid) {
             return Ok(pid);
         }
+        // The relay connects to Cloud Hypervisor's serial socket and exits as
+        // soon as the backend disappears. A dead VMM therefore looks like a
+        // relay failure; report the real cause (and the VMM log) instead.
+        if let Ok(Some(status)) = vm.try_wait() {
+            bail!(
+                "Cloud Hypervisor exited during startup ({status}); last lines of {}: {}",
+                paths.log.display(),
+                log_tail(&paths.log)
+            );
+        }
         if !process_alive(pid) {
-            bail!("the console relay exited before creating its socket");
+            bail!(
+                "the console relay exited before creating its socket; last lines of {}: {}",
+                paths.relay_log.display(),
+                log_tail(&paths.relay_log)
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     terminate_relay(pid, &binary);
     bail!(
-        "timed out waiting for the console relay socket {}",
-        paths.console_socket.display()
+        "timed out waiting for the console relay socket {}; last lines of {}: {}",
+        paths.console_socket.display(),
+        paths.relay_log.display(),
+        log_tail(&paths.relay_log)
     )
+}
+
+/// Last few lines of a startup log, flattened into one diagnostic line.
+fn log_tail(path: &Path) -> String {
+    let Ok(bytes) = crate::logs::tail_bytes(path, 8) else {
+        return "no log output".into();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return "no log output".into();
+    }
+    crate::logs::sanitize_label(&lines.join(" | "))
 }
 
 async fn wait_for_vm(socket: &Path, child: &mut Child, timeout: Duration) -> Result<()> {
@@ -2379,9 +2428,72 @@ mod tests {
             joined.contains("--net tap=hegn2,mac=52:54:00:00:00:03"),
             "{joined}"
         );
+        // Cloud Hypervisor's own Landlock ruleset only grants /dev/net/tun;
+        // reading an existing TAP's sysfs flags needs this read-only rule.
+        assert!(
+            joined.contains("--landlock-rules path=/sys/devices/virtual/net,access=r"),
+            "{joined}"
+        );
         // The host TAP address is owned by `hegn network setup`, not the VMM.
         assert!(!joined.contains("ip=10.213.0."), "{joined}");
         assert!(!joined.contains("mask="), "{joined}");
+    }
+
+    #[test]
+    fn startup_log_tail_is_flattened_and_sanitized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vm.log");
+        assert_eq!(log_tail(&path), "no log output");
+        std::fs::write(&path, b"first\n\x1b[31mfatal\x1b[0m\n\nlast\n").unwrap();
+        let tail = log_tail(&path);
+        assert!(tail.contains("fatal"), "{tail}");
+        assert!(tail.contains("last"), "{tail}");
+        assert!(!tail.contains('\n'), "{tail}");
+        assert!(!tail.contains('\x1b'), "{tail}");
+    }
+
+    #[test]
+    fn sysfs_tap_rule_is_absent_without_a_network_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let sandbox = sandbox_for(dir.path());
+        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let joined = strings(&cloud_hypervisor_args(
+            &config,
+            &sandbox,
+            &paths,
+            &sandbox.rootfs_path(&config),
+            None,
+        ))
+        .join(" ");
+        assert!(!joined.contains("/sys/devices/virtual/net"), "{joined}");
+    }
+
+    #[test]
+    fn sysfs_tap_rule_is_skipped_when_landlock_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.landlock = false;
+        let sandbox = sandbox_for(dir.path());
+        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let lease = crate::network::Lease {
+            index: 2,
+            sandbox: sandbox.name.clone(),
+            tap: crate::network::tap_name(2),
+            mac: crate::network::mac(2),
+            host_ip: crate::network::host_ip(2),
+            guest_ip: crate::network::guest_ip(2),
+        };
+        let joined = strings(&cloud_hypervisor_args(
+            &config,
+            &sandbox,
+            &paths,
+            &sandbox.rootfs_path(&config),
+            Some(&lease),
+        ))
+        .join(" ");
+        assert!(!joined.contains("--landlock"), "{joined}");
+        assert!(!joined.contains("/sys/devices/virtual/net"), "{joined}");
     }
 
     #[test]
