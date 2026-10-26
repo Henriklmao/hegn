@@ -51,7 +51,7 @@ pub fn run(config: Config) -> Result<()> {
     // waiting for a VM start to fail. The "Set up everything" action is an
     // explicit confirmation inside the modal.
     let report = crate::doctor::run(&app.config);
-    if !report.ok || report.can_setup() {
+    if should_show_doctor(&report) {
         app.show_doctor(report, None);
     }
     let (scan_tx, scan_rx) = mpsc::channel();
@@ -401,7 +401,7 @@ fn handle_effects(
                 }
                 if actions.configure_network {
                     app.toast("configuring the guarded network…", ToastLevel::Info);
-                    match with_suspended_terminal(terminal, || setup_network(&app.config)) {
+                    match with_suspended_terminal(terminal, setup_network) {
                         Ok(()) => notes.push("guarded network configured".to_string()),
                         Err(err) => {
                             failed = true;
@@ -593,7 +593,13 @@ fn open_editor(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn setup_network(_config: &Config) -> Result<()> {
+/// Open the doctor on first launch when anything is broken or hegn can prepare
+/// the host without further input.
+fn should_show_doctor(report: &DoctorReport) -> bool {
+    !report.ok || report.can_setup()
+}
+
+fn setup_network() -> Result<()> {
     let user = crate::network::invoking_user()
         .context("could not determine the current user for TAP ownership")?;
     crate::network::setup_with_privilege(&user)
@@ -614,6 +620,29 @@ fn open_lazygit(path: &Path) -> Result<()> {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_launch_opens_the_doctor_when_setup_is_available() {
+        let clean = DoctorReport {
+            ok: true,
+            checks: Vec::new(),
+            assets: Vec::new(),
+            setup: crate::doctor::SetupActions::default(),
+        };
+        assert!(!should_show_doctor(&clean));
+
+        let setup = DoctorReport {
+            setup: crate::doctor::SetupActions {
+                init_config: true,
+                ..crate::doctor::SetupActions::default()
+            },
+            ..clean.clone()
+        };
+        assert!(should_show_doctor(&setup));
+
+        let broken = DoctorReport { ok: false, ..clean };
+        assert!(should_show_doctor(&broken));
+    }
 
     #[test]
     fn vm_start_runs_off_the_ui_thread_and_reports_failure() {

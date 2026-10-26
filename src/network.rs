@@ -181,10 +181,10 @@ pub fn ready_marker() -> Option<ReadyMarker> {
     .then_some(marker)
 }
 
-/// Marker present and at least the first TAP device exists. Used by doctor and
-/// by the automatic setup action.
+/// Marker present and every TAP in the pool exists. Used by doctor and by the
+/// automatic setup action.
 pub fn guard_ready(config: &Config) -> bool {
-    ready_marker().is_some() && status(config).first().is_some_and(|tap| tap.exists)
+    ready_marker().is_some() && status(config).iter().all(|tap| tap.exists)
 }
 
 /// User that should own the TAP devices. `SUDO_USER` wins when hegn itself was

@@ -1921,7 +1921,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
                 ("e", "open in $EDITOR"),
                 ("g", "open in lazygit"),
                 ("r", "refresh projects + sandboxes"),
-                ("F3", "doctor (host checks, image download)"),
+                ("F3", "doctor (host checks, automatic setup)"),
             ],
         ),
         (
