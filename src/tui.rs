@@ -80,6 +80,7 @@ fn run_loop(
         })?;
         app.footer_hits = hits.footer;
         app.project_rows = hits.projects;
+        app.sandbox_rows = hits.sandboxes;
         app.snapshot_rows = hits.snapshots;
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
