@@ -28,6 +28,7 @@ pub enum ConfigKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigPage {
     General,
+    Profiles,
     LocalLlm,
 }
 
@@ -35,6 +36,7 @@ impl ConfigPage {
     pub fn label(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Profiles => "Profiles",
             Self::LocalLlm => "Local LLM",
         }
     }
@@ -69,6 +71,8 @@ pub enum ConfigField {
     ExtraPackages,
     /// Host-loopback LLM endpoints exposed through the guarded network.
     LocalEndpoints,
+    /// A harness profile template (`profiles/<harness>.toml`).
+    Profile(Harness),
     // Sandbox-only, read-only context.
     Project,
     Workspace,
@@ -87,6 +91,8 @@ pub enum FieldKind {
     Bool,
     /// Free-form text, edited inline.
     Text,
+    /// Perform an action instead of editing a value (open a profile, …).
+    Action,
     /// Informational value; never changes.
     Locked,
 }
@@ -118,6 +124,7 @@ impl ConfigField {
             Self::ProfilesDir => "Profiles dir",
             Self::ExtraPackages => "Extra packages",
             Self::LocalEndpoints => "Endpoints (name=port)",
+            Self::Profile(harness) => harness.label(),
             Self::Project => "Project",
             Self::Workspace => "Workspace",
             Self::RootfsPath => "Rootfs",
@@ -141,6 +148,7 @@ impl ConfigField {
                 step: 256,
             },
             Self::AutoBranch | Self::CloudInit => FieldKind::Bool,
+            Self::Profile(_) => FieldKind::Action,
             Self::Project | Self::Workspace | Self::RootfsPath | Self::NetworkIndex => {
                 FieldKind::Locked
             }
@@ -217,6 +225,20 @@ const LOCAL_LLM_ROWS: &[ConfigRow] = &[
     ConfigRow::Note("apply with: sudo hegn network setup"),
 ];
 
+const PROFILE_ROWS: &[ConfigRow] = &[
+    ConfigRow::Group("Harness profiles"),
+    ConfigRow::Note("Enter opens the profile TOML; missing templates are created"),
+    ConfigRow::Note("host files and skills are copied into a per-sandbox bundle"),
+    ConfigRow::Field(ConfigField::Profile(Harness::Opencode)),
+    ConfigRow::Field(ConfigField::Profile(Harness::ClaudeCode)),
+    ConfigRow::Field(ConfigField::Profile(Harness::Codex)),
+    ConfigRow::Field(ConfigField::Profile(Harness::Pi)),
+    ConfigRow::Field(ConfigField::Profile(Harness::PrimeAgent)),
+    ConfigRow::Field(ConfigField::Profile(Harness::Aider)),
+    ConfigRow::Field(ConfigField::Profile(Harness::GeminiCli)),
+    ConfigRow::Note("CLI: hegn profile show <harness> · hegn skills sync-back <sandbox>"),
+];
+
 const SANDBOX_ROWS: &[ConfigRow] = &[
     ConfigRow::Group("Runtime"),
     ConfigRow::Field(ConfigField::Harness),
@@ -243,7 +265,11 @@ pub fn rows(kind: ConfigKind) -> &'static [ConfigRow] {
 /// config has only the general page.
 pub fn pages(kind: ConfigKind) -> &'static [ConfigPage] {
     match kind {
-        ConfigKind::Global => &[ConfigPage::General, ConfigPage::LocalLlm],
+        ConfigKind::Global => &[
+            ConfigPage::General,
+            ConfigPage::Profiles,
+            ConfigPage::LocalLlm,
+        ],
         ConfigKind::Sandbox => &[ConfigPage::General],
     }
 }
@@ -251,6 +277,7 @@ pub fn pages(kind: ConfigKind) -> &'static [ConfigPage] {
 pub fn rows_for(kind: ConfigKind, page: ConfigPage) -> &'static [ConfigRow] {
     match (kind, page) {
         (ConfigKind::Global, ConfigPage::General) => GENERAL_ROWS,
+        (ConfigKind::Global, ConfigPage::Profiles) => PROFILE_ROWS,
         (ConfigKind::Global, ConfigPage::LocalLlm) => LOCAL_LLM_ROWS,
         (ConfigKind::Sandbox, _) => SANDBOX_ROWS,
     }
@@ -267,6 +294,8 @@ pub enum FormOutcome {
     Revert,
     /// Close the modal and open the raw TOML in `$EDITOR`.
     OpenFile,
+    /// Open a harness profile template in `$EDITOR`.
+    OpenProfile(Harness),
 }
 
 /// A successfully persisted draft.
@@ -457,6 +486,7 @@ impl ConfigForm {
                 ConfigField::ProfilesDir => config.profiles_dir.display().to_string(),
                 ConfigField::ExtraPackages => list_value(&config.extra_packages),
                 ConfigField::LocalEndpoints => endpoints_value(&config.local_endpoints),
+                ConfigField::Profile(harness) => self.profile_value(harness),
                 _ => "—".to_string(),
             },
             Draft::Sandbox(sandbox) => match field {
@@ -481,8 +511,23 @@ impl ConfigForm {
                     Some(index) => format!("TAP {index}"),
                     None => "assigned on first start".to_string(),
                 },
+                ConfigField::Profile(harness) => self.profile_value(harness),
                 _ => "—".to_string(),
             },
+        }
+    }
+
+    /// Path (and state) of a harness profile template.
+    fn profile_value(&self, harness: Harness) -> String {
+        let config = match &self.draft {
+            Draft::Global(config) => config.as_ref(),
+            Draft::Sandbox(_) => self.base.as_ref(),
+        };
+        let path = crate::profile::ProfileStore::new(config).path(harness);
+        if path.is_file() {
+            path.display().to_string()
+        } else {
+            format!("{} (missing)", path.display())
         }
     }
 
@@ -569,9 +614,9 @@ impl ConfigForm {
     }
 
     /// `Enter` on the selected row.
-    pub fn activate(&mut self) {
+    pub fn activate(&mut self) -> FormOutcome {
         let Some(field) = self.selected_field() else {
-            return;
+            return FormOutcome::Stay;
         };
         self.error = None;
         match field.kind() {
@@ -585,19 +630,25 @@ impl ConfigForm {
                 self.finish(result);
             }
             FieldKind::Integer { .. } | FieldKind::Text => self.begin_edit(field),
+            FieldKind::Action => {
+                if let ConfigField::Profile(harness) = field {
+                    return FormOutcome::OpenProfile(harness);
+                }
+            }
             FieldKind::Locked => {
                 self.status = Some("read-only".into());
             }
         }
+        FormOutcome::Stay
     }
 
     /// Primary mouse click on the selected row: changes the value directly.
-    pub fn click(&mut self) {
+    pub fn click(&mut self) -> FormOutcome {
         if self.edit.is_some() {
-            return;
+            return FormOutcome::Stay;
         }
         let Some(field) = self.selected_field() else {
-            return;
+            return FormOutcome::Stay;
         };
         self.error = None;
         match field.kind() {
@@ -615,8 +666,14 @@ impl ConfigForm {
                 self.finish(result);
             }
             FieldKind::Text => self.begin_edit(field),
+            FieldKind::Action => {
+                if let ConfigField::Profile(harness) = field {
+                    return FormOutcome::OpenProfile(harness);
+                }
+            }
             FieldKind::Locked => {}
         }
+        FormOutcome::Stay
     }
 
     /// `Enter` while an inline edit is open.
@@ -728,10 +785,7 @@ impl ConfigForm {
                 }
                 FormOutcome::Stay
             }
-            KeyCode::Enter => {
-                self.activate();
-                FormOutcome::Stay
-            }
+            KeyCode::Enter => self.activate(),
             KeyCode::Char('s') if ctrl || key.modifiers.is_empty() => FormOutcome::Save,
             KeyCode::Char('r') if !ctrl && !alt => FormOutcome::Revert,
             KeyCode::Char('e') if !ctrl && !alt => {
@@ -1321,13 +1375,47 @@ mod tests {
     }
 
     #[test]
+    fn profiles_page_lists_harnesses_and_opens_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = global_config(dir.path());
+        let mut form = ConfigForm::global(config, dir.path().join("config.toml"));
+        assert!(form.set_page(ConfigPage::Profiles));
+        assert_eq!(
+            form.selected_field(),
+            Some(ConfigField::Profile(Harness::Opencode))
+        );
+        assert!(
+            form.value(ConfigField::Profile(Harness::Opencode))
+                .contains("opencode.toml")
+        );
+        assert_eq!(
+            form.handle_key(key(KeyCode::Enter)),
+            FormOutcome::OpenProfile(Harness::Opencode)
+        );
+        form.select_delta(1);
+        assert_eq!(
+            form.selected_field(),
+            Some(ConfigField::Profile(Harness::ClaudeCode))
+        );
+    }
+
+    #[test]
     fn local_llm_page_edits_endpoints() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut form = ConfigForm::global(global_config(dir.path()), path.clone());
-        assert_eq!(form.pages(), &[ConfigPage::General, ConfigPage::LocalLlm]);
+        assert_eq!(
+            form.pages(),
+            &[
+                ConfigPage::General,
+                ConfigPage::Profiles,
+                ConfigPage::LocalLlm
+            ]
+        );
         assert_eq!(form.page(), ConfigPage::General);
 
+        form.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(form.page(), ConfigPage::Profiles);
         form.handle_key(key(KeyCode::Char(']')));
         assert_eq!(form.page(), ConfigPage::LocalLlm);
         assert_eq!(form.selected_field(), Some(ConfigField::LocalEndpoints));
@@ -1350,6 +1438,8 @@ mod tests {
         let saved = Config::load_from(&path).unwrap();
         assert_eq!(saved.endpoint_ports(), vec![1234, 11434]);
 
+        form.handle_key(key(KeyCode::Char('[')));
+        assert_eq!(form.page(), ConfigPage::Profiles);
         form.handle_key(key(KeyCode::Char('[')));
         assert_eq!(form.page(), ConfigPage::General);
     }

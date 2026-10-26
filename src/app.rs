@@ -55,6 +55,8 @@ pub enum Focus {
 pub enum Effect {
     Quit,
     OpenEditor(PathBuf),
+    /// Open a harness profile template; missing templates are created first.
+    OpenProfileEditor(Harness),
     OpenLazygit(PathBuf),
     RefreshProjects,
     RestoreSnapshot(SnapshotMeta),
@@ -1329,6 +1331,7 @@ impl App {
                 FormOutcome::Save => self.save_config_form(form),
                 FormOutcome::Revert => self.revert_config_form(form),
                 FormOutcome::OpenFile => vec![Effect::OpenEditor(form.path)],
+                FormOutcome::OpenProfile(harness) => vec![Effect::OpenProfileEditor(harness)],
             },
             Modal::DeleteSandbox(mut modal) => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => Vec::new(),
@@ -1934,6 +1937,15 @@ impl App {
         form.status = status;
         self.config_hover = None;
         self.modal = Some(Modal::Config(form));
+    }
+
+    /// Reopen the global settings modal on a specific page, e.g. after editing
+    /// a harness profile from the Profiles tab.
+    pub fn reopen_global_config(&mut self, page: ConfigPage, status: Option<String>) {
+        self.show_global_config_form(status);
+        if let Some(Modal::Config(form)) = self.modal.as_mut() {
+            form.set_page(page);
+        }
     }
 
     fn open_sandbox_config(&mut self) -> Vec<Effect> {
@@ -2715,19 +2727,29 @@ impl App {
             .iter()
             .find(|row| rect_contains(row.rect, pos))
             .copied();
-        let Some(Modal::Config(form)) = self.modal.as_mut() else {
-            return Vec::new();
+        let outcome = {
+            let Some(Modal::Config(form)) = self.modal.as_mut() else {
+                return Vec::new();
+            };
+            if let Some(stepper) = stepper {
+                form.adjust_field(stepper.field, stepper.step);
+                return Vec::new();
+            }
+            if let Some(row) = row
+                && form.select_row(row.index)
+            {
+                form.click()
+            } else {
+                FormOutcome::Stay
+            }
         };
-        if let Some(stepper) = stepper {
-            form.adjust_field(stepper.field, stepper.step);
-            return Vec::new();
+        match outcome {
+            FormOutcome::OpenProfile(harness) => {
+                self.modal = None;
+                vec![Effect::OpenProfileEditor(harness)]
+            }
+            _ => Vec::new(),
         }
-        if let Some(row) = row
-            && form.select_row(row.index)
-        {
-            form.click();
-        }
-        Vec::new()
     }
 
     /// Test/uploads access to the security engine.
@@ -2842,6 +2864,7 @@ mod tests {
         config.snapshots_dir = dir.path().join("snapshots");
         config.templates_dir = dir.path().join("templates");
         config.sandboxes_dir = dir.path().join("sandboxes");
+        config.profiles_dir = dir.path().join("profiles");
         config.backend = crate::config::BackendKind::Auto;
         config.auto_branch = false;
         std::fs::create_dir_all(&config.projects_root).unwrap();
@@ -3678,6 +3701,28 @@ mod tests {
             Some(Modal::Config(form)) => assert_eq!(form.kind, ConfigKind::Sandbox),
             other => panic!("expected sandbox settings, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn config_profiles_tab_opens_the_profile_editor() {
+        let (_dir, mut app) = test_app();
+        app.handle_key(key(KeyCode::F(4)));
+        app.handle_key(key(KeyCode::Char(']')));
+        match &app.modal {
+            Some(Modal::Config(form)) => {
+                assert_eq!(form.page(), ConfigPage::Profiles);
+                assert_eq!(
+                    form.selected_field(),
+                    Some(ConfigField::Profile(Harness::Opencode))
+                );
+            }
+            other => panic!("expected settings modal, got {other:?}"),
+        }
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::OpenProfileEditor(Harness::Opencode)]
+        ));
     }
 
     #[test]

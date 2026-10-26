@@ -448,6 +448,29 @@ fn handle_effects(
                     Err(err) => app.toast(format!("editor failed: {err}"), ToastLevel::Error),
                 }
             }
+            Effect::OpenProfileEditor(harness) => {
+                let store = crate::profile::ProfileStore::new(&app.config);
+                let path = store.path(harness);
+                if !path.is_file()
+                    && let Err(err) = store.write_templates()
+                {
+                    app.toast(
+                        format!("could not create profile template: {err:#}"),
+                        ToastLevel::Error,
+                    );
+                    continue;
+                }
+                match with_suspended_terminal(terminal, || open_editor(&path)) {
+                    Ok(()) => {
+                        app.reload_after_edit();
+                        app.reopen_global_config(
+                            crate::config_form::ConfigPage::Profiles,
+                            Some(format!("{} profile edited", harness.label())),
+                        );
+                    }
+                    Err(err) => app.toast(format!("editor failed: {err}"), ToastLevel::Error),
+                }
+            }
             Effect::OpenLazygit(path) => {
                 if let Err(err) = with_suspended_terminal(terminal, || open_lazygit(&path)) {
                     app.toast(format!("lazygit failed: {err}"), ToastLevel::Error);

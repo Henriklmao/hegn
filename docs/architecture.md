@@ -184,7 +184,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | --- | --- | --- |
 | `cli.rs` | Clap command surface, JSON/text output, exit codes | Every TUI operation has a CLI counterpart; no fallback paths |
 | `config.rs` | Schema, defaults, env overrides, validation, XDG paths, tool lookup | Unknown keys rejected; SHA-256 and HTTPS URL validation; log dir `0700`; `virtiofsd` resolved via `PATH` then distribution dirs; writes are validated and installed with an atomic tmp+rename |
-| `config_form.rs` | Interactive settings editor for the `F4`/`F5` modal | Edits a validated working copy; schema validation before saving; locked Landlock/seccomp; inline text edits never touch disk until `Ctrl-S` |
+| `config_form.rs` | Interactive settings editor for the `F4`/`F5` modal | Edits a validated working copy; schema validation before saving; locked Landlock/seccomp; global Profiles tab opens harness templates in `$EDITOR`; inline text edits never touch disk until `Ctrl-S` |
 | `project.rs` | Discovery, fuzzy filter, git summaries, create, import, checkpoints | Import only creates a symlink; dangerous targets rejected; discovery skips links to `/`, `$HOME` and root ancestors |
 | `security.rs` | `tirith-core` integration and hegn workspace rules | Empty commands allowed; off mode still keeps destructive-operation guard |
 | `cloud_hypervisor.rs` | Typed REST client over `/api/v1` | Frames responses by `Content-Length`/chunked encoding, accepts bodyless `204`, bounded response sizes, pause/resume/info/snapshot only |

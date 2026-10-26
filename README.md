@@ -52,9 +52,11 @@ fix.
   linked), so a poisoned guest cannot modify the host's real skill directories;
   `hegn skills sync-back` copies guest-created or changed skills back on demand.
 - **Config menus** — `F4` opens an interactive settings editor for the global
-  config, `F5` for the selected sandbox's `hegn.toml`. Navigate with the arrow
-  keys or the mouse, change values in place, and save with `Ctrl-S`. A raw
-  `$EDITOR` round-trip stays available for comments and advanced keys.
+  config, `F5` for the selected sandbox's `hegn.toml`. It has a **Profiles**
+  tab that opens the per-harness TOML (creating a missing template first).
+  Navigate with the arrow keys or the mouse, change values in place, and save
+  with `Ctrl-S`. A raw `$EDITOR` round-trip stays available for comments and
+  advanced keys.
 - **Modal terminal** — Vim-style `i`/`a` insert mode and `Esc` to return to
   normal mode, so scrolling and shortcuts never leak keystrokes into the guest.
 - **Safe deletion** — deleting a sandbox asks twice, offers to keep clone
@@ -432,7 +434,9 @@ kept), and the same modal is available from the sandboxes tab. With
 Per-sandbox settings live in `<sandbox>/hegn.toml`. In the TUI, `F4` opens the
 global settings editor and `F5` opens the selected sandbox's editor. Both are
 interactive modals: use `↑`/`↓` or the mouse to select a row, `←`/`→`, `‹`/`›`
-or a click to change a value, and `Enter` to toggle or type. `Ctrl-S` saves,
+or a click to change a value, and `Enter` to toggle or type. The global editor's
+**Profiles** page lists every harness profile; `Enter` creates the template if
+needed and opens it in `$EDITOR`. `Ctrl-S` saves,
 `r` reloads the file from disk, and `e` (or *Edit file*) opens the raw TOML in
 `$EDITOR` when you need comments or keys the editor does not expose. Saving
 rewrites the file from the schema, so hand-written comments are not preserved;
@@ -689,10 +693,10 @@ never weakens the Cloud Hypervisor sandboxes.
 | --- | --- |
 | `↑`/`↓`, `j`/`k`, wheel, click | Select a row |
 | `←`/`→`, `h`/`l`, `‹`/`›`, click | Cycle a choice, step a number, toggle a switch |
-| `Enter` | Toggle, cycle, or start typing a value |
+| `Enter` | Toggle, cycle, start typing a value, or open a profile template |
 | `Enter` / `Esc` while typing | Apply / discard the value |
 | `Home` / `End`, `PgUp` / `PgDn` | Jump to the first / last row, page through rows |
-| `[` / `]` | Switch settings pages (General / Local LLM) |
+| `[` / `]` | Switch settings pages (General / Profiles / Local LLM; sandbox: General) |
 | `Ctrl-S` | Validate and save |
 | `r` | Reload the file from disk (discard unsaved changes) |
 | `e` | Open the raw TOML in `$EDITOR` (requires a clean draft) |
@@ -701,6 +705,11 @@ never weakens the Cloud Hypervisor sandboxes.
 Inline edits are validated immediately: numbers are range-checked, paths get
 `~` expanded, package names must be valid Debian identifiers, and the same
 schema validation that guards `config.toml` runs again before the atomic save.
+
+The **Profiles** page is global (profiles are selected by a sandbox's harness).
+It shows the template path or `(missing)`, creates a missing template on
+`Enter`, and returns to the same tab after the editor exits. Profile files can
+contain API keys; they stay `0600` in a `0700` directory.
 
 The guarded network is a one-time privileged host setup:
 
