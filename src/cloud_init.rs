@@ -15,6 +15,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use fatfs::{FileSystem, FormatVolumeOptions, FsOptions};
 
+use crate::network::Lease;
 use crate::provision::ProvisionPlan;
 
 /// 4 MiB is enough for the seed and keeps it cheap.
@@ -129,6 +130,7 @@ pub fn write_seed(
     guest_mount: &str,
     instance_id: &str,
     provision: &ProvisionPlan,
+    network: Option<&Lease>,
 ) -> Result<()> {
     if !safe_token(shared_tag) {
         anyhow::bail!("unsafe virtio-fs tag for the cloud-init seed: {shared_tag:?}");
@@ -166,6 +168,9 @@ pub fn write_seed(
         let root = fs.root_dir();
         write_file(&root, "user-data", &user_data)?;
         write_file(&root, "meta-data", &meta_data)?;
+        if let Some(network) = network {
+            write_file(&root, "network-config", &network.guest_network_config())?;
+        }
     }
     file.sync_all()?;
     Ok(())
@@ -185,16 +190,19 @@ fn write_file<IO: std::io::Read + std::io::Write + std::io::Seek>(
     Ok(())
 }
 
-/// Stable id for this seed. It changes when the seed version or preset
-/// changes, which makes cloud-init re-apply the new user-data even when the
-/// rootfs is reused.
-pub fn instance_id(sandbox: &str, provision: &ProvisionPlan) -> String {
+/// Stable id for this seed. It changes when the seed version, preset or
+/// network configuration changes, which makes cloud-init re-apply the new
+/// user-data/network-config even when the rootfs is reused.
+pub fn instance_id(sandbox: &str, provision: &ProvisionPlan, network: Option<&Lease>) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
     hasher.update(SEED_VERSION.to_le_bytes());
     hasher.update(provision.harness.label().as_bytes());
     hasher.update(provision.script().as_bytes());
+    if let Some(lease) = network {
+        hasher.update(lease.guest_network_config().as_bytes());
+    }
     let digest = hex::encode(hasher.finalize());
     format!("hegn-{sandbox}-v{SEED_VERSION}-{}", &digest[..12])
 }
@@ -208,9 +216,21 @@ pub fn disk_arg(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::config::Harness;
+    use crate::network::{Lease, guest_ip, host_ip, mac, tap_name};
     use std::io::Read;
 
-    fn read_seed(path: &Path) -> (String, String) {
+    fn lease() -> Lease {
+        Lease {
+            index: 0,
+            sandbox: "demo".into(),
+            tap: tap_name(0),
+            mac: mac(0),
+            host_ip: host_ip(0),
+            guest_ip: guest_ip(0),
+        }
+    }
+
+    fn read_seed(path: &Path) -> (String, String, Option<String>) {
         let file = OpenOptions::new().read(true).open(path).unwrap();
         let fs = FileSystem::new(file, FsOptions::new()).unwrap();
         let root = fs.root_dir();
@@ -224,7 +244,12 @@ mod tests {
             .unwrap()
             .read_to_string(&mut meta_data)
             .unwrap();
-        (user_data, meta_data)
+        let network = root.open_file("network-config").ok().map(|mut file| {
+            let mut raw = String::new();
+            file.read_to_string(&mut raw).unwrap();
+            raw
+        });
+        (user_data, meta_data, network)
     }
 
     #[test]
@@ -234,14 +259,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cloud-init.img");
         let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
-        write_seed(&path, "workspace", "/workspace", "hegn-demo", &plan).unwrap();
+        write_seed(
+            &path,
+            "workspace",
+            "/workspace",
+            "hegn-demo",
+            &plan,
+            Some(&lease()),
+        )
+        .unwrap();
 
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
 
-        let (user_data, meta_data) = read_seed(&path);
+        let (user_data, meta_data, network) = read_seed(&path);
         assert!(user_data.contains("autologin root"), "{user_data}");
         assert!(
             user_data.contains("mount -t virtiofs 'workspace' '/workspace'"),
@@ -251,16 +284,31 @@ mod tests {
         assert!(user_data.contains("/usr/local/sbin/hegn-provision"));
         assert!(user_data.contains("hegn-provision.service"));
         assert!(meta_data.contains("instance-id: hegn-demo"), "{meta_data}");
+        let network = network.expect("network-config must be present");
+        assert!(network.contains("10.213.0.2/30"), "{network}");
+        assert!(network.contains("via: 10.213.0.1"), "{network}");
     }
 
     #[test]
-    fn instance_id_changes_with_preset() {
+    fn instance_id_changes_with_preset_and_network() {
         let shell = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
         let opencode = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
-        let a = instance_id("demo", &shell);
-        assert_eq!(a, instance_id("demo", &shell));
-        assert_ne!(a, instance_id("demo", &opencode));
+        let a = instance_id("demo", &shell, None);
+        assert_eq!(a, instance_id("demo", &shell, None));
+        assert_ne!(a, instance_id("demo", &opencode, None));
+        assert_ne!(a, instance_id("demo", &shell, Some(&lease())));
         assert!(a.starts_with("hegn-demo-v"));
+    }
+
+    #[test]
+    fn off_network_omits_network_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud-init.img");
+        let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
+        write_seed(&path, "workspace", "/workspace", "hegn-demo", &plan, None).unwrap();
+        let (user_data, _, network) = read_seed(&path);
+        assert!(network.is_none());
+        assert!(!user_data.contains("network-config"));
     }
 
     #[test]
@@ -272,7 +320,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
 
-        assert!(write_seed(&link, "workspace", "/workspace", "hegn-demo", &plan).is_err());
+        assert!(write_seed(&link, "workspace", "/workspace", "hegn-demo", &plan, None).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
     }
 
@@ -281,10 +329,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cloud-init.img");
         let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
-        assert!(write_seed(&path, "bad tag", "/workspace", "hegn-demo", &plan).is_err());
-        assert!(write_seed(&path, "workspace", "/work space", "hegn-demo", &plan).is_err());
-        assert!(write_seed(&path, "workspace;reboot", "/workspace", "hegn-demo", &plan).is_err());
-        assert!(write_seed(&path, "workspace", "/workspace;reboot", "hegn-demo", &plan).is_err());
+        assert!(write_seed(&path, "bad tag", "/workspace", "hegn-demo", &plan, None).is_err());
+        assert!(write_seed(&path, "workspace", "/work space", "hegn-demo", &plan, None).is_err());
+        assert!(
+            write_seed(
+                &path,
+                "workspace;reboot",
+                "/workspace",
+                "hegn-demo",
+                &plan,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            write_seed(
+                &path,
+                "workspace",
+                "/workspace;reboot",
+                "hegn-demo",
+                &plan,
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -293,7 +361,7 @@ mod tests {
         let path = dir.path().join("cloud-init.img");
         std::fs::write(&path, vec![0u8; 1024]).unwrap();
         let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
-        write_seed(&path, "workspace", "/workspace", "hegn-demo", &plan).unwrap();
+        write_seed(&path, "workspace", "/workspace", "hegn-demo", &plan, None).unwrap();
         assert!(std::fs::metadata(&path).unwrap().len() >= SEED_BYTES);
     }
 }

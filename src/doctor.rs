@@ -152,6 +152,26 @@ pub fn run(config: &Config) -> DoctorReport {
         true,
         config.projects_root.display().to_string(),
     ));
+    let guarded = config.network == crate::config::NetworkMode::Guarded;
+    let taps = crate::network::status(config);
+    let guard_ready = crate::network::ready_marker().is_some()
+        && taps.len() == usize::from(crate::network::TAP_POOL)
+        && taps.iter().all(|tap| tap.exists);
+    checks.push(Check::new(
+        "network guard",
+        guard_ready || !guarded,
+        guarded,
+        if !guarded {
+            "disabled in config (air-gapped guest)".to_string()
+        } else if guard_ready {
+            format!(
+                "guarded egress: public HTTP(S)+DNS only, {} TAP slices",
+                crate::network::TAP_POOL
+            )
+        } else {
+            "not configured; run `sudo hegn network setup --user $USER`".to_string()
+        },
+    ));
     checks.push(Check::new(
         "serial logs",
         config.logs_dir().is_dir(),

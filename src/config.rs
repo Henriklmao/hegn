@@ -209,6 +209,28 @@ impl Harness {
     }
 }
 
+/// Whether the guest gets a guarded network device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkMode {
+    /// No network device at all (air-gapped).
+    Off,
+    /// A host-guarded TAP device: public HTTP(S) and public DNS only.
+    #[default]
+    Guarded,
+}
+
+impl NetworkMode {
+    pub const ALL: [Self; 2] = [Self::Off, Self::Guarded];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Guarded => "guarded",
+        }
+    }
+}
+
 /// Validate a Debian package name before it reaches a root shell or YAML file.
 pub fn safe_package_name(name: &str) -> bool {
     !name.is_empty()
@@ -361,6 +383,9 @@ pub struct Config {
     pub backend: BackendKind,
     /// Harness launched when a project is opened.
     pub harness: Harness,
+    /// Guest networking policy. `guarded` is an allow-listed TAP device;
+    /// `off` removes the NIC entirely.
+    pub network: NetworkMode,
     /// Extra packages installed while creating a VM template.
     pub extra_packages: Vec<String>,
     /// Create `agent/hegn-session-<timestamp>` before launching.
@@ -405,6 +430,7 @@ impl Default for Config {
             virtiofs_sandbox: VirtiofsSandbox::Namespace,
             backend: BackendKind::Auto,
             harness: Harness::Shell,
+            network: NetworkMode::Guarded,
             extra_packages: Vec::new(),
             auto_branch: true,
             security: SecurityMode::Enforce,
@@ -505,6 +531,13 @@ impl Config {
         }
         if let Ok(value) = std::env::var("HEGN_ROOTFS_SHA256") {
             self.rootfs_sha256 = value;
+        }
+        if let Ok(value) = std::env::var("HEGN_NETWORK") {
+            self.network = match value.trim().to_ascii_lowercase().as_str() {
+                "off" | "disabled" => NetworkMode::Off,
+                "guarded" | "web" => NetworkMode::Guarded,
+                _ => self.network,
+            };
         }
     }
 

@@ -122,6 +122,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: ImageCommands,
     },
+    /// Configure or inspect the host-enforced guest network guard.
+    Network {
+        #[command(subcommand)]
+        command: NetworkCommands,
+    },
     /// Check host prerequisites (KVM, Cloud Hypervisor, virtiofsd, assets, tools).
     Doctor,
     /// Measure the host cost of a sandbox; boots one on demand.
@@ -313,6 +318,23 @@ pub enum ImageCommands {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum NetworkCommands {
+    /// Show the firewall marker and TAP pool state.
+    Status,
+    /// Create the TAP pool and install the nftables egress rules (requires root).
+    Setup {
+        /// User that may open the TAP devices (defaults to $SUDO_USER or $USER).
+        #[arg(long)]
+        user: Option<String>,
+        /// Print the script instead of applying it (does not require root).
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the TAP pool and the nftables table (requires root).
+    Teardown,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ConfigCommands {
     /// Print the effective configuration as TOML.
     Show,
@@ -391,6 +413,7 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
         Commands::Check { command, cwd } => check(&command.join(" "), cwd.as_deref(), config, json),
         Commands::Config { command } => config_command(command, config, json),
         Commands::Images { command } => image_command(command, config, json),
+        Commands::Network { command } => network_command(command, config, json),
         Commands::Doctor => doctor(config, json),
         Commands::Benchmark { project, clean } => {
             benchmark::run(&config, project.as_deref(), clean, json)
@@ -1050,6 +1073,76 @@ fn print_assets(assets: &[AssetStatus], json: bool) -> Result<()> {
         println!("\nDownload with: hegn images download");
     }
     Ok(())
+}
+
+fn network_command(command: NetworkCommands, config: Config, json: bool) -> Result<i32> {
+    match command {
+        NetworkCommands::Status => {
+            let marker = crate::network::ready_marker();
+            let taps = crate::network::status(&config);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ready": marker.is_some(),
+                        "marker": marker,
+                        "mode": config.network.label(),
+                        "taps": taps,
+                    }))?
+                );
+            } else {
+                match &marker {
+                    Some(marker) => println!(
+                        "guard: ready (subnet {}, {} TAPs, applied {})",
+                        marker.subnet, marker.pool, marker.applied_at
+                    ),
+                    None => println!(
+                        "guard: not configured; run `sudo hegn network setup --user $USER`"
+                    ),
+                }
+                println!("mode: {}", config.network.label());
+                for tap in taps {
+                    let owner = tap.owner.as_deref().unwrap_or("-");
+                    println!(
+                        "  {:<8} {:<15} {} owner={owner}",
+                        tap.tap,
+                        tap.host_ip,
+                        if tap.exists { "up" } else { "missing" }
+                    );
+                }
+            }
+            Ok(0)
+        }
+        NetworkCommands::Setup { user, dry_run } => {
+            let user = user
+                .or_else(|| std::env::var("SUDO_USER").ok())
+                .or_else(|| std::env::var("USER").ok())
+                .context("could not determine the TAP owner; pass --user NAME")?;
+            if dry_run {
+                println!("{}", crate::network::setup_script(&user)?);
+                return Ok(0);
+            }
+            crate::network::setup(&user)?;
+            if json {
+                println!("{}", serde_json::json!({"ready": true, "user": user}));
+            } else {
+                println!(
+                    "guarded network is active; TAPs are owned by '{user}'. Start a sandbox with \
+                     `hegn sandbox start <name>`."
+                );
+            }
+            Ok(0)
+        }
+        NetworkCommands::Teardown => {
+            crate::network::teardown()?;
+            if json {
+                println!("{}", serde_json::json!({"ready": false}));
+            } else {
+                println!("guarded network removed.");
+            }
+            Ok(0)
+        }
+    }
 }
 
 fn doctor(config: Config, json: bool) -> Result<i32> {

@@ -57,6 +57,10 @@ pub struct SandboxConfig {
     pub security: SecurityMode,
     /// Additional apt packages on top of the harness preset.
     pub extra_packages: Vec<String>,
+    /// Stable slice of the guarded-network TAP pool. Assigned on creation so
+    /// snapshots restore onto the same device.
+    #[serde(default)]
+    pub network_index: Option<u8>,
 }
 
 impl Default for SandboxConfig {
@@ -78,6 +82,7 @@ impl Default for SandboxConfig {
             auto_branch: true,
             security: SecurityMode::Enforce,
             extra_packages: Vec::new(),
+            network_index: None,
         }
     }
 }
@@ -217,6 +222,14 @@ impl SandboxConfig {
             .context("sandbox guest_mount must be an absolute, simple path")?;
         if let Some(source) = &self.source_sandbox {
             validate_name(source)?;
+        }
+        if let Some(index) = self.network_index
+            && index >= crate::network::TAP_POOL
+        {
+            bail!(
+                "sandbox network_index {index} is outside the {} TAP pool",
+                crate::network::TAP_POOL
+            );
         }
         for package in &self.extra_packages {
             if !crate::config::safe_package_name(package) {
@@ -538,7 +551,20 @@ impl SandboxStore {
             auto_branch: base.auto_branch,
             security: base.security,
             extra_packages,
+            network_index: self.next_network_index(),
         }
+    }
+
+    /// Lowest TAP slice not used by an existing sandbox. Assignment happens at
+    /// creation; a legacy sandbox with no index gets one on first start.
+    fn next_network_index(&self) -> Option<u8> {
+        let used: Vec<u8> = self
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|sandbox| sandbox.network_index)
+            .collect();
+        (0..crate::network::TAP_POOL).find(|index| !used.contains(index))
     }
 
     /// Remove a sandbox directory.

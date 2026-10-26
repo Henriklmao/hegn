@@ -44,6 +44,7 @@ use crate::cloud_hypervisor::{CloudHypervisorClient, SnapshotConfig, VmInfo, VmS
 use crate::cloud_init;
 use crate::config::{Config, Harness, VIRTIOFSD_FALLBACKS};
 use crate::logs::{DEFAULT_KEEP, LogStore};
+use crate::network;
 use crate::provision::ProvisionPlan;
 use crate::relay::{self, RelayArgs};
 use crate::sandbox_config::{CloneOutcome, DeleteOutcome, SandboxConfig, SandboxStore};
@@ -57,6 +58,26 @@ const RELAY_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERIAL_CONSOLE: &str = "ttyS0";
 #[cfg(target_arch = "aarch64")]
 const SERIAL_CONSOLE: &str = "ttyAMA0";
+
+/// TAP names embedded in a Cloud Hypervisor snapshot config.
+fn snapshot_network_taps(dir: &Path) -> Result<Vec<String>> {
+    let path = dir.join("config.json");
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(value
+        .get("net")
+        .and_then(serde_json::Value::as_array)
+        .map(|devices| {
+            devices
+                .iter()
+                .filter_map(|device| device.get("tap").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
 
 fn boot_args(root_device: &str) -> String {
     format!("console={SERIAL_CONSOLE} reboot=k panic=1 root={root_device} rw")
@@ -210,6 +231,17 @@ impl SandboxManager {
         &self.sandbox
     }
 
+    /// Persist a newly assigned guarded-network slice so later boots and
+    /// snapshot restores use the same TAP device.
+    fn persist_network_index(&self, index: u8) -> Result<()> {
+        if self.sandbox.network_index == Some(index) {
+            return Ok(());
+        }
+        let mut sandbox = self.sandbox.clone();
+        sandbox.network_index = Some(index);
+        SandboxStore::new(self.config.clone()).save(&sandbox)
+    }
+
     pub fn paths(&self) -> SandboxPaths {
         SandboxPaths::from_sandbox(&self.config, &self.sandbox)
     }
@@ -337,13 +369,47 @@ impl SandboxManager {
         if self.session().is_some() {
             self.cleanup_stale();
         }
-        paths.ensure()?;
+        if self.config.network == crate::config::NetworkMode::Off
+            && self.config.cloud_init
+            && self.sandbox.harness != Harness::Shell
+        {
+            bail!(
+                "harness '{}' needs the guarded network for its first-boot install; enable \
+                 `network = \"guarded\"` or use a pre-provisioned rootfs with `cloud_init = false`",
+                self.sandbox.harness.label()
+            );
+        }
+        // Reserve the guarded-network slice before any process is spawned.
+        // `acquire` also verifies that the host firewall marker is present, so
+        // an unconfigured guard fails before virtiofsd or the VMM can start.
+        let network_lease = match self.config.network {
+            crate::config::NetworkMode::Guarded => {
+                Some(network::acquire(&self.config, &self.sandbox)?)
+            }
+            crate::config::NetworkMode::Off => None,
+        };
+        if let Some(lease) = &network_lease
+            && let Err(err) = self.persist_network_index(lease.index)
+        {
+            network::release(&self.config, &self.sandbox.name);
+            return Err(err);
+        }
+        if let Err(err) = paths.ensure() {
+            network::release(&self.config, &self.sandbox.name);
+            return Err(err);
+        }
         // Build the runtime before spawning anything so a failure here cannot
         // leak a running virtiofsd or VMM process.
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .context("failed to build async runtime")?;
+        {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                network::release(&self.config, &self.sandbox.name);
+                return Err(err).context("failed to build async runtime");
+            }
+        };
 
         let started_at = Utc::now();
         let logs = LogStore::new(self.config.logs_dir());
@@ -353,14 +419,27 @@ impl SandboxManager {
                 &format!("warning: could not prune old serial logs: {err:#}"),
             );
         }
-        let serial_log = logs.create_session(project, started_at, std::process::id())?;
+        let serial_log = match logs.create_session(project, started_at, std::process::id()) {
+            Ok(path) => path,
+            Err(err) => {
+                network::release(&self.config, &self.sandbox.name);
+                return Err(err);
+            }
+        };
 
         // 1. virtiofsd, sandboxed to exactly this project.
-        let mut virtiofs = spawn_virtiofsd(&self.config, &paths, project)?;
+        let mut virtiofs = match spawn_virtiofsd(&self.config, &paths, project) {
+            Ok(process) => process,
+            Err(err) => {
+                network::release(&self.config, &self.sandbox.name);
+                return Err(err);
+            }
+        };
         let virtiofs_pid = virtiofs.pid();
         if let Err(err) = write_private(&paths.virtiofs_pid, virtiofs_pid.to_string()) {
             virtiofs.kill();
             cleanup_files(&paths);
+            network::release(&self.config, &self.sandbox.name);
             return Err(err).context("failed to record the virtiofsd pid");
         }
 
@@ -372,6 +451,7 @@ impl SandboxManager {
             Err(err) => {
                 virtiofs.kill();
                 cleanup_files(&paths);
+                network::release(&self.config, &self.sandbox.name);
                 return Err(err);
             }
         };
@@ -380,25 +460,34 @@ impl SandboxManager {
                 &paths.cloud_init,
                 &self.sandbox.shared_tag,
                 &self.sandbox.guest_mount,
-                &cloud_init::instance_id(&self.sandbox.name, &provision),
+                &cloud_init::instance_id(&self.sandbox.name, &provision, network_lease.as_ref()),
                 &provision,
+                network_lease.as_ref(),
             )
         {
             virtiofs.kill();
             cleanup_files(&paths);
+            network::release(&self.config, &self.sandbox.name);
             return Err(err);
         }
 
         // 3. Cloud Hypervisor. Children outlive this CLI call.
-        let mut vm =
-            match spawn_cloud_hypervisor(&self.config, &self.sandbox, &paths, &vm_binary, None) {
-                Ok(child) => child,
-                Err(err) => {
-                    virtiofs.kill();
-                    cleanup_files(&paths);
-                    return Err(err);
-                }
-            };
+        let mut vm = match spawn_cloud_hypervisor(
+            &self.config,
+            &self.sandbox,
+            &paths,
+            &vm_binary,
+            None,
+            network_lease.as_ref(),
+        ) {
+            Ok(child) => child,
+            Err(err) => {
+                virtiofs.kill();
+                cleanup_files(&paths);
+                network::release(&self.config, &self.sandbox.name);
+                return Err(err);
+            }
+        };
         let vm_pid = vm.id();
 
         // 4. The relay is Cloud Hypervisor's only serial client. Start it
@@ -410,6 +499,7 @@ impl SandboxManager {
                 let _ = vm.wait();
                 virtiofs.kill();
                 cleanup_files(&paths);
+                network::release(&self.config, &self.sandbox.name);
                 return Err(err);
             }
         };
@@ -422,6 +512,7 @@ impl SandboxManager {
             terminate_relay(relay_pid, &hegn);
             virtiofs.kill();
             cleanup_files(&paths);
+            network::release(&self.config, &self.sandbox.name);
             return Err(err).context("failed to boot Cloud Hypervisor");
         }
 
@@ -452,6 +543,7 @@ impl SandboxManager {
             terminate_relay(relay_pid, &hegn);
             virtiofs.kill();
             cleanup_files(&paths);
+            network::release(&self.config, &self.sandbox.name);
             return Err(err).context("failed to record the sandbox session");
         }
 
@@ -546,6 +638,7 @@ impl SandboxManager {
             terminate(pid, &self.config.virtiofsd_bin);
         }
         cleanup_files(&paths);
+        network::release(&self.config, &self.sandbox.name);
         Ok(())
     }
 
@@ -796,6 +889,68 @@ impl SandboxManager {
                 paths.run_dir.display()
             );
         }
+        if self.config.network == crate::config::NetworkMode::Off
+            && self.config.cloud_init
+            && self.sandbox.harness != Harness::Shell
+        {
+            bail!(
+                "harness '{}' needs the guarded network for its first-boot install; enable \
+                 `network = \"guarded\"` or use a pre-provisioned rootfs with `cloud_init = false`",
+                self.sandbox.harness.label()
+            );
+        }
+        let network_lease = match self.config.network {
+            crate::config::NetworkMode::Guarded => {
+                Some(network::acquire(&self.config, &self.sandbox)?)
+            }
+            crate::config::NetworkMode::Off => None,
+        };
+        if let Some(lease) = &network_lease
+            && let Err(err) = self.persist_network_index(lease.index)
+        {
+            network::release(&self.config, &self.sandbox.name);
+            return Err(err);
+        }
+        // The snapshot embeds its device tree. Never silently restore a NIC
+        // that contradicts the current policy, and never attach a snapshot to
+        // a different sandbox TAP than the one it was created with.
+        let snapshot_taps = match snapshot_network_taps(&snapshot.dir) {
+            Ok(taps) => taps,
+            Err(err) => {
+                network::release(&self.config, &self.sandbox.name);
+                return Err(err);
+            }
+        };
+        match (&network_lease, snapshot_taps.as_slice()) {
+            (None, []) => {}
+            (None, [_, ..]) => {
+                network::release(&self.config, &self.sandbox.name);
+                bail!(
+                    "snapshot '{}' contains a network device but `network = \"off\"`; enable \
+                     guarded networking or restore an air-gapped snapshot",
+                    snapshot.name
+                );
+            }
+            (Some(lease), []) => append_event_log(
+                &paths.event_log,
+                &format!(
+                    "warning: snapshot {} has no network device; restoring it without the reserved {}",
+                    snapshot.name, lease.tap
+                ),
+            ),
+            (Some(lease), taps) if taps.iter().any(|tap| tap != &lease.tap) => {
+                network::release(&self.config, &self.sandbox.name);
+                bail!(
+                    "snapshot '{}' expects TAP {}, but sandbox '{}' owns {}; restore it in the \
+                     sandbox that created it",
+                    snapshot.name,
+                    taps.join(", "),
+                    self.sandbox.name,
+                    lease.tap
+                );
+            }
+            (Some(_), [_, ..]) => {}
+        }
 
         // Stop the old VM, relay and filesystem daemon. The sockets are freed
         // and recreated below with the same paths the snapshot expects.
@@ -823,6 +978,7 @@ impl SandboxManager {
             Ok(process) => process,
             Err(err) => {
                 cleanup_files(&paths);
+                network::release(&self.config, &self.sandbox.name);
                 return Err(err);
             }
         };
@@ -830,6 +986,7 @@ impl SandboxManager {
         if let Err(err) = write_private(&paths.virtiofs_pid, virtiofs_pid.to_string()) {
             virtiofs.kill();
             cleanup_files(&paths);
+            network::release(&self.config, &self.sandbox.name);
             return Err(err).context("failed to record the virtiofsd pid");
         }
 
@@ -839,6 +996,7 @@ impl SandboxManager {
             Err(err) => {
                 virtiofs.kill();
                 cleanup_files(&paths);
+                network::release(&self.config, &self.sandbox.name);
                 return Err(err);
             }
         };
@@ -847,12 +1005,14 @@ impl SandboxManager {
                 &paths.cloud_init,
                 &self.sandbox.shared_tag,
                 &self.sandbox.guest_mount,
-                &cloud_init::instance_id(&self.sandbox.name, &provision),
+                &cloud_init::instance_id(&self.sandbox.name, &provision, network_lease.as_ref()),
                 &provision,
+                network_lease.as_ref(),
             )
         {
             virtiofs.kill();
             cleanup_files(&paths);
+            network::release(&self.config, &self.sandbox.name);
             return Err(err);
         }
 
@@ -869,6 +1029,7 @@ impl SandboxManager {
             Err(err) => {
                 virtiofs.kill();
                 cleanup_files(&paths);
+                network::release(&self.config, &self.sandbox.name);
                 return Err(err);
             }
         };
@@ -879,11 +1040,13 @@ impl SandboxManager {
             &paths,
             &vm_binary,
             Some(snapshot),
+            None,
         ) {
             Ok(child) => child,
             Err(err) => {
                 virtiofs.kill();
                 cleanup_files(&paths);
+                network::release(&self.config, &self.sandbox.name);
                 return Err(err);
             }
         };
@@ -895,6 +1058,7 @@ impl SandboxManager {
                 let _ = vm.wait();
                 virtiofs.kill();
                 cleanup_files(&paths);
+                network::release(&self.config, &self.sandbox.name);
                 return Err(err);
             }
         };
@@ -905,6 +1069,7 @@ impl SandboxManager {
             terminate_relay(relay_pid, &hegn);
             virtiofs.kill();
             cleanup_files(&paths);
+            network::release(&self.config, &self.sandbox.name);
             return Err(err).context("failed to restore the Cloud Hypervisor snapshot");
         }
 
@@ -936,6 +1101,7 @@ impl SandboxManager {
             terminate_relay(relay_pid, &hegn);
             virtiofs.kill();
             cleanup_files(&paths);
+            network::release(&self.config, &self.sandbox.name);
             return Err(err).context("failed to record the restored sandbox session");
         }
 
@@ -978,6 +1144,7 @@ impl SandboxManager {
             terminate(session.virtiofs_pid, &self.config.virtiofsd_bin);
         }
         cleanup_files(&paths);
+        network::release(&self.config, &self.sandbox.name);
     }
 }
 
@@ -1192,6 +1359,7 @@ impl SandboxRegistry {
         if manager.is_running() {
             manager.stop()?;
         }
+        network::release(&self.config, name);
         self.store.delete(name, delete_files)
     }
 }
@@ -1232,6 +1400,7 @@ fn cloud_hypervisor_args(
     sandbox: &SandboxConfig,
     paths: &SandboxPaths,
     rootfs: &Path,
+    network: Option<&network::Lease>,
 ) -> Vec<OsString> {
     let mut args = common_args(config, paths, true);
     args.push("--kernel".into());
@@ -1265,6 +1434,10 @@ fn cloud_hypervisor_args(
         )
         .into(),
     );
+    if let Some(lease) = network {
+        args.push("--net".into());
+        args.push(lease.cloud_hypervisor_arg().into());
+    }
     args.push("--serial".into());
     args.push(format!("socket={}", paths.serial_socket.display()).into());
     args.push("--console".into());
@@ -1307,6 +1480,7 @@ fn spawn_cloud_hypervisor(
     paths: &SandboxPaths,
     binary: &Path,
     restore: Option<&SnapshotMeta>,
+    network: Option<&network::Lease>,
 ) -> Result<Child> {
     // Cloud Hypervisor must create the API and serial listeners itself.
     remove_socket(&paths.api_socket)?;
@@ -1323,7 +1497,7 @@ fn spawn_cloud_hypervisor(
         Some(snapshot) => restore_args(config, paths, snapshot),
         None => {
             let rootfs = sandbox.prepare_rootfs(config)?;
-            cloud_hypervisor_args(config, sandbox, paths, &rootfs)
+            cloud_hypervisor_args(config, sandbox, paths, &rootfs, network)
         }
     };
     Command::new(binary)
@@ -2137,6 +2311,7 @@ mod tests {
             &sandbox,
             &paths,
             &sandbox.rootfs_path(&config),
+            None,
         ));
         let joined = args.join(" ");
         assert!(joined.contains("--kernel"), "{joined}");
@@ -2166,6 +2341,67 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_tap_names_are_read_from_the_device_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"net":[{"tap":"hegn3","mac":"52:54:00:00:00:04"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(snapshot_network_taps(dir.path()).unwrap(), vec!["hegn3"]);
+        std::fs::write(dir.path().join("config.json"), r#"{"net":[]}"#).unwrap();
+        assert!(snapshot_network_taps(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn guarded_network_adds_only_a_tap_and_mac() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let sandbox = sandbox_for(dir.path());
+        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let lease = crate::network::Lease {
+            index: 2,
+            sandbox: sandbox.name.clone(),
+            tap: crate::network::tap_name(2),
+            mac: crate::network::mac(2),
+            host_ip: crate::network::host_ip(2),
+            guest_ip: crate::network::guest_ip(2),
+        };
+        let joined = strings(&cloud_hypervisor_args(
+            &config,
+            &sandbox,
+            &paths,
+            &sandbox.rootfs_path(&config),
+            Some(&lease),
+        ))
+        .join(" ");
+        assert!(
+            joined.contains("--net tap=hegn2,mac=52:54:00:00:00:03"),
+            "{joined}"
+        );
+        // The host TAP address is owned by `hegn network setup`, not the VMM.
+        assert!(!joined.contains("ip=10.213.0."), "{joined}");
+        assert!(!joined.contains("mask="), "{joined}");
+    }
+
+    #[test]
+    fn air_gapped_boot_has_no_network_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let sandbox = sandbox_for(dir.path());
+        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let joined = strings(&cloud_hypervisor_args(
+            &config,
+            &sandbox,
+            &paths,
+            &sandbox.rootfs_path(&config),
+            None,
+        ))
+        .join(" ");
+        assert!(!joined.contains("--net"), "{joined}");
+    }
+
+    #[test]
     fn seccomp_and_landlock_can_be_disabled_explicitly() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
@@ -2178,6 +2414,7 @@ mod tests {
             &sandbox,
             &paths,
             &sandbox.rootfs_path(&config),
+            None,
         ))
         .join(" ");
         assert!(joined.contains("--seccomp false"), "{joined}");
@@ -2278,6 +2515,7 @@ mod tests {
             &sandbox,
             &paths,
             &sandbox.rootfs_path(&config),
+            None,
         ));
         assert!(
             !args.iter().any(|arg| arg.contains("cloud-init.img")),
