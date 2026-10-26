@@ -581,6 +581,13 @@ network         = "guarded"   # "guarded" (web+DNS only) or "off" (no NIC)
 extra_packages  = []
 auto_branch     = true
 security        = "enforce"   # "off", "warn" or "enforce"
+
+# Optional: host-loopback services the guest may reach (local LLM servers).
+# The guest URL is http://<tap-ip>:<port>; the host must listen on
+# 127.0.0.1:<port>. Re-run `sudo hegn network setup` after changing this list.
+# [[local_endpoints]]
+# name = "ollama"   # guest env: HEGN_ENDPOINT_OLLAMA (and OLLAMA_HOST)
+# port = 11434
 ```
 
 The package list is a list of *extras*; the harness preset is always unioned in.
@@ -604,6 +611,7 @@ never weakens the Cloud Hypervisor sandboxes.
 | `Enter` | Toggle, cycle, or start typing a value |
 | `Enter` / `Esc` while typing | Apply / discard the value |
 | `Home` / `End`, `PgUp` / `PgDn` | Jump to the first / last row, page through rows |
+| `[` / `]` | Switch settings pages (General / Local LLM) |
 | `Ctrl-S` | Validate and save |
 | `r` | Reload the file from disk (discard unsaved changes) |
 | `e` | Open the raw TOML in `$EDITOR` (requires a clean draft) |
@@ -625,6 +633,28 @@ sudo hegn network teardown               # remove taps and rules
 `hegn sandbox start` is fail-closed: with `network = "guarded"` it refuses to
 boot unless `/run/hegn/network.json` exists and was written by root. Rules live
 on the host, so root in the guest cannot remove them.
+
+### Local LLM endpoints
+
+Ollama, LM Studio, llama.cpp and vLLM usually listen on the host's loopback.
+Inside the guest, `127.0.0.1` is the guest itself, so hegn exposes selected host
+ports on the sandbox's own TAP host address:
+
+```toml
+[[local_endpoints]]
+name = "ollama"   # guest env: HEGN_ENDPOINT_OLLAMA (plus OLLAMA_HOST)
+port = 11434      # host target: 127.0.0.1:11434
+```
+
+`hegn network setup` installs a DNAT rule per TAP plus one narrowly scoped
+input accept. The guest uses `http://10.213.0.<n>:11434`; host loopback is never
+bridged, other host interfaces stay unreachable, and ports below 1024 are
+rejected. Endpoints require `network = "guarded"`. After editing the list,
+re-run `sudo hegn network setup` — `hegn sandbox start` fails closed with a hint
+until the root-owned marker matches. With `cloud_init = true`, the URLs are
+exported in the guest through `/etc/profile.d/hegn-endpoints.sh`; every endpoint
+is also available as `HEGN_ENDPOINT_<NAME>`. `hegn sandbox status` prints the
+guest URLs.
 
 ### AGENTS.md templates
 

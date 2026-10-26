@@ -210,6 +210,8 @@ pub struct SandboxReport {
     /// Persistent serial console log, if the session predates logging or the
     /// log has been removed.
     pub serial_log: Option<PathBuf>,
+    /// Guest URLs of the configured local LLM endpoints.
+    pub local_endpoints: Vec<String>,
     pub note: Option<String>,
 }
 
@@ -465,9 +467,15 @@ impl SandboxManager {
                 &paths.cloud_init,
                 &self.sandbox.shared_tag,
                 &self.sandbox.guest_mount,
-                &cloud_init::instance_id(&self.sandbox.name, &provision, network_lease.as_ref()),
+                &cloud_init::instance_id(
+                    &self.sandbox.name,
+                    &provision,
+                    network_lease.as_ref(),
+                    &self.config.local_endpoints,
+                ),
                 &provision,
                 network_lease.as_ref(),
+                &self.config.local_endpoints,
             )
         {
             virtiofs.kill();
@@ -575,6 +583,10 @@ impl SandboxManager {
             virtiofs_pid: Some(virtiofs_pid),
             started_at: Some(record.started_at),
             serial_log: Some(serial_log),
+            local_endpoints: network_lease
+                .as_ref()
+                .map(|lease| endpoint_urls(&self.config, lease.host_ip))
+                .unwrap_or_default(),
             note: Some(format!(
                 "guest workspace mounted at {}",
                 self.sandbox.guest_mount
@@ -745,6 +757,11 @@ impl SandboxManager {
             virtiofs_pid: session.as_ref().map(|s| s.virtiofs_pid),
             started_at: session.as_ref().map(|s| s.started_at),
             serial_log: session.as_ref().and_then(|s| s.serial_log.clone()),
+            local_endpoints: self
+                .sandbox
+                .network_index
+                .map(|index| endpoint_urls(&self.config, network::host_ip(index)))
+                .unwrap_or_default(),
             note,
         })
     }
@@ -1010,9 +1027,15 @@ impl SandboxManager {
                 &paths.cloud_init,
                 &self.sandbox.shared_tag,
                 &self.sandbox.guest_mount,
-                &cloud_init::instance_id(&self.sandbox.name, &provision, network_lease.as_ref()),
+                &cloud_init::instance_id(
+                    &self.sandbox.name,
+                    &provision,
+                    network_lease.as_ref(),
+                    &self.config.local_endpoints,
+                ),
                 &provision,
                 network_lease.as_ref(),
+                &self.config.local_endpoints,
             )
         {
             virtiofs.kill();
@@ -1680,6 +1703,15 @@ fn dir_size(dir: &Path) -> u64 {
         .filter(|meta| meta.file_type().is_file())
         .map(|meta| meta.len())
         .sum()
+}
+
+/// Guest URLs for the configured local endpoints on one TAP.
+fn endpoint_urls(config: &Config, host: std::net::Ipv4Addr) -> Vec<String> {
+    config
+        .local_endpoints
+        .iter()
+        .map(|endpoint| endpoint.url(host))
+        .collect()
 }
 
 /// Append a timestamped lifecycle line to `run/hegn.log`.

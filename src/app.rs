@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::config::{Config, Harness, SecurityMode};
-use crate::config_form::{Applied, ConfigField, FormOutcome};
+use crate::config_form::{Applied, ConfigField, ConfigPage, FormOutcome};
 pub use crate::config_form::{ConfigForm, ConfigKind};
 use crate::console::TerminalConsole;
 use crate::doctor::DoctorReport;
@@ -436,6 +436,13 @@ pub struct ConfigStepHit {
     pub step: i8,
 }
 
+/// Clickable tab in the settings modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigTabHit {
+    pub rect: Rect,
+    pub page: ConfigPage,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteSandboxStage {
     Confirm,
@@ -546,6 +553,7 @@ pub struct App {
     /// Settings rows and `‹ ›` steppers recorded by the renderer.
     pub config_rows: Vec<RowHit>,
     pub config_steppers: Vec<ConfigStepHit>,
+    pub config_tabs: Vec<ConfigTabHit>,
     /// Settings row under the mouse pointer.
     pub config_hover: Option<usize>,
     /// Footer button under the mouse pointer, for the inverted hover style.
@@ -606,6 +614,7 @@ impl App {
             footer_hits: Vec::new(),
             config_rows: Vec::new(),
             config_steppers: Vec::new(),
+            config_tabs: Vec::new(),
             config_hover: None,
             hovered: None,
             modal_scroll: None,
@@ -1958,15 +1967,23 @@ impl App {
         match form.save() {
             Some(Applied::Global(config)) => {
                 let projects_root_changed = self.config.projects_root != config.projects_root;
+                let endpoints_changed = self.config.endpoint_ports() != config.endpoint_ports();
                 self.apply_global_config(*config);
                 self.modal = Some(Modal::Config(form));
-                if projects_root_changed {
+                let effects = if projects_root_changed {
                     self.toast("settings saved — rescanning projects", ToastLevel::Info);
                     vec![Effect::RefreshProjects]
                 } else {
                     self.toast("settings saved", ToastLevel::Info);
                     Vec::new()
+                };
+                if endpoints_changed {
+                    self.toast(
+                        "settings saved — run `sudo hegn network setup` for the new endpoints",
+                        ToastLevel::Warn,
+                    );
                 }
+                effects
             }
             Some(Applied::Sandbox) => {
                 self.refresh_sandboxes();
@@ -2673,6 +2690,17 @@ impl App {
     /// Click inside the settings modal: steppers change a value, a row click
     /// selects and activates it (toggle, cycle, step or inline edit).
     fn click_config_row(&mut self, pos: (u16, u16)) -> Vec<Effect> {
+        let tab = self
+            .config_tabs
+            .iter()
+            .find(|hit| rect_contains(hit.rect, pos))
+            .map(|hit| hit.page);
+        if let Some(page) = tab
+            && let Some(Modal::Config(form)) = self.modal.as_mut()
+        {
+            form.set_page(page);
+            return Vec::new();
+        }
         let stepper = self
             .config_steppers
             .iter()

@@ -12,7 +12,8 @@ use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{
-    BackendKind, Config, Harness, NetworkMode, RootfsFormat, SecurityMode, safe_package_name,
+    BackendKind, Config, Harness, LocalEndpoint, NetworkMode, RootfsFormat, SecurityMode,
+    safe_package_name, validate_local_endpoints,
 };
 use crate::sandbox_config::{CONFIG_FILE, SandboxConfig, SandboxStore};
 
@@ -21,6 +22,22 @@ use crate::sandbox_config::{CONFIG_FILE, SandboxConfig, SandboxStore};
 pub enum ConfigKind {
     Global,
     Sandbox,
+}
+
+/// Pages (tabs) inside the settings modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigPage {
+    General,
+    LocalLlm,
+}
+
+impl ConfigPage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::LocalLlm => "Local LLM",
+        }
+    }
 }
 
 /// A single editable setting. The same enum covers both file kinds; values that
@@ -49,6 +66,8 @@ pub enum ConfigField {
     SandboxesDir,
     TemplatesDir,
     ExtraPackages,
+    /// Host-loopback LLM endpoints exposed through the guarded network.
+    LocalEndpoints,
     // Sandbox-only, read-only context.
     Project,
     Workspace,
@@ -96,6 +115,7 @@ impl ConfigField {
             Self::SandboxesDir => "Sandboxes dir",
             Self::TemplatesDir => "Templates dir",
             Self::ExtraPackages => "Extra packages",
+            Self::LocalEndpoints => "Endpoints (name=port)",
             Self::Project => "Project",
             Self::Workspace => "Workspace",
             Self::RootfsPath => "Rootfs",
@@ -151,7 +171,7 @@ pub enum ConfigRow {
     Note(&'static str),
 }
 
-const GLOBAL_ROWS: &[ConfigRow] = &[
+const GENERAL_ROWS: &[ConfigRow] = &[
     ConfigRow::Group("Runtime"),
     ConfigRow::Field(ConfigField::Harness),
     ConfigRow::Field(ConfigField::Vcpus),
@@ -184,6 +204,15 @@ const GLOBAL_ROWS: &[ConfigRow] = &[
     ConfigRow::Field(ConfigField::ExtraPackages),
 ];
 
+const LOCAL_LLM_ROWS: &[ConfigRow] = &[
+    ConfigRow::Group("Host services"),
+    ConfigRow::Field(ConfigField::LocalEndpoints),
+    ConfigRow::Note("loopback only: host 127.0.0.1:<port>"),
+    ConfigRow::Note("guest URL: http://<tap-ip>:<port>"),
+    ConfigRow::Note("Ollama also exports OLLAMA_HOST in the guest"),
+    ConfigRow::Note("apply with: sudo hegn network setup"),
+];
+
 const SANDBOX_ROWS: &[ConfigRow] = &[
     ConfigRow::Group("Runtime"),
     ConfigRow::Field(ConfigField::Harness),
@@ -203,9 +232,23 @@ const SANDBOX_ROWS: &[ConfigRow] = &[
 ];
 
 pub fn rows(kind: ConfigKind) -> &'static [ConfigRow] {
+    rows_for(kind, ConfigPage::General)
+}
+
+/// Pages available for a file kind. Endpoints are host-wide, so a sandbox's
+/// config has only the general page.
+pub fn pages(kind: ConfigKind) -> &'static [ConfigPage] {
     match kind {
-        ConfigKind::Global => GLOBAL_ROWS,
-        ConfigKind::Sandbox => SANDBOX_ROWS,
+        ConfigKind::Global => &[ConfigPage::General, ConfigPage::LocalLlm],
+        ConfigKind::Sandbox => &[ConfigPage::General],
+    }
+}
+
+pub fn rows_for(kind: ConfigKind, page: ConfigPage) -> &'static [ConfigRow] {
+    match (kind, page) {
+        (ConfigKind::Global, ConfigPage::General) => GENERAL_ROWS,
+        (ConfigKind::Global, ConfigPage::LocalLlm) => LOCAL_LLM_ROWS,
+        (ConfigKind::Sandbox, _) => SANDBOX_ROWS,
     }
 }
 
@@ -255,6 +298,7 @@ pub struct ConfigForm {
     original: Draft,
     /// Global config the sandbox belongs to; used for derived paths and saving.
     base: Box<Config>,
+    page: ConfigPage,
     selected: usize,
     edit: Option<EditState>,
     /// First `Esc` on a dirty draft only warns; the second one discards it.
@@ -287,7 +331,8 @@ impl ConfigForm {
     }
 
     fn build(kind: ConfigKind, title: String, path: PathBuf, draft: Draft, base: Config) -> Self {
-        let selected = first_field(kind);
+        let page = ConfigPage::General;
+        let selected = first_field(kind, page);
         Self {
             kind,
             title,
@@ -297,6 +342,7 @@ impl ConfigForm {
             original: draft.clone(),
             draft,
             base: Box::new(base),
+            page,
             selected,
             edit: None,
             discard_armed: false,
@@ -304,7 +350,39 @@ impl ConfigForm {
     }
 
     pub fn rows(&self) -> &'static [ConfigRow] {
-        rows(self.kind)
+        rows_for(self.kind, self.page)
+    }
+
+    pub fn page(&self) -> ConfigPage {
+        self.page
+    }
+
+    pub fn pages(&self) -> &'static [ConfigPage] {
+        pages(self.kind)
+    }
+
+    /// Switch pages, committing an open inline edit first. Returns `false`
+    /// when the edit is invalid and the page must stay.
+    pub fn set_page(&mut self, page: ConfigPage) -> bool {
+        if !self.pages().contains(&page) || page == self.page {
+            return page == self.page;
+        }
+        if self.edit.is_some() && !self.commit_edit() {
+            return false;
+        }
+        self.page = page;
+        self.selected = first_field(self.kind, page);
+        true
+    }
+
+    /// Cycle through the pages with `[`/`]`.
+    pub fn cycle_page(&mut self, delta: isize) {
+        let pages = self.pages();
+        let Some(index) = pages.iter().position(|page| *page == self.page) else {
+            return;
+        };
+        let next = (index as isize + delta).rem_euclid(pages.len() as isize) as usize;
+        self.set_page(pages[next]);
     }
 
     pub fn selected_row(&self) -> usize {
@@ -373,6 +451,7 @@ impl ConfigForm {
                 ConfigField::SandboxesDir => config.sandboxes_dir.display().to_string(),
                 ConfigField::TemplatesDir => config.templates_dir.display().to_string(),
                 ConfigField::ExtraPackages => list_value(&config.extra_packages),
+                ConfigField::LocalEndpoints => endpoints_value(&config.local_endpoints),
                 _ => "—".to_string(),
             },
             Draft::Sandbox(sandbox) => match field {
@@ -449,7 +528,7 @@ impl ConfigForm {
     }
 
     pub fn select_first(&mut self) {
-        self.selected = first_field(self.kind);
+        self.selected = first_field(self.kind, self.page);
     }
 
     pub fn select_last(&mut self) {
@@ -546,6 +625,15 @@ impl ConfigForm {
                 ConfigField::ExtraPackages => match &self.draft {
                     Draft::Global(config) => config.extra_packages.join(", "),
                     Draft::Sandbox(sandbox) => sandbox.extra_packages.join(", "),
+                },
+                ConfigField::LocalEndpoints => match &self.draft {
+                    Draft::Global(config) => config
+                        .local_endpoints
+                        .iter()
+                        .map(|endpoint| format!("{}={}", endpoint.name, endpoint.port))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    Draft::Sandbox(_) => String::new(),
                 },
                 _ => self.value(field),
             },
@@ -648,6 +736,14 @@ impl ConfigForm {
                 } else {
                     FormOutcome::OpenFile
                 }
+            }
+            KeyCode::Char('[') if !ctrl && !alt => {
+                self.cycle_page(-1);
+                FormOutcome::Stay
+            }
+            KeyCode::Char(']') if !ctrl && !alt => {
+                self.cycle_page(1);
+                FormOutcome::Stay
             }
             _ => FormOutcome::Stay,
         }
@@ -813,7 +909,12 @@ impl ConfigForm {
 
     /// Validate and assign free-form text.
     fn apply_text(&mut self, field: ConfigField, text: &str) -> Result<()> {
-        if text.is_empty() && field != ConfigField::ExtraPackages {
+        if text.is_empty()
+            && !matches!(
+                field,
+                ConfigField::ExtraPackages | ConfigField::LocalEndpoints
+            )
+        {
             bail!("{} cannot be empty", field.label());
         }
         match (&mut self.draft, field) {
@@ -839,6 +940,9 @@ impl ConfigForm {
             }
             (Draft::Global(config), ConfigField::ExtraPackages) => {
                 config.extra_packages = parse_packages(text)?;
+            }
+            (Draft::Global(config), ConfigField::LocalEndpoints) => {
+                config.local_endpoints = parse_local_endpoints(text)?;
             }
             (Draft::Global(config), _) if field.is_path() => {
                 set_global_path(config, field, expand_path(text))?;
@@ -866,8 +970,8 @@ impl ConfigForm {
     }
 }
 
-fn first_field(kind: ConfigKind) -> usize {
-    rows(kind)
+fn first_field(kind: ConfigKind, page: ConfigPage) -> usize {
+    rows_for(kind, page)
         .iter()
         .position(|row| matches!(row, ConfigRow::Field(_)))
         .unwrap_or(0)
@@ -883,6 +987,41 @@ fn list_value(items: &[String]) -> String {
     } else {
         items.join(", ")
     }
+}
+
+fn endpoints_value(endpoints: &[LocalEndpoint]) -> String {
+    if endpoints.is_empty() {
+        "—".to_string()
+    } else {
+        endpoints
+            .iter()
+            .map(|endpoint| format!("{}={}", endpoint.name, endpoint.port))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn parse_local_endpoints(text: &str) -> Result<Vec<LocalEndpoint>> {
+    let mut endpoints = Vec::new();
+    for item in text
+        .split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let (name, port) = item
+            .split_once('=')
+            .with_context(|| format!("endpoint '{item}' must look like name=port"))?;
+        let port: u16 = port
+            .trim()
+            .parse()
+            .with_context(|| format!("endpoint '{}' has an invalid port", name.trim()))?;
+        endpoints.push(LocalEndpoint {
+            name: name.trim().to_string(),
+            port,
+        });
+    }
+    validate_local_endpoints(&endpoints)?;
+    Ok(endpoints)
 }
 
 fn cycle_value<T: Copy + PartialEq>(items: &[T], current: T, dir: i8) -> T {
@@ -1172,6 +1311,70 @@ mod tests {
             .load("demo")
             .unwrap();
         assert_eq!(reloaded.vcpus, 4);
+    }
+
+    #[test]
+    fn local_llm_page_edits_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut form = ConfigForm::global(global_config(dir.path()), path.clone());
+        assert_eq!(form.pages(), &[ConfigPage::General, ConfigPage::LocalLlm]);
+        assert_eq!(form.page(), ConfigPage::General);
+
+        form.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(form.page(), ConfigPage::LocalLlm);
+        assert_eq!(form.selected_field(), Some(ConfigField::LocalEndpoints));
+
+        form.activate();
+        assert_eq!(
+            form.editing_buffer(ConfigField::LocalEndpoints),
+            Some(""),
+            "an empty list starts with an empty buffer, not the display dash"
+        );
+        if let Some(edit) = form.edit.as_mut() {
+            edit.buffer = "ollama=11434, lmstudio=1234".into();
+        }
+        assert!(form.commit_edit(), "valid endpoints are accepted");
+        assert_eq!(
+            form.value(ConfigField::LocalEndpoints),
+            "ollama=11434, lmstudio=1234"
+        );
+        assert!(form.save().is_some());
+        let saved = Config::load_from(&path).unwrap();
+        assert_eq!(saved.endpoint_ports(), vec![1234, 11434]);
+
+        form.handle_key(key(KeyCode::Char('[')));
+        assert_eq!(form.page(), ConfigPage::General);
+    }
+
+    #[test]
+    fn invalid_endpoints_keep_the_editor_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut form =
+            ConfigForm::global(global_config(dir.path()), dir.path().join("config.toml"));
+        form.set_page(ConfigPage::LocalLlm);
+        form.activate();
+        if let Some(edit) = form.edit.as_mut() {
+            edit.buffer = "ollama=22".into();
+        }
+        assert!(!form.commit_edit());
+        assert!(form.error.is_some());
+        assert!(form.is_editing());
+    }
+
+    #[test]
+    fn sandbox_form_has_no_endpoint_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = global_config(dir.path());
+        let store = SandboxStore::new(config.clone());
+        let project = dir.path().join("projects/demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let sandbox = store
+            .create_from_project(&project, Some("demo"), None, false)
+            .unwrap();
+        let form = ConfigForm::sandbox(sandbox, config);
+        assert_eq!(form.pages(), &[ConfigPage::General]);
+        assert_eq!(form.value(ConfigField::LocalEndpoints), "—");
     }
 
     #[test]

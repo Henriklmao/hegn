@@ -39,6 +39,9 @@ pub const DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(9, 9, 9
 /// Marker written by the privileged setup step. `/run` is cleared on reboot,
 /// so a stale marker cannot outlive the nftables rules it vouches for.
 pub const MARKER: &str = "/run/hegn/network.json";
+/// Bumped only for incompatible rule generations. `endpoints` defaults to an
+/// empty list, so a marker written before local endpoints existed stays valid
+/// for a configuration without endpoints.
 const MARKER_VERSION: u32 = 1;
 const NETWORK_DIR: &str = "network";
 
@@ -48,6 +51,9 @@ pub struct ReadyMarker {
     pub pool: u8,
     pub subnet: String,
     pub dns: Vec<String>,
+    /// TCP ports DNATed to the host loopback for the guest.
+    #[serde(default)]
+    pub endpoints: Vec<u16>,
     pub applied_at: DateTime<Utc>,
 }
 
@@ -181,10 +187,11 @@ pub fn ready_marker() -> Option<ReadyMarker> {
     .then_some(marker)
 }
 
-/// Marker present and every TAP in the pool exists. Used by doctor and by the
-/// automatic setup action.
+/// Marker present, every TAP in the pool exists and the endpoint DNAT rules
+/// match the current configuration. Used by doctor and the automatic setup.
 pub fn guard_ready(config: &Config) -> bool {
-    ready_marker().is_some() && status(config).iter().all(|tap| tap.exists)
+    ready_marker().is_some_and(|marker| marker.endpoints == config.endpoint_ports())
+        && status(config).iter().all(|tap| tap.exists)
 }
 
 /// User that should own the TAP devices. `SUDO_USER` wins when hegn itself was
@@ -200,12 +207,12 @@ pub fn invoking_user() -> Option<String> {
 /// Apply the guard, re-executing hegn through sudo/pkexec when the current
 /// process is not root. The caller is responsible for restoring any TUI
 /// terminal first so the privilege helper can prompt.
-pub fn setup_with_privilege(user: &str) -> Result<()> {
+pub fn setup_with_privilege(user: &str, endpoints: &[u16]) -> Result<()> {
     if !safe_user(user) {
         bail!("invalid user name for TAP ownership: {user:?}");
     }
     if is_privileged() {
-        return setup(user);
+        return setup(user, endpoints);
     }
     let exe = std::env::current_exe().context("failed to locate the hegn executable")?;
     let (helper, prefix) = if command_exists("sudo") {
@@ -247,10 +254,19 @@ pub fn ensure_ready(config: &Config) -> Result<()> {
     if crate::config::NetworkMode::Guarded != config.network {
         return Ok(());
     }
-    if ready_marker().is_none() {
+    let Some(marker) = ready_marker() else {
         bail!(
             "guarded networking is enabled but the host firewall is not active; run `sudo hegn \
              network setup` once (or set `network = \"off\"` for an air-gapped VM)"
+        );
+    };
+    let expected = config.endpoint_ports();
+    if marker.endpoints != expected {
+        bail!(
+            "local LLM endpoints changed (configured {:?}, firewall has {:?}); re-run `sudo hegn \
+             network setup`",
+            expected,
+            marker.endpoints
         );
     }
     Ok(())
@@ -434,9 +450,17 @@ pub fn is_privileged() -> bool {
 
 /// Shell script that creates the TAP pool and installs the nftables table.
 /// `user` must pass [`safe_user`]; it is embedded in the script deliberately.
-pub fn setup_script(user: &str) -> Result<String> {
+/// `endpoints` are the TCP ports exposed from the host loopback; ports below
+/// 1024 are rejected by [`crate::config::validate_local_endpoints`] before this
+/// function is reached.
+pub fn setup_script(user: &str, endpoints: &[u16]) -> Result<String> {
     if !safe_user(user) {
         bail!("invalid user name for TAP ownership: {user:?}");
+    }
+    for port in endpoints {
+        if *port < 1024 {
+            bail!("endpoint port {port} is privileged and cannot be exposed");
+        }
     }
     let mut script = String::from(
         "set -eu\n\
@@ -455,12 +479,20 @@ pub fn setup_script(user: &str) -> Result<String> {
              ip addr replace {addr}/30 dev {tap}\n\
              ip link set {tap} up\n"
         ));
+        if !endpoints.is_empty() {
+            // Required for DNAT to 127.0.0.1: without it the kernel drops the
+            // translated packet as a martian destination. Scoped to this TAP,
+            // and the input chain still only accepts DNATed endpoint traffic.
+            script.push_str(&format!(
+                "sysctl -q -w net.ipv4.conf.{tap}.route_localnet=1\n"
+            ));
+        }
     }
     script.push_str(
         "nft delete table inet hegn 2>/dev/null || true\n\
          nft -f - <<'HEGN_NFT'\n",
     );
-    script.push_str(&nft_rules());
+    script.push_str(&nft_rules(endpoints));
     script.push_str("HEGN_NFT\n");
     Ok(script)
 }
@@ -480,9 +512,17 @@ pub fn teardown_script() -> String {
 /// nftables rules. Public HTTP(S) and public DNS only; everything else from a
 /// sandbox TAP is dropped, including RFC1918, link-local, CGNAT, multicast and
 /// all IPv6.
-pub fn nft_rules() -> String {
+///
+/// `endpoints` adds a DNAT from the sandbox's own TAP host address to the host
+/// loopback on the same port, plus an input accept for those translated flows.
+/// The rules are static, so changing the list requires re-running setup.
+pub fn nft_rules(endpoints: &[u16]) -> String {
     let interfaces = (0..TAP_POOL)
         .map(|index| format!("\"{}\"", tap_name(index)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hosts = (0..TAP_POOL)
+        .map(|index| host_ip(index).to_string())
         .collect::<Vec<_>>()
         .join(", ");
     let dns = DNS
@@ -490,12 +530,27 @@ pub fn nft_rules() -> String {
         .map(|ip| ip.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
+    let mut ports: Vec<u16> = endpoints.to_vec();
+    ports.sort_unstable();
+    ports.dedup();
+    let endpoint_ports = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let has_endpoints = !ports.is_empty();
+
+    let mut rules = format!(
         "table inet hegn {{\n\
          \x20 set hegn_ifaces {{\n\
          \x20   type ifname\n\
          \x20   flags constant\n\
          \x20   elements = {{ {interfaces} }}\n\
+         \x20 }}\n\
+         \x20 set hegn_hosts {{\n\
+         \x20   type ipv4_addr\n\
+         \x20   flags interval\n\
+         \x20   elements = {{ {hosts} }}\n\
          \x20 }}\n\
          \x20 set private_v4 {{\n\
          \x20   type ipv4_addr\n\
@@ -511,18 +566,42 @@ pub fn nft_rules() -> String {
          \x20   type ipv4_addr\n\
          \x20   flags interval\n\
          \x20   elements = {{ {dns} }}\n\
-         \x20 }}\n\
-         \x20 chain input {{\n\
-         \x20   type filter hook input priority filter; policy accept;\n\
-         \x20   iifname @hegn_ifaces counter drop\n\
-         \x20 }}\n\
-         \x20 chain forward {{\n\
+         \x20 }}\n"
+    );
+    if has_endpoints {
+        rules.push_str(&format!(
+            "\x20 set endpoint_ports {{\n\
+             \x20   type inet_service\n\
+             \x20   flags constant\n\
+             \x20   elements = {{ {endpoint_ports} }}\n\
+             \x20 }}\n\
+             \x20 chain prerouting {{\n\
+             \x20   type nat hook prerouting priority dstnat; policy accept;\n\
+             \x20   iifname @hegn_ifaces ip daddr @hegn_hosts ip protocol tcp \\\n\
+             \x20     tcp dport @endpoint_ports counter dnat ip to 127.0.0.1\n\
+             \x20 }}\n"
+        ));
+    }
+    rules.push_str(
+        "\x20 chain input {\n\
+         \x20   type filter hook input priority filter; policy accept;\n",
+    );
+    if has_endpoints {
+        rules.push_str(
+            "\x20   iifname @hegn_ifaces ct status dnat ip protocol tcp \\\n\
+             \x20     tcp dport @endpoint_ports counter accept\n",
+        );
+    }
+    rules.push_str(
+        "\x20   iifname @hegn_ifaces counter drop\n\
+         \x20 }\n\
+         \x20 chain forward {\n\
          \x20   type filter hook forward priority filter; policy accept;\n\
          \x20   iifname @hegn_ifaces ip saddr != 10.213.0.0/24 counter drop\n\
          \x20   iifname @hegn_ifaces meta nfproto ipv6 counter drop\n\
          \x20   iifname @hegn_ifaces ip daddr @private_v4 counter drop\n\
          \x20   iifname @hegn_ifaces ct state established,related accept\n\
-         \x20   iifname @hegn_ifaces ip protocol tcp tcp dport {{ 80, 443 }} accept\n\
+         \x20   iifname @hegn_ifaces ip protocol tcp tcp dport { 80, 443 } accept\n\
          \x20   iifname @hegn_ifaces ip protocol tcp tcp dport 53 ip daddr @web_dns accept\n\
          \x20   iifname @hegn_ifaces ip protocol udp udp dport 53 ip daddr @web_dns accept\n\
          \x20   iifname @hegn_ifaces counter limit rate 10/minute burst 20 packets \\\n\
@@ -531,13 +610,14 @@ pub fn nft_rules() -> String {
          \x20   # Conntrack first un-NATs replies, so established traffic is allowed.\n\
          \x20   ip daddr 10.213.0.0/24 ct state established,related accept\n\
          \x20   ip daddr 10.213.0.0/24 counter drop\n\
-         \x20 }}\n\
-         \x20 chain postrouting {{\n\
+         \x20 }\n\
+         \x20 chain postrouting {\n\
          \x20   type nat hook postrouting priority srcnat; policy accept;\n\
          \x20   ip saddr 10.213.0.0/24 masquerade\n\
-         \x20 }}\n\
-         }}\n"
-    )
+         \x20 }\n\
+         }\n",
+    );
+    rules
 }
 
 pub fn safe_user(user: &str) -> bool {
@@ -553,11 +633,14 @@ pub fn safe_user(user: &str) -> bool {
 }
 
 /// Apply the host guard. Requires root; callers surface a clear error.
-pub fn setup(user: &str) -> Result<()> {
+pub fn setup(user: &str, endpoints: &[u16]) -> Result<()> {
     if !is_privileged() {
         bail!("`hegn network setup` must run as root (try `sudo hegn network setup --user $USER`)");
     }
-    let script = setup_script(user)?;
+    let mut endpoints = endpoints.to_vec();
+    endpoints.sort_unstable();
+    endpoints.dedup();
+    let script = setup_script(user, &endpoints)?;
     // The script replaces the nftables table. Drop the marker first so a
     // failed re-run cannot leave a "ready" marker vouching for a guard that no
     // longer exists; new sandbox starts then fail closed until setup succeeds.
@@ -575,6 +658,7 @@ pub fn setup(user: &str) -> Result<()> {
         pool: TAP_POOL,
         subnet: SUBNET.to_string(),
         dns: DNS.iter().map(ToString::to_string).collect(),
+        endpoints,
         applied_at: Utc::now(),
     };
     write_marker(marker_path(), &marker)
@@ -643,7 +727,7 @@ mod tests {
 
     #[test]
     fn nft_rules_block_private_ranges_and_allow_web_only() {
-        let rules = nft_rules();
+        let rules = nft_rules(&[]);
         for private in [
             "10.0.0.0/8",
             "172.16.0.0/12",
@@ -655,7 +739,7 @@ mod tests {
         ] {
             assert!(rules.contains(private), "missing {private}:\n{rules}");
         }
-        assert!(rules.contains("tcp dport { 80, 443 } accept"));
+        assert!(rules.contains("tcp dport { 80, 443 } accept"), "{rules}");
         assert!(rules.contains("udp dport 53 ip daddr @web_dns accept"));
         assert!(rules.contains("iifname @hegn_ifaces counter drop"));
         assert!(rules.contains("masquerade"));
@@ -663,8 +747,55 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_ports_are_dnated_to_the_host_loopback() {
+        let rules = nft_rules(&[11434, 1234, 11434]);
+        assert!(
+            rules.contains("elements = { 1234, 11434 }"),
+            "ports must be sorted and deduplicated:\n{rules}"
+        );
+        assert!(
+            rules.contains("iifname @hegn_ifaces ip daddr @hegn_hosts ip protocol tcp \\"),
+            "{rules}"
+        );
+        assert!(
+            rules.contains("dnat ip to 127.0.0.1"),
+            "endpoint traffic must be DNATed:\n{rules}"
+        );
+        assert!(
+            rules.contains("ct status dnat ip protocol tcp \\"),
+            "only translated endpoint flows may reach the host input chain:\n{rules}"
+        );
+        // The endpoint accept must precede the catch-all drop.
+        let accept = rules.find("ct status dnat").unwrap();
+        let drop = rules.find("iifname @hegn_ifaces counter drop").unwrap();
+        assert!(
+            accept < drop,
+            "endpoint accept must precede the drop:\n{rules}"
+        );
+    }
+
+    #[test]
+    fn route_localnet_is_only_enabled_with_endpoints() {
+        let plain = setup_script("alice", &[]).unwrap();
+        assert!(!plain.contains("route_localnet"), "{plain}");
+
+        let exposed = setup_script("alice", &[11434]).unwrap();
+        assert!(
+            exposed.contains("net.ipv4.conf.hegn0.route_localnet=1"),
+            "{exposed}"
+        );
+        assert!(exposed.contains("tcp dport @endpoint_ports"), "{exposed}");
+    }
+
+    #[test]
+    fn privileged_endpoint_ports_are_rejected() {
+        assert!(setup_script("alice", &[22]).is_err());
+        assert!(setup_script("alice", &[0]).is_err());
+    }
+
+    #[test]
     fn setup_script_creates_every_pool_tap() {
-        let script = setup_script("alice").unwrap();
+        let script = setup_script("alice", &[]).unwrap();
         for index in 0..TAP_POOL {
             assert!(script.contains(&format!(
                 "ip tuntap add dev {} mode tap user alice",
@@ -677,7 +808,7 @@ mod tests {
     #[test]
     fn rejects_unsafe_tap_owners() {
         for bad in ["root; reboot", "$(id)", "-rf", "a/b", ""] {
-            assert!(setup_script(bad).is_err(), "{bad:?} must be rejected");
+            assert!(setup_script(bad, &[]).is_err(), "{bad:?} must be rejected");
         }
         assert!(safe_user("_alice-1"));
     }
@@ -693,6 +824,7 @@ mod tests {
             pool: TAP_POOL,
             subnet: SUBNET.to_string(),
             dns: DNS.iter().map(ToString::to_string).collect(),
+            endpoints: Vec::new(),
             applied_at: Utc::now(),
         };
         write_marker(&path, &marker).unwrap();

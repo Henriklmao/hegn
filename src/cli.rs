@@ -326,7 +326,9 @@ pub enum ImageCommands {
 pub enum NetworkCommands {
     /// Show the firewall marker and TAP pool state.
     Status,
-    /// Create the TAP pool and install the nftables egress rules (requires root).
+    /// Create the TAP pool and install the nftables rules (requires root).
+    ///
+    /// Includes the DNAT rules for configured local LLM endpoints.
     Setup {
         /// User that may open the TAP devices (defaults to $SUDO_USER or $USER).
         #[arg(long)]
@@ -1092,6 +1094,8 @@ fn network_command(command: NetworkCommands, config: Config, json: bool) -> Resu
                         "ready": marker.is_some(),
                         "marker": marker,
                         "mode": config.network.label(),
+                        "endpoints": config.endpoint_ports(),
+                        "endpoints_applied": marker.as_ref().map(|marker| marker.endpoints.clone()),
                         "taps": taps,
                     }))?
                 );
@@ -1106,6 +1110,29 @@ fn network_command(command: NetworkCommands, config: Config, json: bool) -> Resu
                     ),
                 }
                 println!("mode: {}", config.network.label());
+                let ports = config.endpoint_ports();
+                if ports.is_empty() {
+                    println!("endpoints: none");
+                } else {
+                    println!(
+                        "endpoints: {}",
+                        config
+                            .local_endpoints
+                            .iter()
+                            .map(|endpoint| format!(
+                                "{}=127.0.0.1:{}",
+                                endpoint.name, endpoint.port
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                if marker
+                    .as_ref()
+                    .is_some_and(|marker| marker.endpoints != ports)
+                {
+                    println!("note: endpoints changed; re-run `sudo hegn network setup`");
+                }
                 for tap in taps {
                     let owner = tap.owner.as_deref().unwrap_or("-");
                     println!(
@@ -1124,10 +1151,13 @@ fn network_command(command: NetworkCommands, config: Config, json: bool) -> Resu
                 .or_else(|| std::env::var("USER").ok())
                 .context("could not determine the TAP owner; pass --user NAME")?;
             if dry_run {
-                println!("{}", crate::network::setup_script(&user)?);
+                println!(
+                    "{}",
+                    crate::network::setup_script(&user, &config.endpoint_ports())?
+                );
                 return Ok(0);
             }
-            crate::network::setup(&user)?;
+            crate::network::setup(&user, &config.endpoint_ports())?;
             if json {
                 println!("{}", serde_json::json!({"ready": true, "user": user}));
             } else {
@@ -1169,7 +1199,7 @@ fn doctor(config: Config, json: bool, fix: bool) -> Result<i32> {
             if actions.configure_network {
                 let user = crate::network::invoking_user()
                     .context("could not determine the current user for TAP ownership")?;
-                crate::network::setup_with_privilege(&user)?;
+                crate::network::setup_with_privilege(&user, &config.endpoint_ports())?;
             }
         }
     }
@@ -1517,6 +1547,9 @@ fn print_report(report: &SandboxReport, json: bool) -> Result<()> {
     }
     if let Some(log) = &report.serial_log {
         println!("serial log   {}", log.display());
+    }
+    for endpoint in &report.local_endpoints {
+        println!("endpoint     {endpoint}");
     }
     if let Some(note) = &report.note {
         println!("note         {note}");

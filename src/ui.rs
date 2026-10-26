@@ -9,8 +9,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    ActionId, App, ConfigStepHit, CreateFocus, DeleteSandboxStage, Focus, FooterHit, HelpState,
-    Modal, RowHit, SandboxState, Screen, ScrollHit, TerminalMode, ToastLevel,
+    ActionId, App, ConfigStepHit, ConfigTabHit, CreateFocus, DeleteSandboxStage, Focus, FooterHit,
+    HelpState, Modal, RowHit, SandboxState, Screen, ScrollHit, TerminalMode, ToastLevel,
 };
 use crate::config_form::{ConfigField, ConfigForm, ConfigRow, FieldKind};
 
@@ -35,6 +35,7 @@ pub struct UiHits {
     /// Settings rows and `‹ ›` steppers inside the configuration modal.
     pub config: Vec<RowHit>,
     pub config_steppers: Vec<ConfigStepHit>,
+    pub config_tabs: Vec<ConfigTabHit>,
     /// Scrollbar track of the open modal, when its body overflows.
     pub modal_scroll: Option<ScrollHit>,
 }
@@ -44,6 +45,7 @@ struct ModalHits {
     footer: Vec<FooterHit>,
     config: Vec<RowHit>,
     config_steppers: Vec<ConfigStepHit>,
+    config_tabs: Vec<ConfigTabHit>,
     scroll: Option<ScrollHit>,
 }
 
@@ -84,12 +86,14 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
     let mut footer = render_footer(frame, app, chunks[2]);
     let mut config = Vec::new();
     let mut config_steppers = Vec::new();
+    let mut config_tabs = Vec::new();
     let mut modal_scroll = None;
     if let Some(modal) = &app.modal {
         let modal_hits = render_modal(frame, app, modal, area);
         footer.extend(modal_hits.footer);
         config = modal_hits.config;
         config_steppers = modal_hits.config_steppers;
+        config_tabs = modal_hits.config_tabs;
         modal_scroll = modal_hits.scroll;
     }
     render_toast(frame, app, chunks[1]);
@@ -101,6 +105,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
         snapshots: hits.2,
         config,
         config_steppers,
+        config_tabs,
         modal_scroll,
     }
 }
@@ -1645,25 +1650,66 @@ fn render_config_form(frame: &mut Frame, app: &App, form: &ConfigForm, area: Rec
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(inner);
+    let body = chunks[1];
     // Narrow terminals stack the label above the value instead of drawing a
     // label column beside a value column.
-    let narrow = chunks[0].width < CONFIG_NARROW_WIDTH;
+    let narrow = body.width < CONFIG_NARROW_WIDTH;
     let row_height = if narrow { 2 } else { 1 };
-    let height = chunks[0].height.max(1) as usize;
+    let height = body.height.max(1) as usize;
     let rows = form.rows();
     let selected = form.selected_row();
     let visible_rows = (height / row_height).max(1);
     // Stateless scrolling: keep the cursor visible. The wheel moves the
     // selection, so the viewport follows automatically.
     let offset = selected.saturating_sub(visible_rows.saturating_sub(1));
-    let pane = scroll_pane(chunks[0], rows.len() * row_height, offset * row_height);
+    let pane = scroll_pane(body, rows.len() * row_height, offset * row_height);
     let list = pane.content;
+
+    // Page tabs. Every page is a click target; `[`/`]` cycles them.
+    let mut config_tabs = Vec::new();
+    let mut tab_spans = Vec::new();
+    let mut tab_x = chunks[0].x;
+    for (index, page) in form.pages().iter().enumerate() {
+        if index > 0 {
+            tab_spans.push(Span::raw(" "));
+            tab_x = tab_x.saturating_add(1);
+        }
+        let label = format!(" {} ", page.label());
+        let width = (label.width() as u16).min(chunks[0].width.saturating_sub(tab_x - chunks[0].x));
+        if width == 0 {
+            break;
+        }
+        let style = if *page == form.page() {
+            Style::default()
+                .fg(ON_ACCENT)
+                .bg(CYAN)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        tab_spans.push(Span::styled(label.clone(), style));
+        config_tabs.push(ConfigTabHit {
+            rect: Rect {
+                x: tab_x,
+                y: chunks[0].y,
+                width,
+                height: 1,
+            },
+            page: *page,
+        });
+        tab_x = tab_x.saturating_add(width);
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(tab_spans)).style(Style::default()),
+        chunks[0],
+    );
 
     let mut lines = Vec::with_capacity(visible_rows * row_height);
     let mut config_hits = Vec::new();
@@ -1721,7 +1767,7 @@ fn render_config_form(frame: &mut Frame, app: &App, form: &ConfigForm, area: Rec
     render_scrollbar(frame, app, &pane);
 
     // File path on the left, dirty/saved marker on the right.
-    let info = chunks[1];
+    let info = chunks[2];
     let marker = if form.dirty() {
         ("● unsaved", YELLOW)
     } else if form.status.is_some() {
@@ -1767,20 +1813,25 @@ fn render_config_form(frame: &mut Frame, app: &App, form: &ConfigForm, area: Rec
             Style::default().fg(YELLOW),
         )
     } else {
+        let pages_hint = if form.pages().len() > 1 {
+            " · [ ] page"
+        } else {
+            ""
+        };
         Span::styled(
-            " ↑↓ select · ←→ or click change · Enter edit/toggle · Esc close",
+            format!(" ↑↓ select · ←→ or click change · Enter edit/toggle{pages_hint} · Esc close"),
             Style::default().fg(MUTED),
         )
     };
     frame.render_widget(
-        Paragraph::new(fit_line(Line::from(hint), chunks[2].width as usize)),
-        chunks[2],
+        Paragraph::new(fit_line(Line::from(hint), chunks[3].width as usize)),
+        chunks[3],
     );
 
     let footer = hint_buttons(
         frame,
         app,
-        chunks[3],
+        chunks[4],
         &[
             FooterDef {
                 key: "Ctrl-S",
@@ -1809,6 +1860,7 @@ fn render_config_form(frame: &mut Frame, app: &App, form: &ConfigForm, area: Rec
         footer,
         config: config_hits,
         config_steppers: steppers,
+        config_tabs,
         scroll: pane.hit,
     }
 }
@@ -3409,6 +3461,25 @@ mod tests {
             )));
             let _ = render_sized(&app, width, height);
         }
+    }
+
+    #[test]
+    fn config_modal_renders_clickable_tabs() {
+        let (_dir, mut app) = app();
+        let path = app.config.state_dir.join("config.toml");
+        app.modal = Some(Modal::Config(crate::config_form::ConfigForm::global(
+            app.config.clone(),
+            path,
+        )));
+        let (text, hits) = render_sized(&app, 100, 40);
+        assert!(text.contains("General"), "{text}");
+        assert!(text.contains("Local LLM"), "{text}");
+        assert_eq!(hits.config_tabs.len(), 2);
+        assert!(
+            hits.config_tabs
+                .iter()
+                .any(|hit| hit.page == crate::config_form::ConfigPage::LocalLlm)
+        );
     }
 
     #[test]

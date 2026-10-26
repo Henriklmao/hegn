@@ -91,6 +91,7 @@ fn run_loop(
         app.snapshot_rows = hits.snapshots;
         app.config_rows = hits.config;
         app.config_steppers = hits.config_steppers;
+        app.config_tabs = hits.config_tabs;
         app.modal_scroll = hits.modal_scroll;
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
@@ -402,7 +403,8 @@ fn handle_effects(
                 }
                 if actions.configure_network {
                     app.toast("configuring the guarded network…", ToastLevel::Info);
-                    match with_suspended_terminal(terminal, setup_network) {
+                    let ports = app.config.endpoint_ports();
+                    match with_suspended_terminal(terminal, || setup_network(&ports)) {
                         Ok(()) => notes.push("guarded network configured".to_string()),
                         Err(err) => {
                             failed = true;
@@ -600,10 +602,10 @@ fn should_show_doctor(report: &DoctorReport) -> bool {
     !report.ok || report.can_setup()
 }
 
-fn setup_network() -> Result<()> {
+fn setup_network(ports: &[u16]) -> Result<()> {
     let user = crate::network::invoking_user()
         .context("could not determine the current user for TAP ownership")?;
-    crate::network::setup_with_privilege(&user)
+    crate::network::setup_with_privilege(&user, ports)
 }
 
 fn open_lazygit(path: &Path) -> Result<()> {

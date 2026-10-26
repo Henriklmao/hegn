@@ -205,12 +205,21 @@ pub fn run(config: &Config) -> DoctorReport {
         if !guarded {
             "disabled in config (air-gapped guest)".to_string()
         } else if guard_ready {
-            format!(
-                "guarded egress: public HTTP(S)+DNS only, {} TAP slices",
-                crate::network::TAP_POOL
-            )
+            let endpoints = config.local_endpoints.len();
+            if endpoints == 0 {
+                format!(
+                    "guarded egress: public HTTP(S)+DNS only, {} TAP slices",
+                    crate::network::TAP_POOL
+                )
+            } else {
+                format!(
+                    "guarded egress + {endpoints} local endpoint(s), {} TAP slices",
+                    crate::network::TAP_POOL
+                )
+            }
         } else {
-            "not configured; run `sudo hegn network setup --user $USER`".to_string()
+            "not configured or the endpoint list changed; run `sudo hegn network setup --user $USER`"
+                .to_string()
         },
     ));
     checks.push(Check::new(

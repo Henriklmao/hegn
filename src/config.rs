@@ -235,6 +235,68 @@ impl NetworkMode {
     }
 }
 
+/// A host-local TCP service the guest may reach through the guarded network.
+///
+/// The service is expected to listen on `127.0.0.1:<port>` on the host (the
+/// default for Ollama, llama.cpp, LM Studio, vLLM, …). `hegn network setup`
+/// installs a per-TAP DNAT rule so the guest can use the same port on its TAP
+/// host address instead of the loopback address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalEndpoint {
+    /// Short label, also used for the guest's `HEGN_ENDPOINT_<NAME>` variable.
+    pub name: String,
+    /// TCP port on the host loopback that is exposed on the TAP host address.
+    pub port: u16,
+}
+
+impl LocalEndpoint {
+    pub fn env_name(&self) -> String {
+        let mut name = String::from("HEGN_ENDPOINT_");
+        for ch in self.name.chars() {
+            if ch.is_ascii_alphanumeric() {
+                name.push(ch.to_ascii_uppercase());
+            } else {
+                name.push('_');
+            }
+        }
+        name
+    }
+
+    /// URL the guest uses. `host` is the sandbox's TAP host address.
+    pub fn url(&self, host: std::net::Ipv4Addr) -> String {
+        format!("http://{host}:{}", self.port)
+    }
+}
+
+/// Why a [`LocalEndpoint`] is invalid.
+pub fn validate_local_endpoints(endpoints: &[LocalEndpoint]) -> Result<()> {
+    let mut seen = Vec::new();
+    for endpoint in endpoints {
+        if !crate::cloud_init::safe_token(&endpoint.name) || endpoint.name.len() > 32 {
+            bail!(
+                "invalid local endpoint name {:?}: use up to 32 ASCII letters, digits, '-', '_' or '.'",
+                endpoint.name
+            );
+        }
+        // Ports below 1024 are reserved for privileged host services (SSH,
+        // DNS, …). Exposing those to a sandbox is never an LLM passthrough.
+        if endpoint.port < 1024 {
+            bail!(
+                "local endpoint '{}' uses port {}; ports below 1024 are not exposed",
+                endpoint.name,
+                endpoint.port
+            );
+        }
+        let key = endpoint.name.to_ascii_lowercase();
+        if seen.contains(&key) {
+            bail!("duplicate local endpoint name '{}'", endpoint.name);
+        }
+        seen.push(key);
+    }
+    Ok(())
+}
+
 /// Validate a Debian package name before it reaches a root shell or YAML file.
 pub fn safe_package_name(name: &str) -> bool {
     !name.is_empty()
@@ -402,6 +464,8 @@ pub struct Config {
     /// Guest networking policy. `guarded` is an allow-listed TAP device;
     /// `off` removes the NIC entirely.
     pub network: NetworkMode,
+    /// Host-loopback TCP services exposed to the guest (local LLM servers).
+    pub local_endpoints: Vec<LocalEndpoint>,
     /// Extra packages installed while creating a VM template.
     pub extra_packages: Vec<String>,
     /// Create `agent/hegn-session-<timestamp>` before launching.
@@ -447,6 +511,7 @@ impl Default for Config {
             backend: BackendKind::Auto,
             harness: Harness::Shell,
             network: NetworkMode::Guarded,
+            local_endpoints: Vec::new(),
             extra_packages: Vec::new(),
             auto_branch: true,
             security: SecurityMode::Enforce,
@@ -617,7 +682,23 @@ impl Config {
                 bail!("invalid package name in extra_packages: {package:?}");
             }
         }
+        validate_local_endpoints(&self.local_endpoints)?;
+        if !self.local_endpoints.is_empty() && self.network != NetworkMode::Guarded {
+            bail!("local_endpoints need guarded networking; set network = \"guarded\"");
+        }
         Ok(())
+    }
+
+    /// Deduplicated, sorted ports of the configured local endpoints.
+    pub fn endpoint_ports(&self) -> Vec<u16> {
+        let mut ports: Vec<u16> = self
+            .local_endpoints
+            .iter()
+            .map(|endpoint| endpoint.port)
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
     }
 
     /// Create runtime and config directories. Safe to call repeatedly.
@@ -1011,6 +1092,58 @@ root_device = "/dev/vda"
         config.rootfs_image = rootfs;
         assert!(!config.vm_assets_ready());
         assert!(config.require_vm_assets().is_err());
+    }
+
+    #[test]
+    fn local_endpoints_are_validated() {
+        let mut config = Config::default();
+        assert!(config.validate().is_ok());
+
+        config.local_endpoints = vec![LocalEndpoint {
+            name: "ollama".into(),
+            port: 11434,
+        }];
+        assert!(config.validate().is_ok());
+        assert_eq!(config.endpoint_ports(), vec![11434]);
+
+        config.local_endpoints = vec![LocalEndpoint {
+            name: "bad name".into(),
+            port: 11434,
+        }];
+        assert!(config.validate().is_err(), "unsafe names are rejected");
+
+        config.local_endpoints = vec![LocalEndpoint {
+            name: "ssh".into(),
+            port: 22,
+        }];
+        assert!(config.validate().is_err(), "privileged ports are rejected");
+
+        config.local_endpoints = vec![
+            LocalEndpoint {
+                name: "ollama".into(),
+                port: 11434,
+            },
+            LocalEndpoint {
+                name: "OLLAMA".into(),
+                port: 1234,
+            },
+        ];
+        assert!(config.validate().is_err(), "names are unique");
+
+        config.local_endpoints = vec![LocalEndpoint {
+            name: "ollama".into(),
+            port: 11434,
+        }];
+        config.network = NetworkMode::Off;
+        assert!(config.validate().is_err(), "endpoints need a network");
+    }
+
+    #[test]
+    fn endpoints_deserialize_from_toml() {
+        let config: Config =
+            toml::from_str("[[local_endpoints]]\nname = \"ollama\"\nport = 11434\n").unwrap();
+        assert_eq!(config.endpoint_ports(), vec![11434]);
+        assert_eq!(config.local_endpoints[0].env_name(), "HEGN_ENDPOINT_OLLAMA");
     }
 
     #[test]

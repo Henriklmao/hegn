@@ -186,7 +186,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `cloud_hypervisor.rs` | Typed REST client over `/api/v1` | Frames responses by `Content-Length`/chunked encoding, accepts bodyless `204`, bounded response sizes, pause/resume/info/snapshot only |
 | `cloud_init.rs` | NoCloud seed generation | FAT volume labelled `CIDATA`; serial root autologin; first-boot provisioner and guest network config; no secrets; `0600` and `O_NOFOLLOW` |
 | `provision.rs` | Harness preset install plans and first-boot script | Preset packages are always unioned; package names validated; only static install commands; verifies the CLI exists before writing the marker |
-| `network.rs` | Guarded host network: TAP pool reservation, nftables rules, setup marker | Root-only marker; anti-spoof; private/IPv6/guest-to-host drop; HTTP(S)+public DNS allow-list; per-sandbox `/30` slice; stale reservations reclaimed only when the owning VM is not running |
+| `network.rs` | Guarded host network: TAP pool reservation, nftables rules, setup marker | Root-only marker; anti-spoof; private/IPv6/guest-to-host drop; HTTP(S)+public DNS allow-list; per-sandbox `/30` slice; stale reservations reclaimed only when the owning VM is not running; opt-in loopback endpoints are DNATed per TAP with `route_localnet` and cannot write |
 | `relay.rs` | Detached serial relay | Sole VMM serial client; append-only log; replays the log tail on attach; bounded buffers; refuses to replace non-socket paths; stderr goes to `run/console-relay.log` because it has no terminal |
 | `virtiofs.rs` | virtiofsd argv/process construction | Shared dir canonicalized; always sandboxed; `--cache=never` by default; sockets scoped to run dir |
 | `sandbox_config.rs` | Per-sandbox `hegn.toml`, clone/copy workspaces, rootfs copies | Names validated; source project never deleted; git identity copied; clone child output is captured (warnings go to the UI, never the terminal); reflink rootfs with copy fallback |
@@ -412,6 +412,12 @@ These are product requirements, not implementation details.
   resolvers, drops all RFC1918/CGNAT/link-local/multicast destinations, drops
   IPv6 and drops every packet from a TAP addressed to the host. Guest root
   cannot remove host rules. `network = "off"` removes the device entirely.
+- The only guest-to-host exception is the configured
+  `local_endpoints` list: those TCP ports are DNATed from the sandbox's own TAP
+  host address to `127.0.0.1` and accepted in the input chain, and
+  `route_localnet=1` is set only on the TAP interfaces. Ports below 1024 are
+  rejected, no arbitrary loopback address is reachable, and the guest cannot
+  influence the rules.
 - DNS is deliberately limited to public resolvers. DNS tunnelling to an
   attacker-controlled authoritative domain is still possible; a future
   resolver proxy should filter queries. TLS content is not inspected.
