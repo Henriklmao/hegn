@@ -487,6 +487,7 @@ mod tests {
             vm_binary: None,
             relay_pid,
             virtiofs_pid: std::process::id(),
+            profile_virtiofs_pid: 0,
             boot_args: String::new(),
             serial_log: log,
         };

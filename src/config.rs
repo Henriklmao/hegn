@@ -82,6 +82,20 @@ impl Harness {
         Self::GeminiCli,
     ];
 
+    /// Stable file-name fragment for per-harness profile templates.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Opencode => "opencode",
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+            Self::PrimeAgent => "prime-agent",
+            Self::Aider => "aider",
+            Self::GeminiCli => "gemini-cli",
+        }
+    }
+
     /// The executable that is launched for this harness.
     pub fn command(self) -> &'static str {
         match self {
@@ -428,6 +442,10 @@ pub struct Config {
     pub sandboxes_dir: PathBuf,
     /// Directory containing project templates (`agents.md`, language skeletons).
     pub templates_dir: PathBuf,
+    /// Directory containing per-harness profile templates
+    /// (`opencode.toml`, `claude-code.toml`, …). Profiles may contain API keys,
+    /// so the directory is private.
+    pub profiles_dir: PathBuf,
     pub cloud_hypervisor_bin: PathBuf,
     pub virtiofsd_bin: PathBuf,
     pub kernel_image: PathBuf,
@@ -486,6 +504,7 @@ impl Default for Config {
             snapshots_dir: data_dir.join("hegn/snapshots"),
             sandboxes_dir: data_dir.join("hegn/sandboxes"),
             templates_dir: config_dir.join("hegn/templates"),
+            profiles_dir: config_dir.join("hegn/profiles"),
             cloud_hypervisor_bin: PathBuf::from("cloud-hypervisor"),
             virtiofsd_bin: PathBuf::from("virtiofsd"),
             kernel_image: data_dir
@@ -579,6 +598,9 @@ impl Config {
         if let Some(value) = path_var("HEGN_TEMPLATES_DIR") {
             self.templates_dir = value;
         }
+        if let Some(value) = path_var("HEGN_PROFILES_DIR") {
+            self.profiles_dir = value;
+        }
         if let Some(value) = path_var("HEGN_CLOUD_HYPERVISOR_BIN") {
             self.cloud_hypervisor_bin = value;
         }
@@ -631,6 +653,12 @@ impl Config {
         }
         if !crate::cloud_init::safe_token(&self.shared_tag) {
             bail!("shared_tag may only contain ASCII letters, digits, '-', '_' and '.'");
+        }
+        if self.shared_tag == crate::profile::PROFILE_SHARE_TAG {
+            bail!(
+                "shared_tag '{}' is reserved for the harness profile share",
+                crate::profile::PROFILE_SHARE_TAG
+            );
         }
         // virtio-fs tags are limited to 36 bytes including the terminator.
         if self.shared_tag.len() > 36 {
@@ -703,7 +731,12 @@ impl Config {
 
     /// Create runtime and config directories. Safe to call repeatedly.
     pub fn ensure_dirs(&self) -> Result<()> {
-        for dir in [&self.state_dir, &self.snapshots_dir, &self.sandboxes_dir] {
+        for dir in [
+            &self.state_dir,
+            &self.snapshots_dir,
+            &self.sandboxes_dir,
+            &self.profiles_dir,
+        ] {
             if let Ok(metadata) = fs::symlink_metadata(dir)
                 && metadata.file_type().is_symlink()
             {
@@ -804,6 +837,7 @@ impl Config {
             self.snapshots_dir.clone(),
             self.sandboxes_dir.clone(),
             self.templates_dir.clone(),
+            self.profiles_dir.clone(),
         ];
         if let Some(parent) = Self::config_path().parent() {
             protected.push(parent.to_path_buf());
@@ -1009,6 +1043,43 @@ root_device = "/dev/vda"
         config.guest_mount = "/workspace".into();
         config.kernel_image = PathBuf::from("/images/vmlinux,broken");
         assert!(config.validate().is_err());
+        config.kernel_image = PathBuf::from("/images/vmlinux");
+        config.shared_tag = crate::profile::PROFILE_SHARE_TAG.into();
+        assert!(
+            config.validate().is_err(),
+            "the profile share tag is reserved"
+        );
+        config.shared_tag = "workspace".into();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn profiles_dir_is_private_and_protected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.state_dir = dir.path().join("state");
+        config.snapshots_dir = dir.path().join("snapshots");
+        config.sandboxes_dir = dir.path().join("sandboxes");
+        config.templates_dir = dir.path().join("templates");
+        config.profiles_dir = dir.path().join("profiles");
+        config.projects_root = dir.path().join("projects");
+        config.ensure_dirs().unwrap();
+        assert_eq!(
+            fs::metadata(&config.profiles_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(
+            config
+                .protected_paths()
+                .iter()
+                .any(|path| path == &config.profiles_dir)
+        );
     }
 
     #[test]
@@ -1165,6 +1236,7 @@ root_device = "/dev/vda"
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
         config.templates_dir = dir.path().join("templates");
+        config.profiles_dir = dir.path().join("profiles");
         config.projects_root = dir.path().join("projects");
         config.ensure_dirs().unwrap();
         for path in [
@@ -1189,6 +1261,7 @@ root_device = "/dev/vda"
         config.state_dir = link;
         config.snapshots_dir = dir.path().join("snapshots");
         config.templates_dir = dir.path().join("templates");
+        config.profiles_dir = dir.path().join("profiles");
         config.projects_root = dir.path().join("projects");
         let err = config.ensure_dirs().unwrap_err().to_string();
         assert!(err.contains("symlinked"), "{err}");

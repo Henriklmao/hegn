@@ -2205,6 +2205,10 @@ impl App {
         if actions.init_config {
             lines.push("• write the default ~/.config/hegn/config.toml".into());
         }
+        if actions.init_profiles {
+            lines
+                .push("• write per-harness profile templates under ~/.config/hegn/profiles".into());
+        }
         if actions.download_images {
             lines.push("• download and SHA-256 verify the VM kernel and rootfs".into());
         }

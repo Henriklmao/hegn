@@ -8,9 +8,11 @@
 //!   serial.sock             guest serial socket (Cloud Hypervisor listener)
 //!   console.sock            relay socket used by `hegn attach`
 //!   virtiofs.sock           virtiofsd vhost-user socket
+//!   profile-virtiofs.sock   second virtiofsd socket for the profile copy
 //!   cloud-hypervisor.pid
 //!   console-relay.pid
 //!   virtiofs.pid
+//!   profile-virtiofs.pid
 //!   session.json
 //!   cloud-hypervisor.log    VMM log
 //!   console-relay.log       relay stderr (diagnostics only)
@@ -46,6 +48,7 @@ use crate::cloud_init;
 use crate::config::{Config, Harness, VIRTIOFSD_FALLBACKS};
 use crate::logs::{DEFAULT_KEEP, LogStore};
 use crate::network;
+use crate::profile::{self, PROFILE_SHARE_TAG};
 use crate::provision::ProvisionPlan;
 use crate::relay::{self, RelayArgs};
 use crate::sandbox_config::{CloneOutcome, DeleteOutcome, SandboxConfig, SandboxStore};
@@ -84,6 +87,31 @@ fn boot_args(root_device: &str) -> String {
     format!("console={SERIAL_CONSOLE} reboot=k panic=1 root={root_device} rw")
 }
 
+/// virtio-fs tags embedded in a Cloud Hypervisor snapshot config.
+fn snapshot_fs_tags(dir: &Path) -> Result<Vec<String>> {
+    let path = dir.join("config.json");
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(value
+        .get("fs")
+        .and_then(serde_json::Value::as_array)
+        .map(|devices| {
+            devices
+                .iter()
+                .filter_map(|device| device.get("tag").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn profile_bundle_dir(config: &Config, sandbox: &SandboxConfig) -> Option<PathBuf> {
+    let bundle = sandbox.dir(&config.sandboxes_dir).join("profile/bundle");
+    bundle.join("manifest").is_file().then_some(bundle)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPaths {
     pub run_dir: PathBuf,
@@ -94,9 +122,12 @@ pub struct SandboxPaths {
     /// Relay socket consumed by the TUI and `hegn attach`.
     pub console_socket: PathBuf,
     pub virtiofs_socket: PathBuf,
+    /// Second virtiofsd socket for the per-sandbox profile/skill copy.
+    pub profile_socket: PathBuf,
     pub vm_pid: PathBuf,
     pub relay_pid: PathBuf,
     pub virtiofs_pid: PathBuf,
+    pub profile_virtiofs_pid: PathBuf,
     pub session: PathBuf,
     pub log: PathBuf,
     /// Relay stderr. A detached relay has no terminal, so this file is the only
@@ -118,9 +149,11 @@ impl SandboxPaths {
             serial_socket: run_dir.join("serial.sock"),
             console_socket: run_dir.join("console.sock"),
             virtiofs_socket: run_dir.join("virtiofs.sock"),
+            profile_socket: run_dir.join("profile-virtiofs.sock"),
             vm_pid: run_dir.join("cloud-hypervisor.pid"),
             relay_pid: run_dir.join("console-relay.pid"),
             virtiofs_pid: run_dir.join("virtiofs.pid"),
+            profile_virtiofs_pid: run_dir.join("profile-virtiofs.pid"),
             session: run_dir.join("session.json"),
             log: run_dir.join("cloud-hypervisor.log"),
             relay_log: run_dir.join("console-relay.log"),
@@ -181,6 +214,10 @@ pub struct SessionRecord {
     #[serde(default)]
     pub relay_pid: u32,
     pub virtiofs_pid: u32,
+    /// Second virtiofsd for the profile/skill copy. Zero when the profile is
+    /// empty or the VM predates profiles.
+    #[serde(default)]
+    pub profile_virtiofs_pid: u32,
     pub boot_args: String,
     /// Persistent serial log for this session. Optional so session records
     /// written by older hegn versions still deserialize.
@@ -202,6 +239,10 @@ pub struct SandboxReport {
     pub console_socket: PathBuf,
     pub virtiofs_socket: PathBuf,
     pub virtiofs_running: bool,
+    /// Profile/skill share directory exported to the guest, if any.
+    pub profile_share: Option<PathBuf>,
+    pub profile_virtiofs_pid: Option<u32>,
+    pub profile_virtiofs_running: bool,
     pub relay_running: bool,
     pub vm_pid: Option<u32>,
     pub relay_pid: Option<u32>,
@@ -386,6 +427,15 @@ impl SandboxManager {
                 self.sandbox.harness.label()
             );
         }
+        // Materialize the harness profile before reserving the network so a
+        // bad profile cannot leave a TAP reservation behind.
+        let profile_plan = profile::prepare_for_start(&self.config, &self.sandbox)?;
+        for warning in &profile_plan.warnings {
+            append_event_log(&paths.event_log, &format!("profile: {warning}"));
+        }
+        let mut packages = self.sandbox.extra_packages.clone();
+        packages.extend(profile_plan.packages.iter().cloned());
+        let provision = ProvisionPlan::new(self.sandbox.harness, &packages)?;
         // Reserve the guarded-network slice before any process is spawned.
         // `acquire` also verifies that the host firewall marker is present, so
         // an unconfigured guard fails before virtiofsd or the VMM can start.
@@ -450,18 +500,38 @@ impl SandboxManager {
             return Err(err).context("failed to record the virtiofsd pid");
         }
 
-        // 2. Optional NoCloud seed for the official cloud images. It contains
-        // no secrets and only enables a serial root login.
-        let provision = match ProvisionPlan::new(self.sandbox.harness, &self.sandbox.extra_packages)
-        {
-            Ok(plan) => plan,
-            Err(err) => {
+        // 1b. Optional second virtiofsd for the copied profile and skills.
+        let mut profile_virtiofs = None;
+        if let Some(share) = &profile_plan.share {
+            match spawn_virtiofsd_at(&self.config, &share.bundle_dir, &paths.profile_socket) {
+                Ok(process) => profile_virtiofs = Some(process),
+                Err(err) => {
+                    virtiofs.kill();
+                    cleanup_files(&paths);
+                    network::release(&self.config, &self.sandbox.name);
+                    return Err(err);
+                }
+            }
+            if let Some(process) = &profile_virtiofs
+                && let Err(err) =
+                    write_private(&paths.profile_virtiofs_pid, process.pid().to_string())
+            {
+                if let Some(mut process) = profile_virtiofs.take() {
+                    process.kill();
+                }
                 virtiofs.kill();
                 cleanup_files(&paths);
                 network::release(&self.config, &self.sandbox.name);
-                return Err(err);
+                return Err(err).context("failed to record the profile virtiofsd pid");
             }
-        };
+        }
+        let profile_virtiofs_pid = profile_virtiofs
+            .as_ref()
+            .map(VirtiofsProcess::pid)
+            .unwrap_or(0);
+
+        // 2. Optional NoCloud seed for the official cloud images. It contains
+        // no secrets and only enables a serial root login.
         if self.config.cloud_init
             && let Err(err) = cloud_init::write_seed(
                 &paths.cloud_init,
@@ -470,15 +540,20 @@ impl SandboxManager {
                 &cloud_init::instance_id(
                     &self.sandbox.name,
                     &provision,
+                    profile_plan.share.as_ref(),
                     network_lease.as_ref(),
                     &self.config.local_endpoints,
                 ),
                 &provision,
+                profile_plan.share.as_ref(),
                 network_lease.as_ref(),
                 &self.config.local_endpoints,
             )
         {
             virtiofs.kill();
+            if let Some(mut process) = profile_virtiofs.take() {
+                process.kill();
+            }
             cleanup_files(&paths);
             network::release(&self.config, &self.sandbox.name);
             return Err(err);
@@ -492,10 +567,17 @@ impl SandboxManager {
             &vm_binary,
             None,
             network_lease.as_ref(),
+            profile_plan
+                .share
+                .as_ref()
+                .map(|_| paths.profile_socket.as_path()),
         ) {
             Ok(child) => child,
             Err(err) => {
                 virtiofs.kill();
+                if let Some(mut process) = profile_virtiofs.take() {
+                    process.kill();
+                }
                 cleanup_files(&paths);
                 network::release(&self.config, &self.sandbox.name);
                 return Err(err);
@@ -511,6 +593,9 @@ impl SandboxManager {
                 let _ = vm.kill();
                 let _ = vm.wait();
                 virtiofs.kill();
+                if let Some(mut process) = profile_virtiofs.take() {
+                    process.kill();
+                }
                 cleanup_files(&paths);
                 network::release(&self.config, &self.sandbox.name);
                 return Err(err);
@@ -524,6 +609,9 @@ impl SandboxManager {
             let _ = vm.wait();
             terminate_relay(relay_pid, &hegn);
             virtiofs.kill();
+            if let Some(mut process) = profile_virtiofs.take() {
+                process.kill();
+            }
             cleanup_files(&paths);
             network::release(&self.config, &self.sandbox.name);
             return Err(err).context("failed to boot Cloud Hypervisor");
@@ -539,6 +627,7 @@ impl SandboxManager {
             vm_binary: Some(vm_binary.clone()),
             relay_pid,
             virtiofs_pid,
+            profile_virtiofs_pid,
             boot_args: boot_args(&self.config.root_device),
             serial_log: Some(serial_log.clone()),
         };
@@ -555,6 +644,9 @@ impl SandboxManager {
             let _ = vm.wait();
             terminate_relay(relay_pid, &hegn);
             virtiofs.kill();
+            if let Some(mut process) = profile_virtiofs.take() {
+                process.kill();
+            }
             cleanup_files(&paths);
             network::release(&self.config, &self.sandbox.name);
             return Err(err).context("failed to record the sandbox session");
@@ -563,6 +655,9 @@ impl SandboxManager {
         // Do not kill the children on drop.
         std::mem::forget(vm);
         std::mem::forget(virtiofs);
+        if let Some(process) = profile_virtiofs.take() {
+            std::mem::forget(process);
+        }
 
         Ok(SandboxReport {
             state: "running".into(),
@@ -577,6 +672,12 @@ impl SandboxManager {
             console_socket: paths.console_socket,
             virtiofs_socket: paths.virtiofs_socket,
             virtiofs_running: true,
+            profile_share: profile_plan
+                .share
+                .as_ref()
+                .map(|share| share.bundle_dir.clone()),
+            profile_virtiofs_pid: (profile_virtiofs_pid != 0).then_some(profile_virtiofs_pid),
+            profile_virtiofs_running: profile_virtiofs_pid != 0,
             relay_running: true,
             vm_pid: Some(vm_pid),
             relay_pid: Some(relay_pid),
@@ -636,8 +737,17 @@ impl SandboxManager {
             .as_ref()
             .map(|s| s.virtiofs_pid)
             .or_else(|| read_pid(&paths.virtiofs_pid));
+        let profile_virtiofs_pid = session
+            .as_ref()
+            .map(|s| s.profile_virtiofs_pid)
+            .filter(|pid| *pid != 0)
+            .or_else(|| read_pid(&paths.profile_virtiofs_pid));
 
-        if vm_pid.is_none() && relay_pid.is_none() && virtiofs_pid.is_none() {
+        if vm_pid.is_none()
+            && relay_pid.is_none()
+            && virtiofs_pid.is_none()
+            && profile_virtiofs_pid.is_none()
+        {
             bail!("no sandbox session found in {}", paths.run_dir.display());
         }
         let vm_binary = session
@@ -652,6 +762,9 @@ impl SandboxManager {
             terminate_relay(pid, &hegn);
         }
         if let Some(pid) = virtiofs_pid {
+            terminate(pid, &self.config.virtiofsd_bin);
+        }
+        if let Some(pid) = profile_virtiofs_pid {
             terminate(pid, &self.config.virtiofsd_bin);
         }
         cleanup_files(&paths);
@@ -684,6 +797,11 @@ impl SandboxManager {
         let virtiofs_running = session
             .as_ref()
             .map(|s| process_matches(s.virtiofs_pid, &self.config.virtiofsd_bin))
+            .unwrap_or(false);
+        let profile_virtiofs_running = session
+            .as_ref()
+            .filter(|s| s.profile_virtiofs_pid != 0)
+            .map(|s| process_matches(s.profile_virtiofs_pid, &self.config.virtiofsd_bin))
             .unwrap_or(false);
         let hegn = hegn_binary().ok();
         let relay_running = session
@@ -751,6 +869,13 @@ impl SandboxManager {
             console_socket: paths.console_socket,
             virtiofs_socket: paths.virtiofs_socket,
             virtiofs_running,
+            profile_share: profile_bundle_dir(&self.config, &self.sandbox)
+                .filter(|dir| dir.is_dir()),
+            profile_virtiofs_pid: session
+                .as_ref()
+                .map(|s| s.profile_virtiofs_pid)
+                .filter(|pid| *pid != 0),
+            profile_virtiofs_running,
             relay_running,
             vm_pid: session.as_ref().map(|s| s.vm_pid),
             relay_pid: session.as_ref().map(|s| s.relay_pid),
@@ -911,6 +1036,25 @@ impl SandboxManager {
                 paths.run_dir.display()
             );
         }
+        // The snapshot embeds its device tree. Prepare the profile before
+        // stopping the current VM so a bad profile cannot cost the user their
+        // running session.
+        let profile_plan = profile::prepare_for_start(&self.config, &self.sandbox)?;
+        let snapshot_fs = snapshot_fs_tags(&snapshot.dir)?;
+        let needs_profile = snapshot_fs.iter().any(|tag| tag == PROFILE_SHARE_TAG);
+        if needs_profile && profile_plan.share.is_none() {
+            bail!(
+                "snapshot '{}' contains the profile share, but the current profile has no files, \
+                 skills or environment to export",
+                snapshot.name
+            );
+        }
+        for warning in &profile_plan.warnings {
+            append_event_log(&paths.event_log, &format!("profile: {warning}"));
+        }
+        let mut packages = self.sandbox.extra_packages.clone();
+        packages.extend(profile_plan.packages.iter().cloned());
+        let provision = ProvisionPlan::new(self.sandbox.harness, &packages)?;
         if self.config.network == crate::config::NetworkMode::Off
             && self.config.cloud_init
             && self.sandbox.harness != Harness::Shell
@@ -984,6 +1128,9 @@ impl SandboxManager {
             terminate(session.vm_pid, &existing_vm_binary);
             terminate_relay(session.relay_pid, &hegn);
             terminate(session.virtiofs_pid, &self.config.virtiofsd_bin);
+            if session.profile_virtiofs_pid != 0 {
+                terminate(session.profile_virtiofs_pid, &self.config.virtiofsd_bin);
+            }
         }
         if let Some(pid) = read_pid(&paths.vm_pid) {
             terminate(pid, &existing_vm_binary);
@@ -992,6 +1139,9 @@ impl SandboxManager {
             terminate_relay(pid, &hegn);
         }
         if let Some(pid) = read_pid(&paths.virtiofs_pid) {
+            terminate(pid, &self.config.virtiofsd_bin);
+        }
+        if let Some(pid) = read_pid(&paths.profile_virtiofs_pid) {
             terminate(pid, &self.config.virtiofsd_bin);
         }
         cleanup_files(&paths);
@@ -1012,16 +1162,40 @@ impl SandboxManager {
             return Err(err).context("failed to record the virtiofsd pid");
         }
 
-        let provision = match ProvisionPlan::new(self.sandbox.harness, &self.sandbox.extra_packages)
-        {
-            Ok(plan) => plan,
-            Err(err) => {
+        let mut profile_virtiofs = None;
+        if needs_profile && let Some(share) = &profile_plan.share {
+            match spawn_virtiofsd_at(&self.config, &share.bundle_dir, &paths.profile_socket) {
+                Ok(process) => profile_virtiofs = Some(process),
+                Err(err) => {
+                    virtiofs.kill();
+                    cleanup_files(&paths);
+                    network::release(&self.config, &self.sandbox.name);
+                    return Err(err);
+                }
+            }
+            if let Some(process) = &profile_virtiofs
+                && let Err(err) =
+                    write_private(&paths.profile_virtiofs_pid, process.pid().to_string())
+            {
+                if let Some(mut process) = profile_virtiofs.take() {
+                    process.kill();
+                }
                 virtiofs.kill();
                 cleanup_files(&paths);
                 network::release(&self.config, &self.sandbox.name);
-                return Err(err);
+                return Err(err).context("failed to record the profile virtiofsd pid");
             }
+        }
+        let profile_virtiofs_pid = profile_virtiofs
+            .as_ref()
+            .map(VirtiofsProcess::pid)
+            .unwrap_or(0);
+        let profile_share = if needs_profile {
+            profile_plan.share.as_ref()
+        } else {
+            None
         };
+
         if self.config.cloud_init
             && let Err(err) = cloud_init::write_seed(
                 &paths.cloud_init,
@@ -1030,15 +1204,20 @@ impl SandboxManager {
                 &cloud_init::instance_id(
                     &self.sandbox.name,
                     &provision,
+                    profile_share,
                     network_lease.as_ref(),
                     &self.config.local_endpoints,
                 ),
                 &provision,
+                profile_share,
                 network_lease.as_ref(),
                 &self.config.local_endpoints,
             )
         {
             virtiofs.kill();
+            if let Some(mut process) = profile_virtiofs.take() {
+                process.kill();
+            }
             cleanup_files(&paths);
             network::release(&self.config, &self.sandbox.name);
             return Err(err);
@@ -1056,6 +1235,9 @@ impl SandboxManager {
             Ok(path) => path,
             Err(err) => {
                 virtiofs.kill();
+                if let Some(mut process) = profile_virtiofs.take() {
+                    process.kill();
+                }
                 cleanup_files(&paths);
                 network::release(&self.config, &self.sandbox.name);
                 return Err(err);
@@ -1069,10 +1251,14 @@ impl SandboxManager {
             &vm_binary,
             Some(snapshot),
             None,
+            profile_share.map(|_| paths.profile_socket.as_path()),
         ) {
             Ok(child) => child,
             Err(err) => {
                 virtiofs.kill();
+                if let Some(mut process) = profile_virtiofs.take() {
+                    process.kill();
+                }
                 cleanup_files(&paths);
                 network::release(&self.config, &self.sandbox.name);
                 return Err(err);
@@ -1085,6 +1271,9 @@ impl SandboxManager {
                 let _ = vm.kill();
                 let _ = vm.wait();
                 virtiofs.kill();
+                if let Some(mut process) = profile_virtiofs.take() {
+                    process.kill();
+                }
                 cleanup_files(&paths);
                 network::release(&self.config, &self.sandbox.name);
                 return Err(err);
@@ -1096,6 +1285,9 @@ impl SandboxManager {
             let _ = vm.wait();
             terminate_relay(relay_pid, &hegn);
             virtiofs.kill();
+            if let Some(mut process) = profile_virtiofs.take() {
+                process.kill();
+            }
             cleanup_files(&paths);
             network::release(&self.config, &self.sandbox.name);
             return Err(err).context("failed to restore the Cloud Hypervisor snapshot");
@@ -1114,6 +1306,7 @@ impl SandboxManager {
             vm_binary: Some(vm_binary.clone()),
             relay_pid,
             virtiofs_pid,
+            profile_virtiofs_pid,
             boot_args: boot_args(&self.config.root_device),
             serial_log: Some(serial_log),
         };
@@ -1128,6 +1321,9 @@ impl SandboxManager {
             let _ = vm.wait();
             terminate_relay(relay_pid, &hegn);
             virtiofs.kill();
+            if let Some(mut process) = profile_virtiofs.take() {
+                process.kill();
+            }
             cleanup_files(&paths);
             network::release(&self.config, &self.sandbox.name);
             return Err(err).context("failed to record the restored sandbox session");
@@ -1136,6 +1332,9 @@ impl SandboxManager {
         // The restored VM runs for the rest of the hegn session.
         std::mem::forget(vm);
         std::mem::forget(virtiofs);
+        if let Some(process) = profile_virtiofs.take() {
+            std::mem::forget(process);
+        }
         Ok(())
     }
 
@@ -1170,16 +1369,28 @@ impl SandboxManager {
                 terminate_relay(session.relay_pid, &binary);
             }
             terminate(session.virtiofs_pid, &self.config.virtiofsd_bin);
+            if session.profile_virtiofs_pid != 0 {
+                terminate(session.profile_virtiofs_pid, &self.config.virtiofsd_bin);
+            }
         }
         cleanup_files(&paths);
         network::release(&self.config, &self.sandbox.name);
     }
 }
 
+#[cfg(test)]
 fn virtiofs_config(
     config: &Config,
     paths: &SandboxPaths,
     project: &Path,
+) -> Result<VirtiofsConfig> {
+    virtiofs_config_at(config, project, &paths.virtiofs_socket)
+}
+
+fn virtiofs_config_at(
+    config: &Config,
+    shared_dir: &Path,
+    socket_path: &Path,
 ) -> Result<VirtiofsConfig> {
     let binary = config.resolved_virtiofsd().with_context(|| {
         format!(
@@ -1189,7 +1400,7 @@ fn virtiofs_config(
             VIRTIOFSD_FALLBACKS.join(", ")
         )
     })?;
-    let mut virtiofs = VirtiofsConfig::new(binary, project, paths.virtiofs_socket.clone());
+    let mut virtiofs = VirtiofsConfig::new(binary, shared_dir, socket_path);
     // Honour the configured sandbox mode. The default is namespace; chroot is
     // available for hosts where user namespaces are restricted.
     virtiofs.sandbox = config.virtiofs_sandbox;
@@ -1413,7 +1624,15 @@ fn spawn_virtiofsd(
     paths: &SandboxPaths,
     project: &Path,
 ) -> Result<VirtiofsProcess> {
-    let virtiofs = virtiofs_config(config, paths, project)?;
+    spawn_virtiofsd_at(config, project, &paths.virtiofs_socket)
+}
+
+fn spawn_virtiofsd_at(
+    config: &Config,
+    shared_dir: &Path,
+    socket_path: &Path,
+) -> Result<VirtiofsProcess> {
+    let virtiofs = virtiofs_config_at(config, shared_dir, socket_path)?;
     let mut process = virtiofs.spawn().context("failed to start virtiofsd")?;
     if let Err(err) = process.wait_for_socket(Duration::from_secs(5)) {
         process.kill();
@@ -1429,6 +1648,7 @@ fn cloud_hypervisor_args(
     paths: &SandboxPaths,
     rootfs: &Path,
     network: Option<&network::Lease>,
+    profile_socket: Option<&Path>,
 ) -> Vec<OsString> {
     let mut args = common_args(config, paths, true);
     args.push("--kernel".into());
@@ -1462,6 +1682,17 @@ fn cloud_hypervisor_args(
         )
         .into(),
     );
+    if let Some(socket) = profile_socket {
+        args.push("--fs".into());
+        args.push(
+            format!(
+                "tag={},socket={},num_queues=1,queue_size=1024",
+                PROFILE_SHARE_TAG,
+                socket.display()
+            )
+            .into(),
+        );
+    }
     if let Some(lease) = network {
         args.push("--net".into());
         args.push(lease.cloud_hypervisor_arg().into());
@@ -1520,6 +1751,7 @@ fn spawn_cloud_hypervisor(
     binary: &Path,
     restore: Option<&SnapshotMeta>,
     network: Option<&network::Lease>,
+    profile_socket: Option<&Path>,
 ) -> Result<Child> {
     // Cloud Hypervisor must create the API and serial listeners itself.
     remove_socket(&paths.api_socket)?;
@@ -1536,7 +1768,7 @@ fn spawn_cloud_hypervisor(
         Some(snapshot) => restore_args(config, paths, snapshot),
         None => {
             let rootfs = sandbox.prepare_rootfs(config)?;
-            cloud_hypervisor_args(config, sandbox, paths, &rootfs, network)
+            cloud_hypervisor_args(config, sandbox, paths, &rootfs, network, profile_socket)
         }
     };
     Command::new(binary)
@@ -1843,9 +2075,11 @@ fn cleanup_files(paths: &SandboxPaths) {
         &paths.serial_socket,
         &paths.console_socket,
         &paths.virtiofs_socket,
+        &paths.profile_socket,
         &paths.vm_pid,
         &paths.relay_pid,
         &paths.virtiofs_pid,
+        &paths.profile_virtiofs_pid,
         &paths.session,
         &paths.cloud_init,
     ] {
@@ -1865,6 +2099,8 @@ mod tests {
         config.projects_root = dir.join("projects");
         config.snapshots_dir = dir.join("snapshots");
         config.sandboxes_dir = dir.join("sandboxes");
+        config.profiles_dir = dir.join("profiles");
+        config.templates_dir = dir.join("templates");
         config.kernel_image = dir.join("vmlinux");
         config.rootfs_image = dir.join("rootfs.qcow2");
         config.rootfs_format = crate::config::RootfsFormat::Qcow2;
@@ -2096,6 +2332,7 @@ mod tests {
             vm_binary: None,
             relay_pid: 5678,
             virtiofs_pid: 4321,
+            profile_virtiofs_pid: 0,
             boot_args: boot_args("/dev/vda1"),
             serial_log: None,
         };
@@ -2289,6 +2526,7 @@ mod tests {
             vm_binary: Some(std::env::current_exe().unwrap()),
             relay_pid: 0,
             virtiofs_pid: 0,
+            profile_virtiofs_pid: 0,
             boot_args: String::new(),
             serial_log: None,
         };
@@ -2393,6 +2631,7 @@ mod tests {
             &paths,
             &sandbox.rootfs_path(&config),
             None,
+            None,
         ));
         let joined = args.join(" ");
         assert!(joined.contains("--kernel"), "{joined}");
@@ -2435,6 +2674,22 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_fs_tags_are_read_for_profile_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"fs":[{"tag":"workspace"},{"tag":"hegn-profile"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot_fs_tags(dir.path()).unwrap(),
+            vec!["workspace", "hegn-profile"]
+        );
+        std::fs::write(dir.path().join("config.json"), r#"{"fs":[]}"#).unwrap();
+        assert!(snapshot_fs_tags(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
     fn guarded_network_adds_only_a_tap_and_mac() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
@@ -2454,6 +2709,7 @@ mod tests {
             &paths,
             &sandbox.rootfs_path(&config),
             Some(&lease),
+            None,
         ))
         .join(" ");
         assert!(
@@ -2473,6 +2729,32 @@ mod tests {
         // The host TAP address is owned by `hegn network setup`, not the VMM.
         assert!(!joined.contains("ip=10.213.0."), "{joined}");
         assert!(!joined.contains("mask="), "{joined}");
+    }
+
+    #[test]
+    fn profile_share_is_a_second_sandboxed_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let sandbox = sandbox_for(dir.path());
+        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let socket = dir.path().join("profile.sock");
+        let args = strings(&cloud_hypervisor_args(
+            &config,
+            &sandbox,
+            &paths,
+            &sandbox.rootfs_path(&config),
+            None,
+            Some(&socket),
+        ));
+        let joined = args.join(" ");
+        assert!(joined.contains("--fs tag=workspace"), "{joined}");
+        assert!(
+            joined.contains(&format!(
+                "--fs tag=hegn-profile,socket={}",
+                socket.display()
+            )),
+            "{joined}"
+        );
     }
 
     #[test]
@@ -2500,6 +2782,7 @@ mod tests {
             &paths,
             &sandbox.rootfs_path(&config),
             None,
+            None,
         ))
         .join(" ");
         assert!(!joined.contains("/sys/devices/virtual/net"), "{joined}");
@@ -2526,6 +2809,7 @@ mod tests {
             &paths,
             &sandbox.rootfs_path(&config),
             Some(&lease),
+            None,
         ))
         .join(" ");
         assert!(!joined.contains("--landlock"), "{joined}");
@@ -2543,6 +2827,7 @@ mod tests {
             &sandbox,
             &paths,
             &sandbox.rootfs_path(&config),
+            None,
             None,
         ))
         .join(" ");
@@ -2562,6 +2847,7 @@ mod tests {
             &sandbox,
             &paths,
             &sandbox.rootfs_path(&config),
+            None,
             None,
         ))
         .join(" ");
@@ -2663,6 +2949,7 @@ mod tests {
             &sandbox,
             &paths,
             &sandbox.rootfs_path(&config),
+            None,
             None,
         ));
         assert!(

@@ -45,6 +45,7 @@ configuration, runtime directory, serial log and private root filesystem.
 │    │     ├── virtiofs.rs    ── virtiofsd argv/process                     │
 │    │     ├── relay.rs       ── detached serial relay + persistent log     │
 │    │     ├── cloud_init.rs  ── NoCloud seed for official images           │
+│    │     ├── profile.rs     ── profiles + copied skill bundles            │
 │    │     ├── sandbox_config.rs ── hegn.toml, clones, rootfs copies        │
 │    │     ├── console.rs     ── relay socket + attach bar                  │
 │    │     ├── attach_bar.rs  ── pinned status bar + output gate            │
@@ -59,8 +60,9 @@ configuration, runtime directory, serial log and private root filesystem.
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The guest sees exactly one host directory through virtiofsd. The host sees
-control sockets, logs and metadata. By default the guest also gets a guarded
+The guest sees exactly one project directory through virtiofsd, plus an optional
+second share containing only the sandbox's private profile/skill copy. The host
+sees control sockets, logs and metadata. By default the guest also gets a guarded
 TAP device from `hegn network setup`: public HTTP(S) and public DNS only, with
 no route into the host or the local network. `network = "off"` removes the NIC
 entirely.
@@ -119,10 +121,12 @@ legacy single-session `state_dir/run` is only used for pre-multi-sandbox state:
   cloud-hypervisor.sock  Cloud Hypervisor REST API socket
   serial.sock            Cloud Hypervisor guest serial socket
   console.sock           relay socket used by the TUI / hegn attach
-  virtiofs.sock          virtiofsd vhost-user socket
+  virtiofs.sock          virtiofsd vhost-user socket (project)
+  profile-virtiofs.sock  virtiofsd vhost-user socket (profile/skill copy)
   cloud-hypervisor.pid   last known VMM pid
   console-relay.pid      last known relay pid
   virtiofs.pid           last known virtiofsd pid
+  profile-virtiofs.pid   last known profile virtiofsd pid
   session.json           SessionRecord
   cloud-hypervisor.log   VMM log
   console-relay.log      relay stderr (startup failures only)
@@ -186,6 +190,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `cloud_hypervisor.rs` | Typed REST client over `/api/v1` | Frames responses by `Content-Length`/chunked encoding, accepts bodyless `204`, bounded response sizes, pause/resume/info/snapshot only |
 | `cloud_init.rs` | NoCloud seed generation | FAT volume labelled `CIDATA`; serial root autologin; first-boot provisioner and guest network config; no secrets; `0600` and `O_NOFOLLOW` |
 | `provision.rs` | Harness preset install plans and first-boot script | Preset packages are always unioned; package names validated; only static install commands; verifies the CLI exists before writing the marker |
+| `profile.rs` | Per-harness profile templates, guest payload materialization, skill sync | Source/target/mode/env validation; config files refreshed every start; skills seeded once into a private per-sandbox copy; a second sandboxed virtiofsd exports only that copy; sync-back copies regular files and skips symlinks/special files |
 | `network.rs` | Guarded host network: TAP pool reservation, nftables rules, setup marker | Root-only marker; anti-spoof; private/IPv6/guest-to-host drop; HTTP(S)+public DNS allow-list; per-sandbox `/30` slice; stale reservations reclaimed only when the owning VM is not running; opt-in loopback endpoints are DNATed per TAP with `route_localnet` and cannot write |
 | `relay.rs` | Detached serial relay | Sole VMM serial client; append-only log; replays the log tail on attach; bounded buffers; refuses to replace non-socket paths; stderr goes to `run/console-relay.log` because it has no terminal |
 | `virtiofs.rs` | virtiofsd argv/process construction | Shared dir canonicalized; always sandboxed; `--cache=never` by default; sockets scoped to run dir |
@@ -193,7 +198,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `sandbox.rs` | VM lifecycle, registry, lock, session record, status, snapshots | One lifecycle lock per sandbox; preflight before spawn; hardened VMM argv; cleanup on every error path; registry lists/starts/deletes independent sandboxes |
 | `snapshot.rs` | Snapshot metadata store | Sanitized names; private dirs/files; atomic-ish metadata writes |
 | `images.rs` | Upstream asset pins, streaming download, SHA-256 install/verify | HTTPS only by config validation; checksum before rename; no overwrite without `--force` |
-| `doctor.rs` | Shared host checks and automatic setup planning for CLI and TUI | Required vs optional checks; `SetupActions` covers directories, default config, pinned images and the guarded network; `hegn doctor --fix` and the TUI `s` action are idempotent |
+| `doctor.rs` | Shared host checks and automatic setup planning for CLI and TUI | Required vs optional checks; `SetupActions` covers directories, default config, profile templates, pinned images and the guarded network; `hegn doctor --fix` and the TUI `s` action are idempotent |
 | `benchmark.rs` | Measured host cost: process RSS, disk usage, snapshot estimate; boots a VM only when asked | Refuses to delete anything outside its own `hegn-benchmark-*` projects; sparse-aware accounting; JSON output |
 | `console.rs` | Serial transport over the relay socket, tmux-style attach, status bar | Never pretends a VM exists; verifies VMM and relay; bar content sanitized; `--no-bar` for full-screen guests |
 | `attach_bar.rs` | Bottom status bar overlay and sequence-safe output gate | Clamps DECSTBM so the bar stays pinned; repaints after every output burst; never injects into a split escape sequence or UTF-8 character |
@@ -219,25 +224,32 @@ All state paths can be overridden in `config.toml` or by environment variables
 5. Create the session log (`LogStore::create_session`); prune old logs
    best-effort. Give the sandbox a private rootfs copy on first start (reflink or
    full copy).
-6. With `network = "guarded"`, require the root-owned
+6. Materialize the harness profile into
+   `<sandbox>/profile/bundle`: refresh configuration files and environment from
+   the host, keep existing skill copies, and compute the manifest id. Missing
+   optional profile sources only produce a `run/hegn.log` warning.
+7. With `network = "guarded"`, require the root-owned
    `/run/hegn/network.json` marker and reserve a TAP slice. The sandbox's
    `network_index` is persisted so later boots and snapshot restores keep the
    same device.
-7. Spawn `virtiofsd` with the canonical project path and wait for its socket.
-8. Write the NoCloud seed when `cloud_init = true`. It enables serial root
+8. Spawn `virtiofsd` with the canonical project path and wait for its socket.
+   When the profile carries files, skills or environment, spawn a second,
+   equally sandboxed `virtiofsd` for `profile/bundle`.
+9. Write the NoCloud seed when `cloud_init = true`. It enables serial root
    autologin, mounts the virtio-fs tag at `guest_mount` (`/workspace` by
-   default), installs the harness preset through a oneshot service, and (when
-   guarded) configures the TAP address/DNS by MAC match.
-9. Spawn Cloud Hypervisor with an explicit, hardened argv: `--api-socket`,
-   `--kernel`, `--disk` (rootfs + optional seed), `--cpus`, `--memory ...
-   shared=on`, `--fs`, optional `--net tap=hegnN,mac=...`, `--serial socket=...`,
-   `--console off`, `--seccomp` and `--landlock`.
-10. Spawn the detached relay; it connects to the serial socket and appends to
+   default) and the profile copy at `/run/hegn/profile`, installs the harness
+   preset through a oneshot service (which re-applies the profile on every
+   boot), and (when guarded) configures the TAP address/DNS by MAC match.
+10. Spawn Cloud Hypervisor with an explicit, hardened argv: `--api-socket`,
+    `--kernel`, `--disk` (rootfs + optional seed), `--cpus`, `--memory ...
+    shared=on`, one or two `--fs` devices, optional `--net tap=hegnN,mac=...`,
+    `--serial socket=...`, `--console off`, `--seccomp` and `--landlock`.
+11. Spawn the detached relay; it connects to the serial socket and appends to
     the session log. Its stderr goes to `run/console-relay.log`. If the relay or
     the VMM exits before the attach socket exists, the start error names the
     real cause and includes the last log lines instead of blaming the relay.
-11. Wait until `/api/v1/vm.info` reports `Running`.
-12. Write the pid files and `session.json`; release the lock. The children keep
+12. Wait until `/api/v1/vm.info` reports `Running`.
+13. Write the pid files and `session.json`; release the lock. The children keep
     running.
 
 On any failure the VMM, relay and daemon are killed and run links are removed,
@@ -267,7 +279,8 @@ Attach never boots, restarts or repairs a VM.
 ### 5.3 Stop
 
 1. Take `hegn.lock`.
-2. Resolve VMM, relay and virtiofsd pids from `session.json` / pid files.
+2. Resolve VMM, relay, project virtiofsd and profile virtiofsd pids from
+   `session.json` / pid files.
 3. Send `SIGTERM` only when the pid still matches the expected binary/relay
    command, wait up to two seconds, then `SIGKILL` under the same check.
 4. Remove run files. The session log stays.
@@ -291,9 +304,12 @@ Restore:
 1. Validate the snapshot directory and its `config.json`, `state.json` and
    `memory-ranges` files, plus the project.
 2. Preflight Cloud Hypervisor/virtiofsd before stopping the current VM.
-3. Take `hegn.lock`; terminate the old VMM, relay and daemon.
-4. Start a fresh virtiofsd, regenerate the seed, create a new session log, then
-   start Cloud Hypervisor with `--restore source_url=file://<dir>,resume=true`.
+3. Take `hegn.lock`; terminate the old VMM, relay and both filesystem daemons.
+4. Prepare the profile and inspect the snapshot's embedded `fs` tags. If the
+   snapshot contains the `hegn-profile` device, restart the profile virtiofsd on
+   the same socket; otherwise restore without it. Regenerate the seed, create a
+   new session log, then start Cloud Hypervisor with
+   `--restore source_url=file://<dir>,resume=true`.
 5. Start the relay, wait for the API, write the new session record; on failure
    kill the children and remove the new log.
 
@@ -318,7 +334,30 @@ and skips links to `/`, `$HOME`, an ancestor of the projects root, or any path
 overlapping hegn state/snapshots/templates/config, so a manually planted link
 cannot export the host filesystem or runtime state through virtiofsd.
 
-### 5.6 Image provisioning
+### 5.6 Harness profiles and skills
+
+1. `hegn config init` and `hegn doctor --fix` call
+   `profile::ProfileStore::write_templates`, which writes one `0600` template per
+   agent harness into `profiles_dir` and never overwrites an existing file.
+2. On start, `profile::prepare_for_start` loads `profiles/<harness>.toml`,
+   validates every package, source, guest target, mode and environment entry,
+   and materializes `<sandbox>/profile/bundle/`.
+3. Configuration files are copied fresh on every start. Skills are seeded only
+   when their per-sandbox copy does not exist; later starts keep the copy so
+   guest-created skills survive reboots and can be synced back.
+4. The bundle carries a tab-separated `manifest`, an `env.sh`, and the copies.
+   The host-side mapping (`local.json`) stays outside the exported directory.
+5. A second `virtiofsd` exports only `bundle/` at `/run/hegn/profile`. The
+   guest's `/usr/local/sbin/hegn-apply-profile` copies config files, points
+   each skill target at the per-sandbox copy, and installs `env.sh` in
+   `/etc/profile.d`. The provisioning oneshot runs it on every boot, before its
+   install marker check.
+6. `hegn skills sync` merges new/changed host files into the existing skill
+   copy. `hegn skills sync-back` walks the copy and writes changed/new regular
+   files to the configured host source, refusing symlinks and special files; it
+   refuses a live VM unless `--force` is given.
+
+### 5.7 Image provisioning
 
 `hegn images download`:
 
@@ -333,7 +372,7 @@ cannot export the host filesystem or runtime state through virtiofsd.
 `hegn images verify` re-hashes installed files and returns exit code 1 on a
 mismatch. `hegn images status` shows path, presence and size.
 
-### 5.7 Doctor
+### 5.8 Doctor
 
 `doctor::run(&config)` performs cheap blocking checks: Cloud Hypervisor,
 virtiofsd, git, lazygit (optional), `/dev/kvm`, Landlock (required when
@@ -729,8 +768,10 @@ can build their own rootfs and point `rootfs_image`/`rootfs_*` at it.
 it. Harness binaries are installed *inside* the guest on first boot by the
 NoCloud provisioner (`src/provision.rs`): apt packages plus a static per-preset
 installer, retried by a oneshot until `/var/lib/hegn/provisioned` exists. The
-host image is never mutated, and a pre-baked custom rootfs remains an explicit
-opt-in.
+same oneshot re-applies the user's `profiles/<harness>.toml` payload on every
+boot; profile skills live in a per-sandbox copy (`src/profile.rs`), never in a
+host mount. The host image is never mutated, and a pre-baked custom rootfs
+remains an explicit opt-in.
 
 ### ADR-002: Import by symlink, never copy
 
@@ -821,6 +862,7 @@ src/
   config.rs      schema, defaults, env overrides, validation
   config_form.rs interactive settings editor model (F4/F5 modal)
   project.rs     discovery, import, templates, git helpers
+  profile.rs     per-harness profiles, copied skill bundles, sync-back
   security.rs    tirith-core + hegn workspace guardrails
   cloud_hypervisor.rs typed REST client
   cloud_init.rs   NoCloud seed generation

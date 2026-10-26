@@ -17,6 +17,7 @@ use fatfs::{FileSystem, FormatVolumeOptions, FsOptions};
 
 use crate::config::LocalEndpoint;
 use crate::network::Lease;
+use crate::profile::{PROFILE_GUEST_MOUNT, PROFILE_SHARE_TAG, ProfileShare, apply_script};
 use crate::provision::ProvisionPlan;
 
 /// 4 MiB is enough for the seed and keeps it cheap.
@@ -24,7 +25,7 @@ const SEED_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Increment when the seed's user-data changes so existing sandboxes re-run
 /// cloud-init on their next boot.
-pub const SEED_VERSION: u32 = 6;
+pub const SEED_VERSION: u32 = 7;
 
 fn meta_data(instance_id: &str) -> String {
     format!("instance-id: {instance_id}\nlocal-hostname: hegn\n")
@@ -34,6 +35,7 @@ fn user_data(
     shared_tag: &str,
     guest_mount: &str,
     provision: &ProvisionPlan,
+    profile: Option<&ProfileShare>,
     endpoints: Option<&str>,
 ) -> String {
     let script = indent(&provision.script(), 6);
@@ -43,6 +45,32 @@ fn user_data(
              \x20   permissions: '0644'\n\
              \x20   content: |\n{}\n",
             indent(content, 6)
+        ),
+        None => String::new(),
+    };
+    let profile_mount = match profile {
+        Some(_) => format!(
+            "  - [ '{}', '{}', virtiofs, \"defaults,nofail\", \"0\", \"0\" ]\n",
+            PROFILE_SHARE_TAG, PROFILE_GUEST_MOUNT
+        ),
+        None => String::new(),
+    };
+    let profile_file = match profile {
+        Some(_) => {
+            let apply = indent(&apply_script(), 6);
+            format!(
+                "  - path: /usr/local/sbin/hegn-apply-profile\n\
+                 \x20   permissions: '0700'\n\
+                 \x20   content: |\n{apply}\n"
+            )
+        }
+        None => String::new(),
+    };
+    let profile_runcmd = match profile {
+        Some(_) => format!(
+            "  - mkdir -p '{}' || true\n\
+             \x20 - mountpoint -q '{}' || mount -t virtiofs '{}' '{}' || true\n",
+            PROFILE_GUEST_MOUNT, PROFILE_GUEST_MOUNT, PROFILE_SHARE_TAG, PROFILE_GUEST_MOUNT
         ),
         None => String::new(),
     };
@@ -57,13 +85,13 @@ users:
     lock_passwd: true
 mounts:
   - [ '{shared_tag}', '{guest_mount}', virtiofs, "defaults,nofail", "0", "0" ]
-write_files:
+{profile_mount}write_files:
   - path: /etc/gitconfig
     permissions: '0644'
     content: |
       [safe]
           directory = {guest_mount}
-{endpoint_file}  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
+{endpoint_file}{profile_file}  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
     permissions: '0644'
     content: |
       [Service]
@@ -86,7 +114,6 @@ write_files:
       Description=hegn harness provisioning
       Wants=network-online.target
       After=network-online.target
-      ConditionPathExists=!/var/lib/hegn/provisioned
 
       [Service]
       Type=oneshot
@@ -106,7 +133,7 @@ runcmd:
   - systemctl restart serial-getty@ttyAMA0.service || true
   - mkdir -p '{guest_mount}' || true
   - mountpoint -q '{guest_mount}' || mount -t virtiofs '{shared_tag}' '{guest_mount}' || true
-  - systemctl enable --now hegn-provision.service || true
+{profile_runcmd}  - systemctl enable --now hegn-provision.service || true
 "#
     )
 }
@@ -155,12 +182,14 @@ pub(crate) fn safe_mount(value: &str) -> bool {
 ///
 /// The image is created with mode `0600` and `O_NOFOLLOW`; a planted symlink
 /// cannot redirect the write.
+#[allow(clippy::too_many_arguments)]
 pub fn write_seed(
     path: &Path,
     shared_tag: &str,
     guest_mount: &str,
     instance_id: &str,
     provision: &ProvisionPlan,
+    profile: Option<&ProfileShare>,
     network: Option<&Lease>,
     endpoints: &[LocalEndpoint],
 ) -> Result<()> {
@@ -176,7 +205,13 @@ pub fn write_seed(
     let endpoint_env = network
         .filter(|_| !endpoints.is_empty())
         .map(|lease| endpoint_env(lease, endpoints));
-    let user_data = user_data(shared_tag, guest_mount, provision, endpoint_env.as_deref());
+    let user_data = user_data(
+        shared_tag,
+        guest_mount,
+        provision,
+        profile,
+        endpoint_env.as_deref(),
+    );
     let meta_data = meta_data(instance_id);
     let mut file = OpenOptions::new()
         .create(true)
@@ -231,6 +266,7 @@ fn write_file<IO: std::io::Read + std::io::Write + std::io::Seek>(
 pub fn instance_id(
     sandbox: &str,
     provision: &ProvisionPlan,
+    profile: Option<&ProfileShare>,
     network: Option<&Lease>,
     endpoints: &[LocalEndpoint],
 ) -> String {
@@ -240,6 +276,9 @@ pub fn instance_id(
     hasher.update(SEED_VERSION.to_le_bytes());
     hasher.update(provision.harness.label().as_bytes());
     hasher.update(provision.script().as_bytes());
+    if let Some(profile) = profile {
+        hasher.update(profile.manifest_id.as_bytes());
+    }
     if let Some(lease) = network {
         hasher.update(lease.guest_network_config().as_bytes());
         hasher.update(endpoint_env(lease, endpoints).as_bytes());
@@ -306,6 +345,7 @@ mod tests {
             "/workspace",
             "hegn-demo",
             &plan,
+            None,
             Some(&lease()),
             &[],
         )
@@ -352,6 +392,7 @@ mod tests {
             "/workspace",
             "hegn-demo",
             &plan,
+            None,
             Some(&lease()),
             &endpoints,
         )
@@ -376,13 +417,54 @@ mod tests {
     }
 
     #[test]
+    fn profile_share_mounts_and_applies_on_every_boot() {
+        use std::path::PathBuf;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud-init.img");
+        let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
+        let profile = ProfileShare {
+            bundle_dir: PathBuf::from("/tmp/profile-bundle"),
+            manifest_id: "a".repeat(64),
+        };
+        write_seed(
+            &path,
+            "workspace",
+            "/workspace",
+            "hegn-demo",
+            &plan,
+            Some(&profile),
+            None,
+            &[],
+        )
+        .unwrap();
+        let (user_data, _, _) = read_seed(&path);
+        assert!(
+            user_data.contains("'hegn-profile', '/run/hegn/profile'"),
+            "{user_data}"
+        );
+        assert!(
+            user_data.contains("/usr/local/sbin/hegn-apply-profile"),
+            "{user_data}"
+        );
+        assert!(
+            user_data.contains("hegn: applying harness profile"),
+            "{user_data}"
+        );
+        assert!(
+            !user_data.contains("ConditionPathExists=!/var/lib/hegn/provisioned"),
+            "the provisioner must run every boot so profiles are re-applied: {user_data}"
+        );
+    }
+
+    #[test]
     fn instance_id_changes_with_preset_and_network() {
         let shell = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
         let opencode = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
-        let a = instance_id("demo", &shell, None, &[]);
-        assert_eq!(a, instance_id("demo", &shell, None, &[]));
-        assert_ne!(a, instance_id("demo", &opencode, None, &[]));
-        assert_ne!(a, instance_id("demo", &shell, Some(&lease()), &[]));
+        let a = instance_id("demo", &shell, None, None, &[]);
+        assert_eq!(a, instance_id("demo", &shell, None, None, &[]));
+        assert_ne!(a, instance_id("demo", &opencode, None, None, &[]));
+        assert_ne!(a, instance_id("demo", &shell, None, Some(&lease()), &[]));
         assert!(a.starts_with("hegn-demo-v"));
     }
 
@@ -397,6 +479,7 @@ mod tests {
             "/workspace",
             "hegn-demo",
             &plan,
+            None,
             None,
             &[],
         )
@@ -423,6 +506,7 @@ mod tests {
                 "hegn-demo",
                 &plan,
                 None,
+                None,
                 &[]
             )
             .is_err()
@@ -443,6 +527,7 @@ mod tests {
                 "hegn-demo",
                 &plan,
                 None,
+                None,
                 &[]
             )
             .is_err()
@@ -454,6 +539,7 @@ mod tests {
                 "/work space",
                 "hegn-demo",
                 &plan,
+                None,
                 None,
                 &[]
             )
@@ -467,6 +553,7 @@ mod tests {
                 "hegn-demo",
                 &plan,
                 None,
+                None,
                 &[]
             )
             .is_err()
@@ -478,6 +565,7 @@ mod tests {
                 "/workspace;reboot",
                 "hegn-demo",
                 &plan,
+                None,
                 None,
                 &[]
             )
@@ -497,6 +585,7 @@ mod tests {
             "/workspace",
             "hegn-demo",
             &plan,
+            None,
             None,
             &[],
         )

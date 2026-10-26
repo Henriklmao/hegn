@@ -9,6 +9,7 @@
 //! - [`cloud_hypervisor`] — typed Cloud Hypervisor REST client
 //! - [`cloud_init`] — NoCloud seed for the official cloud images
 //! - [`provision`] — first-boot harness preset installers
+//! - [`profile`] — per-harness guest profiles, copy-only skill sync
 //! - [`network`] — host-enforced guarded networking for guests
 //! - [`virtiofs`] — hardened `virtiofsd` command construction
 //! - [`sandbox`] — MicroVM lifecycle orchestration
@@ -40,6 +41,7 @@ pub mod doctor;
 pub mod images;
 pub mod logs;
 pub mod network;
+pub mod profile;
 pub mod project;
 pub mod provision;
 pub mod relay;

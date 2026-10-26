@@ -117,6 +117,16 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    /// Inspect and initialize per-harness guest profiles.
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommands,
+    },
+    /// Copy host skills into a sandbox and sync changes back.
+    Skills {
+        #[command(subcommand)]
+        command: SkillCommands,
+    },
     /// Inspect, download and verify the pinned upstream VM images.
     Images {
         #[command(subcommand)]
@@ -351,6 +361,52 @@ pub enum ConfigCommands {
     Init,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum ProfileCommands {
+    /// List harness profiles and their paths.
+    List,
+    /// Print the effective profile for a harness as TOML.
+    Show {
+        #[arg(value_enum)]
+        harness: Harness,
+    },
+    /// Print the profile file path.
+    Path {
+        #[arg(value_enum)]
+        harness: Harness,
+        /// Open the profile in $EDITOR.
+        #[arg(long)]
+        edit: bool,
+    },
+    /// Write missing per-harness profile templates.
+    Init,
+    /// Refresh a sandbox's profile payload (files, environment, skills).
+    Sync {
+        /// Sandbox name, project name or project path.
+        sandbox: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillCommands {
+    /// Copy host skill changes into a sandbox's private copy.
+    Sync {
+        /// Sandbox name, project name or project path.
+        sandbox: String,
+    },
+    /// Copy guest skill changes from a sandbox back to the host.
+    SyncBack {
+        /// Sandbox name, project name or project path.
+        sandbox: String,
+        /// Report what would be copied without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Sync while the VM is running (files may be mid-write).
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 /// Run the CLI. Returns the process exit code.
 pub fn run(cli: Cli) -> Result<i32> {
     let config = load_config(&cli)?;
@@ -419,6 +475,8 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
         Commands::Snapshot { command } => snapshot_command(command, config, json),
         Commands::Check { command, cwd } => check(&command.join(" "), cwd.as_deref(), config, json),
         Commands::Config { command } => config_command(command, config, json),
+        Commands::Profile { command } => profile_command(command, config, json),
+        Commands::Skills { command } => skill_command(command, config, json),
         Commands::Images { command } => image_command(command, config, json),
         Commands::Network { command } => network_command(command, config, json),
         Commands::Doctor { fix } => doctor(config, json, fix),
@@ -987,15 +1045,200 @@ fn config_command(command: ConfigCommands, config: Config, json: bool) -> Result
             Ok(0)
         }
         ConfigCommands::Init => {
-            if config.write_default_if_missing()? {
-                println!("Wrote {}", Config::config_path().display());
+            let config_written = config.write_default_if_missing()?;
+            let profiles_written = crate::profile::ProfileStore::new(&config).write_templates()?;
+            config.ensure_dirs()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "config": Config::config_path(),
+                        "config_written": config_written,
+                        "profiles_written": profiles_written,
+                    }))?
+                );
+            } else {
+                if config_written {
+                    println!("Wrote {}", Config::config_path().display());
+                } else {
+                    println!(
+                        "Config already exists at {}",
+                        Config::config_path().display()
+                    );
+                }
+                for path in &profiles_written {
+                    println!("Wrote {}", path.display());
+                }
+                if profiles_written.is_empty() {
+                    println!(
+                        "Profile templates already exist in {}",
+                        config.profiles_dir.display()
+                    );
+                }
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn profile_command(command: ProfileCommands, config: Config, json: bool) -> Result<i32> {
+    let store = crate::profile::ProfileStore::new(&config);
+    match command {
+        ProfileCommands::List => {
+            let mut entries = Vec::new();
+            for harness in Harness::ALL {
+                if harness == Harness::Shell {
+                    continue;
+                }
+                let path = store.path(harness);
+                let exists = path.is_file();
+                entries.push(serde_json::json!({
+                    "harness": harness.slug(),
+                    "path": path,
+                    "exists": exists,
+                }));
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                println!("{:<16} {:<6} PATH", "HARNESS", "STATE");
+                for entry in &entries {
+                    println!(
+                        "{:<16} {:<6} {}",
+                        entry["harness"].as_str().unwrap_or(""),
+                        if entry["exists"].as_bool().unwrap_or(false) {
+                            "ok"
+                        } else {
+                            "missing"
+                        },
+                        entry["path"].as_str().unwrap_or("")
+                    );
+                }
+            }
+            Ok(0)
+        }
+        ProfileCommands::Show { harness } => {
+            let profile = store.load(harness)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&profile)?);
+            } else {
+                print!("{}", toml::to_string_pretty(&profile)?);
+            }
+            Ok(0)
+        }
+        ProfileCommands::Path { harness, edit } => {
+            let path = store.path(harness);
+            if edit {
+                if !path.is_file() {
+                    store.write_templates()?;
+                }
+                run_editor(&path)?;
+                return Ok(0);
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&path)?);
+            } else {
+                println!("{}", path.display());
+            }
+            Ok(0)
+        }
+        ProfileCommands::Init => {
+            let written = store.write_templates()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&written)?);
+            } else if written.is_empty() {
+                println!(
+                    "Profile templates already exist in {}",
+                    store.dir().display()
+                );
+            } else {
+                for path in &written {
+                    println!("Wrote {}", path.display());
+                }
+            }
+            Ok(0)
+        }
+        ProfileCommands::Sync { sandbox } => {
+            let registry = SandboxRegistry::new(config);
+            let sandbox = registry.resolve(&sandbox)?;
+            let plan = crate::profile::prepare_for_start(registry.config(), &sandbox)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "sandbox": sandbox.name,
+                        "packages": plan.packages,
+                        "share": plan.share.as_ref().map(|share| &share.bundle_dir),
+                        "warnings": plan.warnings,
+                    }))?
+                );
+            } else {
+                match &plan.share {
+                    Some(share) => println!(
+                        "Profile payload for '{}' refreshed at {}",
+                        sandbox.name,
+                        share.bundle_dir.display()
+                    ),
+                    None => println!(
+                        "Profile for '{}' has no files, skills or environment to export",
+                        sandbox.name
+                    ),
+                }
+                for warning in &plan.warnings {
+                    eprintln!("hegn: {warning}");
+                }
+                println!("Restart the sandbox to apply configuration files.");
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn skill_command(command: SkillCommands, config: Config, json: bool) -> Result<i32> {
+    let registry = SandboxRegistry::new(config);
+    match command {
+        SkillCommands::Sync { sandbox } => {
+            let sandbox = registry.resolve(&sandbox)?;
+            let report = crate::profile::sync_skills(registry.config(), &sandbox)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!(
-                    "Config already exists at {}",
-                    Config::config_path().display()
+                    "Copied {} file(s) from {} host source(s) into sandbox '{}'",
+                    report.copied_files, report.sources, report.sandbox
+                );
+                for warning in &report.warnings {
+                    eprintln!("hegn: {warning}");
+                }
+            }
+            Ok(0)
+        }
+        SkillCommands::SyncBack {
+            sandbox,
+            dry_run,
+            force,
+        } => {
+            let sandbox = registry.resolve(&sandbox)?;
+            let manager = registry.manager(sandbox.clone());
+            if manager.is_running() && !force && !dry_run {
+                bail!(
+                    "sandbox '{}' is running; stop it first or pass --force to copy live files",
+                    sandbox.name
                 );
             }
-            config.ensure_dirs()?;
+            let report = crate::profile::sync_skills_back(registry.config(), &sandbox, dry_run)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let action = if dry_run { "Would copy" } else { "Copied" };
+                println!(
+                    "{} {} file(s) from sandbox '{}' back to the host ({} unchanged)",
+                    action, report.copied_files, report.sandbox, report.skipped_files
+                );
+                for warning in &report.warnings {
+                    eprintln!("hegn: {warning}");
+                }
+            }
             Ok(0)
         }
     }
@@ -1192,6 +1435,14 @@ fn doctor(config: Config, json: bool, fix: bool) -> Result<i32> {
             }
             if actions.init_config && config.write_default_if_missing()? && !json {
                 eprintln!("hegn: wrote {}", Config::config_path().display());
+            }
+            if actions.init_profiles {
+                let written = crate::profile::ProfileStore::new(&config).write_templates()?;
+                if !json {
+                    for path in &written {
+                        eprintln!("hegn: wrote {}", path.display());
+                    }
+                }
             }
             if actions.download_images {
                 images::download_missing(&config, false)?;
@@ -1606,6 +1857,7 @@ mod tests {
         config.snapshots_dir = dir.path().join("snapshots");
         config.sandboxes_dir = dir.path().join("sandboxes");
         config.templates_dir = dir.path().join("templates");
+        config.profiles_dir = dir.path().join("profiles");
         config.backend = BackendKind::Auto;
         std::fs::create_dir_all(&config.projects_root).unwrap();
         (dir, config)
@@ -1945,6 +2197,46 @@ mod tests {
             Some(Commands::Project {
                 command: ProjectCommands::Create { harness, .. },
             }) => assert_eq!(harness, Some(Harness::Opencode)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_profile_and_skill_commands() {
+        let cli =
+            Cli::try_parse_from(["hegn", "profile", "path", "prime-agent", "--edit"]).unwrap();
+        match cli.command {
+            Some(Commands::Profile {
+                command: ProfileCommands::Path { harness, edit },
+            }) => {
+                assert_eq!(harness, Harness::PrimeAgent);
+                assert!(edit);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "hegn",
+            "skills",
+            "sync-back",
+            "demo",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Skills {
+                command:
+                    SkillCommands::SyncBack {
+                        sandbox,
+                        dry_run,
+                        force,
+                    },
+            }) => {
+                assert_eq!(sandbox, "demo");
+                assert!(dry_run);
+                assert!(force);
+            }
             other => panic!("unexpected {other:?}"),
         }
     }

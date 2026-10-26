@@ -401,6 +401,18 @@ fn handle_effects(
                         }
                     }
                 }
+                if actions.init_profiles {
+                    match crate::profile::ProfileStore::new(&app.config).write_templates() {
+                        Ok(paths) if !paths.is_empty() => {
+                            notes.push(format!("{} profile template(s) written", paths.len()))
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            failed = true;
+                            notes.push(format!("profile setup failed: {err:#}"));
+                        }
+                    }
+                }
                 if actions.configure_network {
                     app.toast("configuring the guarded network…", ToastLevel::Info);
                     let ports = app.config.endpoint_ports();

@@ -65,6 +65,7 @@ pub enum ConfigField {
     SnapshotsDir,
     SandboxesDir,
     TemplatesDir,
+    ProfilesDir,
     ExtraPackages,
     /// Host-loopback LLM endpoints exposed through the guarded network.
     LocalEndpoints,
@@ -114,6 +115,7 @@ impl ConfigField {
             Self::SnapshotsDir => "Snapshots dir",
             Self::SandboxesDir => "Sandboxes dir",
             Self::TemplatesDir => "Templates dir",
+            Self::ProfilesDir => "Profiles dir",
             Self::ExtraPackages => "Extra packages",
             Self::LocalEndpoints => "Endpoints (name=port)",
             Self::Project => "Project",
@@ -158,6 +160,7 @@ impl ConfigField {
                 | Self::SnapshotsDir
                 | Self::SandboxesDir
                 | Self::TemplatesDir
+                | Self::ProfilesDir
         )
     }
 }
@@ -200,6 +203,7 @@ const GENERAL_ROWS: &[ConfigRow] = &[
     ConfigRow::Field(ConfigField::SnapshotsDir),
     ConfigRow::Field(ConfigField::SandboxesDir),
     ConfigRow::Field(ConfigField::TemplatesDir),
+    ConfigRow::Field(ConfigField::ProfilesDir),
     ConfigRow::Group("Packages"),
     ConfigRow::Field(ConfigField::ExtraPackages),
 ];
@@ -450,6 +454,7 @@ impl ConfigForm {
                 ConfigField::SnapshotsDir => config.snapshots_dir.display().to_string(),
                 ConfigField::SandboxesDir => config.sandboxes_dir.display().to_string(),
                 ConfigField::TemplatesDir => config.templates_dir.display().to_string(),
+                ConfigField::ProfilesDir => config.profiles_dir.display().to_string(),
                 ConfigField::ExtraPackages => list_value(&config.extra_packages),
                 ConfigField::LocalEndpoints => endpoints_value(&config.local_endpoints),
                 _ => "—".to_string(),
@@ -1108,6 +1113,7 @@ fn set_global_path(config: &mut Config, field: ConfigField, path: PathBuf) -> Re
         ConfigField::SnapshotsDir => config.snapshots_dir = path,
         ConfigField::SandboxesDir => config.sandboxes_dir = path,
         ConfigField::TemplatesDir => config.templates_dir = path,
+        ConfigField::ProfilesDir => config.profiles_dir = path,
         _ => bail!("{} is not a path", field.label()),
     }
     Ok(())
@@ -1134,6 +1140,7 @@ mod tests {
         config.snapshots_dir = dir.join("snapshots");
         config.sandboxes_dir = dir.join("sandboxes");
         config.templates_dir = dir.join("templates");
+        config.profiles_dir = dir.join("profiles");
         config
     }
 

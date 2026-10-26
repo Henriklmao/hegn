@@ -17,6 +17,7 @@ processes plus the guest:
 | `hegn` (TUI or CLI) | state machine, rendering, VMM API client | ~26 MiB for the TUI (10 000-line serial scrollback); a CLI run is short-lived |
 | `hegn __console-relay` | detached serial relay, keeps the session log growing | ~5 MiB |
 | `virtiofsd` (parent + worker) | shares the project directory into the guest (`--sandbox=namespace --cache=never`) | ~12 MiB total |
+| `virtiofsd` (profile share) | optional second daemon for copied config/skill payloads | ~12 MiB total when the profile has content |
 | `cloud-hypervisor(-static)` | the VMM and all guest RAM | ~404 MiB resident with a 2 GiB guest, ~2.1 GiB virtual |
 | `hegn attach` | optional second client on the console socket | ~7 MiB |
 
@@ -30,6 +31,7 @@ Practical sizing rule for each running sandbox:
 
 ```text
 per sandbox ≈ memory_mib + ~50 MiB (virtiofsd + relay + VMM bookkeeping)
+              + ~12 MiB when a profile share is active
               + ~26 MiB if the TUI stays open
 ```
 

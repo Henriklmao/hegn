@@ -152,21 +152,24 @@ Step 5 decides).
 ## Step 3 — Initialise configuration
 
 ```bash
-hegn config init        # writes ~/.config/hegn/config.toml
+hegn config init        # writes config.toml and profile templates
 hegn config path        # prints the active file
 hegn config show        # effective values
 ```
 
 Unknown keys are rejected, so a typo fails loudly. `config init` also creates
-`projects_root`, `templates_dir`, the state directories and the logs directory,
-and it never overwrites an existing file. Only change values when the user asks;
-the defaults are sane:
+`projects_root`, `templates_dir`, `profiles_dir`, the state directories and the
+logs directory, and it never overwrites an existing file. The profile templates
+under `~/.config/hegn/profiles/` hold per-harness packages, copied config files,
+API keys and skill directories. Only change values when the user asks; the
+defaults are sane:
 
 ```toml
 projects_root   = "~/Projects/hegn"
 state_dir       = "~/.local/state/hegn"
 snapshots_dir   = "~/.local/share/hegn/snapshots"
 templates_dir   = "~/.config/hegn/templates"
+profiles_dir    = "~/.config/hegn/profiles"
 cloud_hypervisor_bin = "cloud-hypervisor"
 virtiofsd_bin   = "virtiofsd"
 rootfs_format   = "qcow2"   # "raw" or "qcow2"

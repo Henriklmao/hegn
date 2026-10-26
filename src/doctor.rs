@@ -40,6 +40,8 @@ pub struct SetupActions {
     pub create_dirs: bool,
     /// Write `~/.config/hegn/config.toml` when it does not exist yet.
     pub init_config: bool,
+    /// Write missing per-harness profile templates.
+    pub init_profiles: bool,
     /// Download and hash-check missing kernel/rootfs images.
     pub download_images: bool,
     /// Create the guarded-network TAP pool and nftables rules (needs root).
@@ -48,7 +50,11 @@ pub struct SetupActions {
 
 impl SetupActions {
     pub fn any(self) -> bool {
-        self.create_dirs || self.init_config || self.download_images || self.configure_network
+        self.create_dirs
+            || self.init_config
+            || self.init_profiles
+            || self.download_images
+            || self.configure_network
     }
 }
 
@@ -60,8 +66,10 @@ pub fn setup_actions(config: &Config) -> SetupActions {
             || !config.snapshots_dir.is_dir()
             || !config.sandboxes_dir.is_dir()
             || !config.templates_dir.is_dir()
+            || !config.profiles_dir.is_dir()
             || !config.logs_dir().is_dir(),
         init_config: !Config::config_path().exists(),
+        init_profiles: crate::profile::ProfileStore::new(config).needs_templates(),
         download_images: images::status(config).iter().any(AssetStatus::missing),
         configure_network: config.network == crate::config::NetworkMode::Guarded
             && !crate::network::guard_ready(config),

@@ -45,6 +45,12 @@ fix.
 - **Multi-agent clones** — clone a sandbox into independent git workspaces so
   parallel agents cannot overwrite each other's commits; merge or open pull
   requests when they finish.
+- **Harness profiles** — `hegn config init` writes one profile template per
+  harness under `~/.config/hegn/profiles/`. A profile can add apt packages,
+  copy configuration files and API keys into the guest, and export environment
+  variables. Host skills are **copied** into a private per-sandbox bundle (never
+  linked), so a poisoned guest cannot modify the host's real skill directories;
+  `hegn skills sync-back` copies guest-created or changed skills back on demand.
 - **Config menus** — `F4` opens an interactive settings editor for the global
   config, `F5` for the selected sandbox's `hegn.toml`. Navigate with the arrow
   keys or the mouse, change values in place, and save with `Ctrl-S`. A raw
@@ -133,10 +139,11 @@ is no local PTY fallback.
 
 A running session costs the configured `memory_mib` (default 2 GiB) plus roughly
 50 MiB for `virtiofsd`, the console relay and VMM bookkeeping, and ~26 MiB more
-while the TUI is open. Base sandboxes and clones can run concurrently, so the
-cost scales per sandbox. On disk, the pinned images
-take ~2.2 GiB (shared by every project), the binary ~19 MiB, and a snapshot
-about as much as the guest RAM; session logs are pruned by count.
+while the TUI is open. When a harness profile exports files, skills or
+environment, a second `virtiofsd` adds about another 12 MiB. Base sandboxes and
+clones can run concurrently, so the cost scales per sandbox. On disk, the pinned
+images take ~2.2 GiB (shared by every project), the binary ~19 MiB, and a
+snapshot about as much as the guest RAM; session logs are pruned by count.
 
 Compute runs near-native under KVM, while many-small-file I/O is slower because
 the workspace is exported through virtio-fs with `--cache=never`. Measured
@@ -278,6 +285,71 @@ log appears on the serial console and in the journal; attach and wait for
 `hegn: preset ready` on the first boot. Presets that need packages require the
 guarded network, because installation happens inside the guest.
 
+### Harness profiles and skill sync
+
+`hegn config init` writes one TOML template per agent harness to
+`~/.config/hegn/profiles/` (`opencode.toml`, `prime-agent.toml`,
+`claude-code.toml`, …). The files are private (`0600`) because they may contain
+API keys. Existing profiles are never overwritten.
+
+```toml
+# ~/.config/hegn/profiles/opencode.toml
+version = 1
+packages = ["tmux", "gh"]              # extra apt packages for this sandbox
+
+[environment]
+OPENAI_API_KEY = "sk-..."              # exported to login shells and the agent
+
+[[files]]                              # copied on every start
+source = "~/.config/opencode/opencode.json"
+target = "/root/.config/opencode/opencode.json"
+mode = "0600"
+
+[[files]]
+source = "~/.config/opencode/auth.json"
+target = "/root/.config/opencode/auth.json"
+
+[[skills]]                             # copied, never linked
+source = "~/.config/opencode/skills"
+target = "/root/.config/opencode/skills"
+sync_back = true
+
+[[skills]]
+source = "~/.agents/skills"
+target = "/root/.agents/skills"
+```
+
+Both `source` paths and guest `target` paths are validated. Guest targets must
+stay under `/root`, `/home`, `/etc`, `/usr/local`, `/opt` or `/workspace`.
+Missing configured sources are reported in the sandbox's `run/hegn.log` and do
+not block a start; a default skill directory that does not exist is skipped
+silently.
+
+At start hegn materializes the profile into
+`<sandboxes_dir>/<name>/profile/bundle/` and exports that **copy** through a
+second, sandboxed `virtiofsd` at `/run/hegn/profile`. Configuration files and
+environment variables are applied on every boot; skills are seeded on the first
+start and then live in the per-sandbox copy. Package additions are installed on
+the next boot without re-running the harness installer. The guest's skill
+directory is a link to that copy, not to the host directory, so guest edits
+cannot poison the host.
+
+```bash
+hegn profile list                       # template paths and state
+hegn profile show opencode              # effective profile as TOML
+hegn profile path opencode --edit       # edit the template in $EDITOR
+hegn profile init                       # write only missing templates
+
+hegn profile sync my-app                # refresh files/env/skills for next boot
+hegn skills sync my-app                 # merge host skill changes into the copy
+hegn skills sync-back my-app            # copy guest changes back to the host
+hegn skills sync-back my-app --dry-run  # show what would change
+```
+
+`sync-back` only copies regular files, skips symlinks and special files, and
+refuses to run against a live VM unless `--force` is passed. Deleted host files
+are never removed by a sync-back.
+
 ### Re-attaching like tmux
 
 ```bash
@@ -317,6 +389,7 @@ own directory below `sandboxes_dir`:
 ~/.local/share/hegn/sandboxes/<name>/
   hegn.toml     per-sandbox settings
   run/          API/serial/relay/virtiofs sockets, pids, lock
+  profile/      copied profile, API keys and skills (never host links)
   rootfs.qcow2  private rootfs copy (created on first start)
   workspace/    only for cloned sandboxes
 ```
@@ -520,6 +593,10 @@ hegn [--config PATH] [--json] [COMMAND]
   snapshot restore NAME [--sandbox SANDBOX] | delete NAME | show NAME
   check [--cwd PATH] CMD...        Inspect a command with tirith-core
   config show | path | init
+  profile list | show HARNESS | path HARNESS [--edit] | init
+  profile sync SANDBOX             Refresh a sandbox's profile payload
+  skills sync SANDBOX              Copy host skills into the sandbox copy
+  skills sync-back SANDBOX [--dry-run] [--force]
   images download [--force]        Fetch missing pinned kernel/rootfs images
           [--allow-unverified]
   images status | verify           Show or re-hash the configured images
@@ -532,7 +609,8 @@ Global flags: `--config <PATH>` (or `HEGN_CONFIG`), `--json`.
 ### Environment variables
 
 `HEGN_CONFIG`, `HEGN_PROJECTS_ROOT`, `HEGN_STATE_DIR`, `HEGN_SNAPSHOTS_DIR`,
-`HEGN_TEMPLATES_DIR`, `HEGN_SANDBOXES_DIR`, `HEGN_CLOUD_HYPERVISOR_BIN`, `HEGN_VIRTIOFSD_BIN`,
+`HEGN_TEMPLATES_DIR`, `HEGN_PROFILES_DIR`, `HEGN_SANDBOXES_DIR`,
+`HEGN_CLOUD_HYPERVISOR_BIN`, `HEGN_VIRTIOFSD_BIN`,
 `HEGN_KERNEL_IMAGE`, `HEGN_ROOTFS_IMAGE`, `HEGN_ROOTFS_FORMAT`,
 `HEGN_ROOT_DEVICE`, `HEGN_KERNEL_URL`,
 `HEGN_KERNEL_SHA256`, `HEGN_ROOTFS_URL`, `HEGN_ROOTFS_SHA256` override the
@@ -543,7 +621,8 @@ and `HEGN_WORKSPACE=<path>`.
 
 ## Configuration
 
-`hegn config init` writes `~/.config/hegn/config.toml`. Unknown keys are
+`hegn config init` writes `~/.config/hegn/config.toml` plus one profile
+template per agent harness under `~/.config/hegn/profiles/`. Unknown keys are
 rejected, so typos surface immediately. Defaults:
 
 ```toml
@@ -552,6 +631,7 @@ state_dir       = "~/.local/state/hegn"
 snapshots_dir   = "~/.local/share/hegn/snapshots"
 sandboxes_dir   = "~/.local/share/hegn/sandboxes"
 templates_dir   = "~/.config/hegn/templates"
+profiles_dir    = "~/.config/hegn/profiles"
 cloud_hypervisor_bin = "cloud-hypervisor"
 # Bare names are resolved via PATH. cloud-hypervisor-static (AUR) is accepted
 # automatically. virtiofsd falls back to /usr/lib/virtiofsd (Arch),
@@ -590,7 +670,8 @@ security        = "enforce"   # "off", "warn" or "enforce"
 # port = 11434
 ```
 
-The package list is a list of *extras*; the harness preset is always unioned in.
+The package list is a list of *extras*; the harness preset and the packages from
+the sandbox's harness profile are always unioned in.
 
 Project-level defaults live in `.hegn.toml` inside each project (written by
 `hegn project create`) and record the harness, package list and template used.
@@ -837,7 +918,8 @@ pre-execution checks or the TUI for intercepted input.
 
 The default Cloud Hypervisor cloud image is writable and reused between
 sessions, so guest changes to the root filesystem persist. The workspace is the
-only host directory exposed through virtio-fs. If you need a truly ephemeral
+only project directory exposed through virtio-fs; a second share exposes only
+the sandbox's private profile/skill copy. If you need a truly ephemeral
 root, point `rootfs_image` at a per-session copy or an overlay image that you
 create and dispose of outside hegn.
 
@@ -845,6 +927,15 @@ Persistent serial logs are treated as untrusted data. They live in a private
 directory, are opened without following symlinks, and `hegn logs show` strips
 terminal escape sequences by default. `--raw` exists for debugging and should
 only be used with logs you trust.
+
+Harness profiles are host-owned input, but they are applied as root inside the
+guest. hegn therefore validates package names, environment names/values, modes
+and guest targets before writing the apply script, and the profile bundle is
+exported from a private per-sandbox directory through its own sandboxed
+`virtiofsd`. Skills are copied into that directory instead of mounting the
+host's real skill directories, so a compromised guest only ever edits the
+throw-away copy. `hegn skills sync-back` is an explicit, copy-only operation
+that skips symlinks and special files.
 
 VM images are upstream Cloud Hypervisor artifacts pinned by HTTPS URL and SHA-256.
 `hegn images download` refuses empty checksums unless `--allow-unverified` is
@@ -863,6 +954,7 @@ src/
   cli.rs         clap command surface; non-interactive parity with the TUI
   config.rs      config schema, XDG paths, env overrides, validation
   project.rs     project discovery, fuzzy filter, git summaries, scaffolding
+  profile.rs     per-harness profiles, copied skill bundles and sync-back
   security.rs    tirith-core integration + workspace guardrails
   cloud_hypervisor.rs typed Cloud Hypervisor REST client
   virtiofs.rs    hardened virtiofsd argv/process construction

@@ -214,6 +214,12 @@ impl SandboxConfig {
         crate::cloud_init::safe_token(&self.shared_tag)
             .then_some(())
             .context("sandbox shared_tag contains unsafe characters")?;
+        if self.shared_tag == crate::profile::PROFILE_SHARE_TAG {
+            bail!(
+                "sandbox shared_tag '{}' is reserved for the harness profile share",
+                crate::profile::PROFILE_SHARE_TAG
+            );
+        }
         if self.shared_tag.len() > 36 {
             bail!("sandbox shared_tag must be at most 36 bytes");
         }
