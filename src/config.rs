@@ -406,7 +406,7 @@ impl SecurityMode {
     }
 }
 
-/// Instance mode passed to virtiofsd.
+/// Sandbox mode passed to virtiofsd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum VirtiofsSandbox {
@@ -439,6 +439,7 @@ pub struct Config {
     pub snapshots_dir: PathBuf,
     /// Per-instance configuration, runtime and cloned workspaces.
     /// Defaults to `~/.local/share/hegn/instances`.
+    #[serde(alias = "sandboxes_dir")]
     pub instances_dir: PathBuf,
     /// Directory containing project templates (`agents.md`, language skeletons).
     pub templates_dir: PathBuf,

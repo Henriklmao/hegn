@@ -30,7 +30,7 @@ pub struct SnapshotMeta {
     /// Directory passed to Cloud Hypervisor as `file://<dir>`.
     pub dir: PathBuf,
     /// Instance that owns this snapshot. Optional for older metadata.
-    #[serde(default)]
+    #[serde(default, alias = "sandbox")]
     pub instance: Option<String>,
     pub project: Option<PathBuf>,
     #[serde(default)]

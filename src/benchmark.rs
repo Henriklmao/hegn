@@ -117,7 +117,7 @@ struct SessionFile {
     project: Option<PathBuf>,
     #[serde(default)]
     workspace: Option<PathBuf>,
-    #[serde(default)]
+    #[serde(default, alias = "sandbox")]
     instance: Option<String>,
     #[serde(default)]
     harness: Option<String>,

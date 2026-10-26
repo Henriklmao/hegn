@@ -51,6 +51,7 @@ pub struct InstanceConfig {
     pub guest_mount: String,
     /// Clone created for multi-agent work.
     pub ephemeral: bool,
+    #[serde(alias = "source_sandbox")]
     pub source_instance: Option<String>,
     pub created_at: DateTime<Utc>,
     pub auto_branch: bool,

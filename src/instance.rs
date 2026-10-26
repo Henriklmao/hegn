@@ -204,7 +204,7 @@ pub struct SessionRecord {
     /// Workspace exported to the guest. Empty in records from older versions.
     #[serde(default)]
     pub workspace: PathBuf,
-    #[serde(default)]
+    #[serde(default, alias = "sandbox")]
     pub instance: String,
     pub harness: Harness,
     pub started_at: DateTime<Utc>,
