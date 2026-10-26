@@ -9,9 +9,10 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    ActionId, App, CreateFocus, DeleteSandboxStage, Focus, FooterHit, Modal, RowHit, SandboxState,
-    Screen, TerminalMode, ToastLevel,
+    ActionId, App, ConfigStepHit, CreateFocus, DeleteSandboxStage, Focus, FooterHit, Modal, RowHit,
+    SandboxState, Screen, TerminalMode, ToastLevel,
 };
+use crate::config_form::{ConfigField, ConfigForm, ConfigRow, FieldKind};
 
 // Use the terminal's own palette and default background. Only ANSI colors
 // are selected here; the user's terminal theme decides how they look.
@@ -31,6 +32,25 @@ pub struct UiHits {
     pub projects: Vec<RowHit>,
     pub sandboxes: Vec<RowHit>,
     pub snapshots: Vec<RowHit>,
+    /// Settings rows and `‹ ›` steppers inside the configuration modal.
+    pub config: Vec<RowHit>,
+    pub config_steppers: Vec<ConfigStepHit>,
+}
+
+#[derive(Default)]
+struct ModalHits {
+    footer: Vec<FooterHit>,
+    config: Vec<RowHit>,
+    config_steppers: Vec<ConfigStepHit>,
+}
+
+impl ModalHits {
+    fn buttons(footer: Vec<FooterHit>) -> Self {
+        Self {
+            footer,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -59,8 +79,13 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
         Screen::Terminal => render_terminal(frame, app, chunks[1]),
     };
     let mut footer = render_footer(frame, app, chunks[2]);
+    let mut config = Vec::new();
+    let mut config_steppers = Vec::new();
     if let Some(modal) = &app.modal {
-        footer.extend(render_modal(frame, app, modal, area));
+        let modal_hits = render_modal(frame, app, modal, area);
+        footer.extend(modal_hits.footer);
+        config = modal_hits.config;
+        config_steppers = modal_hits.config_steppers;
     }
     render_toast(frame, app, chunks[1]);
 
@@ -69,6 +94,8 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
         projects: hits.0,
         sandboxes: hits.1,
         snapshots: hits.2,
+        config,
+        config_steppers,
     }
 }
 
@@ -585,7 +612,7 @@ fn render_sandbox_panel(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(MUTED),
                 )),
                 Line::from(Span::styled(
-                    "F4 global config · F5 sandbox config",
+                    "F4 global settings · F5 sandbox settings",
                     Style::default().fg(MUTED),
                 )),
             ]))
@@ -1037,13 +1064,18 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
         ],
         Some(Modal::Config(_)) => vec![
             FooterDef {
+                key: "Ctrl-S",
+                label: "Save",
+                action: ActionId::SaveConfig,
+            },
+            FooterDef {
                 key: "e",
-                label: "Edit",
+                label: "Edit file",
                 action: ActionId::EditConfig,
             },
             FooterDef {
                 key: "r",
-                label: "Reload",
+                label: "Revert",
                 action: ActionId::ReloadConfig,
             },
             FooterDef {
@@ -1294,7 +1326,14 @@ fn hint_buttons(frame: &mut Frame, app: &App, area: Rect, buttons: &[FooterDef])
     hits
 }
 
-fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Vec<FooterHit> {
+fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> ModalHits {
+    if let Modal::Config(form) = modal {
+        return render_config_form(frame, app, form, area);
+    }
+    ModalHits::buttons(render_modal_buttons(frame, app, modal, area))
+}
+
+fn render_modal_buttons(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Vec<FooterHit> {
     match modal {
         Modal::Help => render_help(frame, app, area),
         Modal::Error { title, message } => render_message(
@@ -1343,67 +1382,8 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Vec<
         Modal::ImportProject(form) => render_import_form(frame, app, form, area),
         Modal::Doctor(modal) => render_doctor(frame, app, modal, area),
         Modal::Security(prompt) => render_security(frame, app, prompt, area),
-        Modal::Config(modal) => {
-            let rect = centered(area, 86, 82);
-            frame.render_widget(Clear, rect);
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(ACCENT))
-                .title(Span::styled(
-                    format!(" {} ", modal.title),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ))
-                .style(Style::default());
-            let inner = block.inner(rect);
-            frame.render_widget(block, rect);
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(2)])
-                .split(inner);
-            frame.render_widget(
-                Paragraph::new(modal.content.as_str())
-                    .style(Style::default().fg(TEXT))
-                    .wrap(Wrap { trim: false }),
-                chunks[0],
-            );
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    format!(" {}", modal.path.display()),
-                    Style::default().fg(MUTED),
-                )),
-                Rect {
-                    height: 1,
-                    ..chunks[1]
-                },
-            );
-            hint_buttons(
-                frame,
-                app,
-                Rect {
-                    y: chunks[1].y + 1,
-                    height: 1,
-                    ..chunks[1]
-                },
-                &[
-                    FooterDef {
-                        key: "e",
-                        label: "Edit",
-                        action: ActionId::EditConfig,
-                    },
-                    FooterDef {
-                        key: "r",
-                        label: "Reload",
-                        action: ActionId::ReloadConfig,
-                    },
-                    FooterDef {
-                        key: "Esc",
-                        label: "Close",
-                        action: ActionId::Close,
-                    },
-                ],
-            )
-        }
+        // Rendered by `render_config_form` before this dispatcher.
+        Modal::Config(_) => Vec::new(),
         Modal::DeleteSandbox(modal) => {
             let (body, color, buttons): (String, Color, &[FooterDef]) = match modal.stage {
                 DeleteSandboxStage::Confirm => (
@@ -1551,6 +1531,315 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Vec<
     }
 }
 
+const CONFIG_LABEL_WIDTH: usize = 20;
+/// ` ‹ ›` plus the value column: two chevrons with breathing room.
+const CONFIG_CONTROLS_WIDTH: usize = 4;
+
+fn render_config_form(frame: &mut Frame, app: &App, form: &ConfigForm, area: Rect) -> ModalHits {
+    let rect = centered(area, 84, 88);
+    frame.render_widget(Clear, rect);
+    let title = if form.dirty() {
+        format!(" {} · unsaved ", form.title)
+    } else {
+        format!(" {} ", form.title)
+    };
+    let border = if form.error.is_some() { RED } else { ACCENT };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            title,
+            Style::default().fg(border).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.width < 24 || inner.height < 4 {
+        return ModalHits::default();
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let list = chunks[0];
+    let height = list.height.max(1) as usize;
+    let rows = form.rows();
+    let selected = form.selected_row();
+    // Stateless scrolling: keep the cursor visible. The wheel moves the
+    // selection, so the viewport follows automatically.
+    let offset = selected.saturating_sub(height.saturating_sub(1));
+
+    let mut lines = Vec::with_capacity(height);
+    let mut config_hits = Vec::new();
+    let mut steppers = Vec::new();
+    for (index, row) in rows.iter().enumerate().skip(offset).take(height) {
+        let y = list.y + (index - offset) as u16;
+        let row_rect = Rect {
+            x: list.x,
+            y,
+            width: list.width,
+            height: 1,
+        };
+        match row {
+            ConfigRow::Group(name) => {
+                let label = format!(" ── {name} ");
+                let fill = (list.width as usize)
+                    .saturating_sub(label.width())
+                    .min(list.width as usize);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        label,
+                        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("─".repeat(fill), Style::default().fg(BORDER)),
+                ]));
+            }
+            ConfigRow::Note(note) => {
+                lines.push(Line::from(Span::styled(
+                    truncate(&format!("   {note}"), list.width as usize),
+                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                )));
+            }
+            ConfigRow::Field(field) => {
+                config_hits.push(RowHit {
+                    rect: row_rect,
+                    index,
+                });
+                let (line, mut row_steppers) =
+                    config_field_line(app, form, *field, index, row_rect);
+                lines.push(line);
+                steppers.append(&mut row_steppers);
+            }
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(Style::default()),
+        list,
+    );
+
+    // File path on the left, dirty/saved marker on the right.
+    let info = chunks[1];
+    let marker = if form.dirty() {
+        ("● unsaved", YELLOW)
+    } else if form.status.is_some() {
+        (form.status.as_deref().unwrap_or_default(), GREEN)
+    } else {
+        ("", MUTED)
+    };
+    let reserved = (marker.0.width() as u16).saturating_add(2);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(
+                " {}",
+                truncate(
+                    &form.path.display().to_string(),
+                    info.width.saturating_sub(reserved) as usize
+                )
+            ),
+            Style::default().fg(MUTED),
+        )),
+        info,
+    );
+    if !marker.0.is_empty() {
+        let width = marker.0.width() as u16;
+        frame.render_widget(
+            Paragraph::new(Span::styled(marker.0, Style::default().fg(marker.1))),
+            Rect {
+                x: info.x + info.width.saturating_sub(width),
+                y: info.y,
+                width,
+                height: 1,
+            },
+        );
+    }
+
+    let hint = if let Some(error) = &form.error {
+        Span::styled(
+            format!(" {error}"),
+            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+        )
+    } else if form.is_editing() {
+        Span::styled(
+            " Enter apply · Esc cancel".to_string(),
+            Style::default().fg(YELLOW),
+        )
+    } else {
+        Span::styled(
+            " ↑↓ select · ←→ or click change · Enter edit/toggle · Esc close",
+            Style::default().fg(MUTED),
+        )
+    };
+    frame.render_widget(Paragraph::new(hint), chunks[2]);
+
+    let footer = hint_buttons(
+        frame,
+        app,
+        chunks[3],
+        &[
+            FooterDef {
+                key: "Ctrl-S",
+                label: "Save",
+                action: ActionId::SaveConfig,
+            },
+            FooterDef {
+                key: "e",
+                label: "Edit file",
+                action: ActionId::EditConfig,
+            },
+            FooterDef {
+                key: "r",
+                label: "Revert",
+                action: ActionId::ReloadConfig,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Close",
+                action: ActionId::Close,
+            },
+        ],
+    );
+
+    ModalHits {
+        footer,
+        config: config_hits,
+        config_steppers: steppers,
+    }
+}
+
+/// Build one settings row and its chevron hit boxes.
+fn config_field_line(
+    app: &App,
+    form: &ConfigForm,
+    field: ConfigField,
+    index: usize,
+    rect: Rect,
+) -> (Line<'static>, Vec<ConfigStepHit>) {
+    let selected = index == form.selected_row();
+    let hovered = app.config_hover == Some(index) && !selected;
+    let base = if selected {
+        Style::default()
+            .fg(ON_ACCENT)
+            .bg(CYAN)
+            .add_modifier(Modifier::BOLD)
+    } else if hovered {
+        Style::default().fg(CYAN)
+    } else {
+        Style::default().fg(TEXT)
+    };
+    let muted = if selected {
+        Style::default().fg(ON_ACCENT).bg(CYAN)
+    } else if hovered {
+        Style::default().fg(CYAN)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    let accent = if selected {
+        Style::default()
+            .fg(ON_ACCENT)
+            .bg(CYAN)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    };
+    let editing = selected && form.editing_buffer(field).is_some();
+    let value_style = if editing {
+        Style::default()
+            .fg(if selected { ON_ACCENT } else { YELLOW })
+            .bg(if selected { CYAN } else { Color::Reset })
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        base
+    };
+
+    let width = rect.width as usize;
+    let label_width = CONFIG_LABEL_WIDTH.min(width.saturating_sub(CONFIG_CONTROLS_WIDTH + 4));
+    let value_width = width
+        .saturating_sub(3 + label_width + CONFIG_CONTROLS_WIDTH)
+        .max(2);
+    let kind = field.kind();
+
+    let raw = form.value(field);
+    let display = if let Some(buffer) = form.editing_buffer(field) {
+        format!("[{}▌]", tail(buffer, value_width.saturating_sub(3)))
+    } else if kind == FieldKind::Bool {
+        format!("[{}] {raw}", if raw == "on" { "x" } else { " " })
+    } else {
+        raw
+    };
+    let shown = truncate(&display, value_width);
+    let mut value = shown.clone();
+    value.push_str(&" ".repeat(value_width.saturating_sub(shown.width())));
+
+    let label = format!("{:<label_width$}", field.label());
+    let marker = if selected { "▸" } else { " " };
+    let mut spans = vec![
+        Span::styled(format!(" {marker} "), base),
+        Span::styled(label, base),
+        Span::styled(value, value_style),
+    ];
+
+    let mut steppers = Vec::new();
+    let right = rect.x + rect.width.saturating_sub(1);
+    match kind {
+        FieldKind::Choice | FieldKind::Integer { .. } => {
+            spans.push(Span::styled(" ", base));
+            spans.push(Span::styled("‹", accent));
+            spans.push(Span::styled(" ", base));
+            spans.push(Span::styled("›", accent));
+            steppers.push(ConfigStepHit {
+                rect: Rect {
+                    x: right.saturating_sub(2),
+                    y: rect.y,
+                    width: 1,
+                    height: 1,
+                },
+                field,
+                step: -1,
+            });
+            steppers.push(ConfigStepHit {
+                rect: Rect {
+                    x: right,
+                    y: rect.y,
+                    width: 1,
+                    height: 1,
+                },
+                field,
+                step: 1,
+            });
+        }
+        FieldKind::Locked => spans.push(Span::styled("    ", muted)),
+        FieldKind::Bool | FieldKind::Text => spans.push(Span::styled("    ", base)),
+    }
+
+    (Line::from(spans), steppers)
+}
+
+/// Last `max` display columns of `text`, so an inline editor keeps the cursor
+/// visible in long paths.
+fn tail(text: &str, max: usize) -> String {
+    if text.width() <= max {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut width = 0;
+    for ch in text.chars().rev() {
+        let char_width = ch.width().unwrap_or(0);
+        if width + char_width > max {
+            break;
+        }
+        out.push(ch);
+        width += char_width;
+    }
+    out.chars().rev().collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_message(
     frame: &mut Frame,
@@ -1620,7 +1909,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
                 ("1 / 2 / 3", "jump to projects / sandboxes / snapshots"),
                 ("c", "create project"),
                 ("h / ←", "import existing project"),
-                ("F4", "global config"),
+                ("F4", "global settings (arrows/mouse · Ctrl-S saves)"),
                 ("e", "open in $EDITOR"),
                 ("g", "open in lazygit"),
                 ("r", "refresh projects + sandboxes"),
@@ -1634,8 +1923,8 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
                 ("Enter", "attach/start selected sandbox or clone"),
                 ("S", "stop selected sandbox"),
                 ("d", "delete sandbox (double confirmation)"),
-                ("F5", "sandbox config (edit/reload)"),
-                ("F4", "global config"),
+                ("F5", "sandbox settings (arrows/mouse · Ctrl-S saves)"),
+                ("F4", "global settings"),
             ],
         ),
         (
@@ -2560,6 +2849,67 @@ mod tests {
         assert!(text.contains("hegn help"));
         assert!(text.contains("fuzzy filter"));
         assert!(text.contains("checkpoint"));
+    }
+
+    #[test]
+    fn config_modal_renders_editable_rows_and_hit_boxes() {
+        let (_dir, mut app) = app();
+        let path = app.config.state_dir.join("config.toml");
+        app.modal = Some(Modal::Config(crate::config_form::ConfigForm::global(
+            app.config.clone(),
+            path,
+        )));
+        let (text, hits) = render(&app);
+        assert!(text.contains("global settings"), "{text}");
+        assert!(text.contains("Runtime"), "{text}");
+        assert!(text.contains("Harness"), "{text}");
+        assert!(text.contains("shell"), "{text}");
+        assert!(!text.contains("OpenCode")); // only the current value is shown
+        assert!(text.contains('‹'), "{text}");
+        assert!(text.contains("Ctrl-S"), "{text}");
+        assert!(!hits.config.is_empty(), "settings rows must be clickable");
+        assert!(
+            !hits.config_steppers.is_empty(),
+            "choice and number rows expose steppers"
+        );
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::SaveConfig)
+        );
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::EditConfig)
+        );
+        let mut ys: Vec<u16> = hits.config.iter().map(|row| row.rect.y).collect();
+        ys.sort_unstable();
+        let distinct = ys.len();
+        ys.dedup();
+        assert_eq!(ys.len(), distinct, "every settings row gets its own line");
+    }
+
+    #[test]
+    fn sandbox_config_modal_marks_read_only_context() {
+        let (_dir, mut app) = app();
+        let sandbox = crate::sandbox_config::SandboxConfig {
+            name: "demo".into(),
+            project: PathBuf::from("/projects/demo"),
+            workspace: PathBuf::from("/projects/demo"),
+            ..crate::sandbox_config::SandboxConfig::default()
+        };
+        app.modal = Some(Modal::Config(crate::config_form::ConfigForm::sandbox(
+            sandbox,
+            app.config.clone(),
+        )));
+        let (text, hits) = render(&app);
+        assert!(text.contains("sandbox 'demo' settings"), "{text}");
+        assert!(text.contains("read-only"), "{text}");
+        assert!(text.contains("/projects/demo"), "{text}");
+        assert!(
+            hits.config.iter().any(|row| row.rect.height == 1),
+            "sandbox settings must be clickable"
+        );
     }
 
     #[test]

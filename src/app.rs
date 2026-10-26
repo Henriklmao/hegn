@@ -11,6 +11,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::config::{Config, Harness, SecurityMode};
+use crate::config_form::{Applied, ConfigField, FormOutcome};
+pub use crate::config_form::{ConfigForm, ConfigKind};
 use crate::console::TerminalConsole;
 use crate::doctor::DoctorReport;
 use crate::project::{self, GitSummary, Project, ProjectMeta};
@@ -214,6 +216,7 @@ pub enum ActionId {
     HarnessPrev,
     HarnessNext,
     ToggleCloneStart,
+    SaveConfig,
     Close,
 }
 
@@ -399,17 +402,10 @@ impl DoctorModal {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigKind {
-    Global,
-    Sandbox,
-}
-
-#[derive(Debug, Clone)]
-pub struct ConfigModal {
-    pub title: String,
-    pub kind: ConfigKind,
-    pub path: PathBuf,
-    pub content: String,
+pub struct ConfigStepHit {
+    pub rect: Rect,
+    pub field: ConfigField,
+    pub step: i8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,7 +449,7 @@ pub enum Modal {
     Doctor(DoctorModal),
     Security(SecurityPrompt),
     Confirm(ConfirmPrompt),
-    Config(ConfigModal),
+    Config(ConfigForm),
     DeleteSandbox(DeleteSandboxModal),
     MultiAgent(MultiAgentForm),
     Help,
@@ -490,6 +486,11 @@ pub struct App {
     pub scroll: usize,
     pub toast: Option<Toast>,
     pub footer_hits: Vec<FooterHit>,
+    /// Settings rows and `‹ ›` steppers recorded by the renderer.
+    pub config_rows: Vec<RowHit>,
+    pub config_steppers: Vec<ConfigStepHit>,
+    /// Settings row under the mouse pointer.
+    pub config_hover: Option<usize>,
     /// Footer button under the mouse pointer, for the inverted hover style.
     pub hovered: Option<ActionId>,
     pub should_quit: bool,
@@ -540,6 +541,9 @@ impl App {
             scroll: 0,
             toast: None,
             footer_hits: Vec::new(),
+            config_rows: Vec::new(),
+            config_steppers: Vec::new(),
+            config_hover: None,
             hovered: None,
             should_quit: false,
             loading: true,
@@ -787,6 +791,7 @@ impl App {
     /// Handle a key press and return side effects for the terminal loop.
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         self.hovered = None;
+        self.config_hover = None;
         if self.modal.is_some() {
             return self.handle_modal_key(key);
         }
@@ -1178,17 +1183,15 @@ impl App {
             }
             Modal::Error { .. } => Vec::new(),
             Modal::Confirm(prompt) => self.handle_confirm_key(key, prompt),
-            Modal::Config(modal) => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => Vec::new(),
-                KeyCode::Char('e') | KeyCode::Enter => vec![Effect::OpenEditor(modal.path)],
-                KeyCode::Char('r') => match modal.kind {
-                    ConfigKind::Global => self.open_global_config(),
-                    ConfigKind::Sandbox => self.open_sandbox_config(),
-                },
-                _ => {
-                    self.modal = Some(Modal::Config(modal));
+            Modal::Config(mut form) => match form.handle_key(key) {
+                FormOutcome::Stay => {
+                    self.modal = Some(Modal::Config(form));
                     Vec::new()
                 }
+                FormOutcome::Close => Vec::new(),
+                FormOutcome::Save => self.save_config_form(form),
+                FormOutcome::Revert => self.revert_config_form(form),
+                FormOutcome::OpenFile => vec![Effect::OpenEditor(form.path)],
             },
             Modal::DeleteSandbox(mut modal) => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => Vec::new(),
@@ -1647,35 +1650,121 @@ impl App {
     }
 
     fn open_global_config(&mut self) -> Vec<Effect> {
-        let path = Config::config_path();
-        let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| toml::to_string_pretty(&self.config).unwrap_or_default());
-        self.modal = Some(Modal::Config(ConfigModal {
-            title: "global config".into(),
-            kind: ConfigKind::Global,
-            path,
-            content,
-        }));
+        self.show_global_config_form(None);
         Vec::new()
     }
 
+    fn show_global_config_form(&mut self, status: Option<String>) {
+        let mut form = ConfigForm::global(self.config.clone(), Config::config_path());
+        form.status = status;
+        self.config_hover = None;
+        self.modal = Some(Modal::Config(form));
+    }
+
     fn open_sandbox_config(&mut self) -> Vec<Effect> {
-        let Some(sandbox) = self.selected_sandbox().cloned() else {
+        let Some(sandbox) = self.selected_sandbox().map(|sandbox| sandbox.name.clone()) else {
             self.toast("select a sandbox first", ToastLevel::Warn);
             return Vec::new();
         };
-        let store = crate::sandbox_config::SandboxStore::new(self.config.clone());
-        let content = store
-            .load(&sandbox.name)
-            .and_then(|config| toml::to_string_pretty(&config).map_err(Into::into))
-            .unwrap_or_else(|err| format!("# failed to load config: {err}\n"));
-        self.modal = Some(Modal::Config(ConfigModal {
-            title: format!("sandbox {} config", sandbox.name),
-            kind: ConfigKind::Sandbox,
-            path: sandbox.config_path,
-            content,
-        }));
+        self.show_sandbox_config_form(&sandbox, None);
         Vec::new()
+    }
+
+    fn show_sandbox_config_form(&mut self, name: &str, status: Option<String>) {
+        let store = crate::sandbox_config::SandboxStore::new(self.config.clone());
+        match store.load(name) {
+            Ok(sandbox) => {
+                let mut form = ConfigForm::sandbox(sandbox, self.config.clone());
+                form.status = status;
+                self.config_hover = None;
+                self.modal = Some(Modal::Config(form));
+            }
+            Err(err) => self.toast(
+                format!("could not load sandbox config: {err:#}"),
+                ToastLevel::Error,
+            ),
+        }
+    }
+
+    /// Persist the settings modal and apply the result. The modal stays open so
+    /// the user can keep adjusting; a failed save leaves the draft intact.
+    fn save_config_form(&mut self, mut form: ConfigForm) -> Vec<Effect> {
+        match form.save() {
+            Some(Applied::Global(config)) => {
+                let projects_root_changed = self.config.projects_root != config.projects_root;
+                self.apply_global_config(*config);
+                self.modal = Some(Modal::Config(form));
+                if projects_root_changed {
+                    self.toast("settings saved — rescanning projects", ToastLevel::Info);
+                    vec![Effect::RefreshProjects]
+                } else {
+                    self.toast("settings saved", ToastLevel::Info);
+                    Vec::new()
+                }
+            }
+            Some(Applied::Sandbox) => {
+                self.refresh_sandboxes();
+                self.modal = Some(Modal::Config(form));
+                self.toast("sandbox settings saved", ToastLevel::Info);
+                Vec::new()
+            }
+            None => {
+                self.modal = Some(Modal::Config(form));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Reload the settings modal from disk, discarding unsaved changes.
+    fn revert_config_form(&mut self, mut form: ConfigForm) -> Vec<Effect> {
+        match form.kind {
+            ConfigKind::Global => match Config::load() {
+                Ok(config) => {
+                    let projects_root_changed = self.config.projects_root != config.projects_root;
+                    self.apply_global_config(config);
+                    self.show_global_config_form(Some("reverted to the file on disk".into()));
+                    if projects_root_changed {
+                        vec![Effect::RefreshProjects]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Err(err) => {
+                    form.error = Some(format!("reload failed: {err:#}"));
+                    self.modal = Some(Modal::Config(form));
+                    Vec::new()
+                }
+            },
+            ConfigKind::Sandbox => {
+                match form.sandbox_name().map(str::to_string) {
+                    Some(name) => self.show_sandbox_config_form(
+                        &name,
+                        Some("reverted to the file on disk".into()),
+                    ),
+                    None => {
+                        form.error = Some("sandbox name is missing".into());
+                        self.modal = Some(Modal::Config(form));
+                    }
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// Install a saved global configuration in the running UI.
+    fn apply_global_config(&mut self, config: Config) {
+        self.security_engine = SecurityEngine::new(config.security);
+        self.store = StateStore::load(config.state_dir.join("state.json"));
+        self.config = config;
+        self.sandbox.vcpus = self.config.vcpus;
+        self.sandbox.memory_mib = self.config.memory_mib;
+        self.sandbox.virtiofs = if self.config.vm_assets_ready() {
+            "configured"
+        } else {
+            "missing VM"
+        };
+        self.refresh_snapshots();
+        self.refresh_sandboxes();
     }
 
     fn open_multi_agent(&mut self) -> Vec<Effect> {
@@ -1700,14 +1789,9 @@ impl App {
     /// Reload global and sandbox configuration after an editor round-trip.
     pub fn reload_after_edit(&mut self) {
         match Config::load() {
-            Ok(config) => {
-                self.security_engine = SecurityEngine::new(config.security);
-                self.config = config;
-            }
+            Ok(config) => self.apply_global_config(config),
             Err(err) => self.toast(format!("config reload failed: {err}"), ToastLevel::Error),
         }
-        self.refresh_sandboxes();
-        self.refresh_snapshots();
     }
 
     /// Open the selected project in a Cloud Hypervisor VM.
@@ -1972,9 +2056,18 @@ impl App {
                 self.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             }
             ActionId::EditConfig => match self.modal.take() {
-                Some(Modal::Config(modal)) => {
-                    self.modal = None;
-                    vec![Effect::OpenEditor(modal.path)]
+                Some(Modal::Config(mut form)) => {
+                    if form.is_editing() {
+                        form.error = Some("apply or cancel the current edit first".into());
+                        self.modal = Some(Modal::Config(form));
+                        Vec::new()
+                    } else if form.dirty() {
+                        form.error = Some("save or revert before editing the raw file".into());
+                        self.modal = Some(Modal::Config(form));
+                        Vec::new()
+                    } else {
+                        vec![Effect::OpenEditor(form.path)]
+                    }
                 }
                 Some(other) => {
                     self.modal = Some(other);
@@ -1982,17 +2075,22 @@ impl App {
                 }
                 None => Vec::new(),
             },
-            ActionId::ReloadConfig => {
-                let kind = match &self.modal {
-                    Some(Modal::Config(modal)) => Some(modal.kind),
-                    _ => None,
-                };
-                match kind {
-                    Some(ConfigKind::Global) => self.open_global_config(),
-                    Some(ConfigKind::Sandbox) => self.open_sandbox_config(),
-                    None => Vec::new(),
+            ActionId::SaveConfig => match self.modal.take() {
+                Some(Modal::Config(form)) => self.save_config_form(form),
+                Some(other) => {
+                    self.modal = Some(other);
+                    Vec::new()
                 }
-            }
+                None => Vec::new(),
+            },
+            ActionId::ReloadConfig => match self.modal.take() {
+                Some(Modal::Config(form)) => self.revert_config_form(form),
+                Some(other) => {
+                    self.modal = Some(other);
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
             ActionId::NewSnapshot => {
                 self.toast(
                     "create snapshots with: hegn snapshot create",
@@ -2043,10 +2141,17 @@ impl App {
                     .iter()
                     .find(|hit| rect_contains(hit.rect, pos))
                     .map(|hit| hit.action);
+                self.config_hover = self
+                    .config_rows
+                    .iter()
+                    .find(|row| rect_contains(row.rect, pos))
+                    .map(|row| row.index);
                 Vec::new()
             }
             MouseEventKind::ScrollUp => {
-                if self.screen == Screen::Terminal {
+                if let Some(Modal::Config(form)) = self.modal.as_mut() {
+                    form.select_delta(-1);
+                } else if self.screen == Screen::Terminal {
                     self.scroll = self.scroll.saturating_add(3).min(self.terminal.len());
                 } else {
                     self.select_next(-1);
@@ -2054,7 +2159,9 @@ impl App {
                 Vec::new()
             }
             MouseEventKind::ScrollDown => {
-                if self.screen == Screen::Terminal {
+                if let Some(Modal::Config(form)) = self.modal.as_mut() {
+                    form.select_delta(1);
+                } else if self.screen == Screen::Terminal {
                     self.scroll = self.scroll.saturating_sub(3);
                 } else {
                     self.select_next(1);
@@ -2070,6 +2177,9 @@ impl App {
                     .copied()
                 {
                     return self.handle_action(hit.action);
+                }
+                if matches!(self.modal, Some(Modal::Config(_))) {
+                    return self.click_config_row(pos);
                 }
                 if let Some(row) = self
                     .project_rows
@@ -2127,6 +2237,34 @@ impl App {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Click inside the settings modal: steppers change a value, a row click
+    /// selects and activates it (toggle, cycle, step or inline edit).
+    fn click_config_row(&mut self, pos: (u16, u16)) -> Vec<Effect> {
+        let stepper = self
+            .config_steppers
+            .iter()
+            .find(|hit| rect_contains(hit.rect, pos))
+            .copied();
+        let row = self
+            .config_rows
+            .iter()
+            .find(|row| rect_contains(row.rect, pos))
+            .copied();
+        let Some(Modal::Config(form)) = self.modal.as_mut() else {
+            return Vec::new();
+        };
+        if let Some(stepper) = stepper {
+            form.adjust_field(stepper.field, stepper.step);
+            return Vec::new();
+        }
+        if let Some(row) = row
+            && form.select_row(row.index)
+        {
+            form.click();
+        }
+        Vec::new()
     }
 
     /// Test/uploads access to the security engine.
@@ -2896,25 +3034,75 @@ mod tests {
         let (_dir, mut app) = test_app();
         app.handle_key(key(KeyCode::F(4)));
         match &app.modal {
-            Some(Modal::Config(modal)) => {
-                assert_eq!(modal.kind, crate::app::ConfigKind::Global);
-                assert!(modal.content.contains("cloud_hypervisor_bin"));
+            Some(Modal::Config(form)) => {
+                assert_eq!(form.kind, ConfigKind::Global);
+                assert_eq!(form.value(ConfigField::Harness), "shell");
+                assert!(form.selected_field().is_some());
             }
-            other => panic!("expected global config, got {other:?}"),
+            other => panic!("expected global settings, got {other:?}"),
         }
         app.modal = None;
         let inside = app.config.sandboxes_dir.join("demo").join("workspace");
         app.focus = Focus::Sandboxes;
-        let sandbox = fake_sandbox(&app, "demo", inside);
+        let sandbox = fake_sandbox(&app, "demo", inside.clone());
+        let stored = crate::sandbox_config::SandboxConfig {
+            name: "demo".into(),
+            project: sandbox.project.clone(),
+            workspace: inside,
+            harness: Harness::Shell,
+            ..crate::sandbox_config::SandboxConfig::default()
+        };
+        crate::sandbox_config::SandboxStore::new(app.config.clone())
+            .save(&stored)
+            .unwrap();
         install_sandboxes(&mut app, vec![sandbox]);
         app.handle_key(key(KeyCode::F(5)));
-        assert!(matches!(
-            app.modal,
-            Some(Modal::Config(crate::app::ConfigModal {
-                kind: crate::app::ConfigKind::Sandbox,
-                ..
-            }))
-        ));
+        match &app.modal {
+            Some(Modal::Config(form)) => assert_eq!(form.kind, ConfigKind::Sandbox),
+            other => panic!("expected sandbox settings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_modal_changes_values_with_keys_and_mouse() {
+        let (_dir, mut app) = test_app();
+        app.handle_key(key(KeyCode::F(4)));
+        let harness_row = match &app.modal {
+            Some(Modal::Config(form)) => form.selected_row(),
+            _ => panic!("expected settings modal"),
+        };
+        // The renderer has not run in this test, so install a synthetic row
+        // rectangle and click it.
+        app.config_rows = vec![RowHit {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 1,
+            },
+            index: harness_row,
+        }];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        match &app.modal {
+            Some(Modal::Config(form)) => {
+                assert_eq!(form.value(ConfigField::Harness), "OpenCode");
+            }
+            other => panic!("expected settings modal, got {other:?}"),
+        }
+
+        // Esc guards unsaved edits: the first press warns, the second discards.
+        let effects = app.handle_key(key(KeyCode::Esc));
+        assert!(effects.is_empty());
+        assert!(app.modal.is_some());
+        let effects = app.handle_key(key(KeyCode::Esc));
+        assert!(effects.is_empty());
+        assert!(app.modal.is_none());
+        assert_eq!(app.config.harness, Harness::Shell);
     }
 
     #[test]

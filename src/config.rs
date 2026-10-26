@@ -1,4 +1,6 @@
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -41,6 +43,8 @@ pub enum RootfsFormat {
 }
 
 impl RootfsFormat {
+    pub const ALL: [Self; 2] = [Self::Raw, Self::Qcow2];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Raw => "raw",
@@ -312,6 +316,18 @@ pub enum SecurityMode {
     /// Block high/critical findings and prompt for medium ones.
     #[default]
     Enforce,
+}
+
+impl SecurityMode {
+    pub const ALL: [Self; 3] = [Self::Off, Self::Warn, Self::Enforce];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Warn => "warn",
+            Self::Enforce => "enforce",
+        }
+    }
 }
 
 /// Sandbox mode passed to virtiofsd.
@@ -645,6 +661,43 @@ impl Config {
         fs::write(&path, format!("{header}{toml}"))
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(true)
+    }
+
+    /// Persist this configuration to `path`, replacing an existing file.
+    ///
+    /// The interactive settings editor (`F4`/`F5`) uses this. The file is
+    /// rewritten from the schema, so hand-written comments are not preserved;
+    /// use the "Edit file" action for comment-preserving edits. Writes are
+    /// atomic: a sibling temporary file is fsynced and renamed into place with
+    /// private permissions, so a crash can never leave a half-written config.
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        self.validate()?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let raw = toml::to_string_pretty(self)?;
+        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        let result = (|| -> Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&tmp)
+                .with_context(|| format!("failed to create {}", tmp.display()))?;
+            file.write_all(raw.as_bytes())
+                .with_context(|| format!("failed to write {}", tmp.display()))?;
+            file.sync_all()?;
+            fs::rename(&tmp, path)
+                .with_context(|| format!("failed to replace {}", path.display()))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
     }
 
     /// Runtime directory for API and virtiofs sockets.
@@ -1006,6 +1059,36 @@ root_device = "/dev/vda"
         config.projects_root = dir.path().join("projects");
         let err = config.ensure_dirs().unwrap_err().to_string();
         assert!(err.contains("symlinked"), "{err}");
+    }
+
+    #[test]
+    fn saves_config_to_an_explicit_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hegn/config.toml");
+        let mut config = Config::default();
+        config.projects_root = dir.path().join("projects");
+        config.harness = Harness::Codex;
+        config.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded, config);
+        assert!(dir.path().join("hegn").is_dir());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn saving_an_invalid_config_does_not_touch_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, b"vcpus = 4\n").unwrap();
+        let mut config = Config::default();
+        config.vcpus = 0;
+        assert!(config.save_to(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"vcpus = 4\n");
     }
 
     #[test]

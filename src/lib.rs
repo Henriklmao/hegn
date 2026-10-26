@@ -3,6 +3,7 @@
 //! The crate is split into small, testable modules:
 //!
 //! - [`config`] — user configuration, paths and defaults
+//! - [`config_form`] — interactive settings editor for the TUI modal
 //! - [`project`] — project discovery, fuzzy filtering and git summaries
 //! - [`security`] — `tirith-core` integration and workspace guardrails
 //! - [`cloud_hypervisor`] — typed Cloud Hypervisor REST client
@@ -33,6 +34,7 @@ pub mod cli;
 pub mod cloud_hypervisor;
 pub mod cloud_init;
 pub mod config;
+pub mod config_form;
 pub mod console;
 pub mod doctor;
 pub mod images;

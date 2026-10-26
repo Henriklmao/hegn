@@ -82,6 +82,8 @@ fn run_loop(
         app.project_rows = hits.projects;
         app.sandbox_rows = hits.sandboxes;
         app.snapshot_rows = hits.snapshots;
+        app.config_rows = hits.config;
+        app.config_steppers = hits.config_steppers;
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
