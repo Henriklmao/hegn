@@ -74,11 +74,13 @@ Cloud Hypervisor implements virtio-fs natively. hegn passes the workspace as
 The VMM is launched with seccomp filters and, unless explicitly disabled,
 Landlock. Landlock restricts the VMM's filesystem view to the kernel, the
 disks, the serial socket, the virtio-fs socket and a dedicated snapshot
-staging directory. When a guarded-network TAP is passed, hegn adds a read-only
-rule for `/sys/devices/virtual/net`: Cloud Hypervisor checks an existing TAP's
+staging directory. When a guarded-network TAP is passed, hegn adds a
+read-only rule for that sandbox's TAP directory
+(`/sys/devices/virtual/net/<tap>`): Cloud Hypervisor checks an existing TAP's
 multiqueue support through that sysfs path before opening it, and its own
 ruleset only grants `/dev/net/tun`. Without the rule the VMM fails with
-`ReadSysfsTunFlags`/`EACCES` while creating virtio-net. `virtiofsd`
+`ReadSysfsTunFlags`/`EACCES` while creating virtio-net. Other host interfaces
+and the rest of `/sys` stay invisible to the VMM. `virtiofsd`
 independently runs with `--sandbox=namespace` (or `chroot`) and `--cache=never`.
 A finished snapshot is moved out of the staging directory and its files are
 tightened to `0600`, so the VMM never gets write access to completed

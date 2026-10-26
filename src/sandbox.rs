@@ -1443,15 +1443,15 @@ fn cloud_hypervisor_args(
         args.push("--net".into());
         args.push(lease.cloud_hypervisor_arg().into());
         // Cloud Hypervisor checks an existing TAP's multiqueue support by
-        // reading `/sys/class/net/<tap>/tun_flags` (resolved through sysfs to
-        // `/sys/devices/virtual/net/<tap>/tun_flags`). Its own Landlock ruleset
+        // reading `/sys/class/net/<tap>/tun_flags`, which sysfs resolves to
+        // `/sys/devices/virtual/net/<tap>/tun_flags`. Its own Landlock ruleset
         // only grants `/dev/net/tun`, so that read fails with EACCES and the VM
-        // dies while creating the virtio-net device. Grant the narrow read-only
-        // rule needed for the check; the VMM still cannot write or enumerate
-        // anything else under /sys.
+        // dies while creating the virtio-net device. Grant exactly this
+        // sandbox's TAP directory, read-only: other interfaces and the rest of
+        // /sys stay invisible to the VMM.
         if config.landlock {
             args.push("--landlock-rules".into());
-            args.push("path=/sys/devices/virtual/net,access=r".into());
+            args.push(format!("path=/sys/devices/virtual/net/{},access=r", lease.tap).into());
         }
     }
     args.push("--serial".into());
@@ -2429,9 +2429,13 @@ mod tests {
             "{joined}"
         );
         // Cloud Hypervisor's own Landlock ruleset only grants /dev/net/tun;
-        // reading an existing TAP's sysfs flags needs this read-only rule.
+        // reading an existing TAP's sysfs flags needs only its own directory.
         assert!(
-            joined.contains("--landlock-rules path=/sys/devices/virtual/net,access=r"),
+            joined.contains("--landlock-rules path=/sys/devices/virtual/net/hegn2,access=r"),
+            "{joined}"
+        );
+        assert!(
+            !joined.contains("--landlock-rules path=/sys/devices/virtual/net,access=r"),
             "{joined}"
         );
         // The host TAP address is owned by `hegn network setup`, not the VMM.
