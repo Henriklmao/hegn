@@ -577,16 +577,31 @@ pub fn setup(user: &str) -> Result<()> {
         dns: DNS.iter().map(ToString::to_string).collect(),
         applied_at: Utc::now(),
     };
-    let raw = serde_json::to_vec_pretty(&marker)?;
+    write_marker(marker_path(), &marker)
+}
+
+/// The marker is deliberately world-readable: the unprivileged TUI reads it to
+/// decide whether the host guard is active. It is not secret (the rules are
+/// already visible with `nft list` to root), and the file must stay root-owned.
+fn write_marker(path: &Path, marker: &ReadyMarker) -> Result<()> {
+    let raw = serde_json::to_vec_pretty(marker)?;
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .mode(0o644)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(marker_path())
-        .with_context(|| format!("failed to write {}", marker_path().display()))?;
+        .open(path)
+        .with_context(|| format!("failed to write {}", path.display()))?;
     file.write_all(&raw)?;
+    // The process umask may be 077; set the mode on the open descriptor so the
+    // unprivileged doctor can always read the marker.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("failed to set marker permissions on {}", path.display()))?;
+    }
     file.sync_all()?;
     Ok(())
 }
@@ -665,6 +680,29 @@ mod tests {
             assert!(setup_script(bad).is_err(), "{bad:?} must be rejected");
         }
         assert!(safe_user("_alice-1"));
+    }
+
+    #[test]
+    fn ready_marker_is_readable_by_the_unprivileged_doctor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("network.json");
+        let marker = ReadyMarker {
+            version: MARKER_VERSION,
+            pool: TAP_POOL,
+            subnet: SUBNET.to_string(),
+            dns: DNS.iter().map(ToString::to_string).collect(),
+            applied_at: Utc::now(),
+        };
+        write_marker(&path, &marker).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: ReadyMarker = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.pool, TAP_POOL);
     }
 
     #[test]
