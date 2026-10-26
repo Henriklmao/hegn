@@ -12,6 +12,7 @@
 //! refuses to boot a guarded VM unless the host marker shows that the firewall
 //! is active.
 
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::Ipv4Addr;
@@ -225,22 +226,55 @@ pub fn setup_with_privilege(user: &str, endpoints: &[u16]) -> Result<()> {
              hegn network setup --user {user}` manually"
         );
     };
-    let mut command = Command::new(helper);
+    let mut args: Vec<OsString> = Vec::new();
     if prefix {
-        command.arg("--");
+        args.push("--".into());
     }
-    let status = command
-        .arg(&exe)
-        .arg("network")
-        .arg("setup")
-        .arg("--user")
-        .arg(user)
+    args.push(exe.into_os_string());
+    args.push("network".into());
+    args.push("setup".into());
+    args.push("--user".into());
+    args.push(user.into());
+    // The password prompt happens inside sudo/pkexec. Echo the exact command
+    // first so the user can inspect what will run as root before typing it.
+    eprintln!(
+        "hegn: requesting root privileges; about to run:\n  {}",
+        render_command(helper, &args)
+    );
+    let status = Command::new(helper)
+        .args(&args)
         .status()
         .with_context(|| format!("failed to run {helper}"))?;
     if !status.success() {
         bail!("{helper} exited with {status}");
     }
     Ok(())
+}
+
+/// Render a command line with POSIX shell quoting for the pre-sudo echo.
+fn render_command(program: &str, args: &[OsString]) -> String {
+    std::iter::once(OsStr::new(program))
+        .chain(args.iter().map(OsString::as_os_str))
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &OsStr) -> String {
+    let raw = value.to_string_lossy();
+    if !raw.is_empty()
+        && raw.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '_' | '@' | '%' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
+                )
+        })
+    {
+        raw.into_owned()
+    } else {
+        format!("'{}'", raw.replace('\'', r#"'\''"#))
+    }
 }
 
 fn command_exists(name: &str) -> bool {
@@ -835,6 +869,26 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         let parsed: ReadyMarker = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed.pool, TAP_POOL);
+    }
+
+    #[test]
+    fn privileged_setup_echo_is_shell_quoted() {
+        let args = vec![
+            OsString::from("--"),
+            OsString::from("/opt/hegn tools/hegn"),
+            OsString::from("network"),
+            OsString::from("setup"),
+            OsString::from("--user"),
+            OsString::from("demo user"),
+        ];
+        assert_eq!(
+            render_command("sudo", &args),
+            "sudo -- '/opt/hegn tools/hegn' network setup --user 'demo user'"
+        );
+        assert_eq!(
+            render_command("pkexec", &args[1..]),
+            "pkexec '/opt/hegn tools/hegn' network setup --user 'demo user'"
+        );
     }
 
     #[test]

@@ -720,6 +720,10 @@ hegn network setup --dry-run --user "$USER"  # inspect the exact script
 sudo hegn network teardown               # remove taps and rules
 ```
 
+When hegn invokes `sudo` or `pkexec` itself (`hegn doctor --fix`, the doctor's
+`Set up everything` action), it prints the exact command line with shell quoting
+before the password prompt, so it can be inspected first.
+
 `hegn sandbox start` is fail-closed: with `network = "guarded"` it refuses to
 boot unless `/run/hegn/network.json` exists and was written by root. Rules live
 on the host, so root in the guest cannot remove them.
