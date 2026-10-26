@@ -181,6 +181,67 @@ pub fn ready_marker() -> Option<ReadyMarker> {
     .then_some(marker)
 }
 
+/// Marker present and at least the first TAP device exists. Used by doctor and
+/// by the automatic setup action.
+pub fn guard_ready(config: &Config) -> bool {
+    ready_marker().is_some() && status(config).first().is_some_and(|tap| tap.exists)
+}
+
+/// User that should own the TAP devices. `SUDO_USER` wins when hegn itself was
+/// re-executed through sudo.
+pub fn invoking_user() -> Option<String> {
+    std::env::var("SUDO_USER")
+        .ok()
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("LOGNAME").ok())
+        .filter(|user| safe_user(user))
+}
+
+/// Apply the guard, re-executing hegn through sudo/pkexec when the current
+/// process is not root. The caller is responsible for restoring any TUI
+/// terminal first so the privilege helper can prompt.
+pub fn setup_with_privilege(user: &str) -> Result<()> {
+    if !safe_user(user) {
+        bail!("invalid user name for TAP ownership: {user:?}");
+    }
+    if is_privileged() {
+        return setup(user);
+    }
+    let exe = std::env::current_exe().context("failed to locate the hegn executable")?;
+    let (helper, prefix) = if command_exists("sudo") {
+        ("sudo", true)
+    } else if command_exists("pkexec") {
+        ("pkexec", false)
+    } else {
+        bail!(
+            "guarded networking needs root, but neither sudo nor pkexec is installed; run `sudo \
+             hegn network setup --user {user}` manually"
+        );
+    };
+    let mut command = Command::new(helper);
+    if prefix {
+        command.arg("--");
+    }
+    let status = command
+        .arg(&exe)
+        .arg("network")
+        .arg("setup")
+        .arg("--user")
+        .arg(user)
+        .status()
+        .with_context(|| format!("failed to run {helper}"))?;
+    if !status.success() {
+        bail!("{helper} exited with {status}");
+    }
+    Ok(())
+}
+
+fn command_exists(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
+}
+
 /// Fail closed when guarded networking is configured but not applied.
 pub fn ensure_ready(config: &Config) -> Result<()> {
     if crate::config::NetworkMode::Guarded != config.network {

@@ -216,9 +216,19 @@ This is a host firewall change and needs root. Ask the user before running it.
 It creates a pool of TAP devices owned by the invoking user and installs an
 nftables table that allows only public HTTP(S) and public DNS.
 
+The normal path is the automatic doctor setup, which also creates directories,
+writes the default config and downloads the pinned images:
+
+```bash
+hegn doctor --fix
+hegn network status
+```
+
+`--fix` performs only hegn-owned steps and prompts through `sudo`/`pkexec` for
+the network. The explicit equivalent remains:
+
 ```bash
 sudo hegn network setup --user "$USER"
-hegn network status
 ```
 
 **Gate:** `hegn network status` reports `guard: ready` and lists `hegn0` as
@@ -230,6 +240,7 @@ rules.
 
 ```bash
 hegn doctor              # exit 1 if any required check fails
+hegn doctor --fix        # prepare directories, config, images and network
 hegn doctor --json       # machine-readable, one object per check
 ```
 

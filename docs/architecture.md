@@ -185,7 +185,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `sandbox.rs` | VM lifecycle, registry, lock, session record, status, snapshots | One lifecycle lock per sandbox; preflight before spawn; hardened VMM argv; cleanup on every error path; registry lists/starts/deletes independent sandboxes |
 | `snapshot.rs` | Snapshot metadata store | Sanitized names; private dirs/files; atomic-ish metadata writes |
 | `images.rs` | Upstream asset pins, streaming download, SHA-256 install/verify | HTTPS only by config validation; checksum before rename; no overwrite without `--force` |
-| `doctor.rs` | Shared host checks for CLI and TUI | Required vs optional checks; missing images are downloadable |
+| `doctor.rs` | Shared host checks and automatic setup planning for CLI and TUI | Required vs optional checks; `SetupActions` covers directories, default config, pinned images and the guarded network; `hegn doctor --fix` and the TUI `s` action are idempotent |
 | `benchmark.rs` | Measured host cost: process RSS, disk usage, snapshot estimate; boots a VM only when asked | Refuses to delete anything outside its own `hegn-benchmark-*` projects; sparse-aware accounting; JSON output |
 | `console.rs` | Serial transport over the relay socket, tmux-style attach, status bar | Never pretends a VM exists; verifies VMM and relay; bar content sanitized; `--no-bar` for full-screen guests |
 | `attach_bar.rs` | Bottom status bar overlay and sequence-safe output gate | Clamps DECSTBM so the bar stays pinned; repaints after every output burst; never injects into a split escape sequence or UTF-8 character |
@@ -341,10 +341,16 @@ the static name), then the absolute fallbacks in
 `config::CLOUD_HYPERVISOR_FALLBACKS`. The resolved path is used for spawning and
 for `/proc/<pid>/cmdline` verification.
 
-The TUI opens the doctor modal automatically from `App::fail_start` (VM
-start/attach failure). `F3` opens it manually. `d` triggers a background
-download through `Effect::DownloadImages`; `r` re-runs the checks. The CLI
-prints the same report, with `--json` support.
+The TUI opens the doctor modal on the first launch when automatic setup is
+available or a required check fails, and from `App::fail_start` (VM
+start/attach failure). `F3` opens it manually.
+`d` triggers a background download through `Effect::DownloadImages`; `r`
+re-runs the checks. `s` asks for explicit confirmation and then runs
+`Effect::SetupEnvironment`: create directories, write the default config,
+download/verify images, and call the guarded-network setup through
+`sudo`/`pkexec` with the terminal temporarily restored for the password prompt.
+Every step is idempotent and only hegn-owned state is changed. The CLI exposes
+the same plan as `hegn doctor --fix`, with `--json` support.
 
 ---
 
@@ -555,7 +561,8 @@ matters when hegn runs inside tmux and `Ctrl-B` is consumed as the tmux prefix.
 | Logs | — | `hegn logs list/path/show/prune` |
 | Security check | modal + insert-mode input | `hegn check` |
 | Multi-agent clones | `M` in the project terminal | `hegn sandbox clone` |
-| Doctor | `F3` + automatic on failure | `hegn doctor` |
+| Doctor | `F3` + automatic on first launch/failure | `hegn doctor` |
+| Automatic setup | doctor modal `s` (confirmed) | `hegn doctor --fix` |
 | Image download | doctor modal `d` | `hegn images download` |
 | Image verification | doctor report | `hegn images verify` |
 

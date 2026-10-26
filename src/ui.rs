@@ -1031,11 +1031,19 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
             },
         ],
         Some(Modal::Doctor(modal)) => {
-            let mut buttons = vec![FooterDef {
+            let mut buttons = Vec::new();
+            if modal.report.can_setup() && !modal.downloading && !modal.setting_up {
+                buttons.push(FooterDef {
+                    key: "s",
+                    label: "Set up everything",
+                    action: ActionId::DoctorSetup,
+                });
+            }
+            buttons.push(FooterDef {
                 key: "r",
                 label: "Re-run",
                 action: ActionId::Doctor,
-            }];
+            });
             if modal.report.can_download() && !modal.downloading {
                 buttons.push(FooterDef {
                     key: "d",
@@ -2408,10 +2416,24 @@ fn render_doctor(
             )));
         }
     }
+    if modal.report.can_setup() && !modal.downloading && !modal.setting_up {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            " Not ready yet? Press s to prepare directories, images and the guarded network.",
+            Style::default().fg(CYAN),
+        )));
+    }
     if modal.downloading {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             " Downloading and verifying VM images…",
+            Style::default().fg(CYAN),
+        )));
+    }
+    if modal.setting_up {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            " Setting up hegn… (privileged steps prompt in the terminal)",
             Style::default().fg(CYAN),
         )));
     }
@@ -2427,6 +2449,13 @@ fn render_doctor(
         inner_chunks[0],
     );
     let mut buttons = Vec::new();
+    if modal.report.can_setup() && !modal.downloading && !modal.setting_up {
+        buttons.push(FooterDef {
+            key: "s",
+            label: "Set up everything",
+            action: ActionId::DoctorSetup,
+        });
+    }
     if modal.report.can_download() && !modal.downloading {
         buttons.push(FooterDef {
             key: "d",
@@ -2816,16 +2845,26 @@ mod tests {
                 exists: false,
                 size_bytes: None,
             }],
+            setup: crate::doctor::SetupActions {
+                download_images: true,
+                ..crate::doctor::SetupActions::default()
+            },
         };
         app.modal = Some(Modal::Doctor(crate::app::DoctorModal::new(report)));
         let (text, hits) = render(&app);
         assert!(text.contains("doctor"), "{text}");
         assert!(text.contains("kernel image"), "{text}");
         assert!(text.contains("Download images"), "{text}");
+        assert!(text.contains("Set up everything"), "{text}");
         assert!(
             hits.footer
                 .iter()
                 .any(|hit| hit.action == ActionId::DownloadImages)
+        );
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::DoctorSetup)
         );
 
         if let Some(Modal::Doctor(modal)) = &mut app.modal {

@@ -59,6 +59,9 @@ pub enum Effect {
     RefreshProjects,
     RestoreSnapshot(SnapshotMeta),
     DownloadImages,
+    /// Create directories/config, download images and configure the guarded
+    /// network as needed. Privileged steps prompt via sudo/pkexec.
+    SetupEnvironment,
     /// Ensure a sandbox for a project and attach its console.
     StartProjectSandbox {
         project: PathBuf,
@@ -207,6 +210,7 @@ pub enum ActionId {
     EditConfig,
     ReloadConfig,
     Doctor,
+    DoctorSetup,
     DownloadImages,
     Allow,
     Checkpoint,
@@ -365,6 +369,7 @@ pub struct SecurityPrompt {
 pub enum ConfirmAction {
     DeleteSnapshot(String),
     RestoreSnapshot(Box<SnapshotMeta>),
+    SetupEnvironment,
 }
 
 #[derive(Debug, Clone)]
@@ -379,6 +384,7 @@ pub struct ConfirmPrompt {
 pub struct DoctorModal {
     pub report: DoctorReport,
     pub downloading: bool,
+    pub setting_up: bool,
     /// The failure that opened the modal, if any.
     pub error: Option<String>,
 }
@@ -388,6 +394,7 @@ impl DoctorModal {
         Self {
             report,
             downloading: false,
+            setting_up: false,
             error: None,
         }
     }
@@ -396,6 +403,7 @@ impl DoctorModal {
         Self {
             report,
             downloading: false,
+            setting_up: false,
             error: Some(error.into()),
         }
     }
@@ -1282,6 +1290,12 @@ impl App {
                     self.modal = Some(Modal::Doctor(modal));
                     vec![Effect::DownloadImages]
                 }
+                KeyCode::Char('s')
+                    if modal.report.can_setup() && !modal.downloading && !modal.setting_up =>
+                {
+                    self.modal = Some(Modal::Doctor(modal));
+                    self.open_setup_confirmation()
+                }
                 _ => {
                     self.modal = Some(Modal::Doctor(modal));
                     Vec::new()
@@ -1511,6 +1525,7 @@ impl App {
                 Vec::new()
             }
             ConfirmAction::RestoreSnapshot(snapshot) => vec![Effect::RestoreSnapshot(*snapshot)],
+            ConfirmAction::SetupEnvironment => vec![Effect::SetupEnvironment],
         }
     }
 
@@ -1902,6 +1917,45 @@ impl App {
         )));
     }
 
+    /// Open the explicit confirmation for the automatic first-time setup.
+    ///
+    /// The setup itself may ask for sudo/pkexec; this confirmation is the
+    /// in-TUI "yes" before anything privileged is attempted.
+    pub fn open_setup_confirmation(&mut self) -> Vec<Effect> {
+        let actions = crate::doctor::setup_actions(&self.config);
+        if !actions.any() {
+            self.toast("nothing to set up", ToastLevel::Info);
+            return Vec::new();
+        }
+        let mut lines = vec![
+            "hegn can prepare this machine automatically:".to_string(),
+            String::new(),
+        ];
+        if actions.create_dirs {
+            lines.push("• create missing state/project/template/log directories".into());
+        }
+        if actions.init_config {
+            lines.push("• write the default ~/.config/hegn/config.toml".into());
+        }
+        if actions.download_images {
+            lines.push("• download and SHA-256 verify the VM kernel and rootfs".into());
+        }
+        if actions.configure_network {
+            lines.push(
+                "• create the guarded TAP pool and host nftables rules (asks for sudo)".into(),
+            );
+        }
+        lines.push(String::new());
+        lines.push("Continue?".into());
+        self.modal = Some(Modal::Confirm(ConfirmPrompt {
+            title: "First-time setup".into(),
+            message: lines.join("\n"),
+            confirm_label: "Set up".into(),
+            action: ConfirmAction::SetupEnvironment,
+        }));
+        Vec::new()
+    }
+
     /// Install a fresh doctor report, e.g. after a background image download.
     pub fn show_doctor(&mut self, report: DoctorReport, note: Option<String>) {
         if let Some(note) = note {
@@ -1991,6 +2045,13 @@ impl App {
                     &self.config,
                 ))));
                 Vec::new()
+            }
+            ActionId::DoctorSetup => {
+                if matches!(self.modal, Some(Modal::Doctor(_))) {
+                    self.open_setup_confirmation()
+                } else {
+                    Vec::new()
+                }
             }
             ActionId::DownloadImages => match self.modal.take() {
                 Some(Modal::Doctor(mut modal)) if modal.report.can_download() => {
@@ -3375,6 +3436,26 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         app.handle_action(ActionId::Doctor);
         assert!(matches!(app.modal, Some(Modal::Doctor(_))));
+    }
+
+    #[test]
+    fn doctor_setup_requires_explicit_confirmation() {
+        let (_dir, mut app) = test_app();
+        app.config.kernel_image = app.config.projects_root.join("missing-kernel");
+        app.config.rootfs_image = app.config.projects_root.join("missing-rootfs");
+        app.fail_start("missing VM assets");
+        assert!(matches!(app.modal, Some(Modal::Doctor(_))));
+
+        // The setup key opens a confirmation; nothing runs yet.
+        let effects = app.handle_key(key(KeyCode::Char('s')));
+        assert!(effects.is_empty());
+        assert!(matches!(app.modal, Some(Modal::Confirm(_))));
+
+        // Enter must not confirm; `y` is explicit.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.modal, Some(Modal::Confirm(_))));
+        let effects = app.handle_key(key(KeyCode::Char('y')));
+        assert!(matches!(effects.as_slice(), [Effect::SetupEnvironment]));
     }
 
     #[test]

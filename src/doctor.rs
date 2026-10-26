@@ -33,11 +33,48 @@ impl Check {
     }
 }
 
+/// Host preparation that hegn can perform for the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct SetupActions {
+    /// Create missing state, projects, template and log directories.
+    pub create_dirs: bool,
+    /// Write `~/.config/hegn/config.toml` when it does not exist yet.
+    pub init_config: bool,
+    /// Download and hash-check missing kernel/rootfs images.
+    pub download_images: bool,
+    /// Create the guarded-network TAP pool and nftables rules (needs root).
+    pub configure_network: bool,
+}
+
+impl SetupActions {
+    pub fn any(self) -> bool {
+        self.create_dirs || self.init_config || self.download_images || self.configure_network
+    }
+}
+
+/// What a first launch or the doctor modal can fix automatically.
+pub fn setup_actions(config: &Config) -> SetupActions {
+    SetupActions {
+        create_dirs: !config.projects_root.is_dir()
+            || !config.state_dir.is_dir()
+            || !config.snapshots_dir.is_dir()
+            || !config.sandboxes_dir.is_dir()
+            || !config.templates_dir.is_dir()
+            || !config.logs_dir().is_dir(),
+        init_config: !Config::config_path().exists(),
+        download_images: images::status(config).iter().any(AssetStatus::missing),
+        configure_network: config.network == crate::config::NetworkMode::Guarded
+            && !crate::network::guard_ready(config),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorReport {
     pub ok: bool,
     pub checks: Vec<Check>,
     pub assets: Vec<AssetStatus>,
+    /// Which automatic repairs are available.
+    pub setup: SetupActions,
 }
 
 impl DoctorReport {
@@ -54,6 +91,10 @@ impl DoctorReport {
 
     pub fn can_download(&self) -> bool {
         self.missing_assets().next().is_some()
+    }
+
+    pub fn can_setup(&self) -> bool {
+        self.setup.any()
     }
 }
 
@@ -205,6 +246,7 @@ pub fn run(config: &Config) -> DoctorReport {
         ok,
         checks,
         assets: images::status(config),
+        setup: setup_actions(config),
     }
 }
 
@@ -303,8 +345,27 @@ mod tests {
             ok: true,
             checks: vec![Check::new("editor", false, false, "unset")],
             assets: Vec::new(),
+            setup: SetupActions::default(),
         };
         assert!(report.ok);
         assert_eq!(report.failures().count(), 0);
+        assert!(!report.can_setup());
+    }
+
+    #[test]
+    fn missing_images_are_an_automatic_setup_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.state_dir = dir.path().join("state");
+        config.projects_root = dir.path().join("projects");
+        config.snapshots_dir = dir.path().join("snapshots");
+        config.sandboxes_dir = dir.path().join("sandboxes");
+        config.templates_dir = dir.path().join("templates");
+        config.kernel_image = dir.path().join("missing-kernel");
+        config.rootfs_image = dir.path().join("missing-rootfs");
+        let actions = setup_actions(&config);
+        assert!(actions.create_dirs);
+        assert!(actions.download_images);
+        assert!(actions.any());
     }
 }

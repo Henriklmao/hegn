@@ -47,6 +47,13 @@ enum ScanMessage {
 /// Run the interactive TUI until the user quits.
 pub fn run(config: Config) -> Result<()> {
     let mut app = App::new(config);
+    // First launch / a broken host: surface the doctor immediately instead of
+    // waiting for a VM start to fail. The "Set up everything" action is an
+    // explicit confirmation inside the modal.
+    let report = crate::doctor::run(&app.config);
+    if !report.ok || report.can_setup() {
+        app.show_doctor(report, None);
+    }
     let (scan_tx, scan_rx) = mpsc::channel();
     spawn_scan(app.config.clone(), scan_tx.clone());
 
@@ -364,6 +371,59 @@ fn handle_effects(
                 app.toast("downloading VM images…", ToastLevel::Info);
                 spawn_image_download(app.config.clone(), scan_tx.clone());
             }
+            Effect::SetupEnvironment => {
+                let actions = crate::doctor::setup_actions(&app.config);
+                let mut notes = Vec::new();
+                let mut failed = false;
+                let mut modal = crate::app::DoctorModal::new(crate::doctor::run(&app.config));
+                modal.setting_up = true;
+                app.modal = Some(crate::app::Modal::Doctor(modal));
+                app.toast("setting up hegn…", ToastLevel::Info);
+
+                if actions.create_dirs {
+                    match app.config.ensure_dirs() {
+                        Ok(()) => notes.push("directories created".to_string()),
+                        Err(err) => {
+                            failed = true;
+                            notes.push(format!("directory setup failed: {err:#}"));
+                        }
+                    }
+                }
+                if actions.init_config {
+                    match app.config.write_default_if_missing() {
+                        Ok(true) => notes.push("default config written".to_string()),
+                        Ok(false) => {}
+                        Err(err) => {
+                            failed = true;
+                            notes.push(format!("config setup failed: {err:#}"));
+                        }
+                    }
+                }
+                if actions.configure_network {
+                    app.toast("configuring the guarded network…", ToastLevel::Info);
+                    match with_suspended_terminal(terminal, || setup_network(&app.config)) {
+                        Ok(()) => notes.push("guarded network configured".to_string()),
+                        Err(err) => {
+                            failed = true;
+                            notes.push(format!("network setup failed: {err:#}"));
+                        }
+                    }
+                }
+                if actions.download_images {
+                    app.toast("downloading VM images…", ToastLevel::Info);
+                    spawn_image_download(app.config.clone(), scan_tx.clone());
+                } else {
+                    let note = if notes.is_empty() {
+                        "nothing to set up".to_string()
+                    } else {
+                        notes.join("; ")
+                    };
+                    app.show_doctor(crate::doctor::run(&app.config), Some(note));
+                }
+                if failed && actions.download_images {
+                    app.toast("some setup steps failed; see the doctor", ToastLevel::Error);
+                }
+            }
             Effect::OpenEditor(path) => {
                 match with_suspended_terminal(terminal, || open_editor(&path)) {
                     Ok(()) => {
@@ -531,6 +591,12 @@ fn open_editor(path: &Path) -> Result<()> {
         anyhow::bail!("editor exited with {status}");
     }
     Ok(())
+}
+
+fn setup_network(_config: &Config) -> Result<()> {
+    let user = crate::network::invoking_user()
+        .context("could not determine the current user for TAP ownership")?;
+    crate::network::setup_with_privilege(&user)
 }
 
 fn open_lazygit(path: &Path) -> Result<()> {

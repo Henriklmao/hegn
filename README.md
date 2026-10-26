@@ -83,8 +83,10 @@ fix.
   Cloud Hypervisor kernel and cloud image, verifies SHA-256 and installs them
   with private permissions. A weekly CI job refreshes the pins; hegn never
   builds or publishes its own guest image.
-- **Doctor modal** — host failures open a doctor overlay automatically with the
-  failing checks and a one-key image download. `F3` opens it manually.
+- **Doctor modal** — host failures open the doctor automatically on first launch
+  and after VM start/attach failures. Press `s` to confirm one automatic setup:
+  create directories, write the default config, download/verify images and
+  configure the guarded network (sudo/pkexec prompt). `F3` opens it manually.
 - **Transient session branches** — optionally check out
   `agent/hegn-session-<timestamp>` on the host once the VM is booted.
 - **Mandatory VM** — a missing Cloud Hypervisor VM is always a hard error. hegn
@@ -217,27 +219,20 @@ install -Dm755 target/release/hegn ~/.local/bin/hegn
 ## Quick start
 
 ```bash
-# 1. Write a default config and create runtime directories
-hegn config init
+# 1. One command: check the host and prepare everything hegn owns —
+#    config, directories, pinned images and the guarded network.
+#    It prompts for sudo when it needs the firewall/TAPs.
+hegn doctor --fix
 
-# 2. Download the pinned upstream kernel + rootfs (SHA-256 verified)
-hegn images download
-
-# 3. Verify KVM, Cloud Hypervisor, virtiofsd, images and tools
-hegn doctor
-
-# 3b. Enable the guarded guest network (one-time, needs root):
-#     public HTTP(S) + public DNS only, no LAN and no IPv6.
-sudo hegn network setup --user "$USER"
-
-# 4. Create a project with a template and harness.
+# 2. Create a project with a template and harness.
 #    --package adds to the preset; it never replaces it.
 hegn project create my-app --harness opencode --package jq
 
-# 5. Open the TUI (default when no subcommand is given)
+# 3. Open the TUI (default when no subcommand is given). If something is still
+#    missing, the doctor opens automatically; press s to prepare it.
 hegn
 
-# 6. Or drive it non-interactively
+# 4. Or drive it non-interactively
 hegn ls # alternatively `hegn projects`
 hegn sandbox list
 hegn sandbox start my-app
@@ -703,12 +698,18 @@ through it.
 
 | Key | Action |
 | --- | --- |
+| `s` | Set up everything shown as missing (after a confirmation) |
 | `d` | Download and verify missing VM images (background) |
 | `r` | Re-run all checks |
 | `Esc` / `q` | Close |
 
-The doctor modal opens automatically after a VM start/attach failure. Optional
-tools (lazygit, `$EDITOR`) never make the report fail.
+The doctor opens automatically on the first TUI launch when setup is available
+or a required check fails, and after a VM start/attach failure. `s` is the single setup entry point:
+it creates missing directories and config, downloads the pinned images, and
+applies the guarded network through `sudo`/`pkexec` when needed. Every step is
+idempotent. The same workflow is available non-interactively as
+`hegn doctor --fix`. Optional tools (lazygit, `$EDITOR`) never make the report
+fail and are not installed automatically.
 
 ### Security modal
 

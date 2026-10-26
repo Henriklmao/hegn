@@ -128,7 +128,12 @@ pub enum Commands {
         command: NetworkCommands,
     },
     /// Check host prerequisites (KVM, Cloud Hypervisor, virtiofsd, assets, tools).
-    Doctor,
+    Doctor {
+        /// Perform hegn-owned setup: directories, default config, VM images and
+        /// the guarded network (prompts for sudo when needed).
+        #[arg(long)]
+        fix: bool,
+    },
     /// Measure the host cost of a sandbox; boots one on demand.
     Benchmark {
         /// Project name or path to boot and measure.
@@ -414,7 +419,7 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
         Commands::Config { command } => config_command(command, config, json),
         Commands::Images { command } => image_command(command, config, json),
         Commands::Network { command } => network_command(command, config, json),
-        Commands::Doctor => doctor(config, json),
+        Commands::Doctor { fix } => doctor(config, json, fix),
         Commands::Benchmark { project, clean } => {
             benchmark::run(&config, project.as_deref(), clean, json)
         }
@@ -1145,7 +1150,29 @@ fn network_command(command: NetworkCommands, config: Config, json: bool) -> Resu
     }
 }
 
-fn doctor(config: Config, json: bool) -> Result<i32> {
+fn doctor(config: Config, json: bool, fix: bool) -> Result<i32> {
+    if fix {
+        let actions = doctor::setup_actions(&config);
+        if actions.any() {
+            if !json {
+                eprintln!("hegn: preparing this host");
+            }
+            if actions.create_dirs {
+                config.ensure_dirs()?;
+            }
+            if actions.init_config && config.write_default_if_missing()? && !json {
+                eprintln!("hegn: wrote {}", Config::config_path().display());
+            }
+            if actions.download_images {
+                images::download_missing(&config, false)?;
+            }
+            if actions.configure_network {
+                let user = crate::network::invoking_user()
+                    .context("could not determine the current user for TAP ownership")?;
+                crate::network::setup_with_privilege(&user)?;
+            }
+        }
+    }
     let report = doctor::run(&config);
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1160,6 +1187,11 @@ fn doctor(config: Config, json: bool) -> Result<i32> {
         }
         if report.can_download() {
             println!("\nMissing VM images. Download with: hegn images download");
+        }
+        if report.can_setup() {
+            println!(
+                "Automatic setup available. Run: hegn doctor --fix (privileged steps use sudo)"
+            );
         }
         println!("\nConfig: {}", Config::config_path().display());
     }
