@@ -5,12 +5,13 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     ActionId, App, ConfigStepHit, ConfigTabHit, CreateFocus, DeleteInstanceStage, Focus, FooterHit,
-    HelpState, InstanceState, Modal, RowHit, Screen, ScrollHit, TerminalMode, ToastLevel,
+    HelpState, InstanceState, Modal, ProjectSection, ProjectView, RowHit, Screen, ScrollHit,
+    SectionHit, TerminalMode, ToastLevel,
 };
 use crate::config_form::{ConfigField, ConfigForm, ConfigRow, FieldKind};
 
@@ -32,6 +33,11 @@ pub struct UiHits {
     pub projects: Vec<RowHit>,
     pub instances: Vec<RowHit>,
     pub snapshots: Vec<RowHit>,
+    /// Clickable project section headers/panels.
+    pub sections: Vec<SectionHit>,
+    /// Clickable terminal pane and collapsed terminal strip.
+    pub terminal: Option<Rect>,
+    pub terminal_strip: Option<Rect>,
     /// Settings rows and `‹ ›` steppers inside the configuration modal.
     pub config: Vec<RowHit>,
     pub config_steppers: Vec<ConfigStepHit>,
@@ -80,8 +86,16 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
 
     render_header(frame, app, chunks[0]);
     let hits = match app.screen {
-        Screen::Dashboard => render_dashboard(frame, app, chunks[1]),
-        Screen::Terminal => render_terminal(frame, app, chunks[1]),
+        Screen::Dashboard => {
+            let rows = render_dashboard(frame, app, chunks[1]);
+            RenderHits {
+                projects: rows.0,
+                instances: rows.1,
+                snapshots: rows.2,
+                ..RenderHits::default()
+            }
+        }
+        Screen::Project => render_project(frame, app, chunks[1]),
     };
     let mut footer = render_footer(frame, app, chunks[2]);
     let mut config = Vec::new();
@@ -100,9 +114,12 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
 
     UiHits {
         footer,
-        projects: hits.0,
-        instances: hits.1,
-        snapshots: hits.2,
+        projects: hits.projects,
+        instances: hits.instances,
+        snapshots: hits.snapshots,
+        sections: hits.sections,
+        terminal: hits.terminal,
+        terminal_strip: hits.terminal_strip,
         config,
         config_steppers,
         config_tabs,
@@ -110,38 +127,78 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
     }
 }
 
+#[derive(Default)]
+struct RenderHits {
+    projects: Vec<RowHit>,
+    instances: Vec<RowHit>,
+    snapshots: Vec<RowHit>,
+    sections: Vec<SectionHit>,
+    terminal: Option<Rect>,
+    terminal_strip: Option<Rect>,
+}
+
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default());
+    let project = (app.screen == Screen::Project)
+        .then(|| app.active_project())
+        .flatten();
+    let block = if project.is_some() {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default())
+    } else {
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default())
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let tabs = if app.screen == Screen::Dashboard {
-        "dashboard"
+    let left = if let Some(project) = project {
+        Line::from(vec![
+            Span::styled(
+                " hegn ",
+                Style::default()
+                    .fg(ON_ACCENT)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ▸ ", Style::default().fg(ACCENT)),
+            Span::styled(
+                format!(" {} ", project.name),
+                Style::default()
+                    .fg(ON_ACCENT)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {} ", project.display_path()),
+                Style::default().fg(MUTED),
+            ),
+        ])
     } else {
-        "terminal"
+        Line::from(vec![
+            Span::styled(
+                " hegn ",
+                Style::default()
+                    .fg(ON_ACCENT)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "Cloud Hypervisor instances for coding agents",
+                Style::default().fg(MUTED),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "[dashboard]",
+                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            ),
+        ])
     };
-    let left = Line::from(vec![
-        Span::styled(
-            " hegn ",
-            Style::default()
-                .fg(ON_ACCENT)
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            "Cloud Hypervisor instances for coding agents",
-            Style::default().fg(MUTED),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("[{tabs}]"),
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
-        ),
-    ]);
     frame.render_widget(Paragraph::new(left).style(Style::default()), inner);
 
     let status = match app.instance.state {
@@ -149,7 +206,13 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         InstanceState::Starting => (format!("{} starting", spinner(app.tick())), YELLOW),
         InstanceState::Paused => ("Ⅱ paused".to_string(), YELLOW),
         InstanceState::Failed => ("✕ failed".to_string(), RED),
-        InstanceState::Stopped => ("○ stopped".to_string(), MUTED),
+        InstanceState::Stopped => {
+            if app.active_project().is_some() {
+                ("○ no instance".to_string(), MUTED)
+            } else {
+                ("○ stopped".to_string(), MUTED)
+            }
+        }
     };
     let right_text = format!("{}  {} ", status.0, app.instance.backend);
     let width = right_text.width() as u16;
@@ -180,42 +243,99 @@ fn render_dashboard(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(34), Constraint::Min(20)])
         .split(area);
-    let sidebar = render_sidebar(frame, app, columns[0]);
+    let projects = render_projects(frame, app, columns[0]);
 
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8),
-            Constraint::Length(10),
-            Constraint::Min(6),
-        ])
+        .constraints([Constraint::Length(8), Constraint::Min(6)])
         .spacing(1)
         .split(columns[1]);
-
     render_project_panel(frame, app, right[0]);
-    render_instance_panel(frame, app, right[1]);
-    render_snapshot_detail(frame, app, right[2]);
-    sidebar
+    render_dashboard_preview(frame, app, right[1]);
+    (projects, Vec::new(), Vec::new())
 }
 
-fn render_sidebar(
-    frame: &mut Frame,
-    app: &App,
-    area: Rect,
-) -> (Vec<RowHit>, Vec<RowHit>, Vec<RowHit>) {
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(42),
-            Constraint::Percentage(30),
-            Constraint::Percentage(28),
-        ])
-        .spacing(1)
-        .split(area);
-    let projects = render_projects(frame, app, sections[0]);
-    let instances = render_instances(frame, app, sections[1]);
-    let snapshots = render_snapshots(frame, app, sections[2]);
-    (projects, instances, snapshots)
+fn render_dashboard_preview(frame: &mut Frame, app: &App, area: Rect) {
+    let block = panel_block(" preview ".to_string(), false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let Some(project) = app.selected_project() else {
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(Span::styled(
+                    "No project selected.",
+                    Style::default().fg(TEXT),
+                )),
+                Line::from(Span::styled(
+                    "Enter opens a project; c creates one.",
+                    Style::default().fg(MUTED),
+                )),
+            ])),
+            inner,
+        );
+        return;
+    };
+
+    let instances: Vec<_> = app
+        .instances
+        .iter()
+        .filter(|instance| crate::instance::same_project(&instance.project, &project.path))
+        .collect();
+    let running = instances
+        .iter()
+        .filter(|instance| instance.state == "running")
+        .count();
+    let snapshots = app
+        .snapshots
+        .iter()
+        .filter(|snapshot| snapshot.project.as_deref() == Some(project.path.as_path()))
+        .count();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(" instances ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{} ({} running)", instances.len(), running),
+                Style::default().fg(if running > 0 { GREEN } else { TEXT }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" backups   ", Style::default().fg(MUTED)),
+            Span::styled(snapshots.to_string(), Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled(" last open ", Style::default().fg(MUTED)),
+            Span::styled(
+                project
+                    .last_opened
+                    .map(|time| time.format("%Y-%m-%d %H:%M UTC").to_string())
+                    .unwrap_or_else(|| "never".into()),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" harness   ", Style::default().fg(MUTED)),
+            Span::styled(app.config.harness.label(), Style::default().fg(TEXT)),
+        ]),
+        Line::from(Span::styled(
+            "Enter opens the project · e editor · g lazygit",
+            Style::default().fg(MUTED),
+        )),
+    ];
+    for instance in instances.iter().take(3) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                " ● ",
+                Style::default().fg(if instance.state == "running" {
+                    GREEN
+                } else {
+                    MUTED
+                }),
+            ),
+            Span::styled(truncate(&instance.name, 24), Style::default().fg(TEXT)),
+            Span::styled(format!("  {}", instance.state), Style::default().fg(MUTED)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn render_projects(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
@@ -356,10 +476,10 @@ fn branch_color(git: &crate::project::GitSummary) -> Color {
     }
 }
 
-fn render_instances(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
+fn render_instances(frame: &mut Frame, app: &App, area: Rect, number: usize) -> Vec<RowHit> {
     let active = app.focus == Focus::Instances;
     let title = format!(" instances ({}) ", app.instance_visible.len());
-    let block = tab_block(title, 2, active);
+    let block = tab_block(title, number, active);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -368,7 +488,7 @@ fn render_instances(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
         let (headline, hint) = match app.selected_project() {
             Some(project) => (
                 format!(" ▾ no instances for {}", truncate(&project.name, 18)),
-                "   Enter on project boots one",
+                "   Enter or n starts one",
             ),
             None => (
                 " ▾ no project selected".to_string(),
@@ -463,15 +583,25 @@ fn render_instances(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
     hits
 }
 
-fn render_snapshots(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
+fn render_snapshots(frame: &mut Frame, app: &App, area: Rect, number: usize) -> Vec<RowHit> {
     let active = app.focus == Focus::Snapshots;
-    let title = format!(" snapshots ({}) ", app.snapshots.len());
-    let block = tab_block(title, 3, active);
+    let indices: Vec<usize> = if app.screen == Screen::Project {
+        app.project_snapshots.clone()
+    } else {
+        (0..app.snapshots.len()).collect()
+    };
+    let selected_index = if app.screen == Screen::Project {
+        app.project_snapshot_selected
+    } else {
+        app.selected_snapshot
+    };
+    let title = format!(" snapshots ({}) ", indices.len());
+    let block = tab_block(title, number, active);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let mut hits = Vec::new();
-    if app.snapshots.is_empty() {
+    if indices.is_empty() {
         frame.render_widget(
             Paragraph::new(Text::from(vec![
                 Line::from(Span::styled(" ▾ no snapshots", Style::default().fg(MUTED))),
@@ -486,18 +616,13 @@ fn render_snapshots(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
     }
 
     let visible_rows = inner.height as usize;
-    let offset = app
-        .selected_snapshot
-        .saturating_sub(visible_rows.saturating_sub(1));
+    let offset = selected_index.saturating_sub(visible_rows.saturating_sub(1));
     let mut lines = Vec::new();
-    for (row, snapshot) in app
-        .snapshots
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(visible_rows)
-    {
-        let selected = row == app.selected_snapshot && active;
+    for (row, &index) in indices.iter().enumerate().skip(offset).take(visible_rows) {
+        let Some(snapshot) = app.snapshots.get(index) else {
+            continue;
+        };
+        let selected = row == selected_index && active;
         let style = if selected {
             Style::default()
                 .fg(ON_ACCENT)
@@ -598,246 +723,247 @@ fn render_project_panel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).style(Style::default()), inner);
 }
 
-fn render_instance_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let block = panel_block(" instance ".to_string(), false);
+fn render_project(frame: &mut Frame, app: &App, area: Rect) -> RenderHits {
+    match app.project_view {
+        ProjectView::Compact => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(6), Constraint::Length(1)])
+                .split(area);
+            let mut hits = render_composed_project(frame, app, rows[0]);
+            hits.terminal_strip = render_terminal_strip(frame, app, rows[1]);
+            hits
+        }
+        ProjectView::Split | ProjectView::Section => render_project_split(frame, app, area),
+    }
+}
+
+fn render_composed_project(frame: &mut Frame, app: &App, area: Rect) -> RenderHits {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .spacing(1)
+        .split(area);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .spacing(1)
+        .split(columns[0]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .spacing(1)
+        .split(columns[1]);
+
+    let mut hits = RenderHits {
+        instances: render_instances(frame, app, left[0], 1),
+        snapshots: render_snapshots(frame, app, left[1], 2),
+        ..RenderHits::default()
+    };
+    render_health(frame, app, right[0], 3);
+    render_git(frame, app, right[1], 4);
+    hits.sections = vec![
+        SectionHit {
+            rect: left[0],
+            section: ProjectSection::Instances,
+        },
+        SectionHit {
+            rect: left[1],
+            section: ProjectSection::Snapshots,
+        },
+        SectionHit {
+            rect: right[0],
+            section: ProjectSection::Health,
+        },
+        SectionHit {
+            rect: right[1],
+            section: ProjectSection::Git,
+        },
+    ];
+    hits
+}
+
+fn render_project_split(frame: &mut Frame, app: &App, area: Rect) -> RenderHits {
+    // Keep the terminal usable on small terminals by giving it the full width.
+    if area.width < 80 {
+        let mut hits = RenderHits::default();
+        render_terminal_pane(frame, app, area);
+        hits.terminal = Some(area);
+        return hits;
+    }
+    let (left, right) = match app.project_view {
+        ProjectView::Section => (70, 30),
+        _ => (45, 55),
+    };
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(left), Constraint::Percentage(right)])
+        .split(area);
+    let mut hits = if app.project_view == ProjectView::Section {
+        render_section_expanded(frame, app, columns[0], app.project_section())
+    } else {
+        render_section_headers(frame, app, columns[0])
+    };
+    render_terminal_pane(frame, app, columns[1]);
+    hits.terminal = Some(columns[1]);
+    hits
+}
+
+fn render_section_headers(frame: &mut Frame, app: &App, area: Rect) -> RenderHits {
+    let block = panel_block(" project sections ".to_string(), true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let Some(instance) = app.selected_instance() else {
-        let (headline, hint) = match app.selected_project() {
-            Some(project) => (
-                format!("No instance for {}.", project.name),
-                "Press Enter on the project to boot one.",
-            ),
-            None => (
-                "No project selected.".to_string(),
-                "Select a project to see its instances.",
-            ),
+    let mut hits = RenderHits::default();
+    for (row, section) in ProjectSection::ALL.iter().copied().enumerate() {
+        if row as u16 >= inner.height {
+            break;
+        }
+        let count = match section {
+            ProjectSection::Instances => Some(app.instance_visible.len()),
+            ProjectSection::Snapshots => Some(app.project_snapshots.len()),
+            ProjectSection::Health => None,
+            ProjectSection::Git => None,
         };
-        frame.render_widget(
-            Paragraph::new(Text::from(vec![
-                Line::from(Span::styled(headline, Style::default().fg(TEXT))),
-                Line::from(Span::styled(hint.to_string(), Style::default().fg(MUTED))),
-                Line::from(Span::styled(
-                    "Multi-agent clones appear in this list too.",
-                    Style::default().fg(MUTED),
-                )),
-                Line::from(Span::styled(
-                    "F4 global settings · F5 instance settings",
-                    Style::default().fg(MUTED),
-                )),
-            ]))
-            .wrap(Wrap { trim: true }),
-            inner,
-        );
-        return;
-    };
-
-    let (state_color, state_label) = match instance.state.as_str() {
-        "running" => (GREEN, "RUNNING"),
-        "paused" => (YELLOW, "PAUSED"),
-        "failed" => (RED, "FAILED"),
-        _ => (MUTED, "STOPPED"),
-    };
-    let mode = if instance.ephemeral {
-        "clone"
-    } else {
-        "project"
-    };
-    let lines = vec![
-        Line::from(vec![
+        let active = app.focus == section.focus();
+        let mut spans = vec![
             Span::styled(
-                format!(" {} ", instance.name),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" {mode} "),
-                if instance.ephemeral {
-                    Style::default().fg(ON_ACCENT).bg(ACCENT)
-                } else {
-                    Style::default().fg(MUTED)
-                },
-            ),
-            Span::styled(
-                format!("● {state_label}"),
+                format!(" [{}] ", section.number()),
                 Style::default()
-                    .fg(state_color)
+                    .fg(if active { GREEN } else { YELLOW })
                     .add_modifier(Modifier::BOLD),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled(" project  ", Style::default().fg(MUTED)),
             Span::styled(
-                truncate(&instance.project.display().to_string(), 48),
-                Style::default().fg(TEXT),
+                section.label(),
+                Style::default()
+                    .fg(if active { ACCENT } else { TEXT })
+                    .add_modifier(if active {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled(" workspace", Style::default().fg(MUTED)),
-            Span::styled(
-                truncate(&instance.workspace.display().to_string(), 48),
-                Style::default().fg(TEXT),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" harness  ", Style::default().fg(MUTED)),
-            Span::styled(instance.harness.label(), Style::default().fg(TEXT)),
-            Span::styled("   resources ", Style::default().fg(MUTED)),
-            Span::styled(
-                format!("{} vCPU · {} MiB", instance.vcpus, instance.memory_mib),
-                Style::default().fg(TEXT),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" config   ", Style::default().fg(MUTED)),
-            Span::styled(
-                truncate(&instance.config_path.display().to_string(), 46),
-                Style::default().fg(TEXT),
-            ),
-        ]),
-        Line::from(Span::styled(
-            instance
-                .source_instance
-                .as_ref()
-                .map(|source| format!("clone of {source}"))
-                .unwrap_or_else(|| "Enter attach/start · S stop · d delete · F5 config".into()),
-            Style::default().fg(MUTED),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(lines).style(Style::default()), inner);
+        ];
+        if let Some(count) = count {
+            spans.push(Span::styled(
+                format!("  {count}"),
+                Style::default().fg(MUTED),
+            ));
+        }
+        let rect = Rect {
+            x: inner.x,
+            y: inner.y + row as u16,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+        hits.sections.push(SectionHit { rect, section });
+    }
+    hits
 }
 
-fn render_snapshot_detail(frame: &mut Frame, app: &App, area: Rect) {
-    let block = panel_block(" snapshot manager ".to_string(), false);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let Some(snapshot) = app.selected_snapshot() else {
-        frame.render_widget(
-            Paragraph::new(Text::from(vec![
-                Line::from(Span::styled(
-                    "No VM checkpoints yet.",
-                    Style::default().fg(TEXT),
-                )),
-                Line::from(Span::styled(
-                    "Create one with: hegn snapshot create <project>",
-                    Style::default().fg(MUTED),
-                )),
-                Line::from(Span::styled(
-                    "Snapshots restore RAM + CPU state in milliseconds.",
-                    Style::default().fg(MUTED),
-                )),
-            ]))
-            .wrap(Wrap { trim: true }),
-            inner,
-        );
-        return;
-    };
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(" ◆ ", Style::default().fg(CYAN)),
-            Span::styled(
-                snapshot.name.clone(),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" created ", Style::default().fg(MUTED)),
-            Span::styled(
-                snapshot
-                    .created_at
-                    .format("%Y-%m-%d %H:%M:%S UTC")
-                    .to_string(),
-                Style::default().fg(TEXT),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" state   ", Style::default().fg(MUTED)),
-            Span::styled(snapshot.vm_state.clone(), Style::default().fg(TEXT)),
-            Span::styled("   size ", Style::default().fg(MUTED)),
-            Span::styled(snapshot.size_label(), Style::default().fg(TEXT)),
-        ]),
-        Line::from(vec![
-            Span::styled(" project ", Style::default().fg(MUTED)),
-            Span::styled(
-                snapshot
-                    .project
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "—".into()),
-                Style::default().fg(TEXT),
-            ),
-        ]),
-        Line::from(Span::styled(
-            " Enter restore · d delete · n new",
-            Style::default().fg(MUTED),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(lines).style(Style::default()), inner);
-}
-
-fn render_terminal(
+fn render_section_expanded(
     frame: &mut Frame,
     app: &App,
     area: Rect,
-) -> (Vec<RowHit>, Vec<RowHit>, Vec<RowHit>) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(34), Constraint::Min(20)])
-        .split(area);
-    let sidebar = render_sidebar(frame, app, columns[0]);
+    section: ProjectSection,
+) -> RenderHits {
+    let mut hits = RenderHits::default();
+    match section {
+        ProjectSection::Instances => {
+            hits.instances = render_instances(frame, app, area, 1);
+        }
+        ProjectSection::Snapshots => {
+            hits.snapshots = render_snapshots(frame, app, area, 2);
+        }
+        ProjectSection::Health => render_health(frame, app, area, 3),
+        ProjectSection::Git => render_git(frame, app, area, 4),
+    }
+    hits.sections.push(SectionHit {
+        rect: area,
+        section,
+    });
+    hits
+}
 
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(4),
-            Constraint::Length(3),
-        ])
-        .split(columns[1]);
-
-    let session_label = app
-        .session
-        .as_ref()
-        .map(|s| format!("{} · {}", s.label(), s.project().display()))
-        .unwrap_or_else(|| "no session".into());
-    let mode = match app.terminal_mode {
-        TerminalMode::Normal => Span::styled(
-            " NORMAL ",
-            Style::default()
-                .fg(ON_ACCENT)
-                .bg(CYAN)
-                .add_modifier(Modifier::BOLD),
-        ),
-        TerminalMode::Insert => Span::styled(
-            " INSERT ",
-            Style::default()
-                .fg(ON_ACCENT)
-                .bg(GREEN)
-                .add_modifier(Modifier::BOLD),
-        ),
-        TerminalMode::Raw => Span::styled(
-            " RAW ",
-            Style::default()
-                .fg(ON_ACCENT)
-                .bg(RED)
-                .add_modifier(Modifier::BOLD),
+fn render_terminal_strip(frame: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
+    let selected = app
+        .selected_instance()
+        .map(|instance| (instance.name.clone(), instance.state.clone()));
+    let selected = selected.or_else(|| {
+        app.session
+            .as_ref()
+            .map(|session| (session.instance_name().to_string(), "running".to_string()))
+    });
+    let (text, color) = match selected {
+        Some((name, state)) => {
+            let color = match state.as_str() {
+                "running" => GREEN,
+                "failed" => RED,
+                _ => MUTED,
+            };
+            let action = if app.session.is_some() {
+                "i to open · F2 attach"
+            } else {
+                "Enter to open · F2 attach"
+            };
+            (format!(" terminal · {name} · {state} · {action} "), color)
+        }
+        None => (
+            " terminal · no instance · Enter to start ".to_string(),
+            MUTED,
         ),
     };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" ▸ ", Style::default().fg(ACCENT)),
-            Span::styled(session_label, Style::default().fg(MUTED)),
-            Span::raw(" "),
-            mode,
-        ])),
-        right[0],
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))),
+        area,
     );
+    Some(area)
+}
 
-    let block = panel_block(" terminal ".to_string(), true);
-    let out = block.inner(right[1]);
-    frame.render_widget(block, right[1]);
+fn render_terminal_pane(frame: &mut Frame, app: &App, area: Rect) {
+    let name = app
+        .session
+        .as_ref()
+        .map(|session| session.instance_name().to_string())
+        .or_else(|| {
+            app.selected_instance()
+                .map(|instance| instance.name.clone())
+        })
+        .unwrap_or_else(|| "no instance".into());
+    let mode_label = match app.terminal_mode {
+        TerminalMode::Normal => "normal",
+        TerminalMode::Insert => "insert",
+        TerminalMode::Raw => "raw",
+    };
+    let block = panel_block(
+        format!(" terminal · {name} · {mode_label} "),
+        app.terminal_focus,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 4 || inner.width < 16 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "terminal too small",
+                Style::default().fg(MUTED),
+            ))),
+            inner,
+        );
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(2), Constraint::Length(3)])
+        .split(inner);
+    let out = rows[0];
     let available = out.height.max(1) as usize;
     let total = app.terminal.len();
     let scroll = app.scroll.min(total.saturating_sub(available));
@@ -852,10 +978,17 @@ fn render_terminal(
             Line::from(Span::styled(line, Style::default().fg(color)))
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(Text::from(visible)).style(Style::default()),
-        out,
-    );
+    if visible.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no console output yet — start an instance with Enter",
+                Style::default().fg(MUTED),
+            ))),
+            out,
+        );
+    } else {
+        frame.render_widget(Paragraph::new(Text::from(visible)), out);
+    }
 
     let input_block = panel_block(
         match app.terminal_mode {
@@ -863,23 +996,23 @@ fn render_terminal(
             TerminalMode::Insert => " insert · command (tirith-core) ".to_string(),
             TerminalMode::Raw => " raw passthrough ".to_string(),
         },
-        true,
+        app.terminal_focus,
     );
-    let input_inner = input_block.inner(right[2]);
-    frame.render_widget(input_block, right[2]);
-    if app.terminal_mode == TerminalMode::Raw {
+    let input_inner = input_block.inner(rows[1]);
+    frame.render_widget(input_block, rows[1]);
+    if app.terminal_mode == TerminalMode::Normal {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "Every key goes to the guest. F2 returns to normal, Esc leaves the project.",
-                Style::default().fg(YELLOW),
+                "i type · Esc sections · F2 attach · Ctrl-B back",
+                Style::default().fg(MUTED),
             ))),
             input_inner,
         );
-    } else if app.terminal_mode == TerminalMode::Normal {
+    } else if app.terminal_mode == TerminalMode::Raw {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "i or a to type · M multi-agent · PgUp/PgDn scroll · F2 raw · Ctrl-B dashboard",
-                Style::default().fg(MUTED),
+                "raw passthrough · F2 attach · Ctrl-B back",
+                Style::default().fg(YELLOW),
             ))),
             input_inner,
         );
@@ -887,8 +1020,6 @@ fn render_terminal(
         let prompt = Span::styled("❯ ", Style::default().fg(ACCENT));
         let available = input_inner.width.saturating_sub(3) as usize;
         let shown = if app.input.width() > available {
-            // Scroll by characters, not by display columns: skipping `width`
-            // characters would cut wide (CJK) input in the wrong place.
             let mut width = app.input.width();
             let mut skip = 0;
             for ch in app.input.chars() {
@@ -917,7 +1048,162 @@ fn render_terminal(
             .min(input_inner.x + input_inner.width.saturating_sub(1));
         frame.set_cursor_position((cursor_x, input_inner.y));
     }
-    sidebar
+}
+
+fn render_health(frame: &mut Frame, app: &App, area: Rect, number: usize) {
+    let active = app.focus == Focus::Health;
+    let block = tab_block(" health ".to_string(), number, active);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let project = app.active_project();
+    let instance = app.selected_instance();
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(" hegn      ", Style::default().fg(MUTED)),
+        Span::styled(env!("CARGO_PKG_VERSION"), Style::default().fg(TEXT)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" images    ", Style::default().fg(MUTED)),
+        Span::styled(
+            if app.config.vm_assets_ready() {
+                "pinned · ready"
+            } else {
+                "missing · run doctor"
+            },
+            Style::default().fg(if app.config.vm_assets_ready() {
+                GREEN
+            } else {
+                YELLOW
+            }),
+        ),
+    ]));
+    let age = instance
+        .map(|instance| {
+            let created = instance.created_at.format("%Y-%m-%d").to_string();
+            if instance.state == "running" {
+                format!("{created} · running")
+            } else {
+                created
+            }
+        })
+        .or_else(|| {
+            project.and_then(|project| {
+                project
+                    .last_opened
+                    .map(|t| t.format("%Y-%m-%d").to_string())
+            })
+        })
+        .unwrap_or_else(|| "—".into());
+    lines.push(Line::from(vec![
+        Span::styled(" age       ", Style::default().fg(MUTED)),
+        Span::styled(age, Style::default().fg(TEXT)),
+    ]));
+    let backup = app
+        .project_snapshots
+        .first()
+        .and_then(|&index| app.snapshots.get(index))
+        .map(|snapshot| {
+            format!(
+                "{} · {}",
+                snapshot.created_at.format("%Y-%m-%d %H:%M"),
+                snapshot.size_label()
+            )
+        })
+        .unwrap_or_else(|| "none".into());
+    lines.push(Line::from(vec![
+        Span::styled(" backup    ", Style::default().fg(MUTED)),
+        Span::styled(backup, Style::default().fg(TEXT)),
+    ]));
+    let apt = app
+        .health
+        .as_ref()
+        .map(|health| health.label())
+        .unwrap_or_else(|| "not checked".into());
+    lines.push(Line::from(vec![
+        Span::styled(" apt       ", Style::default().fg(MUTED)),
+        Span::styled(apt, Style::default().fg(TEXT)),
+    ]));
+    let template = if let Some(template) = &app.project_meta.template {
+        template.clone()
+    } else {
+        "—".into()
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" template  ", Style::default().fg(MUTED)),
+        Span::styled(
+            format!(
+                "{template} · {}",
+                app.project_meta
+                    .harness
+                    .unwrap_or(app.config.harness)
+                    .label()
+            ),
+            Style::default().fg(TEXT),
+        ),
+    ]));
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn render_git(frame: &mut Frame, app: &App, area: Rect, number: usize) {
+    let active = app.focus == Focus::Git;
+    let block = tab_block(" git ".to_string(), number, active);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(project) = app.active_project() else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no project",
+                Style::default().fg(MUTED),
+            ))),
+            inner,
+        );
+        return;
+    };
+    if !project.git.is_repo {
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(Span::styled(
+                    "not a git repository",
+                    Style::default().fg(YELLOW),
+                )),
+                Line::from(Span::styled(
+                    "checkpoints are unavailable",
+                    Style::default().fg(MUTED),
+                )),
+            ])),
+            inner,
+        );
+        return;
+    }
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(" branch ", Style::default().fg(MUTED)),
+            Span::styled(
+                project.git.badge(),
+                Style::default().fg(branch_color(&project.git)),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" sync   ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("↑{} ↓{}", project.git.ahead, project.git.behind),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" change ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!(
+                    "{} staged · {} modified · {} untracked",
+                    project.git.staged, project.git.modified, project.git.untracked
+                ),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
@@ -970,7 +1256,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
     if inner.height > 1 {
         let hint = if app.searching {
             " typing filter · ↑↓ select · Enter open · Esc cancel ".to_string()
-        } else if app.screen == Screen::Terminal {
+        } else if app.screen == Screen::Project {
             " Esc/← dashboard · Ctrl-B/^] dashboard · PgUp/PgDn scroll · Ctrl-L clear ".to_string()
         } else {
             " / filter · 1-3 focus · Tab cycle · Enter open · c create · ? help ".to_string()
@@ -1170,50 +1456,104 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 action: ActionId::Close,
             }]
         }
-        None if app.screen == Screen::Terminal => vec![
-            if app.terminal_mode == TerminalMode::Insert {
-                FooterDef {
-                    key: "Esc",
-                    label: "Normal",
-                    action: ActionId::NormalMode,
-                }
-            } else {
-                FooterDef {
-                    key: "i",
-                    label: "Type",
-                    action: ActionId::InsertMode,
-                }
-            },
-            FooterDef {
-                key: "M",
-                label: "Multi-agent",
-                action: ActionId::MultiAgent,
-            },
-            FooterDef {
-                key: "F2",
-                label: if app.terminal_mode == TerminalMode::Raw {
-                    "Normal"
-                } else {
-                    "Raw"
+        None if app.screen == Screen::Project => {
+            let mut buttons = match app.project_view {
+                ProjectView::Compact => match app.focus {
+                    Focus::Instances => {
+                        let label = if app.selected_instance().is_some() {
+                            "Open"
+                        } else {
+                            "Start"
+                        };
+                        vec![
+                            FooterDef {
+                                key: "Enter",
+                                label,
+                                action: ActionId::StartInstance,
+                            },
+                            FooterDef {
+                                key: "i",
+                                label: "Terminal",
+                                action: ActionId::InsertMode,
+                            },
+                            FooterDef {
+                                key: "S",
+                                label: "Stop",
+                                action: ActionId::StopInstance,
+                            },
+                            FooterDef {
+                                key: "d",
+                                label: "Delete",
+                                action: ActionId::DeleteInstance,
+                            },
+                        ]
+                    }
+                    Focus::Snapshots => vec![
+                        FooterDef {
+                            key: "Enter",
+                            label: "Restore",
+                            action: ActionId::Restore,
+                        },
+                        FooterDef {
+                            key: "n",
+                            label: "New",
+                            action: ActionId::NewSnapshot,
+                        },
+                        FooterDef {
+                            key: "d",
+                            label: "Delete",
+                            action: ActionId::DeleteSnapshot,
+                        },
+                        FooterDef {
+                            key: "i",
+                            label: "Terminal",
+                            action: ActionId::InsertMode,
+                        },
+                    ],
+                    Focus::Health | Focus::Git | Focus::Projects => vec![FooterDef {
+                        key: "i",
+                        label: "Terminal",
+                        action: ActionId::InsertMode,
+                    }],
                 },
+                ProjectView::Split => {
+                    if app.terminal_mode == TerminalMode::Insert {
+                        vec![FooterDef {
+                            key: "Esc",
+                            label: "Normal",
+                            action: ActionId::NormalMode,
+                        }]
+                    } else {
+                        vec![FooterDef {
+                            key: "i",
+                            label: "Type",
+                            action: ActionId::InsertMode,
+                        }]
+                    }
+                }
+                ProjectView::Section => vec![FooterDef {
+                    key: "i",
+                    label: "Terminal",
+                    action: ActionId::InsertMode,
+                }],
+            };
+            buttons.push(FooterDef {
+                key: "F2",
+                label: "Attach",
                 action: ActionId::ToggleRaw,
-            },
-            FooterDef {
+            });
+            buttons.push(FooterDef {
                 key: "Ctrl-B",
-                label: "Dashboard",
+                label: "Back",
                 action: ActionId::Back,
-            },
-            FooterDef {
-                key: "PgUp",
-                label: "Scroll",
-                action: ActionId::ScrollUp,
-            },
-            FooterDef {
+            });
+            buttons.push(FooterDef {
                 key: "?",
                 label: "Help",
                 action: ActionId::Help,
-            },
-        ],
+            });
+            buttons
+        }
         None => {
             let mut buttons = match app.focus {
                 Focus::Projects => vec![
@@ -1272,6 +1612,7 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                         action: ActionId::DeleteSnapshot,
                     },
                 ],
+                Focus::Health | Focus::Git => Vec::new(),
             };
             buttons.push(FooterDef {
                 key: "F4",
@@ -2118,10 +2459,10 @@ fn render_help(
             "Projects",
             &[
                 ("↑/↓ j/k", "move selection"),
-                ("Enter", "open project in instance"),
+                ("Enter", "open the project screen (does not boot)"),
                 ("/", "fuzzy filter projects"),
-                ("Tab", "switch projects → instances → snapshots"),
-                ("1 / 2 / 3", "jump to projects / instances / snapshots"),
+                ("b / 2", "open the project screen on instances"),
+                ("s / 3", "open the project screen on snapshots"),
                 ("c", "create project"),
                 ("h / ←", "import existing project"),
                 ("F4", "global settings (arrows/mouse · Ctrl-S saves)"),
@@ -2132,32 +2473,32 @@ fn render_help(
             ],
         ),
         (
-            "Instances",
+            "Project",
             &[
-                ("b", "focus instance list (selected project only)"),
-                ("Enter", "attach/start selected instance or clone"),
+                ("1 / 2 / 3 / 4", "instances / snapshots / health / git"),
+                ("Tab", "cycle project sections"),
+                ("i / a / Enter", "open the terminal or attach the instance"),
+                ("Esc", "sections → split; ×2 back to dashboard"),
+                ("←", "back to dashboard (VM keeps running)"),
+                ("F2", "real attach mode (Ctrl-B/^] detaches)"),
                 ("S", "stop selected instance"),
-                (
-                    "d",
-                    "delete instance, or selected project's VM (project files kept)",
-                ),
-                ("F5", "instance settings (arrows/mouse · Ctrl-S saves)"),
-                ("F4", "global settings"),
+                ("n", "start a new instance / new snapshot"),
+                ("M", "multi-agent clones for this project"),
+                ("F5", "instance settings"),
+                ("d", "delete instance or snapshot"),
+                ("security", "a allow · c checkpoint + allow · d deny"),
+                ("Ctrl-B / Ctrl-]", "back to dashboard from every mode"),
             ],
         ),
         (
             "Terminal",
             &[
                 ("i / a", "insert mode — write in the guest terminal"),
-                ("Esc", "leave insert mode (dashboard in normal mode)"),
-                ("←", "return to dashboard (normal mode)"),
-                ("M", "multi-agent clones for this project"),
+                ("Esc", "normal mode, then back to the sections"),
                 (
                     "Enter",
                     "in insert mode: inspect with tirith-core, then send",
                 ),
-                ("F2", "toggle raw passthrough (no interception)"),
-                ("Ctrl-B / Ctrl-]", "return to dashboard"),
                 ("PgUp/PgDn", "scroll output"),
                 ("Ctrl-L", "clear scrollback"),
                 ("security", "a allow · c checkpoint + allow · d deny"),
@@ -2166,7 +2507,7 @@ fn render_help(
         (
             "Snapshots",
             &[
-                ("Tab", "focus snapshot manager"),
+                ("2", "focus the snapshots section"),
                 ("Enter", "restore selected snapshot"),
                 ("d", "delete selected snapshot"),
                 ("n", "new snapshot (CLI: hegn snapshot create)"),
@@ -3235,19 +3576,53 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_renders_header_sidebar_and_footer() {
+    fn dashboard_renders_projects_and_preview() {
         let (_dir, app) = app();
         let (text, hits) = render(&app);
         assert!(text.contains("hegn"));
         assert!(text.contains("projects (1)"));
-        assert!(text.contains("[1]"));
-        assert!(text.contains("[2]"));
-        assert!(text.contains("[3]"));
+        assert!(text.contains("preview"));
+        assert!(text.contains("instances"));
+        assert!(text.contains("backups"));
         assert!(text.contains("demo"));
-        assert!(text.contains("instance"));
-        assert!(text.contains("Open"));
         assert!(!hits.footer.is_empty());
         assert_eq!(hits.projects.len(), 1);
+    }
+
+    #[test]
+    fn project_screen_shows_sections_health_git_and_strip() {
+        let (_dir, mut app) = app();
+        app.screen = Screen::Project;
+        app.open_project = Some(PathBuf::from("/projects/demo"));
+        app.refresh_project_snapshots();
+        let (text, hits) = render(&app);
+        for needle in [
+            "instances",
+            "snapshots",
+            "health",
+            "git",
+            "hegn",
+            "terminal",
+        ] {
+            assert!(text.contains(needle), "missing {needle} in:\n{text}");
+        }
+        assert_eq!(hits.sections.len(), 4);
+        assert!(hits.terminal_strip.is_some());
+        assert!(hits.terminal.is_none());
+    }
+
+    #[test]
+    fn split_project_view_renders_terminal_and_section_headers() {
+        let (_dir, mut app) = app();
+        app.screen = Screen::Project;
+        app.open_project = Some(PathBuf::from("/projects/demo"));
+        app.project_view = ProjectView::Split;
+        app.terminal_focus = true;
+        let (text, hits) = render(&app);
+        assert!(text.contains("terminal ·"), "{text}");
+        assert!(text.contains("[1]"), "{text}");
+        assert!(hits.terminal.is_some());
+        assert_eq!(hits.sections.len(), 4);
     }
 
     #[test]
@@ -3626,26 +4001,30 @@ mod tests {
     #[test]
     fn terminal_view_renders_buffer_and_prompt() {
         let (_dir, mut app) = app();
-        app.screen = Screen::Terminal;
+        app.screen = Screen::Project;
+        app.project_view = ProjectView::Split;
+        app.terminal_focus = true;
         app.terminal
             .push_bytes(b"first output line\r\nsecond output line\r\n");
         let (text, _) = render(&app);
         assert!(text.contains("first output line"), "{text}");
         assert!(text.contains("second output line"), "{text}");
-        assert!(text.contains("NORMAL"));
-        assert!(text.contains("i or a to type"));
+        assert!(text.contains("terminal"));
+        assert!(text.contains("normal"));
 
         app.terminal_mode = TerminalMode::Insert;
         app.input = "cargo test".into();
         let (text, _) = render(&app);
         assert!(text.contains("cargo test"));
-        assert!(text.contains("INSERT"));
+        assert!(text.contains("insert"));
     }
 
     #[test]
     fn terminal_renders_the_full_scrollback_window() {
         let (_dir, mut app) = app();
-        app.screen = Screen::Terminal;
+        app.screen = Screen::Project;
+        app.project_view = ProjectView::Split;
+        app.terminal_focus = true;
         for index in 0..40 {
             app.terminal
                 .push_bytes(format!("scrollback line {index}\r\n").as_bytes());
@@ -3690,6 +4069,8 @@ mod tests {
     #[test]
     fn snapshots_render_when_present() {
         let (_dir, mut app) = app();
+        app.screen = Screen::Project;
+        app.open_project = Some(PathBuf::from("/projects/demo"));
         app.snapshots = vec![crate::snapshot::SnapshotMeta {
             name: "before-refactor".into(),
             created_at: chrono::Utc::now(),
@@ -3700,6 +4081,7 @@ mod tests {
             size_bytes: 1024 * 1024,
             note: None,
         }];
+        app.refresh_project_snapshots();
         let (text, hits) = render(&app);
         assert!(text.contains("before-refactor"));
         assert!(text.contains("1.0 MiB"));

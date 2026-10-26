@@ -889,9 +889,23 @@ mod tests {
         };
         write_meta(dir.path(), &meta).unwrap();
         let loaded = read_meta(dir.path());
+        assert!(dir.path().join("hegn.toml").is_file());
         assert_eq!(loaded.harness, Some(crate::config::Harness::Codex));
         assert_eq!(loaded.packages.len(), 2);
         assert_eq!(read_meta(Path::new("/missing")).packages.len(), 0);
+    }
+
+    #[test]
+    fn project_meta_reads_legacy_dotfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".hegn.toml"),
+            "harness = \"codex\"\npackages = [\"git\"]\n",
+        )
+        .unwrap();
+        let loaded = read_meta(dir.path());
+        assert_eq!(loaded.harness, Some(crate::config::Harness::Codex));
+        assert_eq!(loaded.packages, vec!["git"]);
     }
 
     #[test]

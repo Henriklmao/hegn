@@ -2114,6 +2114,17 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_alias_still_parses_as_instance() {
+        let cli = Cli::try_parse_from(["hegn", "sandbox", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Instance {
+                command: InstanceCommands::List
+            })
+        ));
+    }
+
+    #[test]
     fn attach_alias_parses_and_accepts_an_optional_project() {
         let cli = Cli::try_parse_from(["hegn", "a", "demo"]).unwrap();
         match cli.command {

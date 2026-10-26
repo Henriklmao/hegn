@@ -125,6 +125,42 @@ mounts:
 
       [Install]
       WantedBy=multi-user.target
+  - path: /usr/local/sbin/hegn-health
+    permissions: '0700'
+    content: |
+      #!/bin/bash
+      set -u
+      export DEBIAN_FRONTEND=noninteractive
+      checked=$(date +%s)
+      count=unknown
+      reason=ok
+      if [ -d /var/lib/apt/lists ] && [ -z "$(find /var/lib/apt/lists -maxdepth 0 -mmin -360 2>/dev/null)" ]; then
+        if ! apt-get update -qq >/tmp/hegn-health.log 2>&1; then
+          reason=offline
+        fi
+      fi
+      if [ "$reason" = ok ]; then
+        count=$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst ' || true)
+        [ -n "$count" ] || count=unknown
+      fi
+      echo "hegn-health v1 apt=$count checked=$checked reason=$reason"
+  - path: /etc/systemd/system/hegn-health.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=hegn apt health
+      Wants=network-online.target
+      After=network-online.target hegn-provision.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/hegn-health
+      StandardOutput=journal+console
+      StandardError=journal+console
+      TimeoutStartSec=300
+
+      [Install]
+      WantedBy=multi-user.target
 runcmd:
   - systemctl daemon-reload || true
   - systemctl enable serial-getty@ttyS0.service || true
@@ -134,6 +170,8 @@ runcmd:
   - mkdir -p '{guest_mount}' || true
   - mountpoint -q '{guest_mount}' || mount -t virtiofs '{shared_tag}' '{guest_mount}' || true
 {profile_runcmd}  - systemctl enable --now hegn-provision.service || true
+  - systemctl enable hegn-health.service || true
+  - systemctl start --no-block hegn-health.service || true
 "#
     )
 }

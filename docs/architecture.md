@@ -22,7 +22,7 @@ configuration, runtime directory, serial log and private root filesystem.
    before any child process is spawned. Partial failures are cleaned up rather
    than left running.
 3. **No silent bypasses.** Input paths that skip `tirith-core` are visibly
-   labelled (`RAW`, `INPUT DIRECT`). Unverified image downloads require an
+   labelled (`INPUT DIRECT`). Unverified image downloads require an
    explicit flag.
 4. **Predictable state.** Runtime files live in one private state directory;
    snapshots and logs are separate, private, and survive restarts.
@@ -428,10 +428,10 @@ These are product requirements, not implementation details.
    explicit unsafe opt-in.
 8. **Logs are private but may contain secrets.** No upload/transmission; only
    hegn's own session logs are pruned; the active log is protected.
-9. **Direct input is visible.** `NORMAL` / `INSERT` / `RAW` and `INPUT DIRECT`
-   labels are mandatory. The TUI terminal opens in normal mode and forwards
-   nothing; insert mode is inspected by `tirith-core`; raw passthrough is a
-   deliberate user action.
+9. **Direct input is visible.** `NORMAL` / `INSERT` and `INPUT DIRECT` labels
+   are mandatory. The project terminal opens in normal mode and forwards
+   nothing; insert mode is inspected by `tirith-core`; `F2` and `hegn attach`
+   hand the terminal directly to the guest as a deliberate user action.
 10. **Images are pinned, not trusted blindly.** HTTPS URL + SHA-256; unverified
     downloads require `--allow-unverified`; existing files require `--force` to
     replace; temporary files never become visible as final images.
@@ -558,21 +558,33 @@ and drags into offset changes, and the thumb inverts while hovered or dragged.
 Long lines are ellipsized by `fit_line` rather than wrapped, so one logical line
 is always one row and the scrollbar offset stays exact.
 
-The three focusable dashboard tabs are also addressable by number: `1` for
-projects, `2` for instances and `3` for snapshots. Each panel title carries a
-colored `[n]` badge in its top-right corner.
+The dashboard is a project picker plus a compact preview. Entering a project
+does not boot a VM; it opens the dedicated project screen with a folder-style
+title bar, the project path, VM state and four numbered sections: `1`
+instances, `2` snapshots, `3` health, `4` git. The composed page shows
+instances and snapshots on the left and health and git on the right.
 
-The instance tab is scoped to the project selected in the projects tab. Switching
-projects rebuilds the list from the already-loaded instances (no extra disk
-scan), preferring a running instance. Clones created for multi-agent work share
-the source project, so they stay in the list and are attached with one `Enter`.
+The terminal starts as a one-line strip. `i`, `Enter` or a click opens it on the
+right at 55%; pressing a section number expands that section on the left and
+shrinks the terminal to 30%. Refocusing the terminal restores 55%. `Esc` in
+insert mode returns to normal; `Esc` in normal mode returns focus to the section
+headers while keeping the pane open. `←` and the clickable `← all projects`
+breadcrumb return to the dashboard; `Ctrl-B`/`Ctrl-]` do so from every mode and
+the VM keeps running. `F2` releases the TUI and runs the real `hegn attach`
+client instead of a raw in-TUI mode.
+
+The project instance list is scoped to the open project. Switching projects
+rebuilds the list from the already-loaded instances (no extra disk scan),
+preferring a running instance. Clones created for multi-agent work share the
+source project, so they stay in the list and are attached with one `Enter`.
 Clone workspace commands (`git clone`, `git config`) capture stdout/stderr
 instead of inheriting the TUI's terminal; git warnings such as an empty
 repository are reported as a warning toast.
 
-In the terminal view, `←` and `Esc` (normal mode) return to the dashboard;
-`Ctrl-B`/`Ctrl-]` do so from every mode. Raw mode still forwards `←` to the
-guest like every other key.
+The health section reads the host hegn version, VM image readiness, instance
+creation date, the newest project snapshot, the project template, and the last
+`hegn-health` line from the selected instance's serial log. The guest writes
+that line at boot; the host never queries the guest from the renderer.
 
 VM starts run on a named worker thread (`hegn-start-vm`) and report through the
 same channel as project scans. The UI therefore keeps drawing an animated

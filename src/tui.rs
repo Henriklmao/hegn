@@ -89,6 +89,9 @@ fn run_loop(
         app.project_rows = hits.projects;
         app.instance_rows = hits.instances;
         app.snapshot_rows = hits.snapshots;
+        app.section_hits = hits.sections;
+        app.terminal_hit = hits.terminal;
+        app.terminal_strip_hit = hits.terminal_strip;
         app.config_rows = hits.config;
         app.config_steppers = hits.config_steppers;
         app.config_tabs = hits.config_tabs;
@@ -484,6 +487,22 @@ fn handle_effects(
             Effect::AttachInstance { instance } => {
                 app.toast(format!("attaching to {instance}…"), ToastLevel::Info);
                 spawn_attach(app.config.clone(), instance, scan_tx.clone());
+            }
+            Effect::AttachConsole { instance } => {
+                let registry = crate::instance::InstanceRegistry::new(app.config.clone());
+                let result = with_suspended_terminal(terminal, || {
+                    let config = registry.resolve(&instance)?;
+                    let console = registry.manager(config).ensure_console()?;
+                    crate::console::run_interactive(console, true)
+                });
+                match result {
+                    Ok(()) => {
+                        app.project_view = crate::app::ProjectView::Split;
+                        app.terminal_focus = true;
+                        app.toast("detached from console", ToastLevel::Info);
+                    }
+                    Err(err) => app.toast(format!("attach failed: {err}"), ToastLevel::Error),
+                }
             }
             Effect::StopInstance { instance } => {
                 let registry = crate::instance::InstanceRegistry::new(app.config.clone());

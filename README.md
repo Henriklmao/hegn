@@ -376,7 +376,7 @@ or resets the scroll region:
 `Ctrl-B` is the outer prefix), use `Ctrl-]` instead. Both keys are shown in the
 bar. Input is forwarded directly to the
 guest UART; the `INPUT DIRECT` marker makes that bypass of `tirith-core`
-visible. Use the TUI terminal view for intercepted line input, or `hegn check`
+visible. Use the project terminal for intercepted line input, or `hegn check`
 in scripts. The guest console geometry cannot be changed over the legacy
 serial port, so the bar uses one host row and full-screen guest programs keep
 their own size; pass `--no-bar` (also accepted by `hegn open`) when a guest TUI
@@ -397,14 +397,13 @@ own directory below `instances_dir`:
 ```
 
 A normal instance exports the original project through virtiofs. A **clone**
-(`hegn instance clone`, or `M` in the project's terminal view) gets an independent
+(`hegn instance clone`, or `M` on the project screen) gets an independent
 git clone and its own rootfs copy, so multiple agents can work on the same
 repository without overwriting each other's commits. Merge or open pull requests
 from the clones when they are done. Multi-agent clones are intentionally scoped
 to the project: open the project in the TUI and press `M` in its terminal. They
-then appear in the instance list, which is filtered to the project currently
-selected in the projects tab, and are attached with `Enter` like any other
-instance. Clones are real git clones and contain committed history only: commit
+then appear in the instance list, which is filtered to the open project, and are
+attached with `Enter` like any other instance. Clones are real git clones and contain committed history only: commit
 or stash uncommitted work before creating them. Cloning a repository with no
 commits yields an empty clone; hegn surfaces git's warning as a toast instead of
 letting it corrupt the TUI.
@@ -428,7 +427,7 @@ instance and keeps the clone under `<instances_dir>/<name>-files-<timestamp>/`.
 Deleting never boots the VM and runs no host checks (no images, firewall, KVM or
 relay required), so an instance whose start failed can always be removed. In the
 TUI, `d` on a project row deletes that project's base instance (project files are
-kept), and the same modal is available from the instances tab. With
+kept), and the same modal is available from the project screen. With
 `--yes --keep-files` the CLI can delete unattended in CI.
 
 Per-instance settings live in `<instance>/hegn.toml`. In the TUI, `F4` opens the
@@ -762,20 +761,20 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 
 ### Dashboard
 
+The dashboard is a project picker plus a compact preview of the selected
+project. It never boots a VM.
+
 | Key | Action |
 | --- | --- |
 | `↑`/`↓`, `j`/`k` | Move selection |
-| `Enter` / `o` | Open project (projects), attach/start instance (instances), restore snapshot |
+| `Enter` / `o` | Open the project screen (does not boot) |
 | `/` | Fuzzy filter projects |
-| `1` / `2` / `3` | Jump to the projects / instances / snapshots tab |
-| `Tab` | Switch projects → instances → snapshots |
-| `b` | Focus the instance list |
-| `c` | Create project (projects focus) |
+| `b` / `2` | Open the project screen on instances |
+| `s` / `3` | Open the project screen on snapshots |
+| `c` | Create project |
 | `h` / `←` | Import an existing directory (symlink, no copy) |
-| `S` | Stop the selected instance |
-| `d` | Delete the project's VM (projects), instance (instances) or snapshot (snapshots) |
+| `d` | Delete the project's VM (project files kept) |
 | `F4` | Global settings editor (mouse supported, `Ctrl-S` to save) |
-| `F5` | Instance settings editor (mouse supported, `Ctrl-S` to save) |
 | `e` | Open selected project in `$EDITOR` |
 | `g` | Open selected project in lazygit |
 | `r` | Refresh projects and instances |
@@ -783,11 +782,38 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 | `?` / `F1` | Help |
 | `q` | Quit |
 
-Each focusable tab shows its number shortcut as a coloured `[1]`, `[2]`, `[3]`
-badge in the top-right corner of the panel. The instance tab is scoped to the
-project selected in the projects tab: switching projects rebuilds the list, and
-multi-agent clones created for that project appear there for one-`Enter`
-attachment.
+### Project screen
+
+The folder-style title bar shows `hegn ▸ <project>`, the path, and the VM
+state. The project page is composed of four numbered sections: `1` instances,
+`2` snapshots, `3` health, `4` git. The terminal is a one-line strip until you
+open it.
+
+| Key | Action |
+| --- | --- |
+| `1` / `2` / `3` / `4` | Instances / snapshots / health / git |
+| `Tab` | Cycle project sections |
+| `↑`/`↓`, `j`/`k` | Move inside the focused section |
+| `Enter` (instances) | Attach the selected instance, or boot the default one |
+| `Enter` (snapshots) | Restore the selected snapshot |
+| `i` / `a` / `t` | Open/focus the terminal (starts an instance if needed) |
+| `Esc` | Insert → normal; normal → section headers (pane stays at 55%) |
+| `←` | Back to the dashboard (the VM keeps running) |
+| `F2` | Leave the TUI for the real `hegn attach` client |
+| `Ctrl-B` / `Ctrl-]` | Back to the dashboard from every mode |
+| `n` | Start a new instance (instances) / new snapshot (snapshots) |
+| `M` | Multi-agent clones for this project |
+| `S` | Stop the selected instance |
+| `d` | Delete the selected instance or snapshot |
+| `F5` | Instance settings editor |
+| `e` / `g` | Editor / lazygit for the project |
+| `F4` | Global settings editor |
+| `?` / `F1` | Help |
+
+Opening the terminal moves it to the right at 55%. Pressing a section number
+expands that section and shrinks the terminal to 30%; focusing the terminal
+again restores 55%. The collapsed strip shows the selected instance and whether
+it is running.
 
 Destructive actions are never confirmed with `Enter`. Deleting an instance or
 snapshot and allowing a flagged command require the explicit `y` (or `a` for
@@ -832,19 +858,20 @@ another row when necessary.
 
 ### Terminal (guest serial console)
 
-The terminal view is modal, like Vim. It opens in **normal** mode, where keys are
-hegn shortcuts and nothing reaches the guest. Press `i` or `a` to enter
-**insert** mode and type commands; `Esc` leaves insert mode again.
+The terminal is a pane inside the project screen. It opens in **normal** mode,
+where keys are hegn shortcuts and nothing reaches the guest. Press `i` or `a`
+to enter **insert** mode and type commands; `Esc` returns to normal and then to
+the section headers while the pane stays open.
 
 | Key | Action |
 | --- | --- |
-| `i` / `a` | Enter insert mode and write in the guest terminal |
-| `Esc` | Leave insert mode (in normal mode: return to dashboard) |
-| `←` | Return to dashboard (normal mode) |
-| `M` | Multi-agent clones for the project in this terminal |
+| `i` / `a` / `t` | Open or focus the terminal and enter insert mode |
+| `Esc` | Insert → normal; normal → section headers |
+| `←` | Return to the dashboard (the VM keeps running) |
+| `M` | Multi-agent clones for the open project |
 | `Enter` | In insert mode: inspect the command with tirith-core, then send it |
-| `F2` | Toggle raw passthrough (every key goes to the guest) |
-| `Ctrl-B` / `Ctrl-]` | Return to dashboard |
+| `F2` | Leave the TUI for the real `hegn attach` client |
+| `Ctrl-B` / `Ctrl-]` | Return to the dashboard from every mode |
 | `PgUp` / `PgDn` | Scroll output |
 | `Ctrl-L` | Clear scrollback |
 
@@ -915,19 +942,19 @@ diagnostic cells use a small ANSI background color.
    dropped. The guest's only route is the host `/30` gateway, and NAT exposes
    nothing inbound. Rules are host-side, so guest root cannot disable them.
    `network = "off"` removes the NIC entirely.
-5. **Interception** — in the TUI terminal view (unless raw mode is on), input is
-   buffered into a command line and passed to `tirith-core` plus hegn's own
-   workspace guardrails before any bytes reach the guest serial port.
+5. **Interception** — in the project terminal, input is buffered into a command
+   line and passed to `tirith-core` plus hegn's own workspace guardrails before
+   any bytes reach the guest serial port.
 6. **Policy** — `enforce` blocks high/critical findings and prompts for medium
    ones; `warn` reports everything; `off` disables `tirith-core` but keeps
    hegn's destructive-workspace checks.
 7. **Recovery** — a blocked-but-allowed command can be preceded by a git
    checkpoint, and VM snapshots allow instant rollback beyond git.
 
-No instance is a substitute for reviewing what you run. `F2` raw passthrough
-deliberately bypasses inspection. `hegn attach` is raw as well and marks this
-in its status bar as `INPUT DIRECT`; use `hegn check` for scripted
-pre-execution checks or the TUI for intercepted input.
+No instance is a substitute for reviewing what you run. `F2` and `hegn attach`
+hand the terminal directly to the guest and mark this as `INPUT DIRECT`; use
+`hegn check` for scripted pre-execution checks or the in-TUI terminal for
+intercepted input.
 
 The default Cloud Hypervisor cloud image is writable and reused between
 sessions, so guest changes to the root filesystem persist. The workspace is the

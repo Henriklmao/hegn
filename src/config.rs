@@ -840,6 +840,12 @@ impl Config {
             self.templates_dir.clone(),
             self.profiles_dir.clone(),
         ];
+        if let Some(parent) = self.instances_dir.parent() {
+            let legacy = parent.join("sandboxes");
+            if legacy != self.instances_dir && legacy.exists() {
+                protected.push(legacy);
+            }
+        }
         if let Some(parent) = Self::config_path().parent() {
             protected.push(parent.to_path_buf());
         }

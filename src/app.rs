@@ -28,7 +28,67 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(450);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Dashboard,
-    Terminal,
+    Project,
+}
+
+/// Sections shown on the project screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectSection {
+    Instances,
+    Snapshots,
+    Health,
+    Git,
+}
+
+impl ProjectSection {
+    pub const ALL: [Self; 4] = [Self::Instances, Self::Snapshots, Self::Health, Self::Git];
+
+    pub fn number(self) -> usize {
+        match self {
+            Self::Instances => 1,
+            Self::Snapshots => 2,
+            Self::Health => 3,
+            Self::Git => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Instances => "instances",
+            Self::Snapshots => "snapshots",
+            Self::Health => "health",
+            Self::Git => "git",
+        }
+    }
+
+    pub fn focus(self) -> Focus {
+        match self {
+            Self::Instances => Focus::Instances,
+            Self::Snapshots => Focus::Snapshots,
+            Self::Health => Focus::Health,
+            Self::Git => Focus::Git,
+        }
+    }
+
+    pub fn from_focus(focus: Focus) -> Self {
+        match focus {
+            Focus::Snapshots => Self::Snapshots,
+            Focus::Health => Self::Health,
+            Focus::Git => Self::Git,
+            Focus::Projects | Focus::Instances => Self::Instances,
+        }
+    }
+}
+
+/// Terminal geometry on the project screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectView {
+    /// One-line terminal strip; the composed project page fills the window.
+    Compact,
+    /// Terminal on the right at 55%; section headers collapsed on the left.
+    Split,
+    /// One section expanded on the left at 70%; terminal on the right at 30%.
+    Section,
 }
 
 /// Vim-style input mode for the terminal view.
@@ -47,6 +107,8 @@ pub enum Focus {
     Projects,
     Instances,
     Snapshots,
+    Health,
+    Git,
 }
 
 /// Side effects that need the terminal to be released (editor/lazygit), an
@@ -71,6 +133,10 @@ pub enum Effect {
     },
     /// Start (if needed) and attach an existing instance.
     AttachInstance {
+        instance: String,
+    },
+    /// Leave the TUI and attach the real serial console client.
+    AttachConsole {
         instance: String,
     },
     StopInstance {
@@ -148,6 +214,52 @@ pub struct InstanceStatus {
     pub socket: Option<PathBuf>,
     pub note: Option<String>,
     pub started_at: Option<Instant>,
+}
+
+/// Last guest-reported health line from the serial log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceHealth {
+    pub apt: Option<u32>,
+    pub reason: String,
+    pub checked: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl InstanceHealth {
+    fn parse(text: &str) -> Option<Self> {
+        for line in text.lines().rev() {
+            let Some(rest) = line.trim().strip_prefix("hegn-health v1 ") else {
+                continue;
+            };
+            let mut health = Self::default();
+            for token in rest.split_whitespace() {
+                if let Some(value) = token.strip_prefix("apt=") {
+                    health.apt = value.parse().ok();
+                } else if let Some(value) = token.strip_prefix("reason=") {
+                    health.reason = value.to_string();
+                } else if let Some(value) = token.strip_prefix("checked=")
+                    && let Ok(seconds) = value.parse::<i64>()
+                {
+                    health.checked = chrono::DateTime::from_timestamp(seconds, 0);
+                }
+            }
+            return Some(health);
+        }
+        None
+    }
+
+    pub fn label(&self) -> String {
+        if self.apt.is_none() && !self.reason.is_empty() && self.reason != "ok" {
+            return self.reason.clone();
+        }
+        let apt = match self.apt {
+            Some(count) => format!("{count} upgrades"),
+            None => "not checked".to_string(),
+        };
+        match &self.checked {
+            Some(checked) => format!("{apt} · checked {}", checked.format("%Y-%m-%d %H:%M")),
+            None => apt,
+        }
+    }
 }
 
 impl InstanceStatus {
@@ -239,6 +351,13 @@ pub struct FooterHit {
 pub struct RowHit {
     pub rect: Rect,
     pub index: usize,
+}
+
+/// Clickable project section header or tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectionHit {
+    pub rect: Rect,
+    pub section: ProjectSection,
 }
 
 /// Scrollbar geometry and bounds recorded by the renderer for the open modal.
@@ -533,10 +652,25 @@ pub struct App {
     pub searching: bool,
     pub focus: Focus,
     pub screen: Screen,
+    /// Project whose dedicated screen is open, frozen while the user browses.
+    pub open_project: Option<PathBuf>,
+    pub project_view: ProjectView,
+    /// True while the terminal pane has keyboard focus in [`ProjectView::Split`].
+    pub terminal_focus: bool,
+    /// Clickable section headers recorded by the renderer.
+    pub section_hits: Vec<SectionHit>,
+    /// Clickable terminal pane and collapsed strip for mouse focus.
+    pub terminal_hit: Option<Rect>,
+    pub terminal_strip_hit: Option<Rect>,
     pub modal: Option<Modal>,
     pub instance: InstanceStatus,
+    /// Health line parsed from the selected instance's serial log.
+    pub health: Option<InstanceHealth>,
     pub snapshots: Vec<SnapshotMeta>,
     pub selected_snapshot: usize,
+    /// Indices into [`App::snapshots`] for the open project.
+    pub project_snapshots: Vec<usize>,
+    pub project_snapshot_selected: usize,
     pub snapshot_rows: Vec<RowHit>,
     pub instances: Vec<InstanceSummary>,
     /// Indices into [`App::instances`] for the selected project.
@@ -545,6 +679,8 @@ pub struct App {
     instance_project: Option<PathBuf>,
     pub instance_rows: Vec<RowHit>,
     pub project_rows: Vec<RowHit>,
+    /// Settings read from the open project's `hegn.toml`.
+    pub project_meta: ProjectMeta,
     pub session: Option<Box<dyn TerminalConsole>>,
     pub terminal: TerminalBuffer,
     pub input: String,
@@ -596,10 +732,19 @@ impl App {
             searching: false,
             focus: Focus::Projects,
             screen: Screen::Dashboard,
+            open_project: None,
+            project_view: ProjectView::Compact,
+            terminal_focus: false,
+            section_hits: Vec::new(),
+            terminal_hit: None,
+            terminal_strip_hit: None,
             modal: None,
             instance,
+            health: None,
             snapshots,
             selected_snapshot: 0,
+            project_snapshots: Vec::new(),
+            project_snapshot_selected: 0,
             snapshot_rows: Vec::new(),
             instances,
             instance_visible: Vec::new(),
@@ -607,6 +752,7 @@ impl App {
             instance_project: None,
             instance_rows: Vec::new(),
             project_rows: Vec::new(),
+            project_meta: ProjectMeta::default(),
             session: None,
             terminal: TerminalBuffer::default(),
             input: String::new(),
@@ -673,12 +819,69 @@ impl App {
         self.refresh_instance_filter();
     }
 
+    /// Read the last `hegn-health` line from the selected instance's log.
+    ///
+    /// The guest writes it at boot; the host never queries the guest from the
+    /// renderer. A missing or stale line is shown as `not checked`.
+    pub fn refresh_health(&mut self) {
+        let Some(instance) = self.selected_instance() else {
+            self.health = None;
+            return;
+        };
+        let Some(path) = instance.serial_log.as_deref() else {
+            self.health = None;
+            return;
+        };
+        let bytes = crate::logs::tail_bytes(path, 200).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        self.health = InstanceHealth::parse(&text);
+    }
+
     pub fn refresh_snapshots(&mut self) {
         self.snapshots = SnapshotStore::new(&self.config.snapshots_dir)
             .list()
             .unwrap_or_default();
         if self.selected_snapshot >= self.snapshots.len() {
             self.selected_snapshot = self.snapshots.len().saturating_sub(1);
+        }
+        self.refresh_project_snapshots();
+    }
+
+    /// Rebuild the project-scoped snapshot list. Older snapshots without a
+    /// recorded project are intentionally left out of the project screen.
+    pub fn refresh_project_snapshots(&mut self) {
+        let project = self
+            .active_project()
+            .map(|project| project.path.clone())
+            .or_else(|| self.open_project.clone());
+        let instance_names: Vec<&str> = project
+            .as_ref()
+            .map(|project| {
+                self.instances
+                    .iter()
+                    .filter(|instance| crate::instance::same_project(&instance.project, project))
+                    .map(|instance| instance.name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.project_snapshots = match project {
+            Some(project) => self
+                .snapshots
+                .iter()
+                .enumerate()
+                .filter(|(_, snapshot)| {
+                    snapshot.project.as_deref() == Some(project.as_path())
+                        || snapshot
+                            .instance
+                            .as_deref()
+                            .is_some_and(|name| instance_names.contains(&name))
+                })
+                .map(|(index, _)| index)
+                .collect(),
+            None => Vec::new(),
+        };
+        if self.project_snapshot_selected >= self.project_snapshots.len() {
+            self.project_snapshot_selected = self.project_snapshots.len().saturating_sub(1);
         }
     }
 
@@ -699,7 +902,38 @@ impl App {
     }
 
     pub fn selected_snapshot(&self) -> Option<&SnapshotMeta> {
-        self.snapshots.get(self.selected_snapshot)
+        if self.screen == Screen::Project {
+            self.project_snapshots
+                .get(self.project_snapshot_selected)
+                .and_then(|&index| self.snapshots.get(index))
+        } else {
+            self.snapshots.get(self.selected_snapshot)
+        }
+    }
+
+    /// Project shown on the project screen, frozen when it was entered.
+    pub fn active_project(&self) -> Option<&Project> {
+        match &self.open_project {
+            Some(path) => {
+                if let Some(project) = self.projects.iter().find(|project| &project.path == path) {
+                    return Some(project);
+                }
+                // Clone consoles record their private workspace as the session
+                // project. Map it back to the original project for the chrome.
+                let project_path = self
+                    .instances
+                    .iter()
+                    .find(|instance| {
+                        crate::instance::same_project(&instance.workspace, path)
+                            || crate::instance::same_project(&instance.project, path)
+                    })
+                    .map(|instance| instance.project.clone())?;
+                self.projects
+                    .iter()
+                    .find(|project| project.path == project_path)
+            }
+            None => self.selected_project(),
+        }
     }
 
     pub fn selected_instance(&self) -> Option<&InstanceSummary> {
@@ -725,7 +959,10 @@ impl App {
     /// captured before [`App::instances`] is replaced: the visible indices point
     /// into the old vector.
     fn refresh_instance_filter_named(&mut self, selected: Option<String>) {
-        let project = self.selected_project().map(|project| project.path.clone());
+        let project = self
+            .active_project()
+            .map(|project| project.path.clone())
+            .or_else(|| self.open_project.clone());
         let project_changed = self.instance_project != project;
         self.instance_project = project.clone();
 
@@ -787,15 +1024,30 @@ impl App {
                     _ => InstanceState::Stopped,
                 };
             }
+        } else if self.session.is_none() && self.instance.state != InstanceState::Starting {
+            self.instance.state = InstanceState::Stopped;
+            self.instance.started_at = None;
+            self.instance.note = None;
+            self.instance.socket = None;
         }
+        self.refresh_health();
     }
 
     pub fn focus_next(&mut self) {
+        if self.screen == Screen::Dashboard {
+            self.focus = Focus::Projects;
+            return;
+        }
         self.focus = match self.focus {
             Focus::Projects => Focus::Instances,
             Focus::Instances => Focus::Snapshots,
-            Focus::Snapshots => Focus::Projects,
+            Focus::Snapshots => Focus::Health,
+            Focus::Health => Focus::Git,
+            Focus::Git => Focus::Instances,
         };
+        if self.project_view == ProjectView::Section {
+            self.project_section();
+        }
     }
 
     pub fn select_next(&mut self, delta: isize) {
@@ -816,12 +1068,22 @@ impl App {
                 self.instance_selected = clamp_index(self.instance_selected, delta, max);
             }
             Focus::Snapshots => {
-                if self.snapshots.is_empty() {
+                let len = if self.screen == Screen::Project {
+                    self.project_snapshots.len()
+                } else {
+                    self.snapshots.len()
+                };
+                if len == 0 {
                     return;
                 }
-                let max = self.snapshots.len() - 1;
-                self.selected_snapshot = clamp_index(self.selected_snapshot, delta, max);
+                if self.screen == Screen::Project {
+                    self.project_snapshot_selected =
+                        clamp_index(self.project_snapshot_selected, delta, len - 1);
+                } else {
+                    self.selected_snapshot = clamp_index(self.selected_snapshot, delta, len - 1);
+                }
             }
+            Focus::Health | Focus::Git => {}
         }
     }
 
@@ -880,7 +1142,7 @@ impl App {
         self.scroll_dragging = false;
         match self.screen {
             Screen::Dashboard => self.handle_dashboard_key(key),
-            Screen::Terminal => self.handle_terminal_key(key),
+            Screen::Project => self.handle_project_key(key),
         }
     }
 
@@ -961,62 +1223,45 @@ impl App {
                 self.select_next(-5);
                 Vec::new()
             }
-            KeyCode::Tab => {
-                self.focus_next();
-                Vec::new()
-            }
-            KeyCode::Enter | KeyCode::Char('o') => {
-                if self.focus == Focus::Snapshots {
-                    self.confirm_restore_snapshot()
-                } else {
-                    self.open_selected()
-                }
-            }
-            KeyCode::Char('1') => {
-                self.focus = Focus::Projects;
-                Vec::new()
-            }
-            KeyCode::Char('2') => {
-                self.focus = Focus::Instances;
-                self.refresh_instances();
-                Vec::new()
-            }
-            KeyCode::Char('3') => {
-                self.focus = Focus::Snapshots;
-                Vec::new()
-            }
-            KeyCode::Char('c') if self.focus == Focus::Projects => {
+            KeyCode::Enter | KeyCode::Char('o') => self.open_project(),
+            KeyCode::Char('c') => {
                 self.modal = Some(Modal::CreateProject(CreateProjectForm::new(
                     self.config.harness,
                 )));
                 Vec::new()
             }
-            KeyCode::Char('h') | KeyCode::Left if self.focus == Focus::Projects => {
+            KeyCode::Char('h') | KeyCode::Left => {
                 self.modal = Some(Modal::ImportProject(ImportProjectForm::new()));
                 Vec::new()
             }
             KeyCode::Char('e') => self.effect_for_selected(Effect::OpenEditor),
             KeyCode::Char('g') => self.effect_for_selected(Effect::OpenLazygit),
-            KeyCode::Char('r') => vec![Effect::RefreshProjects, Effect::RefreshInstances],
+            KeyCode::Char('r') => {
+                self.refresh_snapshots();
+                vec![Effect::RefreshProjects, Effect::RefreshInstances]
+            }
             KeyCode::Char('d') => match self.focus {
-                Focus::Snapshots => self.confirm_delete_snapshot(),
                 Focus::Instances => self.confirm_delete_instance(),
-                Focus::Projects => self.confirm_delete_project_instance(),
+                Focus::Snapshots => self.confirm_delete_snapshot(),
+                Focus::Projects | Focus::Health | Focus::Git => {
+                    self.confirm_delete_project_instance()
+                }
             },
             KeyCode::Char('n') if self.focus == Focus::Snapshots => {
                 self.handle_action(ActionId::NewSnapshot)
             }
-            KeyCode::Char('s') => {
-                self.focus = Focus::Snapshots;
-                Vec::new()
-            }
-            KeyCode::Char('p') => {
-                self.focus = Focus::Projects;
-                Vec::new()
-            }
-            KeyCode::Char('b') => {
+            KeyCode::Char('b') | KeyCode::Char('2') => {
+                let effects = self.open_project();
                 self.focus = Focus::Instances;
-                self.refresh_instances();
+                effects
+            }
+            KeyCode::Char('s') | KeyCode::Char('3') => {
+                let effects = self.open_project();
+                self.focus = Focus::Snapshots;
+                effects
+            }
+            KeyCode::Char('p') | KeyCode::Char('1') => {
+                self.focus = Focus::Projects;
                 Vec::new()
             }
             KeyCode::Char('S') if self.focus == Focus::Instances => self.stop_selected_instance(),
@@ -1024,11 +1269,12 @@ impl App {
             KeyCode::F(5) if self.focus == Focus::Instances => self.open_instance_config(),
             KeyCode::Char('t') => {
                 if self.session.is_some() {
-                    self.screen = Screen::Terminal;
+                    self.show_session_project();
+                    Vec::new()
                 } else {
                     self.toast("no active session", ToastLevel::Warn);
+                    Vec::new()
                 }
-                Vec::new()
             }
             _ => Vec::new(),
         }
@@ -1041,31 +1287,175 @@ impl App {
         }
     }
 
-    fn handle_terminal_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        if key.code == KeyCode::F(2) {
-            self.toggle_raw_mode();
+    pub fn project_section(&self) -> ProjectSection {
+        ProjectSection::from_focus(self.focus)
+    }
+
+    /// Open the selected project without booting a VM.
+    pub fn open_project(&mut self) -> Vec<Effect> {
+        let Some(project) = self.selected_project().cloned() else {
+            self.toast("no project selected", ToastLevel::Warn);
             return Vec::new();
+        };
+        if let Err(err) = self.store.touch(&project.path) {
+            self.toast(
+                format!("could not save recent projects: {err}"),
+                ToastLevel::Warn,
+            );
         }
+        self.enter_project(project.path);
+        Vec::new()
+    }
+
+    fn enter_project(&mut self, path: PathBuf) {
+        self.project_meta = project::read_meta(&path);
+        self.open_project = Some(path);
+        self.screen = Screen::Project;
+        self.project_view = ProjectView::Compact;
+        self.terminal_focus = false;
+        self.focus = Focus::Instances;
+        self.terminal_mode = TerminalMode::Normal;
+        self.refresh_instances();
+        self.refresh_snapshots();
+    }
+
+    fn show_session_project(&mut self) {
+        let Some(project) = self.session.as_ref().map(|s| s.project().to_path_buf()) else {
+            return;
+        };
+        self.enter_project(project);
+        self.project_view = ProjectView::Split;
+        self.terminal_focus = true;
+        self.terminal_mode = TerminalMode::Normal;
+    }
+
+    pub fn leave_project(&mut self) {
+        self.screen = Screen::Dashboard;
+        self.open_project = None;
+        self.project_view = ProjectView::Compact;
+        self.terminal_focus = false;
+        self.focus = Focus::Projects;
+        self.refresh_filter();
+    }
+
+    fn handle_project_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         if crate::attach_bar::detach_requested(key) {
-            self.screen = Screen::Dashboard;
+            self.leave_project();
             return Vec::new();
         }
-        // Left leaves the project terminal in normal mode. Raw mode still
-        // forwards it to the guest; insert mode is for typing, where Esc
-        // returns to normal mode.
+        if key.code == KeyCode::F(2) {
+            return self.attach_console_external();
+        }
+        // Left leaves the project unless the guest is actively receiving text.
         if key.code == KeyCode::Left && self.terminal_mode == TerminalMode::Normal {
-            self.screen = Screen::Dashboard;
+            self.leave_project();
+            return Vec::new();
+        }
+        if self.terminal_mode != TerminalMode::Insert
+            && let KeyCode::Char(number @ '1'..='4') = key.code
+        {
+            let section = match number {
+                '1' => ProjectSection::Instances,
+                '2' => ProjectSection::Snapshots,
+                '3' => ProjectSection::Health,
+                _ => ProjectSection::Git,
+            };
+            self.focus = section.focus();
+            if self.project_view != ProjectView::Compact {
+                self.project_view = ProjectView::Section;
+                self.terminal_focus = false;
+            }
+            return Vec::new();
+        }
+        if self.terminal_mode != TerminalMode::Insert
+            && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+        {
+            self.focus_next();
+            return Vec::new();
+        }
+        if self.terminal_focus {
+            return self.handle_project_terminal_key(key);
+        }
+
+        if key.code == KeyCode::Esc {
+            if self.project_view == ProjectView::Section {
+                self.project_view = ProjectView::Split;
+                self.terminal_focus = false;
+            } else {
+                self.leave_project();
+            }
             return Vec::new();
         }
 
+        match key.code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.focus_next();
+                if self.project_view == ProjectView::Section {
+                    self.project_section();
+                }
+                Vec::new()
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.select_next(1);
+                Vec::new()
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.select_next(-1);
+                Vec::new()
+            }
+            KeyCode::PageDown => {
+                self.select_next(5);
+                Vec::new()
+            }
+            KeyCode::PageUp => {
+                self.select_next(-5);
+                Vec::new()
+            }
+            KeyCode::Enter if self.focus == Focus::Snapshots => self.confirm_restore_snapshot(),
+            KeyCode::Enter if self.focus == Focus::Instances => {
+                if self.selected_instance().is_some() {
+                    self.attach_selected_instance()
+                } else {
+                    self.start_project_instance()
+                }
+            }
+            KeyCode::Char('i') | KeyCode::Char('a') | KeyCode::Char('t') => self.open_terminal(),
+            KeyCode::Char('n') if self.focus == Focus::Snapshots => {
+                self.handle_action(ActionId::NewSnapshot)
+            }
+            KeyCode::Char('n') if self.focus == Focus::Instances => self.start_project_instance(),
+            KeyCode::Char('M') => self.open_multi_agent(),
+            KeyCode::Char('S') => self.stop_selected_instance(),
+            KeyCode::Char('d') if self.focus == Focus::Instances => self.confirm_delete_instance(),
+            KeyCode::Char('d') if self.focus == Focus::Snapshots => self.confirm_delete_snapshot(),
+            KeyCode::Char('e') => self.effect_for_open_project(Effect::OpenEditor),
+            KeyCode::Char('g') => self.effect_for_open_project(Effect::OpenLazygit),
+            KeyCode::Char('r') => {
+                self.refresh_snapshots();
+                vec![Effect::RefreshProjects, Effect::RefreshInstances]
+            }
+            KeyCode::F(4) => self.open_global_config(),
+            KeyCode::F(5) if self.focus == Focus::Instances => self.open_instance_config(),
+            KeyCode::Char('?') | KeyCode::F(1) => {
+                self.modal = Some(Modal::Help(HelpState::default()));
+                Vec::new()
+            }
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+                vec![Effect::Quit]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn handle_project_terminal_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         if key.code == KeyCode::Esc {
             match self.terminal_mode {
                 TerminalMode::Insert => {
                     self.terminal_mode = TerminalMode::Normal;
                     self.toast("normal mode — press i or a to type", ToastLevel::Info);
                 }
-                // Esc in normal/raw mode leaves the project terminal.
-                _ => self.screen = Screen::Dashboard,
+                _ => self.terminal_focus = false,
             }
             return Vec::new();
         }
@@ -1148,22 +1538,54 @@ impl App {
         Vec::new()
     }
 
-    fn toggle_raw_mode(&mut self) {
-        self.terminal_mode = match self.terminal_mode {
-            TerminalMode::Raw => TerminalMode::Normal,
-            _ => TerminalMode::Raw,
+    fn open_terminal(&mut self) -> Vec<Effect> {
+        if self.open_project.is_none() && self.session.is_none() {
+            self.project_view = ProjectView::Split;
+            self.terminal_focus = true;
+            self.terminal_mode = TerminalMode::Insert;
+            return Vec::new();
+        }
+        let selected = self
+            .selected_instance()
+            .map(|instance| instance.name.clone());
+        if let Some(name) = selected {
+            if self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.instance_name() == name)
+            {
+                self.project_view = ProjectView::Split;
+                self.terminal_focus = true;
+                self.terminal_mode = TerminalMode::Insert;
+                return Vec::new();
+            }
+            self.attach_selected_instance()
+        } else {
+            self.start_project_instance()
+        }
+    }
+
+    fn effect_for_open_project(&self, effect: impl FnOnce(PathBuf) -> Effect) -> Vec<Effect> {
+        self.open_project
+            .clone()
+            .map(|path| vec![effect(path)])
+            .unwrap_or_default()
+    }
+
+    fn attach_console_external(&mut self) -> Vec<Effect> {
+        let instance = self
+            .selected_instance()
+            .map(|instance| instance.name.clone())
+            .or_else(|| {
+                self.session
+                    .as_ref()
+                    .map(|session| session.instance_name().to_string())
+            });
+        let Some(instance) = instance else {
+            self.toast("no instance selected", ToastLevel::Warn);
+            return Vec::new();
         };
-        self.toast(
-            match self.terminal_mode {
-                TerminalMode::Raw => "raw passthrough — every key goes to the guest",
-                _ => "normal mode — press i or a to type",
-            },
-            if self.terminal_mode == TerminalMode::Raw {
-                ToastLevel::Warn
-            } else {
-                ToastLevel::Info
-            },
-        );
+        vec![Effect::AttachConsole { instance }]
     }
 
     /// Inspect and submit the terminal input buffer.
@@ -1858,6 +2280,9 @@ impl App {
         self.instance.state = InstanceState::Starting;
         self.instance.started_at = None;
         self.instance.note = Some(format!("attaching to instance {}", instance.name));
+        self.enter_project(instance.project.clone());
+        self.project_view = ProjectView::Split;
+        self.terminal_focus = true;
         vec![Effect::AttachInstance {
             instance: instance.name,
         }]
@@ -2096,17 +2521,30 @@ impl App {
         }
     }
 
-    /// Open the selected project in a Cloud Hypervisor VM.
+    /// Open the selected project or instance.
+    ///
+    /// On the dashboard this enters the project screen without booting a VM.
+    /// On the project screen it attaches/boots the selected instance.
+    pub fn open_selected(&mut self) -> Vec<Effect> {
+        match self.focus {
+            Focus::Snapshots => self.confirm_restore_snapshot(),
+            Focus::Instances => self.attach_selected_instance(),
+            Focus::Health | Focus::Git => Vec::new(),
+            Focus::Projects => {
+                if self.screen == Screen::Project {
+                    self.open_terminal()
+                } else {
+                    self.open_project()
+                }
+            }
+        }
+    }
+
+    /// Boot the project's default instance.
     ///
     /// This only *requests* the VM start; the terminal loop owns the runtime and
     /// performs the boot. A missing VM is a hard error, never a local shell.
-    pub fn open_selected(&mut self) -> Vec<Effect> {
-        if self.focus == Focus::Snapshots {
-            return self.confirm_restore_snapshot();
-        }
-        if self.focus == Focus::Instances {
-            return self.attach_selected_instance();
-        }
+    fn start_project_instance(&mut self) -> Vec<Effect> {
         if self.instance.state == InstanceState::Starting {
             self.toast("a VM is already starting…", ToastLevel::Warn);
             return Vec::new();
@@ -2121,7 +2559,9 @@ impl App {
             .as_ref()
             .is_some_and(|session| crate::instance::same_project(session.project(), &project.path));
         if attached_to_project && self.session_active() {
-            self.screen = Screen::Terminal;
+            self.enter_project(project.path);
+            self.project_view = ProjectView::Split;
+            self.terminal_focus = true;
             return Vec::new();
         }
 
@@ -2147,8 +2587,11 @@ impl App {
             "booting Cloud Hypervisor VM for {}",
             project.display_path()
         ));
+        self.enter_project(project.path.clone());
+        self.project_view = ProjectView::Split;
+        self.terminal_focus = true;
         vec![Effect::StartProjectInstance {
-            project: project.path.clone(),
+            project: project.path,
             harness,
         }]
     }
@@ -2176,8 +2619,11 @@ impl App {
         {
             self.instance_selected = index;
         }
+        let project = console.project().to_path_buf();
         self.session = Some(console);
-        self.screen = Screen::Terminal;
+        self.enter_project(project);
+        self.project_view = ProjectView::Split;
+        self.terminal_focus = true;
         self.terminal_mode = TerminalMode::Normal;
         self.session_closed_reported = false;
         self.toast(
@@ -2378,28 +2824,33 @@ impl App {
                 vec![Effect::Quit]
             }
             ActionId::Back => {
-                self.screen = Screen::Dashboard;
+                self.leave_project();
                 Vec::new()
             }
             ActionId::ToggleRaw => {
                 self.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
             }
             ActionId::InsertMode => {
-                if self.screen == Screen::Terminal {
+                if self.screen == Screen::Project {
+                    let effects = self.open_terminal();
+                    self.project_view = ProjectView::Split;
+                    self.terminal_focus = true;
                     self.terminal_mode = TerminalMode::Insert;
                     self.toast("insert mode — Esc returns to normal", ToastLevel::Info);
+                    effects
+                } else {
+                    Vec::new()
                 }
-                Vec::new()
             }
             ActionId::NormalMode => {
-                if self.screen == Screen::Terminal {
+                if self.screen == Screen::Project {
                     self.terminal_mode = TerminalMode::Normal;
                     self.toast("normal mode — press i or a to type", ToastLevel::Info);
                 }
                 Vec::new()
             }
             ActionId::ScrollUp => {
-                if self.screen == Screen::Terminal {
+                if self.screen == Screen::Project {
                     self.scroll = self.scroll.saturating_add(5).min(self.terminal.len());
                 }
                 Vec::new()
@@ -2598,7 +3049,9 @@ impl App {
                     form.package_cursor = form.package_cursor.saturating_sub(1);
                 } else if self.modal.is_some() {
                     self.scroll_modal(-3);
-                } else if self.screen == Screen::Terminal {
+                } else if self.screen == Screen::Project
+                    && self.project_view != ProjectView::Compact
+                {
                     self.scroll = self.scroll.saturating_add(3).min(self.terminal.len());
                 } else {
                     self.select_next(-1);
@@ -2613,7 +3066,9 @@ impl App {
                         (form.package_cursor + 1).min(form.packages.len().saturating_sub(1));
                 } else if self.modal.is_some() {
                     self.scroll_modal(3);
-                } else if self.screen == Screen::Terminal {
+                } else if self.screen == Screen::Project
+                    && self.project_view != ProjectView::Compact
+                {
                     self.scroll = self.scroll.saturating_sub(3);
                 } else {
                     self.select_next(1);
@@ -2651,6 +3106,21 @@ impl App {
                 }
                 if matches!(self.modal, Some(Modal::Config(_))) {
                     return self.click_config_row(pos);
+                }
+                if self
+                    .terminal_strip_hit
+                    .is_some_and(|rect| rect_contains(rect, pos))
+                {
+                    return self.open_terminal();
+                }
+                if self
+                    .terminal_hit
+                    .is_some_and(|rect| rect_contains(rect, pos))
+                {
+                    self.project_view = ProjectView::Split;
+                    self.terminal_focus = true;
+                    self.terminal_mode = TerminalMode::Normal;
+                    return Vec::new();
                 }
                 if let Some(row) = self
                     .project_rows
@@ -2702,7 +3172,24 @@ impl App {
                     .copied()
                 {
                     self.focus = Focus::Snapshots;
-                    self.selected_snapshot = row.index;
+                    if self.screen == Screen::Project {
+                        self.project_snapshot_selected = row.index;
+                    } else {
+                        self.selected_snapshot = row.index;
+                    }
+                }
+                if let Some(hit) = self
+                    .section_hits
+                    .iter()
+                    .find(|hit| rect_contains(hit.rect, pos))
+                    .copied()
+                {
+                    self.screen = Screen::Project;
+                    self.focus = hit.section.focus();
+                    if self.project_view != ProjectView::Compact {
+                        self.project_view = ProjectView::Section;
+                        self.terminal_focus = false;
+                    }
                 }
                 Vec::new()
             }
@@ -2986,27 +3473,33 @@ mod tests {
     }
 
     #[test]
-    fn tab_toggles_focus() {
+    fn tab_toggles_project_sections() {
         let (_dir, mut app) = test_app();
-        assert_eq!(app.focus, Focus::Projects);
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.focus, Focus::Instances);
+        app.screen = Screen::Project;
+        app.focus = Focus::Instances;
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Snapshots);
         app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.focus, Focus::Projects);
+        assert_eq!(app.focus, Focus::Health);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Git);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Instances);
     }
 
     #[test]
-    fn number_keys_jump_to_the_matching_tab() {
+    fn number_keys_jump_to_project_sections() {
         let (_dir, mut app) = test_app();
-        assert_eq!(app.focus, Focus::Projects);
+        app.screen = Screen::Project;
+        app.focus = Focus::Instances;
         app.handle_key(key(KeyCode::Char('2')));
-        assert_eq!(app.focus, Focus::Instances);
-        app.handle_key(key(KeyCode::Char('3')));
         assert_eq!(app.focus, Focus::Snapshots);
+        app.handle_key(key(KeyCode::Char('3')));
+        assert_eq!(app.focus, Focus::Health);
+        app.handle_key(key(KeyCode::Char('4')));
+        assert_eq!(app.focus, Focus::Git);
         app.handle_key(key(KeyCode::Char('1')));
-        assert_eq!(app.focus, Focus::Projects);
+        assert_eq!(app.focus, Focus::Instances);
     }
 
     #[test]
@@ -3265,17 +3758,17 @@ mod tests {
     #[test]
     fn terminal_scroll_footer_action_scrolls_instead_of_opening() {
         let (_dir, mut app) = test_app();
-        app.screen = Screen::Terminal;
+        app.screen = Screen::Project;
         app.terminal.push_bytes(b"one\ntwo\n");
         app.handle_action(ActionId::ScrollUp);
         assert!(app.scroll > 0);
-        assert_eq!(app.screen, Screen::Terminal);
+        assert_eq!(app.screen, Screen::Project);
     }
 
     #[test]
     fn terminal_input_collects_and_clears_on_empty_submit() {
         let (_dir, mut app) = test_app();
-        app.screen = Screen::Terminal;
+        app.screen = Screen::Project;
         app.handle_key(key(KeyCode::Char('i')));
         app.handle_key(key(KeyCode::Char('l')));
         app.handle_key(key(KeyCode::Char('s')));
@@ -3290,7 +3783,7 @@ mod tests {
     #[test]
     fn benign_submit_without_session_warns_instead_of_crashing() {
         let (_dir, mut app) = test_app();
-        app.screen = Screen::Terminal;
+        app.screen = Screen::Project;
         app.handle_key(key(KeyCode::Char('i')));
         for c in "ls".chars() {
             app.handle_key(key(KeyCode::Char(c)));
@@ -3303,7 +3796,7 @@ mod tests {
     #[test]
     fn destructive_submit_opens_security_modal() {
         let (_dir, mut app) = test_app();
-        app.screen = Screen::Terminal;
+        app.screen = Screen::Project;
         app.handle_key(key(KeyCode::Char('i')));
         for c in "rm -rf /workspace".chars() {
             app.handle_key(key(KeyCode::Char(c)));
@@ -3319,19 +3812,23 @@ mod tests {
     }
 
     #[test]
-    fn raw_mode_toggles_and_hides_interception() {
+    fn f2_requests_the_real_attach_client() {
         let (_dir, mut app) = test_app();
-        app.screen = Screen::Terminal;
-        app.handle_key(key(KeyCode::F(2)));
-        assert_eq!(app.terminal_mode, TerminalMode::Raw);
-        app.handle_key(key(KeyCode::F(2)));
-        assert_eq!(app.terminal_mode, TerminalMode::Normal);
+        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let instance = fake_instance(&app, "demo", inside);
+        install_instances(&mut app, vec![instance]);
+        app.screen = Screen::Project;
+        let effects = app.handle_key(key(KeyCode::F(2)));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::AttachConsole { instance }] if instance == "demo"
+        ));
     }
 
     #[test]
     fn terminal_starts_in_normal_mode_and_i_enters_insert() {
         let (_dir, mut app) = test_app();
-        app.screen = Screen::Terminal;
+        app.screen = Screen::Project;
         // Normal mode swallows printable keys instead of forwarding them.
         app.handle_key(key(KeyCode::Char('x')));
         assert!(app.input.is_empty());
@@ -3341,27 +3838,30 @@ mod tests {
         assert_eq!(app.input, "x");
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.terminal_mode, TerminalMode::Normal);
-        assert_eq!(app.screen, Screen::Terminal);
-        // Esc in normal mode leaves the terminal.
+        assert_eq!(app.screen, Screen::Project);
+        // Esc in normal mode returns focus to the sections; the pane stays.
         app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Project);
+        // Left (or the breadcrumb) leaves the project.
+        app.handle_key(key(KeyCode::Left));
         assert_eq!(app.screen, Screen::Dashboard);
     }
 
     #[test]
     fn insert_mode_esc_does_not_leave_the_terminal() {
         let (_dir, mut app) = test_app();
-        app.screen = Screen::Terminal;
+        app.screen = Screen::Project;
         app.handle_key(key(KeyCode::Char('a')));
         assert_eq!(app.terminal_mode, TerminalMode::Insert);
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen, Screen::Terminal);
+        assert_eq!(app.screen, Screen::Project);
     }
 
     #[test]
     fn left_arrow_leaves_the_project_terminal_in_normal_mode() {
         let (_dir, mut app) = test_app();
         app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
-        assert_eq!(app.screen, Screen::Terminal);
+        assert_eq!(app.screen, Screen::Project);
 
         app.handle_key(key(KeyCode::Left));
         assert_eq!(app.screen, Screen::Dashboard);
@@ -3374,18 +3874,18 @@ mod tests {
 
         app.terminal_mode = TerminalMode::Insert;
         app.handle_key(key(KeyCode::Left));
-        assert_eq!(app.screen, Screen::Terminal);
+        assert_eq!(app.screen, Screen::Project);
 
         app.terminal_mode = TerminalMode::Raw;
         app.handle_key(key(KeyCode::Left));
-        assert_eq!(app.screen, Screen::Terminal);
+        assert_eq!(app.screen, Screen::Project);
     }
 
     #[test]
     fn multi_agent_is_reachable_from_the_project_terminal() {
         let (_dir, mut app) = test_app();
         app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
-        assert_eq!(app.screen, Screen::Terminal);
+        assert_eq!(app.screen, Screen::Project);
         let effects = app.handle_key(key(KeyCode::Char('M')));
         assert!(effects.is_empty());
         match &app.modal {
@@ -3555,6 +4055,7 @@ mod tests {
             harness: Harness::Shell,
             ephemeral: false,
             source_instance: None,
+            created_at: chrono::Utc::now(),
             state: "stopped".into(),
             vm_pid: None,
             serial_log: None,
@@ -3914,14 +4415,16 @@ mod tests {
     }
 
     #[test]
-    fn open_requests_a_instance_and_resets_the_terminal_mode() {
+    fn starting_a_project_instance_resets_the_terminal_mode() {
         let (_dir, mut app) = test_app();
         let mut project = fake_project("demo");
         project.path = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project.path).unwrap();
         app.set_projects(vec![project.clone()]);
+        app.screen = Screen::Project;
+        app.focus = Focus::Instances;
         app.terminal_mode = TerminalMode::Raw;
-        let effects = app.open_selected();
+        let effects = app.start_project_instance();
         assert_eq!(
             app.terminal_mode,
             TerminalMode::Normal,
@@ -3944,10 +4447,102 @@ mod tests {
     }
 
     #[test]
+    fn entering_a_project_does_not_start_a_vm() {
+        let (_dir, mut app) = test_app();
+        let mut project = fake_project("demo");
+        project.path = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project.path).unwrap();
+        app.set_projects(vec![project.clone()]);
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert!(
+            effects.is_empty(),
+            "opening a project must not boot: {effects:?}"
+        );
+        assert_eq!(app.screen, Screen::Project);
+        assert_eq!(app.project_view, ProjectView::Compact);
+        assert_eq!(app.instance.state, InstanceState::Stopped);
+        assert_eq!(app.open_project.as_deref(), Some(project.path.as_path()));
+    }
+
+    #[test]
+    fn a_section_number_shrinks_the_terminal_to_section_view() {
+        let (_dir, mut app) = test_app();
+        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
+        app.project_view = ProjectView::Split;
+        app.focus = Focus::Instances;
+        app.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(app.project_view, ProjectView::Section);
+        assert_eq!(app.focus, Focus::Snapshots);
+        assert!(!app.terminal_focus);
+    }
+
+    #[test]
+    fn esc_keeps_the_terminal_expanded_until_left_or_breadcrumb() {
+        let (_dir, mut app) = test_app();
+        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
+        assert_eq!(app.project_view, ProjectView::Split);
+        app.terminal_mode = TerminalMode::Insert;
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.terminal_mode, TerminalMode::Normal);
+        assert!(app.terminal_focus);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.project_view, ProjectView::Split);
+        assert!(!app.terminal_focus);
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.screen, Screen::Dashboard);
+    }
+
+    #[test]
+    fn health_parser_takes_the_last_guest_line() {
+        let parsed = InstanceHealth::parse(
+            "boot\nhegn-health v1 apt=2 checked=1700000000 reason=ok\n\
+             hegn-health v1 apt=5 checked=1700003600 reason=ok\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.apt, Some(5));
+        assert_eq!(parsed.reason, "ok");
+        assert!(parsed.checked.is_some());
+        assert!(InstanceHealth::parse("no health line").is_none());
+    }
+
+    #[test]
+    fn project_snapshots_are_filtered_by_project() {
+        let (_dir, mut app) = test_app();
+        app.open_project = Some(PathBuf::from("/projects/demo"));
+        app.snapshots = vec![
+            SnapshotMeta {
+                name: "one".into(),
+                created_at: chrono::Utc::now(),
+                vm_state: "Paused".into(),
+                dir: PathBuf::from("/snap/one"),
+                instance: None,
+                project: Some(PathBuf::from("/projects/demo")),
+                size_bytes: 0,
+                note: None,
+            },
+            SnapshotMeta {
+                name: "two".into(),
+                created_at: chrono::Utc::now(),
+                vm_state: "Paused".into(),
+                dir: PathBuf::from("/snap/two"),
+                instance: None,
+                project: Some(PathBuf::from("/projects/other")),
+                size_bytes: 0,
+                note: None,
+            },
+        ];
+        app.refresh_project_snapshots();
+        assert_eq!(app.project_snapshots.len(), 1);
+        assert_eq!(app.selected_snapshot().unwrap().name, "one");
+    }
+
+    #[test]
     fn a_second_start_is_rejected_while_the_first_is_booting() {
         let (_dir, mut app) = test_app();
+        app.screen = Screen::Project;
+        app.focus = Focus::Instances;
         app.instance.state = InstanceState::Starting;
-        let effects = app.open_selected();
+        let effects = app.start_project_instance();
         assert!(effects.is_empty());
         assert!(
             app.toast
@@ -4070,7 +4665,7 @@ mod tests {
     fn attaching_a_console_enters_the_terminal_view() {
         let (_dir, mut app) = test_app();
         app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
-        assert_eq!(app.screen, Screen::Terminal);
+        assert_eq!(app.screen, Screen::Project);
         assert_eq!(app.instance.state, InstanceState::Running);
         assert!(app.session_active());
     }
@@ -4089,7 +4684,7 @@ mod tests {
         app.attach_console(Box::new(FakeConsole::new(&real)));
         let effects = app.open_selected();
         assert!(effects.is_empty(), "must not boot a second VM");
-        assert_eq!(app.screen, Screen::Terminal);
+        assert_eq!(app.screen, Screen::Project);
     }
 
     #[test]
