@@ -45,8 +45,10 @@ fix.
 - **Multi-agent clones** — clone a sandbox into independent git workspaces so
   parallel agents cannot overwrite each other's commits; merge or open pull
   requests when they finish.
-- **Config menus** — `F4` edits the global config, `F5` edits the selected
-  sandbox's `hegn.toml`; both reload after `$EDITOR`.
+- **Config menus** — `F4` opens an interactive settings editor for the global
+  config, `F5` for the selected sandbox's `hegn.toml`. Navigate with the arrow
+  keys or the mouse, change values in place, and save with `Ctrl-S`. A raw
+  `$EDITOR` round-trip stays available for comments and advanced keys.
 - **Modal terminal** — Vim-style `i`/`a` insert mode and `Esc` to return to
   normal mode, so scrolling and shortcuts never leak keystrokes into the guest.
 - **Safe deletion** — deleting a sandbox asks twice, offers to keep clone
@@ -54,6 +56,10 @@ fix.
 - **Defence in depth** — Cloud Hypervisor runs with seccomp filters and
   Landlock filesystem sandboxing; `virtiofsd` always runs with
   `--sandbox=namespace` (or `chroot`).
+- **Guarded networking** — guests only reach the public web: host nftables
+  allows public HTTP(S) + DNS and drops the LAN, IPv6 and all guest→host
+  traffic. Presets install their real CLI (Node 22, Python, etc.) in the guest
+  on first boot.
 - **Zero-copy workspace sharing** — a per-session `virtiofsd` exports only the
   selected project, always sandboxed (`--sandbox=namespace` by default,
   `chroot` optional), and mounts it at `/workspace` in the guest.
@@ -220,8 +226,13 @@ hegn images download
 # 3. Verify KVM, Cloud Hypervisor, virtiofsd, images and tools
 hegn doctor
 
-# 4. Create a project with a template and harness
-hegn project create my-app --harness opencode --package git --package nodejs
+# 3b. Enable the guarded guest network (one-time, needs root):
+#     public HTTP(S) + public DNS only, no LAN and no IPv6.
+sudo hegn network setup --user "$USER"
+
+# 4. Create a project with a template and harness.
+#    --package adds to the preset; it never replaces it.
+hegn project create my-app --harness opencode --package jq
 
 # 5. Open the TUI (default when no subcommand is given)
 hegn
@@ -247,6 +258,30 @@ responding while the VM boots. Press `Ctrl-B` (or `Ctrl-]`) to detach without st
 the session metadata and shown in the status line; launch it from the guest
 shell. `hegn open my-app --editor` and
 `--lazygit` are host-side project tools and do not start a sandbox.
+
+### Harness presets and first-boot provisioning
+
+A harness is more than a label. Each preset installs its own runtime and CLI in
+the guest on first boot (tracked by `/var/lib/hegn/provisioned`):
+
+| Preset | Installs |
+| --- | --- |
+| `shell` | base CLI tools (git, curl, ripgrep, fd, jq, less) |
+| `opencode` | Node.js 22 + `opencode-ai` |
+| `claude-code` | Node.js 22 + `@anthropic-ai/claude-code` |
+| `codex` | Node.js 22 + `@openai/codex` |
+| `pi` | Node.js 22 + `@earendil-works/pi-coding-agent` |
+| `prime-agent` | Python + the official Prime Agent installer |
+| `aider` | Python + `aider-chat` |
+| `gemini-cli` | Node.js 22 + `@google/gemini-cli` |
+
+Provisioning runs as a systemd oneshot on every boot until it succeeds. Node
+presets upgrade Jammy's old package to Node.js 22 from NodeSource inside the
+guest. Package selections from the create form/`--package` are additive: the
+preset can never lose its runtime because a user deselected a box. The install
+log appears on the serial console and in the journal; attach and wait for
+`hegn: preset ready` on the first boot. Presets that need packages require the
+guarded network, because installation happens inside the guest.
 
 ### Re-attaching like tmux
 
@@ -321,8 +356,13 @@ sandbox and keeps the clone under `<sandboxes_dir>/<name>-files-<timestamp>/`.
 `--delete-files` removes the clone.
 
 Per-sandbox settings live in `<sandbox>/hegn.toml`. In the TUI, `F4` opens the
-global config menu and `F5` opens the selected sandbox's config menu; both offer
-edit-in-`$EDITOR` and reload. From the CLI:
+global settings editor and `F5` opens the selected sandbox's editor. Both are
+interactive modals: use `↑`/`↓` or the mouse to select a row, `←`/`→`, `‹`/`›`
+or a click to change a value, and `Enter` to toggle or type. `Ctrl-S` saves,
+`r` reloads the file from disk, and `e` (or *Edit file*) opens the raw TOML in
+`$EDITOR` when you need comments or keys the editor does not expose. Saving
+rewrites the file from the schema, so hand-written comments are not preserved;
+the raw editor is the comment-preserving path. From the CLI:
 
 ```bash
 hegn sandbox config my-app          # print hegn.toml
@@ -533,13 +573,54 @@ seccomp         = true        # Cloud Hypervisor seccomp filters
 cloud_init      = true        # NoCloud seed for the official cloud image
 harness         = "shell"     # shell | opencode | claude-code | codex | pi |
                               # prime-agent | aider | gemini-cli
+network         = "guarded"   # "guarded" (web+DNS only) or "off" (no NIC)
 extra_packages  = []
 auto_branch     = true
 security        = "enforce"   # "off", "warn" or "enforce"
 ```
 
+The package list is a list of *extras*; the harness preset is always unioned in.
+
 Project-level defaults live in `.hegn.toml` inside each project (written by
 `hegn project create`) and record the harness, package list and template used.
+
+### Settings editor
+
+`F4` (global) and `F5` (selected sandbox) open a modal that edits the same
+schema interactively instead of printing the file. Rows are grouped by runtime,
+storage, sharing, network/security, tools, directories and packages; the
+sandbox editor also shows its project, workspace, rootfs and TAP slot as
+read-only rows. `landlock` and `seccomp` are deliberately not editable — hegn
+never weakens the Cloud Hypervisor sandboxes.
+
+| Input | Action |
+| --- | --- |
+| `↑`/`↓`, `j`/`k`, wheel, click | Select a row |
+| `←`/`→`, `h`/`l`, `‹`/`›`, click | Cycle a choice, step a number, toggle a switch |
+| `Enter` | Toggle, cycle, or start typing a value |
+| `Enter` / `Esc` while typing | Apply / discard the value |
+| `Home` / `End`, `PgUp` / `PgDn` | Jump to the first / last row, page through rows |
+| `Ctrl-S` | Validate and save |
+| `r` | Reload the file from disk (discard unsaved changes) |
+| `e` | Open the raw TOML in `$EDITOR` (requires a clean draft) |
+| `Esc` | Close; with unsaved changes, press twice to discard |
+
+Inline edits are validated immediately: numbers are range-checked, paths get
+`~` expanded, package names must be valid Debian identifiers, and the same
+schema validation that guards `config.toml` runs again before the atomic save.
+
+The guarded network is a one-time privileged host setup:
+
+```bash
+sudo hegn network setup --user "$USER"   # TAP pool + nftables table + /run marker
+hegn network status                      # marker, taps and reservations
+hegn network setup --dry-run --user "$USER"  # inspect the exact script
+sudo hegn network teardown               # remove taps and rules
+```
+
+`hegn sandbox start` is fail-closed: with `network = "guarded"` it refuses to
+boot unless `/run/hegn/network.json` exists and was written by root. Rules live
+on the host, so root in the guest cannot remove them.
 
 ### AGENTS.md templates
 
@@ -565,8 +646,8 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 | `h` / `←` | Import an existing directory (symlink, no copy) |
 | `S` | Stop the selected sandbox |
 | `d` | Delete sandbox (sandboxes) or snapshot (snapshots) |
-| `F4` | Global config menu (edit/reload) |
-| `F5` | Sandbox config menu (edit/reload) |
+| `F4` | Global settings editor (mouse supported, `Ctrl-S` to save) |
+| `F5` | Sandbox settings editor (mouse supported, `Ctrl-S` to save) |
 | `e` | Open selected project in `$EDITOR` |
 | `g` | Open selected project in lazygit |
 | `r` | Refresh projects and sandboxes |
@@ -667,15 +748,21 @@ diagnostic cells use a small ANSI background color.
    VMM never has write access to completed checkpoints.
 3. **Console access** — the official cloud image is bootstrapped with a private
    NoCloud seed that enables an automatic root login on the serial console. The
-   VM has no network device; the serial and relay sockets are only reachable by
-   the owning user.
-4. **Interception** — in the TUI terminal view (unless raw mode is on), input is
+   serial and relay sockets are only reachable by the owning user.
+4. **Network guard** — with `network = "guarded"`, each VM gets a dedicated TAP
+   from a host-created pool. Host nftables rules allow only outbound TCP 80/443
+   and DNS to `1.1.1.1`/`9.9.9.9`; RFC1918, CGNAT, link-local, multicast,
+   anti-spoofed sources and all IPv6 are dropped, and all guest→host traffic is
+   dropped. The guest's only route is the host `/30` gateway, and NAT exposes
+   nothing inbound. Rules are host-side, so guest root cannot disable them.
+   `network = "off"` removes the NIC entirely.
+5. **Interception** — in the TUI terminal view (unless raw mode is on), input is
    buffered into a command line and passed to `tirith-core` plus hegn's own
    workspace guardrails before any bytes reach the guest serial port.
-5. **Policy** — `enforce` blocks high/critical findings and prompts for medium
+6. **Policy** — `enforce` blocks high/critical findings and prompts for medium
    ones; `warn` reports everything; `off` disables `tirith-core` but keeps
    hegn's destructive-workspace checks.
-6. **Recovery** — a blocked-but-allowed command can be preceded by a git
+7. **Recovery** — a blocked-but-allowed command can be preceded by a git
    checkpoint, and VM snapshots allow instant rollback beyond git.
 
 No sandbox is a substitute for reviewing what you run. `F2` raw passthrough

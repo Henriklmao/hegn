@@ -60,8 +60,10 @@ configuration, runtime directory, serial log and private root filesystem.
 ```
 
 The guest sees exactly one host directory through virtiofsd. The host sees
-control sockets, logs and metadata. There is no network port, no shared
-namespace and no second mount by default.
+control sockets, logs and metadata. By default the guest also gets a guarded
+TAP device from `hegn network setup`: public HTTP(S) and public DNS only, with
+no route into the host or the local network. `network = "off"` removes the NIC
+entirely.
 
 ### 2.1 Native virtio-fs and VMM hardening
 
@@ -169,11 +171,14 @@ All state paths can be overridden in `config.toml` or by environment variables
 | Module | Responsibility | Notable invariants |
 | --- | --- | --- |
 | `cli.rs` | Clap command surface, JSON/text output, exit codes | Every TUI operation has a CLI counterpart; no fallback paths |
-| `config.rs` | Schema, defaults, env overrides, validation, XDG paths, tool lookup | Unknown keys rejected; SHA-256 and HTTPS URL validation; log dir `0700`; `virtiofsd` resolved via `PATH` then distribution dirs |
+| `config.rs` | Schema, defaults, env overrides, validation, XDG paths, tool lookup | Unknown keys rejected; SHA-256 and HTTPS URL validation; log dir `0700`; `virtiofsd` resolved via `PATH` then distribution dirs; writes are validated and installed with an atomic tmp+rename |
+| `config_form.rs` | Interactive settings editor for the `F4`/`F5` modal | Edits a validated working copy; schema validation before saving; locked Landlock/seccomp; inline text edits never touch disk until `Ctrl-S` |
 | `project.rs` | Discovery, fuzzy filter, git summaries, create, import, checkpoints | Import only creates a symlink; dangerous targets rejected; discovery skips links to `/`, `$HOME` and root ancestors |
 | `security.rs` | `tirith-core` integration and hegn workspace rules | Empty commands allowed; off mode still keeps destructive-operation guard |
 | `cloud_hypervisor.rs` | Typed REST client over `/api/v1` | Frames responses by `Content-Length`/chunked encoding, accepts bodyless `204`, bounded response sizes, pause/resume/info/snapshot only |
-| `cloud_init.rs` | NoCloud seed generation | FAT volume labelled `CIDATA`; serial root autologin; no secrets; `0600` and `O_NOFOLLOW` |
+| `cloud_init.rs` | NoCloud seed generation | FAT volume labelled `CIDATA`; serial root autologin; first-boot provisioner and guest network config; no secrets; `0600` and `O_NOFOLLOW` |
+| `provision.rs` | Harness preset install plans and first-boot script | Preset packages are always unioned; package names validated; only static install commands; verifies the CLI exists before writing the marker |
+| `network.rs` | Guarded host network: TAP pool reservation, nftables rules, setup marker | Root-only marker; anti-spoof; private/IPv6/guest-to-host drop; HTTP(S)+public DNS allow-list; per-sandbox `/30` slice; stale reservations reclaimed only when the owning VM is not running |
 | `relay.rs` | Detached serial relay | Sole VMM serial client; append-only log; replays the log tail on attach; bounded buffers; refuses to replace non-socket paths |
 | `virtiofs.rs` | virtiofsd argv/process construction | Shared dir canonicalized; always sandboxed; `--cache=never` by default; sockets scoped to run dir |
 | `sandbox_config.rs` | Per-sandbox `hegn.toml`, clone/copy workspaces, rootfs copies | Names validated; source project never deleted; git identity copied; clone child output is captured (warnings go to the UI, never the terminal); reflink rootfs with copy fallback |
@@ -188,7 +193,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `terminal.rs` | ANSI-aware scrollback | Strips CSI/OSC; handles CRLF without losing lines; caps line bytes and scrollback |
 | `state.rs` | Recent-project persistence | Atomic tmp+rename |
 | `app.rs` | TUI state machine, modals, key/mouse handling, effects | Pure state transitions; side effects returned as `Effect` |
-| `ui.rs` | Ratatui rendering | Pure renderer; footer hit rectangles; all modals testable with `TestBackend` |
+| `ui.rs` | Ratatui rendering | Pure renderer; footer, row and settings-stepper hit rectangles; all modals testable with `TestBackend` |
 | `tui.rs` | Terminal lifecycle, event loop, background jobs | Restores terminal on every exit path; project scan and image download off the UI thread |
 
 ---
@@ -206,18 +211,23 @@ All state paths can be overridden in `config.toml` or by environment variables
 5. Create the session log (`LogStore::create_session`); prune old logs
    best-effort. Give the sandbox a private rootfs copy on first start (reflink or
    full copy).
-6. Spawn `virtiofsd` with the canonical project path and wait for its socket.
-7. Write the NoCloud seed when `cloud_init = true`. It enables serial root
-   autologin and mounts the virtio-fs tag at `guest_mount` (`/workspace` by
-   default).
-8. Spawn Cloud Hypervisor with an explicit, hardened argv: `--api-socket`,
+6. With `network = "guarded"`, require the root-owned
+   `/run/hegn/network.json` marker and reserve a TAP slice. The sandbox's
+   `network_index` is persisted so later boots and snapshot restores keep the
+   same device.
+7. Spawn `virtiofsd` with the canonical project path and wait for its socket.
+8. Write the NoCloud seed when `cloud_init = true`. It enables serial root
+   autologin, mounts the virtio-fs tag at `guest_mount` (`/workspace` by
+   default), installs the harness preset through a oneshot service, and (when
+   guarded) configures the TAP address/DNS by MAC match.
+9. Spawn Cloud Hypervisor with an explicit, hardened argv: `--api-socket`,
    `--kernel`, `--disk` (rootfs + optional seed), `--cpus`, `--memory ...
-   shared=on`, `--fs`, `--serial socket=...`, `--console off`, `--seccomp` and
-   `--landlock`.
-9. Spawn the detached relay; it connects to the serial socket and appends to
-   the session log.
-10. Wait until `/api/v1/vm.info` reports `Running`.
-11. Write the pid files and `session.json`; release the lock. The children keep
+   shared=on`, `--fs`, optional `--net tap=hegnN,mac=...`, `--serial socket=...`,
+   `--console off`, `--seccomp` and `--landlock`.
+10. Spawn the detached relay; it connects to the serial socket and appends to
+    the session log.
+11. Wait until `/api/v1/vm.info` reports `Running`.
+12. Write the pid files and `session.json`; release the lock. The children keep
     running.
 
 On any failure the VMM, relay and daemon are killed and run links are removed,
@@ -381,8 +391,14 @@ These are product requirements, not implementation details.
 ### 6.1 Threat notes
 
 - A malicious agent inside the guest is constrained by KVM plus the single
-  virtiofs export. The host firewall/network is not managed by hegn; configure
-  guest networking deliberately (or leave it absent).
+  virtiofs export. The guest network is enforced on the host, outside the
+  guest's control: nftables accepts only outbound TCP 80/443 and DNS to public
+  resolvers, drops all RFC1918/CGNAT/link-local/multicast destinations, drops
+  IPv6 and drops every packet from a TAP addressed to the host. Guest root
+  cannot remove host rules. `network = "off"` removes the device entirely.
+- DNS is deliberately limited to public resolvers. DNS tunnelling to an
+  attacker-controlled authoritative domain is still possible; a future
+  resolver proxy should filter queries. TLS content is not inspected.
 - `tirith-core` inspects commands in the TUI; a determined user can use raw
   mode or attach. This is visible, not hidden.
 - Serial logs can contain terminal escape sequences. The default `logs show`
@@ -445,8 +461,12 @@ and `root_device`; the official qcow2 image uses `/dev/vda1`.
 
 - `app.rs` owns all state: projects, selection, focus, modal, sandbox status,
   snapshots, terminal scrollback, input mode, toasts and footer hit rectangles.
-- `ui.rs` is a pure renderer. It returns hit rectangles for footer buttons and
-  project/sandbox/snapshot rows; mouse handling lives in `app.rs`.
+- `ui.rs` is a pure renderer. It returns hit rectangles for footer buttons,
+  project/sandbox/snapshot rows, and the settings modal's rows and `‹ ›`
+  steppers; mouse handling lives in `app.rs`.
+- `config_form.rs` owns settings-modal navigation, inline editing, validation
+  and the save. It edits a working copy and only writes on `Ctrl-S`
+  (`config::save_to` for globals, `SandboxStore::save` for sandboxes).
 - `tui.rs` owns the terminal, the 50 ms tick, crossterm events and effects.
 - Effects that must release or block the terminal (editor, lazygit) or run
   async work (snapshots, image downloads) are returned to `tui.rs`.
@@ -669,9 +689,12 @@ refresh pins weekly via CI PR.
 artifact, while still making updates reviewable. Users who need extra packages
 can build their own rootfs and point `rootfs_image`/`rootfs_*` at it.
 
-**Consequence:** the upstream rootfs may not contain every agent/harness binary;
-the harness/package list in `.hegn.toml` records intent but does not mutate the
-upstream rootfs. A future custom-image workflow would be an explicit opt-in.
+**Consequence:** the upstream rootfs stays signed upstream; hegn never rebuilds
+it. Harness binaries are installed *inside* the guest on first boot by the
+NoCloud provisioner (`src/provision.rs`): apt packages plus a static per-preset
+installer, retried by a oneshot until `/var/lib/hegn/provisioned` exists. The
+host image is never mutated, and a pre-baked custom rootfs remains an explicit
+opt-in.
 
 ### ADR-002: Import by symlink, never copy
 
@@ -728,7 +751,9 @@ normal mode.
 
 ## 14. Known limitations and future work
 
-- No guest network management; configure it outside hegn.
+- The network guard is an allow-list, not an inspecting proxy: it does not
+  decrypt TLS or filter DNS answers. Resolver-level filtering and an optional
+  CONNECT proxy are future work.
 - No guest tty resize channel over the legacy serial port.
 - Attach input bypasses `tirith-core` by design and is labelled; a guarded raw
   proxy would require a full terminal emulator.
@@ -758,10 +783,13 @@ src/
   cli.rs         clap commands and text/JSON output
   benchmark.rs   measured host cost and disk usage
   config.rs      schema, defaults, env overrides, validation
+  config_form.rs interactive settings editor model (F4/F5 modal)
   project.rs     discovery, import, templates, git helpers
   security.rs    tirith-core + hegn workspace guardrails
   cloud_hypervisor.rs typed REST client
   cloud_init.rs   NoCloud seed generation
+  provision.rs    harness preset installers and first-boot script
+  network.rs      guarded TAP pool, nftables rules and reservations
   relay.rs        detached serial relay
   virtiofs.rs    hardened virtiofsd process construction
   sandbox_config.rs per-sandbox config, clones, rootfs copies

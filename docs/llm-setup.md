@@ -180,6 +180,7 @@ seccomp         = true
 cloud_init      = true
 security        = "enforce"
 harness         = "shell"   # shell | opencode | claude-code | codex | pi | prime-agent | aider | gemini-cli
+network         = "guarded" # "guarded" (web+DNS only) or "off" (no NIC)
 ```
 
 Every value also has an environment override (`HEGN_CONFIG`,
@@ -208,6 +209,22 @@ custom, unhashed images.
 **Gate:** `hegn images verify` exits `0`.
 
 ---
+
+## Step 4b — Enable the guarded guest network
+
+This is a host firewall change and needs root. Ask the user before running it.
+It creates a pool of TAP devices owned by the invoking user and installs an
+nftables table that allows only public HTTP(S) and public DNS.
+
+```bash
+sudo hegn network setup --user "$USER"
+hegn network status
+```
+
+**Gate:** `hegn network status` reports `guard: ready` and lists `hegn0` as
+`up`. `hegn doctor` reports the `network guard` check as ok. If the host already
+has a conflicting `10.213.0.0/24` network, stop and report it; do not weaken the
+rules.
 
 ## Step 5 — Host check
 
@@ -321,6 +338,8 @@ allow, `1` block, `2` warn.
 | `~/.local/share/hegn/snapshots/` | VM snapshots |
 | `~/Projects/hegn/` | default `projects_root` (the only host directory shared into guests) |
 
-The workspace is mounted read-write at `/workspace`; the guest has no network
-device and uses a persistent rootfs, so only the project directory is shared
-with the host.
+The workspace is mounted read-write at `/workspace`; the guest uses a
+persistent rootfs, so only the project directory is shared with the host. With
+the default `network = "guarded"`, the guest has a TAP device whose host-side
+rules permit only public HTTP(S) and public DNS; the host LAN, IPv6 and all
+guest-to-host traffic are dropped.
