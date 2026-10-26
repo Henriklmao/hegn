@@ -1,6 +1,6 @@
 //! Interactive settings editor behind the `F4`/`F5` configuration modal.
 //!
-//! The modal edits a working copy of the global `config.toml` or a sandbox's
+//! The modal edits a working copy of the global `config.toml` or an instance's
 //! `hegn.toml`. Nothing touches disk until the user saves, and every change is
 //! validated against the same schema the CLI uses. Keyboard handling lives here
 //! so navigation, editing and persistence are unit-testable without a terminal;
@@ -15,13 +15,13 @@ use crate::config::{
     BackendKind, Config, Harness, LocalEndpoint, NetworkMode, RootfsFormat, SecurityMode,
     safe_package_name, validate_local_endpoints,
 };
-use crate::sandbox_config::{CONFIG_FILE, SandboxConfig, SandboxStore};
+use crate::instance_config::{CONFIG_FILE, InstanceConfig, InstanceStore};
 
 /// Which configuration file the modal edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKind {
     Global,
-    Sandbox,
+    Instance,
 }
 
 /// Pages (tabs) inside the settings modal.
@@ -65,7 +65,7 @@ pub enum ConfigField {
     ProjectsRoot,
     StateDir,
     SnapshotsDir,
-    SandboxesDir,
+    InstancesDir,
     TemplatesDir,
     ProfilesDir,
     ExtraPackages,
@@ -73,7 +73,7 @@ pub enum ConfigField {
     LocalEndpoints,
     /// A harness profile template (`profiles/<harness>.toml`).
     Profile(Harness),
-    // Sandbox-only, read-only context.
+    // Instance-only, read-only context.
     Project,
     Workspace,
     RootfsPath,
@@ -119,7 +119,7 @@ impl ConfigField {
             Self::ProjectsRoot => "Projects root",
             Self::StateDir => "State dir",
             Self::SnapshotsDir => "Snapshots dir",
-            Self::SandboxesDir => "Sandboxes dir",
+            Self::InstancesDir => "Instances dir",
             Self::TemplatesDir => "Templates dir",
             Self::ProfilesDir => "Profiles dir",
             Self::ExtraPackages => "Extra packages",
@@ -166,7 +166,7 @@ impl ConfigField {
                 | Self::ProjectsRoot
                 | Self::StateDir
                 | Self::SnapshotsDir
-                | Self::SandboxesDir
+                | Self::InstancesDir
                 | Self::TemplatesDir
                 | Self::ProfilesDir
         )
@@ -209,7 +209,7 @@ const GENERAL_ROWS: &[ConfigRow] = &[
     ConfigRow::Field(ConfigField::ProjectsRoot),
     ConfigRow::Field(ConfigField::StateDir),
     ConfigRow::Field(ConfigField::SnapshotsDir),
-    ConfigRow::Field(ConfigField::SandboxesDir),
+    ConfigRow::Field(ConfigField::InstancesDir),
     ConfigRow::Field(ConfigField::TemplatesDir),
     ConfigRow::Field(ConfigField::ProfilesDir),
     ConfigRow::Group("Packages"),
@@ -228,7 +228,7 @@ const LOCAL_LLM_ROWS: &[ConfigRow] = &[
 const PROFILE_ROWS: &[ConfigRow] = &[
     ConfigRow::Group("Harness profiles"),
     ConfigRow::Note("Enter opens the profile TOML; missing templates are created"),
-    ConfigRow::Note("host files and skills are copied into a per-sandbox bundle"),
+    ConfigRow::Note("host files and skills are copied into a per-instance bundle"),
     ConfigRow::Field(ConfigField::Profile(Harness::Opencode)),
     ConfigRow::Field(ConfigField::Profile(Harness::ClaudeCode)),
     ConfigRow::Field(ConfigField::Profile(Harness::Codex)),
@@ -236,10 +236,10 @@ const PROFILE_ROWS: &[ConfigRow] = &[
     ConfigRow::Field(ConfigField::Profile(Harness::PrimeAgent)),
     ConfigRow::Field(ConfigField::Profile(Harness::Aider)),
     ConfigRow::Field(ConfigField::Profile(Harness::GeminiCli)),
-    ConfigRow::Note("CLI: hegn profile show <harness> · hegn skills sync-back <sandbox>"),
+    ConfigRow::Note("CLI: hegn profile show <harness> · hegn skills sync-back <instance>"),
 ];
 
-const SANDBOX_ROWS: &[ConfigRow] = &[
+const INSTANCE_ROWS: &[ConfigRow] = &[
     ConfigRow::Group("Runtime"),
     ConfigRow::Field(ConfigField::Harness),
     ConfigRow::Field(ConfigField::Vcpus),
@@ -250,7 +250,7 @@ const SANDBOX_ROWS: &[ConfigRow] = &[
     ConfigRow::Field(ConfigField::GuestMount),
     ConfigRow::Group("Packages"),
     ConfigRow::Field(ConfigField::ExtraPackages),
-    ConfigRow::Group("Sandbox (read-only)"),
+    ConfigRow::Group("Instance (read-only)"),
     ConfigRow::Field(ConfigField::Project),
     ConfigRow::Field(ConfigField::Workspace),
     ConfigRow::Field(ConfigField::RootfsPath),
@@ -261,7 +261,7 @@ pub fn rows(kind: ConfigKind) -> &'static [ConfigRow] {
     rows_for(kind, ConfigPage::General)
 }
 
-/// Pages available for a file kind. Endpoints are host-wide, so a sandbox's
+/// Pages available for a file kind. Endpoints are host-wide, so an instance's
 /// config has only the general page.
 pub fn pages(kind: ConfigKind) -> &'static [ConfigPage] {
     match kind {
@@ -270,7 +270,7 @@ pub fn pages(kind: ConfigKind) -> &'static [ConfigPage] {
             ConfigPage::Profiles,
             ConfigPage::LocalLlm,
         ],
-        ConfigKind::Sandbox => &[ConfigPage::General],
+        ConfigKind::Instance => &[ConfigPage::General],
     }
 }
 
@@ -279,7 +279,7 @@ pub fn rows_for(kind: ConfigKind, page: ConfigPage) -> &'static [ConfigRow] {
         (ConfigKind::Global, ConfigPage::General) => GENERAL_ROWS,
         (ConfigKind::Global, ConfigPage::Profiles) => PROFILE_ROWS,
         (ConfigKind::Global, ConfigPage::LocalLlm) => LOCAL_LLM_ROWS,
-        (ConfigKind::Sandbox, _) => SANDBOX_ROWS,
+        (ConfigKind::Instance, _) => INSTANCE_ROWS,
     }
 }
 
@@ -302,13 +302,13 @@ pub enum FormOutcome {
 #[derive(Debug, Clone)]
 pub enum Applied {
     Global(Box<Config>),
-    Sandbox,
+    Instance,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Draft {
     Global(Box<Config>),
-    Sandbox(Box<SandboxConfig>),
+    Instance(Box<InstanceConfig>),
 }
 
 #[derive(Debug, Clone)]
@@ -329,7 +329,7 @@ pub struct ConfigForm {
     pub status: Option<String>,
     draft: Draft,
     original: Draft,
-    /// Global config the sandbox belongs to; used for derived paths and saving.
+    /// Global config the instance belongs to; used for derived paths and saving.
     base: Box<Config>,
     page: ConfigPage,
     selected: usize,
@@ -350,15 +350,15 @@ impl ConfigForm {
         )
     }
 
-    /// Open the editor for an existing sandbox.
-    pub fn sandbox(sandbox: SandboxConfig, base: Config) -> Self {
-        let path = base.sandboxes_dir.join(&sandbox.name).join(CONFIG_FILE);
-        let title = format!("sandbox '{}' settings", sandbox.name);
+    /// Open the editor for an existing instance.
+    pub fn instance(instance: InstanceConfig, base: Config) -> Self {
+        let path = base.instances_dir.join(&instance.name).join(CONFIG_FILE);
+        let title = format!("instance '{}' settings", instance.name);
         Self::build(
-            ConfigKind::Sandbox,
+            ConfigKind::Instance,
             title,
             path,
-            Draft::Sandbox(Box::new(sandbox)),
+            Draft::Instance(Box::new(instance)),
             base,
         )
     }
@@ -449,9 +449,9 @@ impl ConfigForm {
         self.draft != self.original
     }
 
-    pub fn sandbox_name(&self) -> Option<&str> {
+    pub fn instance_name(&self) -> Option<&str> {
         match &self.draft {
-            Draft::Sandbox(sandbox) => Some(sandbox.name.as_str()),
+            Draft::Instance(instance) => Some(instance.name.as_str()),
             Draft::Global(_) => None,
         }
     }
@@ -481,7 +481,7 @@ impl ConfigForm {
                 ConfigField::ProjectsRoot => config.projects_root.display().to_string(),
                 ConfigField::StateDir => config.state_dir.display().to_string(),
                 ConfigField::SnapshotsDir => config.snapshots_dir.display().to_string(),
-                ConfigField::SandboxesDir => config.sandboxes_dir.display().to_string(),
+                ConfigField::InstancesDir => config.instances_dir.display().to_string(),
                 ConfigField::TemplatesDir => config.templates_dir.display().to_string(),
                 ConfigField::ProfilesDir => config.profiles_dir.display().to_string(),
                 ConfigField::ExtraPackages => list_value(&config.extra_packages),
@@ -489,25 +489,25 @@ impl ConfigForm {
                 ConfigField::Profile(harness) => self.profile_value(harness),
                 _ => "—".to_string(),
             },
-            Draft::Sandbox(sandbox) => match field {
-                ConfigField::Harness => sandbox.harness.label().to_string(),
-                ConfigField::Vcpus => sandbox.vcpus.to_string(),
-                ConfigField::Memory => sandbox.memory_mib.to_string(),
-                ConfigField::AutoBranch => on_off(sandbox.auto_branch),
-                ConfigField::Security => sandbox.security.label().to_string(),
-                ConfigField::SharedTag => sandbox.shared_tag.clone(),
-                ConfigField::GuestMount => sandbox.guest_mount.clone(),
-                ConfigField::ExtraPackages => list_value(&sandbox.extra_packages),
-                ConfigField::Project => sandbox.project.display().to_string(),
-                ConfigField::Workspace => sandbox.workspace.display().to_string(),
+            Draft::Instance(instance) => match field {
+                ConfigField::Harness => instance.harness.label().to_string(),
+                ConfigField::Vcpus => instance.vcpus.to_string(),
+                ConfigField::Memory => instance.memory_mib.to_string(),
+                ConfigField::AutoBranch => on_off(instance.auto_branch),
+                ConfigField::Security => instance.security.label().to_string(),
+                ConfigField::SharedTag => instance.shared_tag.clone(),
+                ConfigField::GuestMount => instance.guest_mount.clone(),
+                ConfigField::ExtraPackages => list_value(&instance.extra_packages),
+                ConfigField::Project => instance.project.display().to_string(),
+                ConfigField::Workspace => instance.workspace.display().to_string(),
                 ConfigField::RootfsPath => {
-                    let rootfs = sandbox
+                    let rootfs = instance
                         .rootfs_image
                         .clone()
-                        .unwrap_or_else(|| sandbox.rootfs_path(&self.base));
+                        .unwrap_or_else(|| instance.rootfs_path(&self.base));
                     rootfs.display().to_string()
                 }
-                ConfigField::NetworkIndex => match sandbox.network_index {
+                ConfigField::NetworkIndex => match instance.network_index {
                     Some(index) => format!("TAP {index}"),
                     None => "assigned on first start".to_string(),
                 },
@@ -521,7 +521,7 @@ impl ConfigForm {
     fn profile_value(&self, harness: Harness) -> String {
         let config = match &self.draft {
             Draft::Global(config) => config.as_ref(),
-            Draft::Sandbox(_) => self.base.as_ref(),
+            Draft::Instance(_) => self.base.as_ref(),
         };
         let path = crate::profile::ProfileStore::new(config).path(harness);
         if path.is_file() {
@@ -686,7 +686,7 @@ impl ConfigForm {
             buffer: match field {
                 ConfigField::ExtraPackages => match &self.draft {
                     Draft::Global(config) => config.extra_packages.join(", "),
-                    Draft::Sandbox(sandbox) => sandbox.extra_packages.join(", "),
+                    Draft::Instance(instance) => instance.extra_packages.join(", "),
                 },
                 ConfigField::LocalEndpoints => match &self.draft {
                     Draft::Global(config) => config
@@ -695,7 +695,7 @@ impl ConfigForm {
                         .map(|endpoint| format!("{}={}", endpoint.name, endpoint.port))
                         .collect::<Vec<_>>()
                         .join(", "),
-                    Draft::Sandbox(_) => String::new(),
+                    Draft::Instance(_) => String::new(),
                 },
                 _ => self.value(field),
             },
@@ -856,9 +856,9 @@ impl ConfigForm {
                 .save_to(&self.path)
                 .with_context(|| format!("failed to save {}", self.path.display()))
                 .map(|()| Applied::Global(config.clone())),
-            Draft::Sandbox(sandbox) => SandboxStore::new((*self.base).clone())
-                .save(sandbox)
-                .map(|()| Applied::Sandbox),
+            Draft::Instance(instance) => InstanceStore::new((*self.base).clone())
+                .save(instance)
+                .map(|()| Applied::Instance),
         };
         match result {
             Ok(applied) => {
@@ -908,12 +908,12 @@ impl ConfigForm {
                 }
                 _ => {}
             },
-            Draft::Sandbox(sandbox) => match field {
+            Draft::Instance(instance) => match field {
                 ConfigField::Harness => {
-                    sandbox.harness = cycle_value(&Harness::ALL, sandbox.harness, dir)
+                    instance.harness = cycle_value(&Harness::ALL, instance.harness, dir)
                 }
                 ConfigField::Security => {
-                    sandbox.security = cycle_value(&SecurityMode::ALL, sandbox.security, dir)
+                    instance.security = cycle_value(&SecurityMode::ALL, instance.security, dir)
                 }
                 _ => {}
             },
@@ -928,8 +928,8 @@ impl ConfigForm {
         let current = match (&self.draft, field) {
             (Draft::Global(config), ConfigField::Vcpus) => i64::from(config.vcpus),
             (Draft::Global(config), ConfigField::Memory) => i64::from(config.memory_mib),
-            (Draft::Sandbox(sandbox), ConfigField::Vcpus) => i64::from(sandbox.vcpus),
-            (Draft::Sandbox(sandbox), ConfigField::Memory) => i64::from(sandbox.memory_mib),
+            (Draft::Instance(instance), ConfigField::Vcpus) => i64::from(instance.vcpus),
+            (Draft::Instance(instance), ConfigField::Memory) => i64::from(instance.memory_mib),
             _ => return Ok(()),
         };
         let next = (current + i64::from(dir.signum()) * step).clamp(min, max);
@@ -940,8 +940,8 @@ impl ConfigForm {
         match (&mut self.draft, field) {
             (Draft::Global(config), ConfigField::Vcpus) => config.vcpus = value as u8,
             (Draft::Global(config), ConfigField::Memory) => config.memory_mib = value as u32,
-            (Draft::Sandbox(sandbox), ConfigField::Vcpus) => sandbox.vcpus = value as u8,
-            (Draft::Sandbox(sandbox), ConfigField::Memory) => sandbox.memory_mib = value as u32,
+            (Draft::Instance(instance), ConfigField::Vcpus) => instance.vcpus = value as u8,
+            (Draft::Instance(instance), ConfigField::Memory) => instance.memory_mib = value as u32,
             _ => bail!("{} is not a number", field.label()),
         }
         Ok(())
@@ -951,7 +951,7 @@ impl ConfigForm {
         match (&self.draft, field) {
             (Draft::Global(config), ConfigField::AutoBranch) => config.auto_branch,
             (Draft::Global(config), ConfigField::CloudInit) => config.cloud_init,
-            (Draft::Sandbox(sandbox), ConfigField::AutoBranch) => sandbox.auto_branch,
+            (Draft::Instance(instance), ConfigField::AutoBranch) => instance.auto_branch,
             _ => false,
         }
     }
@@ -960,7 +960,7 @@ impl ConfigForm {
         match (&mut self.draft, field) {
             (Draft::Global(config), ConfigField::AutoBranch) => config.auto_branch = value,
             (Draft::Global(config), ConfigField::CloudInit) => config.cloud_init = value,
-            (Draft::Sandbox(sandbox), ConfigField::AutoBranch) => sandbox.auto_branch = value,
+            (Draft::Instance(instance), ConfigField::AutoBranch) => instance.auto_branch = value,
             _ => bail!("{} is not a toggle", field.label()),
         }
         Ok(())
@@ -1006,22 +1006,22 @@ impl ConfigForm {
             (Draft::Global(config), _) if field.is_path() => {
                 set_global_path(config, field, expand_path(text))?;
             }
-            (Draft::Sandbox(sandbox), ConfigField::Vcpus) => {
-                sandbox.vcpus = parse_number(text, 1, 32)? as u8;
+            (Draft::Instance(instance), ConfigField::Vcpus) => {
+                instance.vcpus = parse_number(text, 1, 32)? as u8;
             }
-            (Draft::Sandbox(sandbox), ConfigField::Memory) => {
-                sandbox.memory_mib = parse_number(text, 128, 262_144)? as u32;
+            (Draft::Instance(instance), ConfigField::Memory) => {
+                instance.memory_mib = parse_number(text, 128, 262_144)? as u32;
             }
-            (Draft::Sandbox(sandbox), ConfigField::SharedTag) => {
+            (Draft::Instance(instance), ConfigField::SharedTag) => {
                 validate_shared_tag(text)?;
-                sandbox.shared_tag = text.to_string();
+                instance.shared_tag = text.to_string();
             }
-            (Draft::Sandbox(sandbox), ConfigField::GuestMount) => {
+            (Draft::Instance(instance), ConfigField::GuestMount) => {
                 validate_guest_mount(text)?;
-                sandbox.guest_mount = text.to_string();
+                instance.guest_mount = text.to_string();
             }
-            (Draft::Sandbox(sandbox), ConfigField::ExtraPackages) => {
-                sandbox.extra_packages = parse_packages(text)?;
+            (Draft::Instance(instance), ConfigField::ExtraPackages) => {
+                instance.extra_packages = parse_packages(text)?;
             }
             _ => bail!("{} cannot be edited", field.label()),
         }
@@ -1165,7 +1165,7 @@ fn set_global_path(config: &mut Config, field: ConfigField, path: PathBuf) -> Re
         ConfigField::ProjectsRoot => config.projects_root = path,
         ConfigField::StateDir => config.state_dir = path,
         ConfigField::SnapshotsDir => config.snapshots_dir = path,
-        ConfigField::SandboxesDir => config.sandboxes_dir = path,
+        ConfigField::InstancesDir => config.instances_dir = path,
         ConfigField::TemplatesDir => config.templates_dir = path,
         ConfigField::ProfilesDir => config.profiles_dir = path,
         _ => bail!("{} is not a path", field.label()),
@@ -1192,7 +1192,7 @@ mod tests {
         config.projects_root = dir.join("projects");
         config.state_dir = dir.join("state");
         config.snapshots_dir = dir.join("snapshots");
-        config.sandboxes_dir = dir.join("sandboxes");
+        config.instances_dir = dir.join("instances");
         config.templates_dir = dir.join("templates");
         config.profiles_dir = dir.join("profiles");
         config
@@ -1303,7 +1303,7 @@ mod tests {
         let applied = form.save().expect("save succeeds");
         match applied {
             Applied::Global(config) => assert_eq!(config.harness, Harness::Opencode),
-            Applied::Sandbox => panic!("expected a global config"),
+            Applied::Instance => panic!("expected a global config"),
         }
         assert!(!form.dirty());
         assert_eq!(Config::load_from(&path).unwrap().harness, Harness::Opencode);
@@ -1351,24 +1351,24 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_form_saves_into_the_sandbox_store() {
+    fn instance_form_saves_into_the_instance_store() {
         let dir = tempfile::tempdir().unwrap();
         let config = global_config(dir.path());
-        let store = SandboxStore::new(config.clone());
+        let store = InstanceStore::new(config.clone());
         let project = dir.path().join("projects/demo");
         std::fs::create_dir_all(&project).unwrap();
-        let sandbox = store
+        let instance = store
             .create_from_project(&project, Some("demo"), None, false)
             .unwrap();
 
-        let mut form = ConfigForm::sandbox(sandbox, config);
-        assert_eq!(form.kind, ConfigKind::Sandbox);
-        assert_eq!(form.sandbox_name(), Some("demo"));
+        let mut form = ConfigForm::instance(instance, config);
+        assert_eq!(form.kind, ConfigKind::Instance);
+        assert_eq!(form.instance_name(), Some("demo"));
         select(&mut form, ConfigField::Vcpus);
         form.adjust(1);
         form.adjust(1);
         assert!(form.save().is_some());
-        let reloaded = SandboxStore::new(global_config(dir.path()))
+        let reloaded = InstanceStore::new(global_config(dir.path()))
             .load("demo")
             .unwrap();
         assert_eq!(reloaded.vcpus, 4);
@@ -1460,16 +1460,16 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_form_has_no_endpoint_page() {
+    fn instance_form_has_no_endpoint_page() {
         let dir = tempfile::tempdir().unwrap();
         let config = global_config(dir.path());
-        let store = SandboxStore::new(config.clone());
+        let store = InstanceStore::new(config.clone());
         let project = dir.path().join("projects/demo");
         std::fs::create_dir_all(&project).unwrap();
-        let sandbox = store
+        let instance = store
             .create_from_project(&project, Some("demo"), None, false)
             .unwrap();
-        let form = ConfigForm::sandbox(sandbox, config);
+        let form = ConfigForm::instance(instance, config);
         assert_eq!(form.pages(), &[ConfigPage::General]);
         assert_eq!(form.value(ConfigField::LocalEndpoints), "—");
     }

@@ -64,7 +64,7 @@ pub fn setup_actions(config: &Config) -> SetupActions {
         create_dirs: !config.projects_root.is_dir()
             || !config.state_dir.is_dir()
             || !config.snapshots_dir.is_dir()
-            || !config.sandboxes_dir.is_dir()
+            || !config.instances_dir.is_dir()
             || !config.templates_dir.is_dir()
             || !config.profiles_dir.is_dir()
             || !config.logs_dir().is_dir(),
@@ -376,7 +376,7 @@ mod tests {
         config.state_dir = dir.path().join("state");
         config.projects_root = dir.path().join("projects");
         config.snapshots_dir = dir.path().join("snapshots");
-        config.sandboxes_dir = dir.path().join("sandboxes");
+        config.instances_dir = dir.path().join("instances");
         config.templates_dir = dir.path().join("templates");
         config.kernel_image = dir.path().join("missing-kernel");
         config.rootfs_image = dir.path().join("missing-rootfs");

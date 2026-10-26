@@ -32,11 +32,11 @@ enum ScanMessage {
         branch: Option<Result<String, String>>,
     },
     StartFailed(String),
-    SandboxesChanged {
+    InstancesChanged {
         note: String,
         level: ToastLevel,
     },
-    SandboxError(String),
+    InstanceError(String),
     Doctor {
         report: DoctorReport,
         note: Option<String>,
@@ -87,7 +87,7 @@ fn run_loop(
         })?;
         app.footer_hits = hits.footer;
         app.project_rows = hits.projects;
-        app.sandbox_rows = hits.sandboxes;
+        app.instance_rows = hits.instances;
         app.snapshot_rows = hits.snapshots;
         app.config_rows = hits.config;
         app.config_steppers = hits.config_steppers;
@@ -140,12 +140,12 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 }
             }
             Ok(ScanMessage::StartFailed(err)) => app.fail_start(err),
-            Ok(ScanMessage::SandboxesChanged { note, level }) => {
-                app.refresh_sandboxes();
+            Ok(ScanMessage::InstancesChanged { note, level }) => {
+                app.refresh_instances();
                 app.toast(note, level);
             }
-            Ok(ScanMessage::SandboxError(err)) => {
-                app.refresh_sandboxes();
+            Ok(ScanMessage::InstanceError(err)) => {
+                app.refresh_instances();
                 app.toast(err, ToastLevel::Error);
             }
             Ok(ScanMessage::Doctor { report, note }) => app.show_doctor(report, note),
@@ -200,14 +200,14 @@ fn spawn_image_download(config: Config, tx: mpsc::Sender<ScanMessage>) {
     }
 }
 
-fn spawn_attach(config: Config, sandbox: String, tx: mpsc::Sender<ScanMessage>) {
+fn spawn_attach(config: Config, instance: String, tx: mpsc::Sender<ScanMessage>) {
     let thread_tx = tx.clone();
     let spawned = std::thread::Builder::new()
         .name("hegn-attach-vm".into())
         .spawn(move || {
-            let registry = crate::sandbox::SandboxRegistry::new(config);
+            let registry = crate::instance::InstanceRegistry::new(config);
             let result = registry
-                .manager_by_name(&sandbox)
+                .manager_by_name(&instance)
                 .and_then(|manager| manager.ensure_console());
             match result {
                 Ok(console) => {
@@ -240,12 +240,12 @@ fn spawn_clones(
     let spawned = std::thread::Builder::new()
         .name("hegn-clone-agents".into())
         .spawn(move || {
-            let registry = crate::sandbox::SandboxRegistry::new(config.clone());
+            let registry = crate::instance::InstanceRegistry::new(config.clone());
             let source = match registry.resolve(&source) {
                 Ok(source) => source,
                 Err(err) => {
                     // Clone failures must not tear down the attached VM.
-                    let _ = thread_tx.send(ScanMessage::SandboxError(format!(
+                    let _ = thread_tx.send(ScanMessage::InstanceError(format!(
                         "could not create clones: {err}"
                     )));
                     return;
@@ -270,7 +270,8 @@ fn spawn_clones(
                                 warnings.push(warning.clone());
                             }
                         }
-                        if start && let Err(err) = registry.manager(outcome.sandbox.clone()).start()
+                        if start
+                            && let Err(err) = registry.manager(outcome.instance.clone()).start()
                         {
                             failures.push(format!("{name}: {err}"));
                         }
@@ -297,10 +298,10 @@ fn spawn_clones(
             } else {
                 ToastLevel::Warn
             };
-            let _ = thread_tx.send(ScanMessage::SandboxesChanged { note, level });
+            let _ = thread_tx.send(ScanMessage::InstancesChanged { note, level });
         });
     if let Err(err) = spawned {
-        let _ = tx.send(ScanMessage::SandboxError(format!(
+        let _ = tx.send(ScanMessage::InstanceError(format!(
             "could not start the clone thread: {err}"
         )));
     }
@@ -316,17 +317,17 @@ fn spawn_start(
     let spawned = std::thread::Builder::new()
         .name("hegn-start-vm".into())
         .spawn(move || {
-            let registry = crate::sandbox::SandboxRegistry::new(config.clone());
-            let sandbox = match registry.ensure_for_project(&project, harness) {
-                Ok(sandbox) => sandbox,
+            let registry = crate::instance::InstanceRegistry::new(config.clone());
+            let instance = match registry.ensure_for_project(&project, harness) {
+                Ok(instance) => instance,
                 Err(err) => {
                     let _ = thread_tx.send(ScanMessage::StartFailed(err.to_string()));
                     return;
                 }
             };
-            let workspace = sandbox.workspace.clone();
-            let auto_branch = sandbox.auto_branch;
-            let manager = registry.manager(sandbox);
+            let workspace = instance.workspace.clone();
+            let auto_branch = instance.auto_branch;
+            let manager = registry.manager(instance);
             match manager.ensure_console() {
                 Ok(console) => {
                     let branch = if auto_branch && project::read_git_summary(&workspace).is_repo {
@@ -476,46 +477,48 @@ fn handle_effects(
                     app.toast(format!("lazygit failed: {err}"), ToastLevel::Error);
                 }
             }
-            Effect::StartProjectSandbox { project, harness } => {
+            Effect::StartProjectInstance { project, harness } => {
                 app.toast("starting VM…", ToastLevel::Info);
                 spawn_start(app.config.clone(), project, harness, scan_tx.clone());
             }
-            Effect::AttachSandbox { sandbox } => {
-                app.toast(format!("attaching to {sandbox}…"), ToastLevel::Info);
-                spawn_attach(app.config.clone(), sandbox, scan_tx.clone());
+            Effect::AttachInstance { instance } => {
+                app.toast(format!("attaching to {instance}…"), ToastLevel::Info);
+                spawn_attach(app.config.clone(), instance, scan_tx.clone());
             }
-            Effect::StopSandbox { sandbox } => {
-                let registry = crate::sandbox::SandboxRegistry::new(app.config.clone());
-                match registry.stop(&sandbox) {
+            Effect::StopInstance { instance } => {
+                let registry = crate::instance::InstanceRegistry::new(app.config.clone());
+                match registry.stop(&instance) {
                     Ok(()) => {
-                        app.toast(format!("sandbox {sandbox} stopped"), ToastLevel::Info);
-                        app.refresh_sandboxes();
+                        app.toast(format!("instance {instance} stopped"), ToastLevel::Info);
+                        app.refresh_instances();
                     }
                     Err(err) => app.toast(format!("stop failed: {err}"), ToastLevel::Error),
                 }
             }
-            Effect::DeleteSandbox {
-                sandbox,
+            Effect::DeleteInstance {
+                instance,
                 delete_files,
             } => {
-                let registry = crate::sandbox::SandboxRegistry::new(app.config.clone());
-                match registry.delete(&sandbox, delete_files) {
+                let registry = crate::instance::InstanceRegistry::new(app.config.clone());
+                match registry.delete(&instance, delete_files) {
                     Ok(outcome) => {
                         let message = match outcome.kept_workspace {
                             Some(path) => format!(
-                                "sandbox {sandbox} removed; files kept at {}",
+                                "instance {instance} removed; files kept at {}",
                                 path.display()
                             ),
-                            None if delete_files => format!("sandbox {sandbox} and files deleted"),
-                            None => format!("sandbox {sandbox} removed; project files kept"),
+                            None if delete_files => {
+                                format!("instance {instance} and files deleted")
+                            }
+                            None => format!("instance {instance} removed; project files kept"),
                         };
                         app.toast(message, ToastLevel::Info);
-                        app.refresh_sandboxes();
+                        app.refresh_instances();
                     }
                     Err(err) => app.toast(format!("delete failed: {err}"), ToastLevel::Error),
                 }
             }
-            Effect::CloneSandbox {
+            Effect::CloneInstance {
                 source,
                 count,
                 harness,
@@ -531,11 +534,11 @@ fn handle_effects(
                     scan_tx.clone(),
                 );
             }
-            Effect::RefreshSandboxes => app.refresh_sandboxes(),
+            Effect::RefreshInstances => app.refresh_instances(),
             Effect::RestoreSnapshot(snapshot) => {
-                let registry = crate::sandbox::SandboxRegistry::new(app.config.clone());
-                let sandbox = snapshot
-                    .sandbox
+                let registry = crate::instance::InstanceRegistry::new(app.config.clone());
+                let instance = snapshot
+                    .instance
                     .as_deref()
                     .and_then(|name| registry.store().load(name).ok())
                     .or_else(|| {
@@ -544,11 +547,14 @@ fn handle_effects(
                             .as_deref()
                             .and_then(|project| registry.resolve(&project.to_string_lossy()).ok())
                     });
-                let Some(sandbox) = sandbox else {
-                    app.toast("restore failed: no sandbox for snapshot", ToastLevel::Error);
+                let Some(instance) = instance else {
+                    app.toast(
+                        "restore failed: no instance for snapshot",
+                        ToastLevel::Error,
+                    );
                     return Ok(());
                 };
-                let manager = registry.manager(sandbox);
+                let manager = registry.manager(instance);
                 match runtime.block_on(manager.restore_snapshot(&snapshot)) {
                     Ok(()) => match manager.attach_console() {
                         Ok(console) => {

@@ -53,10 +53,10 @@ is the minimum bar.
 - `src/config.rs` — config schema; unknown keys are rejected, so update the
   struct *and* the README example when adding options.
 - `src/security.rs` — `tirith-core` integration plus hegn-specific guardrails.
-- `src/cloud_hypervisor.rs` / `src/sandbox.rs` / `src/virtiofs.rs` — VM lifecycle.
+- `src/cloud_hypervisor.rs` / `src/instance.rs` / `src/virtiofs.rs` — VM lifecycle.
 - `src/relay.rs` / `src/console.rs` — detached serial relay and attach transport.
 - `src/cloud_init.rs` — NoCloud seed for the official cloud images.
-- `src/sandbox_config.rs` — per-sandbox `hegn.toml`, cloning and rootfs copies.
+- `src/instance_config.rs` — per-instance `hegn.toml`, cloning and rootfs copies.
 - `src/snapshot.rs` / `src/state.rs` — persisted metadata under XDG dirs.
 - `src/images.rs` / `src/doctor.rs` — pinned upstream VM assets and shared
   prerequisite checks.

@@ -12,7 +12,7 @@ use anyhow::{Result, bail};
 
 use crate::config::{Harness, safe_package_name};
 
-/// Everything the guest provisioner needs for one sandbox.
+/// Everything the guest provisioner needs for one instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionPlan {
     pub harness: Harness,
@@ -96,7 +96,7 @@ impl ProvisionPlan {
              if [ -e \"$MARKER\" ] && [ ! -f \"$PACKAGE_MARKER\" ]; then\n\
                # Upgrade from a hegn version without a package marker: keep the\n\
                # existing, already provisioned harness instead of hitting the\n\
-               # network again on an offline sandbox.\n\
+               # network again on an offline instance.\n\
                echo \"$PACKAGE_HASH\" > \"$PACKAGE_MARKER\"\n\
                echo \"hegn: recorded the existing package set\"\n\
                exit 0\n\

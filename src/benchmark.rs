@@ -1,4 +1,4 @@
-//! `hegn benchmark` — measured host cost of running sandboxes.
+//! `hegn benchmark` — measured host cost of running instances.
 //!
 //! The report answers the questions behind `docs/resources.md`: how much RAM
 //! the VMM, `virtiofsd` and the console relay actually use, how much disk the
@@ -7,9 +7,9 @@
 //!
 //! Three modes:
 //!
-//! - no argument: measure every running sandbox (read-only), or ask whether to
+//! - no argument: measure every running instance (read-only), or ask whether to
 //!   boot a throwaway one when nothing is running;
-//! - `benchmark <project>`: boot that project's sandbox (or reuse it) and
+//! - `benchmark <project>`: boot that project's instance (or reuse it) and
 //!   measure it;
 //! - `benchmark --clean`: create a temporary project, boot it, measure it, stop
 //!   it and delete the project again.
@@ -27,14 +27,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Harness};
+use crate::instance::{InstanceRegistry, same_project};
 use crate::project;
-use crate::sandbox::{SandboxRegistry, same_project};
 
 const MIB: u64 = 1024 * 1024;
 /// Prefix for throwaway projects created by `benchmark --clean`.
 const TEMP_PREFIX: &str = "hegn-benchmark-";
 
-/// One host process that belongs to a running sandbox.
+/// One host process that belongs to a running instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProcessCost {
     /// `cloud-hypervisor`, `virtiofsd` or `console-relay`.
@@ -57,10 +57,10 @@ pub struct DiskCost {
     pub files: u64,
 }
 
-/// The host cost of one sandbox, resolved from its `session.json`.
+/// The host cost of one instance, resolved from its `session.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionCost {
-    pub sandbox: String,
+    pub instance: String,
     pub project: Option<PathBuf>,
     pub workspace: Option<PathBuf>,
     pub harness: Option<String>,
@@ -77,15 +77,15 @@ pub struct SessionCost {
 pub struct BenchmarkReport {
     pub generated_at: DateTime<Utc>,
     pub sessions: Vec<SessionCost>,
-    /// vCPUs of all measured sandboxes, or the configured default when none
+    /// vCPUs of all measured instances, or the configured default when none
     /// runs.
     pub vcpus: u32,
-    /// Guest RAM of all measured sandboxes, or the configured default when
+    /// Guest RAM of all measured instances, or the configured default when
     /// none runs.
     pub guest_memory_bytes: u64,
     /// Resident memory of every measured session process right now.
     pub process_rss_bytes: u64,
-    /// Whether this invocation booted a sandbox.
+    /// Whether this invocation booted an instance.
     pub started: bool,
     /// Present for `--clean`: what happened to the throwaway project.
     pub cleanup: Option<Cleanup>,
@@ -101,14 +101,14 @@ pub struct BenchmarkReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Cleanup {
     pub project: PathBuf,
-    pub sandbox: String,
-    pub sandbox_stopped: bool,
+    pub instance: String,
+    pub instance_stopped: bool,
     pub removed: bool,
 }
 
-/// `session.json` written by `hegn sandbox start`.
+/// `session.json` written by `hegn instance start`.
 ///
-/// The struct is deliberately permissive: sandbox-scoped sessions gained
+/// The struct is deliberately permissive: instance-scoped sessions gained
 /// fields over time, and `benchmark` must also read records written by older
 /// versions.
 #[derive(Debug, Deserialize)]
@@ -118,7 +118,7 @@ struct SessionFile {
     #[serde(default)]
     workspace: Option<PathBuf>,
     #[serde(default)]
-    sandbox: Option<String>,
+    instance: Option<String>,
     #[serde(default)]
     harness: Option<String>,
     #[serde(default)]
@@ -133,9 +133,9 @@ struct SessionFile {
 
 /// Measure the current host cost and print or emit the report.
 ///
-/// - no project and no `--clean`: measure every running sandbox; if nothing
+/// - no project and no `--clean`: measure every running instance; if nothing
 ///   runs and the terminal is interactive, offer to boot a throwaway one;
-/// - `project`: boot that project's sandbox (or reuse it) and measure it;
+/// - `project`: boot that project's instance (or reuse it) and measure it;
 /// - `clean`: create a temporary project, boot it, measure it, stop and remove
 ///   it again.
 pub fn run(config: &Config, project: Option<&str>, clean: bool, json: bool) -> Result<i32> {
@@ -150,7 +150,7 @@ pub fn run(config: &Config, project: Option<&str>, clean: bool, json: bool) -> R
         return emit(report, json);
     }
     if !json && io::stdin().is_terminal() {
-        let question = "No sandbox is running. Create a temporary benchmark project, boot a \
+        let question = "No instance is running. Create a temporary benchmark project, boot a \
                         VM and remove both afterwards?";
         if confirm(question)? {
             return measure_temporary(config, json);
@@ -158,7 +158,7 @@ pub fn run(config: &Config, project: Option<&str>, clean: bool, json: bool) -> R
     }
 
     report.notes.push(
-        "no sandbox running; pass a project name to boot one, or --clean for a throwaway \
+        "no instance running; pass a project name to boot one, or --clean for a throwaway \
          project"
             .to_string(),
     );
@@ -191,43 +191,43 @@ fn confirm(question: &str) -> Result<bool> {
     ))
 }
 
-/// Boot (or reuse) the sandbox of an existing project and measure it.
+/// Boot (or reuse) the instance of an existing project and measure it.
 fn measure_project(config: &Config, project: &str, json: bool) -> Result<i32> {
     let path = crate::cli::resolve_project(config, project)?;
 
-    // Prefer a sandbox that is already running for this project, base or
-    // clone; otherwise create/reuse the base sandbox and start it.
+    // Prefer an instance that is already running for this project, base or
+    // clone; otherwise create/reuse the base instance and start it.
     if let Some((session, _)) = running_sessions(config).into_iter().find(|(session, _)| {
         session
             .project
             .as_ref()
             .is_some_and(|running| same_project(running, &path))
     }) {
-        // Prefer the recorded sandbox name; legacy records predate it.
-        let mut report = match session.sandbox.as_deref().filter(|name| !name.is_empty()) {
-            Some(name) => collect_for_sandbox(config, name),
+        // Prefer the recorded instance name; legacy records predate it.
+        let mut report = match session.instance.as_deref().filter(|name| !name.is_empty()) {
+            Some(name) => collect_for_instance(config, name),
             None => collect_for_project(config, &path),
         };
         report
             .notes
-            .push("the sandbox was already running; nothing was started".to_string());
+            .push("the instance was already running; nothing was started".to_string());
         return emit(report, json);
     }
 
     let harness = project::read_meta(&path).harness.unwrap_or(config.harness);
-    let registry = SandboxRegistry::new(config.clone());
-    let sandbox = registry.ensure_for_project(&path, harness)?;
-    registry.manager(sandbox.clone()).start()?;
+    let registry = InstanceRegistry::new(config.clone());
+    let instance = registry.ensure_for_project(&path, harness)?;
+    registry.manager(instance.clone()).start()?;
 
-    let mut report = collect_for_sandbox(config, &sandbox.name);
+    let mut report = collect_for_instance(config, &instance.name);
     report.started = true;
     report.notes.push(format!(
-        "sandbox '{}' started; measured right after the VMM socket came up, so guest RSS \
+        "instance '{}' started; measured right after the VMM socket came up, so guest RSS \
          grows while the guest boots (attach with `hegn attach {}`, stop it with \
-         `hegn sandbox stop {}`)",
-        sandbox.name, sandbox.name, sandbox.name
+         `hegn instance stop {}`)",
+        instance.name, instance.name, instance.name
     ));
-    note_other_sandboxes(config, &sandbox.name, &mut report.notes);
+    note_other_instances(config, &instance.name, &mut report.notes);
     emit(report, json)
 }
 
@@ -247,41 +247,41 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
         packages: packages_for(config.harness),
         template: template.map(|path| path.display().to_string()),
     };
-    // `.hegn.toml` is optional; never leave the throwaway project behind
+    // `hegn.toml` is optional; never leave the throwaway project behind
     // because its metadata could not be written.
     if let Err(err) = project::write_meta(&path, &meta) {
         eprintln!(
             "warning: could not write {}: {err}",
-            path.join(".hegn.toml").display()
+            path.join("hegn.toml").display()
         );
     }
 
-    let registry = SandboxRegistry::new(config.clone());
-    let mut sandbox = None;
+    let registry = InstanceRegistry::new(config.clone());
+    let mut instance = None;
     let started = (|| -> Result<BenchmarkReport> {
         let created = registry.ensure_for_project(&path, config.harness)?;
-        // Record the sandbox before booting: if the start fails, the cleanup
+        // Record the instance before booting: if the start fails, the cleanup
         // below still has to unregister it.
-        sandbox = Some(created.clone());
+        instance = Some(created.clone());
         registry.manager(created).start()?;
-        let mut report = collect_for_sandbox(config, &sandbox.as_ref().unwrap().name);
+        let mut report = collect_for_instance(config, &instance.as_ref().unwrap().name);
         report.started = true;
         report.notes.push(
             "measured right after the VMM socket came up, so guest RSS grows while the guest \
-             boots; the sandbox was stopped and removed after this snapshot"
+             boots; the instance was stopped and removed after this snapshot"
                 .to_string(),
         );
-        note_other_sandboxes(config, &sandbox.as_ref().unwrap().name, &mut report.notes);
+        note_other_instances(config, &instance.as_ref().unwrap().name, &mut report.notes);
         Ok(report)
     })();
 
-    let stopped = sandbox
+    let stopped = instance
         .as_ref()
-        .map(|sandbox| registry.manager(sandbox.clone()).stop().is_ok())
+        .map(|instance| registry.manager(instance.clone()).stop().is_ok())
         .unwrap_or(false);
-    let sandbox_removed = sandbox
+    let instance_removed = instance
         .as_ref()
-        .map(|sandbox| registry.delete(&sandbox.name, true).is_ok())
+        .map(|instance| registry.delete(&instance.name, true).is_ok())
         .unwrap_or(false);
     let removed = match remove_temp_project(config, &path) {
         Ok(()) => true,
@@ -295,22 +295,22 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
         Ok(mut report) => {
             report.cleanup = Some(Cleanup {
                 project: path.clone(),
-                sandbox: sandbox
+                instance: instance
                     .as_ref()
-                    .map(|sandbox| sandbox.name.clone())
+                    .map(|instance| instance.name.clone())
                     .unwrap_or_default(),
-                sandbox_stopped: stopped,
+                instance_stopped: stopped,
                 removed,
             });
             if !stopped {
                 report
                     .notes
-                    .push("the temporary sandbox could not be stopped".to_string());
+                    .push("the temporary instance could not be stopped".to_string());
             }
-            if !sandbox_removed {
+            if !instance_removed {
                 report
                     .notes
-                    .push("the temporary sandbox could not be removed".to_string());
+                    .push("the temporary instance could not be removed".to_string());
             }
             if !removed {
                 report.notes.push(format!(
@@ -364,14 +364,14 @@ fn remove_temp_project(config: &Config, path: &Path) -> Result<()> {
     fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))
 }
 
-/// Build the report for every running sandbox without printing anything.
+/// Build the report for every running instance without printing anything.
 pub fn collect(config: &Config) -> BenchmarkReport {
     collect_with(config, |_, _| true)
 }
 
-fn collect_for_sandbox(config: &Config, name: &str) -> BenchmarkReport {
+fn collect_for_instance(config: &Config, name: &str) -> BenchmarkReport {
     collect_with(config, |session, _| {
-        session.sandbox.as_deref() == Some(name)
+        session.instance.as_deref() == Some(name)
     })
 }
 
@@ -401,13 +401,13 @@ fn collect_with(config: &Config, keep: impl Fn(&SessionFile, &Path) -> bool) -> 
 
     if sessions.is_empty() {
         notes.push(
-            "no running sandbox session found; disk usage and the configured guest cost are \
+            "no running instance session found; disk usage and the configured guest cost are \
              reported instead"
                 .to_string(),
         );
     } else {
         notes.push(format!(
-            "guest RAM is populated on demand: {} in total across {} sandbox(es)",
+            "guest RAM is populated on demand: {} in total across {} instance(es)",
             human_bytes(guest_memory_bytes),
             sessions.len()
         ));
@@ -452,7 +452,7 @@ fn totals(config: &Config, sessions: &[SessionCost]) -> (u32, u64, u64) {
     (vcpus, memory, rss)
 }
 
-/// The sandboxes that are alive right now.
+/// The instances that are alive right now.
 fn running_sessions(config: &Config) -> Vec<(SessionFile, PathBuf)> {
     let mut running = Vec::new();
     for path in session_candidates(config) {
@@ -471,14 +471,14 @@ fn running_sessions(config: &Config) -> Vec<(SessionFile, PathBuf)> {
     running
 }
 
-fn note_other_sandboxes(config: &Config, measured: &str, notes: &mut Vec<String>) {
+fn note_other_instances(config: &Config, measured: &str, notes: &mut Vec<String>) {
     let others = running_sessions(config)
         .into_iter()
-        .filter(|(session, _)| session.sandbox.as_deref() != Some(measured))
+        .filter(|(session, _)| session.instance.as_deref() != Some(measured))
         .count();
     if others > 0 {
         notes.push(format!(
-            "{others} other sandbox(es) are running; their RAM is not part of this report"
+            "{others} other instance(es) are running; their RAM is not part of this report"
         ));
     }
 }
@@ -520,7 +520,7 @@ fn session_costs(
         if !keep(&session, &path) {
             continue;
         }
-        let (vcpus, memory_mib) = sandbox_limits(&path, config);
+        let (vcpus, memory_mib) = instance_limits(&path, config);
         costs.push(build_session(&session, config, vcpus, memory_mib, notes));
     }
     costs
@@ -581,8 +581,8 @@ fn build_session(
         .map(|started| (Utc::now() - started).num_seconds().max(0) as u64);
 
     SessionCost {
-        sandbox: session
-            .sandbox
+        instance: session
+            .instance
             .clone()
             .or_else(|| {
                 session
@@ -604,7 +604,7 @@ fn build_session(
     }
 }
 
-/// Candidate `session.json` paths: the sandbox-scoped layout and the legacy
+/// Candidate `session.json` paths: the instance-scoped layout and the legacy
 /// `state_dir/run` layout.
 fn session_candidates(config: &Config) -> Vec<PathBuf> {
     let mut paths = Vec::new();
@@ -612,7 +612,7 @@ fn session_candidates(config: &Config) -> Vec<PathBuf> {
     if legacy.is_file() {
         paths.push(legacy);
     }
-    if let Ok(entries) = fs::read_dir(&config.sandboxes_dir) {
+    if let Ok(entries) = fs::read_dir(&config.instances_dir) {
         for entry in entries.flatten() {
             let candidate = entry.path().join("run").join("session.json");
             if candidate.is_file() {
@@ -624,8 +624,8 @@ fn session_candidates(config: &Config) -> Vec<PathBuf> {
     paths
 }
 
-/// Read per-sandbox limits from the sibling `hegn.toml`, if there is one.
-fn sandbox_limits(session: &Path, config: &Config) -> (u8, u32) {
+/// Read per-instance limits from the sibling `hegn.toml`, if there is one.
+fn instance_limits(session: &Path, config: &Config) -> (u8, u32) {
     #[derive(Deserialize, Default)]
     struct Limits {
         vcpus: Option<u8>,
@@ -635,7 +635,7 @@ fn sandbox_limits(session: &Path, config: &Config) -> (u8, u32) {
     let config_file = session
         .parent()
         .and_then(Path::parent)
-        .map(|dir| dir.join(crate::sandbox_config::CONFIG_FILE));
+        .map(|dir| dir.join(crate::instance_config::CONFIG_FILE));
     let limits = config_file
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|raw| toml::from_str::<Limits>(&raw).ok())
@@ -669,7 +669,7 @@ fn disk_costs(config: &Config) -> Vec<DiskCost> {
         dirs.push(("images".to_string(), dir.to_path_buf(), None));
     }
     dirs.push(("snapshots".to_string(), config.snapshots_dir.clone(), None));
-    dirs.push(("sandboxes".to_string(), config.sandboxes_dir.clone(), None));
+    dirs.push(("instances".to_string(), config.instances_dir.clone(), None));
     dirs.push(("logs".to_string(), logs.clone(), None));
     // Session logs live inside the state directory; do not count them twice.
     dirs.push(("state".to_string(), config.state_dir.clone(), Some(logs)));
@@ -872,7 +872,7 @@ fn print_report(report: &BenchmarkReport) {
     }
     for session in &report.sessions {
         let harness = session.harness.as_deref().unwrap_or("unknown harness");
-        println!("\nSession   {} ({harness})", session.sandbox);
+        println!("\nSession   {} ({harness})", session.instance);
         if let Some(project) = &session.project {
             println!("Project   {}", project.display());
         }
@@ -918,14 +918,14 @@ fn print_report(report: &BenchmarkReport) {
     }
 
     if report.started {
-        println!("\nStarted   a sandbox for this measurement");
+        println!("\nStarted   an instance for this measurement");
     }
     if let Some(cleanup) = &report.cleanup {
         println!(
-            "\nCleanup   {} [{}] (sandbox stopped: {}, project removed: {})",
+            "\nCleanup   {} [{}] (instance stopped: {}, project removed: {})",
             cleanup.project.display(),
-            cleanup.sandbox,
-            cleanup.sandbox_stopped,
+            cleanup.instance,
+            cleanup.instance_stopped,
             cleanup.removed
         );
     }
@@ -1076,20 +1076,20 @@ mod tests {
     }
 
     #[test]
-    fn session_candidates_cover_the_sandbox_layout() {
+    fn session_candidates_cover_the_instance_layout() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            sandboxes_dir: dir.path().join("sandboxes"),
+            instances_dir: dir.path().join("instances"),
             ..Config::default()
         };
 
-        fs::create_dir_all(config.sandboxes_dir.join("a/run")).unwrap();
-        fs::write(config.sandboxes_dir.join("a/run/session.json"), b"{}").unwrap();
+        fs::create_dir_all(config.instances_dir.join("a/run")).unwrap();
+        fs::write(config.instances_dir.join("a/run/session.json"), b"{}").unwrap();
 
         let candidates = session_candidates(&config);
         assert_eq!(candidates.len(), 1);
-        assert!(candidates[0].ends_with("sandboxes/a/run/session.json"));
+        assert!(candidates[0].ends_with("instances/a/run/session.json"));
     }
 
     #[test]
@@ -1098,7 +1098,7 @@ mod tests {
         let config = Config {
             state_dir: dir.path().join("state"),
             snapshots_dir: dir.path().join("data/snapshots"),
-            sandboxes_dir: dir.path().join("data/sandboxes"),
+            instances_dir: dir.path().join("data/instances"),
             kernel_image: dir.path().join("data/images/kernel"),
             vcpus: 4,
             memory_mib: 1024,
@@ -1113,7 +1113,7 @@ mod tests {
             report
                 .notes
                 .iter()
-                .any(|note| note.contains("no running sandbox"))
+                .any(|note| note.contains("no running instance"))
         );
         assert!(report.disk.iter().any(|cost| cost.name == "images"));
     }
@@ -1126,7 +1126,7 @@ mod tests {
             ..Config::default()
         };
         let session = |vcpus: u8, memory_mib: u32, rss: u64| SessionCost {
-            sandbox: "s".into(),
+            instance: "s".into(),
             project: None,
             workspace: None,
             harness: None,
@@ -1164,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_limits_prefer_the_sandbox_config() {
+    fn instance_limits_prefer_the_instance_config() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             vcpus: 2,
@@ -1172,15 +1172,15 @@ mod tests {
             ..Config::default()
         };
 
-        let run = dir.path().join("sandbox/run");
+        let run = dir.path().join("instance/run");
         fs::create_dir_all(&run).unwrap();
         fs::write(
-            dir.path().join("sandbox/hegn.toml"),
+            dir.path().join("instance/hegn.toml"),
             b"vcpus = 8\nmemory_mib = 8192\n",
         )
         .unwrap();
 
-        let (vcpus, memory) = sandbox_limits(&run.join("session.json"), &config);
+        let (vcpus, memory) = instance_limits(&run.join("session.json"), &config);
         assert_eq!((vcpus, memory), (8, 8192));
     }
 
@@ -1216,13 +1216,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            sandboxes_dir: dir.path().join("data/sandboxes"),
+            instances_dir: dir.path().join("data/instances"),
             ..Config::default()
         };
         fs::create_dir_all(config.state_dir.join("run")).unwrap();
         let session = serde_json::json!({
             "project": dir.path().join("project"),
-            "sandbox": "demo",
+            "instance": "demo",
             "harness": "shell",
             "started_at": "2026-01-01T00:00:00Z",
             "vm_pid": std::process::id(),

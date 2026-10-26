@@ -9,8 +9,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    ActionId, App, ConfigStepHit, ConfigTabHit, CreateFocus, DeleteSandboxStage, Focus, FooterHit,
-    HelpState, Modal, RowHit, SandboxState, Screen, ScrollHit, TerminalMode, ToastLevel,
+    ActionId, App, ConfigStepHit, ConfigTabHit, CreateFocus, DeleteInstanceStage, Focus, FooterHit,
+    HelpState, InstanceState, Modal, RowHit, Screen, ScrollHit, TerminalMode, ToastLevel,
 };
 use crate::config_form::{ConfigField, ConfigForm, ConfigRow, FieldKind};
 
@@ -30,7 +30,7 @@ const RED: Color = Color::Red;
 pub struct UiHits {
     pub footer: Vec<FooterHit>,
     pub projects: Vec<RowHit>,
-    pub sandboxes: Vec<RowHit>,
+    pub instances: Vec<RowHit>,
     pub snapshots: Vec<RowHit>,
     /// Settings rows and `‹ ›` steppers inside the configuration modal.
     pub config: Vec<RowHit>,
@@ -101,7 +101,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
     UiHits {
         footer,
         projects: hits.0,
-        sandboxes: hits.1,
+        instances: hits.1,
         snapshots: hits.2,
         config,
         config_steppers,
@@ -133,7 +133,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw("  "),
         Span::styled(
-            "Cloud Hypervisor sandboxes for coding agents",
+            "Cloud Hypervisor instances for coding agents",
             Style::default().fg(MUTED),
         ),
         Span::raw("  "),
@@ -144,14 +144,14 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     ]);
     frame.render_widget(Paragraph::new(left).style(Style::default()), inner);
 
-    let status = match app.sandbox.state {
-        SandboxState::Running => ("● running".to_string(), GREEN),
-        SandboxState::Starting => (format!("{} starting", spinner(app.tick())), YELLOW),
-        SandboxState::Paused => ("Ⅱ paused".to_string(), YELLOW),
-        SandboxState::Failed => ("✕ failed".to_string(), RED),
-        SandboxState::Stopped => ("○ stopped".to_string(), MUTED),
+    let status = match app.instance.state {
+        InstanceState::Running => ("● running".to_string(), GREEN),
+        InstanceState::Starting => (format!("{} starting", spinner(app.tick())), YELLOW),
+        InstanceState::Paused => ("Ⅱ paused".to_string(), YELLOW),
+        InstanceState::Failed => ("✕ failed".to_string(), RED),
+        InstanceState::Stopped => ("○ stopped".to_string(), MUTED),
     };
-    let right_text = format!("{}  {} ", status.0, app.sandbox.backend);
+    let right_text = format!("{}  {} ", status.0, app.instance.backend);
     let width = right_text.width() as u16;
     if inner.width > width + 10 {
         let right = Rect {
@@ -193,7 +193,7 @@ fn render_dashboard(
         .split(columns[1]);
 
     render_project_panel(frame, app, right[0]);
-    render_sandbox_panel(frame, app, right[1]);
+    render_instance_panel(frame, app, right[1]);
     render_snapshot_detail(frame, app, right[2]);
     sidebar
 }
@@ -213,9 +213,9 @@ fn render_sidebar(
         .spacing(1)
         .split(area);
     let projects = render_projects(frame, app, sections[0]);
-    let sandboxes = render_sandboxes(frame, app, sections[1]);
+    let instances = render_instances(frame, app, sections[1]);
     let snapshots = render_snapshots(frame, app, sections[2]);
-    (projects, sandboxes, snapshots)
+    (projects, instances, snapshots)
 }
 
 fn render_projects(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
@@ -356,18 +356,18 @@ fn branch_color(git: &crate::project::GitSummary) -> Color {
     }
 }
 
-fn render_sandboxes(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
-    let active = app.focus == Focus::Sandboxes;
-    let title = format!(" sandboxes ({}) ", app.sandbox_visible.len());
+fn render_instances(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
+    let active = app.focus == Focus::Instances;
+    let title = format!(" instances ({}) ", app.instance_visible.len());
     let block = tab_block(title, 2, active);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let mut hits = Vec::new();
-    if app.sandbox_visible.is_empty() {
+    if app.instance_visible.is_empty() {
         let (headline, hint) = match app.selected_project() {
             Some(project) => (
-                format!(" ▾ no sandboxes for {}", truncate(&project.name, 18)),
+                format!(" ▾ no instances for {}", truncate(&project.name, 18)),
                 "   Enter on project boots one",
             ),
             None => (
@@ -387,18 +387,18 @@ fn render_sandboxes(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
 
     let visible_rows = inner.height as usize;
     let offset = app
-        .sandbox_selected
+        .instance_selected
         .saturating_sub(visible_rows.saturating_sub(1));
     let mut lines = Vec::new();
     for (row, &index) in app
-        .sandbox_visible
+        .instance_visible
         .iter()
         .enumerate()
         .skip(offset)
         .take(visible_rows)
     {
-        let sandbox = &app.sandboxes[index];
-        let selected = row == app.sandbox_selected && active;
+        let instance = &app.instances[index];
+        let selected = row == app.instance_selected && active;
         let base = if selected {
             Style::default()
                 .fg(ON_ACCENT)
@@ -407,18 +407,18 @@ fn render_sandboxes(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
         } else {
             Style::default().fg(TEXT)
         };
-        let state_color = match sandbox.state.as_str() {
+        let state_color = match instance.state.as_str() {
             "running" => GREEN,
             "paused" => YELLOW,
             "failed" => RED,
             _ => MUTED,
         };
-        let marker = if sandbox.state == "running" {
+        let marker = if instance.state == "running" {
             "●"
         } else {
             "○"
         };
-        let badge = if sandbox.ephemeral { " clone" } else { "" };
+        let badge = if instance.ephemeral { " clone" } else { "" };
         lines.push(Line::from(vec![
             Span::styled(
                 format!(" {marker} "),
@@ -428,7 +428,7 @@ fn render_sandboxes(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
                     Style::default().fg(state_color)
                 },
             ),
-            Span::styled(truncate(&sandbox.name, 18), base),
+            Span::styled(truncate(&instance.name, 18), base),
             Span::styled(
                 badge,
                 if selected {
@@ -438,7 +438,7 @@ fn render_sandboxes(frame: &mut Frame, app: &App, area: Rect) -> Vec<RowHit> {
                 },
             ),
             Span::styled(
-                format!(" {}", sandbox.harness.label()),
+                format!(" {}", instance.harness.label()),
                 if selected {
                     Style::default().fg(ON_ACCENT).bg(CYAN)
                 } else {
@@ -598,20 +598,20 @@ fn render_project_panel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).style(Style::default()), inner);
 }
 
-fn render_sandbox_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let block = panel_block(" sandbox ".to_string(), false);
+fn render_instance_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let block = panel_block(" instance ".to_string(), false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let Some(sandbox) = app.selected_sandbox() else {
+    let Some(instance) = app.selected_instance() else {
         let (headline, hint) = match app.selected_project() {
             Some(project) => (
-                format!("No sandbox for {}.", project.name),
+                format!("No instance for {}.", project.name),
                 "Press Enter on the project to boot one.",
             ),
             None => (
                 "No project selected.".to_string(),
-                "Select a project to see its sandboxes.",
+                "Select a project to see its instances.",
             ),
         };
         frame.render_widget(
@@ -623,7 +623,7 @@ fn render_sandbox_panel(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(MUTED),
                 )),
                 Line::from(Span::styled(
-                    "F4 global settings · F5 sandbox settings",
+                    "F4 global settings · F5 instance settings",
                     Style::default().fg(MUTED),
                 )),
             ]))
@@ -633,13 +633,13 @@ fn render_sandbox_panel(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
-    let (state_color, state_label) = match sandbox.state.as_str() {
+    let (state_color, state_label) = match instance.state.as_str() {
         "running" => (GREEN, "RUNNING"),
         "paused" => (YELLOW, "PAUSED"),
         "failed" => (RED, "FAILED"),
         _ => (MUTED, "STOPPED"),
     };
-    let mode = if sandbox.ephemeral {
+    let mode = if instance.ephemeral {
         "clone"
     } else {
         "project"
@@ -647,12 +647,12 @@ fn render_sandbox_panel(frame: &mut Frame, app: &App, area: Rect) {
     let lines = vec![
         Line::from(vec![
             Span::styled(
-                format!(" {} ", sandbox.name),
+                format!(" {} ", instance.name),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" {mode} "),
-                if sandbox.ephemeral {
+                if instance.ephemeral {
                     Style::default().fg(ON_ACCENT).bg(ACCENT)
                 } else {
                     Style::default().fg(MUTED)
@@ -668,36 +668,36 @@ fn render_sandbox_panel(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled(" project  ", Style::default().fg(MUTED)),
             Span::styled(
-                truncate(&sandbox.project.display().to_string(), 48),
+                truncate(&instance.project.display().to_string(), 48),
                 Style::default().fg(TEXT),
             ),
         ]),
         Line::from(vec![
             Span::styled(" workspace", Style::default().fg(MUTED)),
             Span::styled(
-                truncate(&sandbox.workspace.display().to_string(), 48),
+                truncate(&instance.workspace.display().to_string(), 48),
                 Style::default().fg(TEXT),
             ),
         ]),
         Line::from(vec![
             Span::styled(" harness  ", Style::default().fg(MUTED)),
-            Span::styled(sandbox.harness.label(), Style::default().fg(TEXT)),
+            Span::styled(instance.harness.label(), Style::default().fg(TEXT)),
             Span::styled("   resources ", Style::default().fg(MUTED)),
             Span::styled(
-                format!("{} vCPU · {} MiB", sandbox.vcpus, sandbox.memory_mib),
+                format!("{} vCPU · {} MiB", instance.vcpus, instance.memory_mib),
                 Style::default().fg(TEXT),
             ),
         ]),
         Line::from(vec![
             Span::styled(" config   ", Style::default().fg(MUTED)),
             Span::styled(
-                truncate(&sandbox.config_path.display().to_string(), 46),
+                truncate(&instance.config_path.display().to_string(), 46),
                 Style::default().fg(TEXT),
             ),
         ]),
         Line::from(Span::styled(
-            sandbox
-                .source_sandbox
+            instance
+                .source_instance
                 .as_ref()
                 .map(|source| format!("clone of {source}"))
                 .unwrap_or_else(|| "Enter attach/start · S stop · d delete · F5 config".into()),
@@ -1103,8 +1103,8 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 action: ActionId::Close,
             },
         ],
-        Some(Modal::DeleteSandbox(modal)) => match modal.stage {
-            DeleteSandboxStage::Confirm => vec![
+        Some(Modal::DeleteInstance(modal)) => match modal.stage {
+            DeleteInstanceStage::Confirm => vec![
                 FooterDef {
                     key: "y",
                     label: "Continue",
@@ -1116,7 +1116,7 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                     action: ActionId::Cancel,
                 },
             ],
-            DeleteSandboxStage::Files => vec![
+            DeleteInstanceStage::Files => vec![
                 FooterDef {
                     key: "y",
                     label: "Delete files",
@@ -1238,26 +1238,26 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                         action: ActionId::Edit,
                     },
                 ],
-                Focus::Sandboxes => vec![
+                Focus::Instances => vec![
                     FooterDef {
                         key: "Enter",
                         label: "Attach",
-                        action: ActionId::StartSandbox,
+                        action: ActionId::StartInstance,
                     },
                     FooterDef {
                         key: "S",
                         label: "Stop",
-                        action: ActionId::StopSandbox,
+                        action: ActionId::StopInstance,
                     },
                     FooterDef {
                         key: "d",
                         label: "Delete",
-                        action: ActionId::DeleteSandbox,
+                        action: ActionId::DeleteInstance,
                     },
                     FooterDef {
                         key: "F5",
-                        label: "Sandbox config",
-                        action: ActionId::SandboxConfig,
+                        label: "Instance config",
+                        action: ActionId::InstanceConfig,
                     },
                 ],
                 Focus::Snapshots => vec![
@@ -1460,14 +1460,14 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Moda
         Modal::ImportProject(form) => {
             ModalHits::buttons(render_import_form(frame, app, form, area))
         }
-        Modal::DeleteSandbox(modal) => {
+        Modal::DeleteInstance(modal) => {
             let (body, color, buttons): (String, Color, &[FooterDef]) = match modal.stage {
-                DeleteSandboxStage::Confirm => (
+                DeleteInstanceStage::Confirm => (
                     format!(
-                        "Delete sandbox '{}'?\n\nProject: {}\nWorkspace: {}\n\nThe VM is stopped first.",
-                        modal.sandbox.name,
-                        modal.sandbox.project.display(),
-                        modal.sandbox.workspace.display()
+                        "Delete instance '{}'?\n\nProject: {}\nWorkspace: {}\n\nThe VM is stopped first.",
+                        modal.instance.name,
+                        modal.instance.project.display(),
+                        modal.instance.workspace.display()
                     ),
                     YELLOW,
                     &[
@@ -1483,10 +1483,10 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Moda
                         },
                     ],
                 ),
-                DeleteSandboxStage::Files => (
+                DeleteInstanceStage::Files => (
                     format!(
-                        "Also delete the cloned workspace files?\n\n{}\n\nChoose 'Keep files' to unregister the sandbox but keep the clone.",
-                        modal.sandbox.workspace.display()
+                        "Also delete the cloned workspace files?\n\n{}\n\nChoose 'Keep files' to unregister the instance but keep the clone.",
+                        modal.instance.workspace.display()
                     ),
                     RED,
                     &[
@@ -1515,7 +1515,7 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Moda
                 72,
                 42,
                 1,
-                "delete sandbox",
+                "delete instance",
                 &body,
                 color,
                 modal.scroll,
@@ -1541,7 +1541,7 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Moda
         }
         Modal::MultiAgent(form) => {
             let body = format!(
-                "Create temporary clones for parallel agents.\n\nSandbox: {}\nClones:  {}\nHarness: {}\nStart:   {}\n\nEach clone gets its own workspace; commits cannot collide.",
+                "Create temporary clones for parallel agents.\n\nInstance: {}\nClones:  {}\nHarness: {}\nStart:   {}\n\nEach clone gets its own workspace; commits cannot collide.",
                 form.source,
                 form.count,
                 form.harness.label(),
@@ -2118,30 +2118,30 @@ fn render_help(
             "Projects",
             &[
                 ("↑/↓ j/k", "move selection"),
-                ("Enter", "open project in sandbox"),
+                ("Enter", "open project in instance"),
                 ("/", "fuzzy filter projects"),
-                ("Tab", "switch projects → sandboxes → snapshots"),
-                ("1 / 2 / 3", "jump to projects / sandboxes / snapshots"),
+                ("Tab", "switch projects → instances → snapshots"),
+                ("1 / 2 / 3", "jump to projects / instances / snapshots"),
                 ("c", "create project"),
                 ("h / ←", "import existing project"),
                 ("F4", "global settings (arrows/mouse · Ctrl-S saves)"),
                 ("e", "open in $EDITOR"),
                 ("g", "open in lazygit"),
-                ("r", "refresh projects + sandboxes"),
+                ("r", "refresh projects + instances"),
                 ("F3", "doctor (host checks, automatic setup)"),
             ],
         ),
         (
-            "Sandboxes",
+            "Instances",
             &[
-                ("b", "focus sandbox list (selected project only)"),
-                ("Enter", "attach/start selected sandbox or clone"),
-                ("S", "stop selected sandbox"),
+                ("b", "focus instance list (selected project only)"),
+                ("Enter", "attach/start selected instance or clone"),
+                ("S", "stop selected instance"),
                 (
                     "d",
-                    "delete sandbox, or selected project's VM (project files kept)",
+                    "delete instance, or selected project's VM (project files kept)",
                 ),
-                ("F5", "sandbox settings (arrows/mouse · Ctrl-S saves)"),
+                ("F5", "instance settings (arrows/mouse · Ctrl-S saves)"),
                 ("F4", "global settings"),
             ],
         ),
@@ -3244,7 +3244,7 @@ mod tests {
         assert!(text.contains("[2]"));
         assert!(text.contains("[3]"));
         assert!(text.contains("demo"));
-        assert!(text.contains("sandbox"));
+        assert!(text.contains("instance"));
         assert!(text.contains("Open"));
         assert!(!hits.footer.is_empty());
         assert_eq!(hits.projects.len(), 1);
@@ -3570,25 +3570,25 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_config_modal_marks_read_only_context() {
+    fn instance_config_modal_marks_read_only_context() {
         let (_dir, mut app) = app();
-        let sandbox = crate::sandbox_config::SandboxConfig {
+        let instance = crate::instance_config::InstanceConfig {
             name: "demo".into(),
             project: PathBuf::from("/projects/demo"),
             workspace: PathBuf::from("/projects/demo"),
-            ..crate::sandbox_config::SandboxConfig::default()
+            ..crate::instance_config::InstanceConfig::default()
         };
-        app.modal = Some(Modal::Config(crate::config_form::ConfigForm::sandbox(
-            sandbox,
+        app.modal = Some(Modal::Config(crate::config_form::ConfigForm::instance(
+            instance,
             app.config.clone(),
         )));
         let (text, hits) = render(&app);
-        assert!(text.contains("sandbox 'demo' settings"), "{text}");
+        assert!(text.contains("instance 'demo' settings"), "{text}");
         assert!(text.contains("read-only"), "{text}");
         assert!(text.contains("/projects/demo"), "{text}");
         assert!(
             hits.config.iter().any(|row| row.rect.height == 1),
-            "sandbox settings must be clickable"
+            "instance settings must be clickable"
         );
     }
 
@@ -3695,7 +3695,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             vm_state: "Paused".into(),
             dir: PathBuf::from("/snap/demo"),
-            sandbox: None,
+            instance: None,
             project: Some(PathBuf::from("/projects/demo")),
             size_bytes: 1024 * 1024,
             note: None,

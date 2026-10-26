@@ -15,8 +15,8 @@ use crate::config_form::{Applied, ConfigField, ConfigPage, FormOutcome};
 pub use crate::config_form::{ConfigForm, ConfigKind};
 use crate::console::TerminalConsole;
 use crate::doctor::DoctorReport;
+use crate::instance::InstanceSummary;
 use crate::project::{self, GitSummary, Project, ProjectMeta};
-use crate::sandbox::SandboxSummary;
 use crate::security::{Decision, Inspection, SecurityEngine};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
 use crate::state::StateStore;
@@ -45,7 +45,7 @@ pub enum TerminalMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Projects,
-    Sandboxes,
+    Instances,
     Snapshots,
 }
 
@@ -64,29 +64,29 @@ pub enum Effect {
     /// Create directories/config, download images and configure the guarded
     /// network as needed. Privileged steps prompt via sudo/pkexec.
     SetupEnvironment,
-    /// Ensure a sandbox for a project and attach its console.
-    StartProjectSandbox {
+    /// Ensure an instance for a project and attach its console.
+    StartProjectInstance {
         project: PathBuf,
         harness: Harness,
     },
-    /// Start (if needed) and attach an existing sandbox.
-    AttachSandbox {
-        sandbox: String,
+    /// Start (if needed) and attach an existing instance.
+    AttachInstance {
+        instance: String,
     },
-    StopSandbox {
-        sandbox: String,
+    StopInstance {
+        instance: String,
     },
-    DeleteSandbox {
-        sandbox: String,
+    DeleteInstance {
+        instance: String,
         delete_files: bool,
     },
-    CloneSandbox {
+    CloneInstance {
         source: String,
         count: usize,
         harness: Harness,
         start: bool,
     },
-    RefreshSandboxes,
+    RefreshInstances,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +118,7 @@ impl Toast {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SandboxState {
+pub enum InstanceState {
     Stopped,
     Starting,
     Running,
@@ -126,7 +126,7 @@ pub enum SandboxState {
     Failed,
 }
 
-impl SandboxState {
+impl InstanceState {
     pub fn label(self) -> &'static str {
         match self {
             Self::Stopped => "stopped",
@@ -139,8 +139,8 @@ impl SandboxState {
 }
 
 #[derive(Debug, Clone)]
-pub struct SandboxStatus {
-    pub state: SandboxState,
+pub struct InstanceStatus {
+    pub state: InstanceState,
     pub backend: &'static str,
     pub vcpus: u8,
     pub memory_mib: u32,
@@ -150,7 +150,7 @@ pub struct SandboxStatus {
     pub started_at: Option<Instant>,
 }
 
-impl SandboxStatus {
+impl InstanceStatus {
     pub fn from_config(config: &Config) -> Self {
         let backend = "cloud-hypervisor";
         let virtiofs = if config.vm_assets_ready() {
@@ -159,7 +159,7 @@ impl SandboxStatus {
             "missing VM"
         };
         Self {
-            state: SandboxState::Stopped,
+            state: InstanceState::Stopped,
             backend,
             vcpus: config.vcpus,
             memory_mib: config.memory_mib,
@@ -202,12 +202,12 @@ pub enum ActionId {
     NewSnapshot,
     DeleteSnapshot,
     Restore,
-    FocusSandboxes,
-    StartSandbox,
-    StopSandbox,
-    CloneSandbox,
-    DeleteSandbox,
-    SandboxConfig,
+    FocusInstances,
+    StartInstance,
+    StopInstance,
+    CloneInstance,
+    DeleteInstance,
+    InstanceConfig,
     GlobalConfig,
     MultiAgent,
     KeepFiles,
@@ -446,15 +446,15 @@ pub struct ConfigTabHit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeleteSandboxStage {
+pub enum DeleteInstanceStage {
     Confirm,
     Files,
 }
 
 #[derive(Debug, Clone)]
-pub struct DeleteSandboxModal {
-    pub sandbox: SandboxSummary,
-    pub stage: DeleteSandboxStage,
+pub struct DeleteInstanceModal {
+    pub instance: InstanceSummary,
+    pub stage: DeleteInstanceStage,
     pub error: Option<String>,
     pub scroll: usize,
 }
@@ -512,7 +512,7 @@ pub enum Modal {
     Security(SecurityPrompt),
     Confirm(ConfirmPrompt),
     Config(ConfigForm),
-    DeleteSandbox(DeleteSandboxModal),
+    DeleteInstance(DeleteInstanceModal),
     MultiAgent(MultiAgentForm),
     Help(HelpState),
     Error {
@@ -534,16 +534,16 @@ pub struct App {
     pub focus: Focus,
     pub screen: Screen,
     pub modal: Option<Modal>,
-    pub sandbox: SandboxStatus,
+    pub instance: InstanceStatus,
     pub snapshots: Vec<SnapshotMeta>,
     pub selected_snapshot: usize,
     pub snapshot_rows: Vec<RowHit>,
-    pub sandboxes: Vec<SandboxSummary>,
-    /// Indices into [`App::sandboxes`] for the selected project.
-    pub sandbox_visible: Vec<usize>,
-    pub sandbox_selected: usize,
-    sandbox_project: Option<PathBuf>,
-    pub sandbox_rows: Vec<RowHit>,
+    pub instances: Vec<InstanceSummary>,
+    /// Indices into [`App::instances`] for the selected project.
+    pub instance_visible: Vec<usize>,
+    pub instance_selected: usize,
+    instance_project: Option<PathBuf>,
+    pub instance_rows: Vec<RowHit>,
     pub project_rows: Vec<RowHit>,
     pub session: Option<Box<dyn TerminalConsole>>,
     pub terminal: TerminalBuffer,
@@ -581,10 +581,10 @@ impl App {
         let snapshots = SnapshotStore::new(&config.snapshots_dir)
             .list()
             .unwrap_or_default();
-        let sandboxes = crate::sandbox::SandboxRegistry::new(config.clone())
+        let instances = crate::instance::InstanceRegistry::new(config.clone())
             .summaries()
             .unwrap_or_default();
-        let sandbox = SandboxStatus::from_config(&config);
+        let instance = InstanceStatus::from_config(&config);
         let security_engine = SecurityEngine::new(config.security);
         Self {
             config,
@@ -597,15 +597,15 @@ impl App {
             focus: Focus::Projects,
             screen: Screen::Dashboard,
             modal: None,
-            sandbox,
+            instance,
             snapshots,
             selected_snapshot: 0,
             snapshot_rows: Vec::new(),
-            sandboxes,
-            sandbox_visible: Vec::new(),
-            sandbox_selected: 0,
-            sandbox_project: None,
-            sandbox_rows: Vec::new(),
+            instances,
+            instance_visible: Vec::new(),
+            instance_selected: 0,
+            instance_project: None,
+            instance_rows: Vec::new(),
             project_rows: Vec::new(),
             session: None,
             terminal: TerminalBuffer::default(),
@@ -651,7 +651,7 @@ impl App {
         {
             self.selected = index;
         }
-        self.refresh_sandbox_filter();
+        self.refresh_instance_filter();
     }
 
     pub fn add_project(&mut self, project: Project) {
@@ -670,7 +670,7 @@ impl App {
         {
             self.selected = index;
         }
-        self.refresh_sandbox_filter();
+        self.refresh_instance_filter();
     }
 
     pub fn refresh_snapshots(&mut self) {
@@ -689,7 +689,7 @@ impl App {
         } else if self.selected >= self.visible.len() {
             self.selected = self.visible.len() - 1;
         }
-        self.refresh_sandbox_filter();
+        self.refresh_instance_filter();
     }
 
     pub fn selected_project(&self) -> Option<&Project> {
@@ -702,37 +702,39 @@ impl App {
         self.snapshots.get(self.selected_snapshot)
     }
 
-    pub fn selected_sandbox(&self) -> Option<&SandboxSummary> {
-        self.sandbox_visible
-            .get(self.sandbox_selected)
-            .and_then(|&index| self.sandboxes.get(index))
+    pub fn selected_instance(&self) -> Option<&InstanceSummary> {
+        self.instance_visible
+            .get(self.instance_selected)
+            .and_then(|&index| self.instances.get(index))
     }
 
-    /// Rebuild the sandbox list so it only contains sandboxes for the project
+    /// Rebuild the instance list so it only contains instances for the project
     /// selected in the project list. Multi-agent clones share their source
     /// project, so they stay visible and are one `Enter` away.
     ///
     /// The previous selection is preserved while the project stays the same;
-    /// switching projects selects a running sandbox when one exists.
-    pub fn refresh_sandbox_filter(&mut self) {
-        let selected = self.selected_sandbox().map(|sandbox| sandbox.name.clone());
-        self.refresh_sandbox_filter_named(selected);
+    /// switching projects selects a running instance when one exists.
+    pub fn refresh_instance_filter(&mut self) {
+        let selected = self
+            .selected_instance()
+            .map(|instance| instance.name.clone());
+        self.refresh_instance_filter_named(selected);
     }
 
     /// Rebuild the filter while preserving `selected` by name. The name must be
-    /// captured before [`App::sandboxes`] is replaced: the visible indices point
+    /// captured before [`App::instances`] is replaced: the visible indices point
     /// into the old vector.
-    fn refresh_sandbox_filter_named(&mut self, selected: Option<String>) {
+    fn refresh_instance_filter_named(&mut self, selected: Option<String>) {
         let project = self.selected_project().map(|project| project.path.clone());
-        let project_changed = self.sandbox_project != project;
-        self.sandbox_project = project.clone();
+        let project_changed = self.instance_project != project;
+        self.instance_project = project.clone();
 
-        self.sandbox_visible = match project {
+        self.instance_visible = match project {
             Some(project) => self
-                .sandboxes
+                .instances
                 .iter()
                 .enumerate()
-                .filter(|(_, sandbox)| crate::sandbox::same_project(&sandbox.project, &project))
+                .filter(|(_, instance)| crate::instance::same_project(&instance.project, &project))
                 .map(|(index, _)| index)
                 .collect(),
             None => Vec::new(),
@@ -741,46 +743,48 @@ impl App {
         if !project_changed
             && let Some(name) = selected
             && let Some(index) = self
-                .sandbox_visible
+                .instance_visible
                 .iter()
-                .position(|&index| self.sandboxes[index].name == name)
+                .position(|&index| self.instances[index].name == name)
         {
-            self.sandbox_selected = index;
+            self.instance_selected = index;
             return;
         }
         if project_changed {
-            self.sandbox_selected = self
-                .sandbox_visible
+            self.instance_selected = self
+                .instance_visible
                 .iter()
-                .position(|&index| self.sandboxes[index].state == "running")
+                .position(|&index| self.instances[index].state == "running")
                 .unwrap_or(0);
         } else {
-            self.sandbox_selected = self
-                .sandbox_selected
-                .min(self.sandbox_visible.len().saturating_sub(1));
+            self.instance_selected = self
+                .instance_selected
+                .min(self.instance_visible.len().saturating_sub(1));
         }
     }
 
-    /// Refresh the sandbox list from disk/process state. Cheap enough for the
+    /// Refresh the instance list from disk/process state. Cheap enough for the
     /// UI tick; it only reads files and `/proc`.
-    pub fn refresh_sandboxes(&mut self) {
-        let selected = self.selected_sandbox().map(|sandbox| sandbox.name.clone());
-        let registry = crate::sandbox::SandboxRegistry::new(self.config.clone());
-        if let Ok(sandboxes) = registry.summaries() {
-            self.sandboxes = sandboxes;
+    pub fn refresh_instances(&mut self) {
+        let selected = self
+            .selected_instance()
+            .map(|instance| instance.name.clone());
+        let registry = crate::instance::InstanceRegistry::new(self.config.clone());
+        if let Ok(instances) = registry.summaries() {
+            self.instances = instances;
         }
-        self.refresh_sandbox_filter_named(selected);
-        let selected = self.selected_sandbox().cloned();
+        self.refresh_instance_filter_named(selected);
+        let selected = self.selected_instance().cloned();
         if let Some(summary) = selected {
-            self.sandbox.vcpus = summary.vcpus;
-            self.sandbox.memory_mib = summary.memory_mib;
+            self.instance.vcpus = summary.vcpus;
+            self.instance.memory_mib = summary.memory_mib;
             // Do not overwrite the optimistic Starting state while the attach
             // thread is still booting; it would re-enable double starts.
-            if self.sandbox.state != SandboxState::Starting {
-                self.sandbox.state = match summary.state.as_str() {
-                    "running" => SandboxState::Running,
-                    "paused" => SandboxState::Paused,
-                    _ => SandboxState::Stopped,
+            if self.instance.state != InstanceState::Starting {
+                self.instance.state = match summary.state.as_str() {
+                    "running" => InstanceState::Running,
+                    "paused" => InstanceState::Paused,
+                    _ => InstanceState::Stopped,
                 };
             }
         }
@@ -788,8 +792,8 @@ impl App {
 
     pub fn focus_next(&mut self) {
         self.focus = match self.focus {
-            Focus::Projects => Focus::Sandboxes,
-            Focus::Sandboxes => Focus::Snapshots,
+            Focus::Projects => Focus::Instances,
+            Focus::Instances => Focus::Snapshots,
             Focus::Snapshots => Focus::Projects,
         };
     }
@@ -802,14 +806,14 @@ impl App {
                 }
                 let max = self.visible.len() - 1;
                 self.selected = clamp_index(self.selected, delta, max);
-                self.refresh_sandbox_filter();
+                self.refresh_instance_filter();
             }
-            Focus::Sandboxes => {
-                if self.sandbox_visible.is_empty() {
+            Focus::Instances => {
+                if self.instance_visible.is_empty() {
                     return;
                 }
-                let max = self.sandbox_visible.len() - 1;
-                self.sandbox_selected = clamp_index(self.sandbox_selected, delta, max);
+                let max = self.instance_visible.len() - 1;
+                self.instance_selected = clamp_index(self.instance_selected, delta, max);
             }
             Focus::Snapshots => {
                 if self.snapshots.is_empty() {
@@ -835,7 +839,7 @@ impl App {
     pub fn poll(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         if self.tick.is_multiple_of(40) {
-            self.refresh_sandboxes();
+            self.refresh_instances();
         }
         let mut closed = false;
         if let Some(session) = &mut self.session {
@@ -848,8 +852,8 @@ impl App {
         }
         if closed && !self.session_closed_reported {
             self.session_closed_reported = true;
-            self.sandbox.state = SandboxState::Stopped;
-            self.sandbox.started_at = None;
+            self.instance.state = InstanceState::Stopped;
+            self.instance.started_at = None;
             self.toast("session exited", ToastLevel::Info);
         }
         if self
@@ -973,8 +977,8 @@ impl App {
                 Vec::new()
             }
             KeyCode::Char('2') => {
-                self.focus = Focus::Sandboxes;
-                self.refresh_sandboxes();
+                self.focus = Focus::Instances;
+                self.refresh_instances();
                 Vec::new()
             }
             KeyCode::Char('3') => {
@@ -993,11 +997,11 @@ impl App {
             }
             KeyCode::Char('e') => self.effect_for_selected(Effect::OpenEditor),
             KeyCode::Char('g') => self.effect_for_selected(Effect::OpenLazygit),
-            KeyCode::Char('r') => vec![Effect::RefreshProjects, Effect::RefreshSandboxes],
+            KeyCode::Char('r') => vec![Effect::RefreshProjects, Effect::RefreshInstances],
             KeyCode::Char('d') => match self.focus {
                 Focus::Snapshots => self.confirm_delete_snapshot(),
-                Focus::Sandboxes => self.confirm_delete_sandbox(),
-                Focus::Projects => self.confirm_delete_project_sandbox(),
+                Focus::Instances => self.confirm_delete_instance(),
+                Focus::Projects => self.confirm_delete_project_instance(),
             },
             KeyCode::Char('n') if self.focus == Focus::Snapshots => {
                 self.handle_action(ActionId::NewSnapshot)
@@ -1011,13 +1015,13 @@ impl App {
                 Vec::new()
             }
             KeyCode::Char('b') => {
-                self.focus = Focus::Sandboxes;
-                self.refresh_sandboxes();
+                self.focus = Focus::Instances;
+                self.refresh_instances();
                 Vec::new()
             }
-            KeyCode::Char('S') if self.focus == Focus::Sandboxes => self.stop_selected_sandbox(),
+            KeyCode::Char('S') if self.focus == Focus::Instances => self.stop_selected_instance(),
             KeyCode::F(4) => self.open_global_config(),
-            KeyCode::F(5) if self.focus == Focus::Sandboxes => self.open_sandbox_config(),
+            KeyCode::F(5) if self.focus == Focus::Instances => self.open_instance_config(),
             KeyCode::Char('t') => {
                 if self.session.is_some() {
                     self.screen = Screen::Terminal;
@@ -1333,57 +1337,57 @@ impl App {
                 FormOutcome::OpenFile => vec![Effect::OpenEditor(form.path)],
                 FormOutcome::OpenProfile(harness) => vec![Effect::OpenProfileEditor(harness)],
             },
-            Modal::DeleteSandbox(mut modal) => match key.code {
+            Modal::DeleteInstance(mut modal) => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => Vec::new(),
                 KeyCode::Char('y') => match modal.stage {
-                    DeleteSandboxStage::Confirm => {
-                        if self.workspace_is_inside_sandbox(&modal.sandbox) {
-                            modal.stage = DeleteSandboxStage::Files;
-                            self.modal = Some(Modal::DeleteSandbox(modal));
+                    DeleteInstanceStage::Confirm => {
+                        if self.workspace_is_inside_instance(&modal.instance) {
+                            modal.stage = DeleteInstanceStage::Files;
+                            self.modal = Some(Modal::DeleteInstance(modal));
                             Vec::new()
                         } else {
-                            vec![Effect::DeleteSandbox {
-                                sandbox: modal.sandbox.name,
+                            vec![Effect::DeleteInstance {
+                                instance: modal.instance.name,
                                 delete_files: false,
                             }]
                         }
                     }
-                    DeleteSandboxStage::Files => vec![Effect::DeleteSandbox {
-                        sandbox: modal.sandbox.name,
+                    DeleteInstanceStage::Files => vec![Effect::DeleteInstance {
+                        instance: modal.instance.name,
                         delete_files: true,
                     }],
                 },
                 KeyCode::Char('n') | KeyCode::Char('k')
-                    if modal.stage == DeleteSandboxStage::Files =>
+                    if modal.stage == DeleteInstanceStage::Files =>
                 {
-                    vec![Effect::DeleteSandbox {
-                        sandbox: modal.sandbox.name,
+                    vec![Effect::DeleteInstance {
+                        instance: modal.instance.name,
                         delete_files: false,
                     }]
                 }
                 KeyCode::Char('n') => Vec::new(),
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.modal = Some(Modal::DeleteSandbox(modal));
+                    self.modal = Some(Modal::DeleteInstance(modal));
                     self.scroll_modal(1);
                     Vec::new()
                 }
-                KeyCode::Char('k') | KeyCode::Up if modal.stage == DeleteSandboxStage::Confirm => {
-                    self.modal = Some(Modal::DeleteSandbox(modal));
+                KeyCode::Char('k') | KeyCode::Up if modal.stage == DeleteInstanceStage::Confirm => {
+                    self.modal = Some(Modal::DeleteInstance(modal));
                     self.scroll_modal(-1);
                     Vec::new()
                 }
                 KeyCode::PageDown => {
-                    self.modal = Some(Modal::DeleteSandbox(modal));
+                    self.modal = Some(Modal::DeleteInstance(modal));
                     self.scroll_modal_page(1);
                     Vec::new()
                 }
                 KeyCode::PageUp => {
-                    self.modal = Some(Modal::DeleteSandbox(modal));
+                    self.modal = Some(Modal::DeleteInstance(modal));
                     self.scroll_modal_page(-1);
                     Vec::new()
                 }
                 _ => {
-                    self.modal = Some(Modal::DeleteSandbox(modal));
+                    self.modal = Some(Modal::DeleteInstance(modal));
                     Vec::new()
                 }
             },
@@ -1428,7 +1432,7 @@ impl App {
                     self.scroll_modal_page(-1);
                     Vec::new()
                 }
-                KeyCode::Enter => vec![Effect::CloneSandbox {
+                KeyCode::Enter => vec![Effect::CloneInstance {
                     source: form.source,
                     count: form.count,
                     harness: form.harness,
@@ -1836,12 +1840,12 @@ impl App {
         Vec::new()
     }
 
-    fn attach_selected_sandbox(&mut self) -> Vec<Effect> {
-        let Some(sandbox) = self.selected_sandbox().cloned() else {
-            self.toast("no sandbox selected", ToastLevel::Warn);
+    fn attach_selected_instance(&mut self) -> Vec<Effect> {
+        let Some(instance) = self.selected_instance().cloned() else {
+            self.toast("no instance selected", ToastLevel::Warn);
             return Vec::new();
         };
-        if self.sandbox.state == SandboxState::Starting {
+        if self.instance.state == InstanceState::Starting {
             self.toast("a VM is already starting…", ToastLevel::Warn);
             return Vec::new();
         }
@@ -1851,79 +1855,79 @@ impl App {
         self.input.clear();
         self.terminal_mode = TerminalMode::Normal;
         self.session_closed_reported = false;
-        self.sandbox.state = SandboxState::Starting;
-        self.sandbox.started_at = None;
-        self.sandbox.note = Some(format!("attaching to sandbox {}", sandbox.name));
-        vec![Effect::AttachSandbox {
-            sandbox: sandbox.name,
+        self.instance.state = InstanceState::Starting;
+        self.instance.started_at = None;
+        self.instance.note = Some(format!("attaching to instance {}", instance.name));
+        vec![Effect::AttachInstance {
+            instance: instance.name,
         }]
     }
 
-    fn stop_selected_sandbox(&mut self) -> Vec<Effect> {
-        let Some(sandbox) = self.selected_sandbox().cloned() else {
-            self.toast("no sandbox selected", ToastLevel::Warn);
+    fn stop_selected_instance(&mut self) -> Vec<Effect> {
+        let Some(instance) = self.selected_instance().cloned() else {
+            self.toast("no instance selected", ToastLevel::Warn);
             return Vec::new();
         };
-        vec![Effect::StopSandbox {
-            sandbox: sandbox.name,
+        vec![Effect::StopInstance {
+            instance: instance.name,
         }]
     }
 
-    fn confirm_delete_sandbox(&mut self) -> Vec<Effect> {
-        let Some(sandbox) = self.selected_sandbox().cloned() else {
-            self.toast("no sandbox selected", ToastLevel::Warn);
+    fn confirm_delete_instance(&mut self) -> Vec<Effect> {
+        let Some(instance) = self.selected_instance().cloned() else {
+            self.toast("no instance selected", ToastLevel::Warn);
             return Vec::new();
         };
-        self.modal = Some(Modal::DeleteSandbox(DeleteSandboxModal {
-            sandbox,
-            stage: DeleteSandboxStage::Confirm,
+        self.modal = Some(Modal::DeleteInstance(DeleteInstanceModal {
+            instance,
+            stage: DeleteInstanceStage::Confirm,
             error: None,
             scroll: 0,
         }));
         Vec::new()
     }
 
-    /// Delete the VM/sandbox of the selected project without starting it.
+    /// Delete the VM/instance of the selected project without starting it.
     ///
     /// The project directory itself is never touched. This is the dashboard
-    /// counterpart of `hegn sandbox delete`, and importantly it does not run
+    /// counterpart of `hegn instance delete`, and importantly it does not run
     /// any host prerequisite checks: a VM whose start failed (missing images,
     /// inactive firewall, broken relay) can still be removed.
-    fn confirm_delete_project_sandbox(&mut self) -> Vec<Effect> {
+    fn confirm_delete_project_instance(&mut self) -> Vec<Effect> {
         let Some(project) = self.selected_project().cloned() else {
             self.toast("no project selected", ToastLevel::Warn);
             return Vec::new();
         };
-        let sandbox = self
-            .sandboxes
+        let instance = self
+            .instances
             .iter()
-            .filter(|sandbox| crate::sandbox::same_project(&sandbox.project, &project.path))
-            // Prefer the base sandbox over multi-agent clones.
-            .min_by_key(|sandbox| sandbox.ephemeral)
+            .filter(|instance| crate::instance::same_project(&instance.project, &project.path))
+            // Prefer the base instance over multi-agent clones.
+            .min_by_key(|instance| instance.ephemeral)
             .cloned();
-        let Some(sandbox) = sandbox else {
+        let Some(instance) = instance else {
             self.toast(
                 format!("no VM for {} — nothing to delete", project.name),
                 ToastLevel::Warn,
             );
             return Vec::new();
         };
-        self.modal = Some(Modal::DeleteSandbox(DeleteSandboxModal {
-            sandbox,
-            stage: DeleteSandboxStage::Confirm,
+        self.modal = Some(Modal::DeleteInstance(DeleteInstanceModal {
+            instance,
+            stage: DeleteInstanceStage::Confirm,
             error: None,
             scroll: 0,
         }));
         Vec::new()
     }
 
-    fn workspace_is_inside_sandbox(&self, sandbox: &SandboxSummary) -> bool {
-        let dir = self.config.sandboxes_dir.join(&sandbox.name);
+    fn workspace_is_inside_instance(&self, instance: &InstanceSummary) -> bool {
+        let dir = self.config.instances_dir.join(&instance.name);
         let dir = dir.canonicalize().unwrap_or(dir);
-        let workspace = sandbox
+        let workspace = instance
             .workspace
             .canonicalize()
-            .unwrap_or_else(|_| sandbox.workspace.clone());
+            .unwrap_or_else(|_| instance.workspace.clone());
         workspace.starts_with(&dir)
     }
 
@@ -1948,26 +1952,29 @@ impl App {
         }
     }
 
-    fn open_sandbox_config(&mut self) -> Vec<Effect> {
-        let Some(sandbox) = self.selected_sandbox().map(|sandbox| sandbox.name.clone()) else {
-            self.toast("select a sandbox first", ToastLevel::Warn);
+    fn open_instance_config(&mut self) -> Vec<Effect> {
+        let Some(instance) = self
+            .selected_instance()
+            .map(|instance| instance.name.clone())
+        else {
+            self.toast("select an instance first", ToastLevel::Warn);
             return Vec::new();
         };
-        self.show_sandbox_config_form(&sandbox, None);
+        self.show_instance_config_form(&instance, None);
         Vec::new()
     }
 
-    fn show_sandbox_config_form(&mut self, name: &str, status: Option<String>) {
-        let store = crate::sandbox_config::SandboxStore::new(self.config.clone());
+    fn show_instance_config_form(&mut self, name: &str, status: Option<String>) {
+        let store = crate::instance_config::InstanceStore::new(self.config.clone());
         match store.load(name) {
-            Ok(sandbox) => {
-                let mut form = ConfigForm::sandbox(sandbox, self.config.clone());
+            Ok(instance) => {
+                let mut form = ConfigForm::instance(instance, self.config.clone());
                 form.status = status;
                 self.config_hover = None;
                 self.modal = Some(Modal::Config(form));
             }
             Err(err) => self.toast(
-                format!("could not load sandbox config: {err:#}"),
+                format!("could not load instance config: {err:#}"),
                 ToastLevel::Error,
             ),
         }
@@ -1997,10 +2004,10 @@ impl App {
                 }
                 effects
             }
-            Some(Applied::Sandbox) => {
-                self.refresh_sandboxes();
+            Some(Applied::Instance) => {
+                self.refresh_instances();
                 self.modal = Some(Modal::Config(form));
-                self.toast("sandbox settings saved", ToastLevel::Info);
+                self.toast("instance settings saved", ToastLevel::Info);
                 Vec::new()
             }
             None => {
@@ -2030,14 +2037,14 @@ impl App {
                     Vec::new()
                 }
             },
-            ConfigKind::Sandbox => {
-                match form.sandbox_name().map(str::to_string) {
-                    Some(name) => self.show_sandbox_config_form(
+            ConfigKind::Instance => {
+                match form.instance_name().map(str::to_string) {
+                    Some(name) => self.show_instance_config_form(
                         &name,
                         Some("reverted to the file on disk".into()),
                     ),
                     None => {
-                        form.error = Some("sandbox name is missing".into());
+                        form.error = Some("instance name is missing".into());
                         self.modal = Some(Modal::Config(form));
                     }
                 }
@@ -2051,15 +2058,15 @@ impl App {
         self.security_engine = SecurityEngine::new(config.security);
         self.store = StateStore::load(config.state_dir.join("state.json"));
         self.config = config;
-        self.sandbox.vcpus = self.config.vcpus;
-        self.sandbox.memory_mib = self.config.memory_mib;
-        self.sandbox.virtiofs = if self.config.vm_assets_ready() {
+        self.instance.vcpus = self.config.vcpus;
+        self.instance.memory_mib = self.config.memory_mib;
+        self.instance.virtiofs = if self.config.vm_assets_ready() {
             "configured"
         } else {
             "missing VM"
         };
         self.refresh_snapshots();
-        self.refresh_sandboxes();
+        self.refresh_instances();
     }
 
     fn open_multi_agent(&mut self) -> Vec<Effect> {
@@ -2070,18 +2077,18 @@ impl App {
             );
             return Vec::new();
         };
-        let sandbox = session.sandbox_name().to_string();
+        let instance = session.instance_name().to_string();
         let harness = self
-            .sandboxes
+            .instances
             .iter()
-            .find(|entry| entry.name == sandbox)
+            .find(|entry| entry.name == instance)
             .map(|entry| entry.harness)
             .unwrap_or(self.config.harness);
-        self.modal = Some(Modal::MultiAgent(MultiAgentForm::new(sandbox, harness)));
+        self.modal = Some(Modal::MultiAgent(MultiAgentForm::new(instance, harness)));
         Vec::new()
     }
 
-    /// Reload global and sandbox configuration after an editor round-trip.
+    /// Reload global and instance configuration after an editor round-trip.
     pub fn reload_after_edit(&mut self) {
         match Config::load() {
             Ok(config) => self.apply_global_config(config),
@@ -2097,10 +2104,10 @@ impl App {
         if self.focus == Focus::Snapshots {
             return self.confirm_restore_snapshot();
         }
-        if self.focus == Focus::Sandboxes {
-            return self.attach_selected_sandbox();
+        if self.focus == Focus::Instances {
+            return self.attach_selected_instance();
         }
-        if self.sandbox.state == SandboxState::Starting {
+        if self.instance.state == InstanceState::Starting {
             self.toast("a VM is already starting…", ToastLevel::Warn);
             return Vec::new();
         }
@@ -2112,7 +2119,7 @@ impl App {
         let attached_to_project = self
             .session
             .as_ref()
-            .is_some_and(|session| crate::sandbox::same_project(session.project(), &project.path));
+            .is_some_and(|session| crate::instance::same_project(session.project(), &project.path));
         if attached_to_project && self.session_active() {
             self.screen = Screen::Terminal;
             return Vec::new();
@@ -2134,13 +2141,13 @@ impl App {
         self.input.clear();
         self.terminal_mode = TerminalMode::Normal;
         self.session_closed_reported = false;
-        self.sandbox.state = SandboxState::Starting;
-        self.sandbox.started_at = None;
-        self.sandbox.note = Some(format!(
+        self.instance.state = InstanceState::Starting;
+        self.instance.started_at = None;
+        self.instance.note = Some(format!(
             "booting Cloud Hypervisor VM for {}",
             project.display_path()
         ));
-        vec![Effect::StartProjectSandbox {
+        vec![Effect::StartProjectInstance {
             project: project.path.clone(),
             harness,
         }]
@@ -2148,26 +2155,26 @@ impl App {
 
     /// Install a console for a successfully started/attached VM.
     pub fn attach_console(&mut self, console: Box<dyn TerminalConsole>) {
-        self.sandbox.state = SandboxState::Running;
-        self.sandbox.backend = "cloud-hypervisor";
-        self.sandbox.note = Some(format!(
+        self.instance.state = InstanceState::Running;
+        self.instance.backend = "cloud-hypervisor";
+        self.instance.note = Some(format!(
             "{} in {}",
             console.label(),
             console.project().display()
         ));
-        self.sandbox.started_at = Some(Instant::now());
-        self.sandbox.socket = Some(
+        self.instance.started_at = Some(Instant::now());
+        self.instance.socket = Some(
             self.config
-                .sandboxes_dir
-                .join(console.sandbox_name())
+                .instances_dir
+                .join(console.instance_name())
                 .join("run/cloud-hypervisor.sock"),
         );
         if let Some(index) = self
-            .sandbox_visible
+            .instance_visible
             .iter()
-            .position(|&index| self.sandboxes[index].name == console.sandbox_name())
+            .position(|&index| self.instances[index].name == console.instance_name())
         {
-            self.sandbox_selected = index;
+            self.instance_selected = index;
         }
         self.session = Some(console);
         self.screen = Screen::Terminal;
@@ -2177,7 +2184,7 @@ impl App {
             "attached — normal mode, press i or a to type",
             ToastLevel::Info,
         );
-        self.refresh_sandboxes();
+        self.refresh_instances();
     }
 
     /// Report a hard VM start/attach failure. No host fallback is attempted.
@@ -2187,9 +2194,9 @@ impl App {
     pub fn fail_start(&mut self, error: impl Into<String>) {
         let error = error.into();
         self.session = None;
-        self.sandbox.state = SandboxState::Failed;
-        self.sandbox.started_at = None;
-        self.sandbox.note = Some(error.clone());
+        self.instance.state = InstanceState::Failed;
+        self.instance.started_at = None;
+        self.instance.note = Some(error.clone());
         self.toast(format!("VM start failed: {error}"), ToastLevel::Error);
         self.modal = Some(Modal::Doctor(DoctorModal::with_error(
             crate::doctor::run(&self.config),
@@ -2281,7 +2288,7 @@ impl App {
                 Some(Modal::MultiAgent(_)) => {
                     self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 }
-                Some(Modal::Confirm(_) | Modal::DeleteSandbox(_)) => {
+                Some(Modal::Confirm(_) | Modal::DeleteInstance(_)) => {
                     self.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
                 }
                 _ => Vec::new(),
@@ -2289,7 +2296,7 @@ impl App {
             ActionId::Cancel => {
                 if matches!(
                     self.modal,
-                    Some(Modal::Confirm(_) | Modal::DeleteSandbox(_) | Modal::MultiAgent(_))
+                    Some(Modal::Confirm(_) | Modal::DeleteInstance(_) | Modal::MultiAgent(_))
                 ) {
                     self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
                 } else {
@@ -2324,7 +2331,7 @@ impl App {
             },
             ActionId::Edit => self.effect_for_selected(Effect::OpenEditor),
             ActionId::Lazygit => self.effect_for_selected(Effect::OpenLazygit),
-            ActionId::Refresh => vec![Effect::RefreshProjects, Effect::RefreshSandboxes],
+            ActionId::Refresh => vec![Effect::RefreshProjects, Effect::RefreshInstances],
             ActionId::Doctor => {
                 self.modal = Some(Modal::Doctor(DoctorModal::new(crate::doctor::run(
                     &self.config,
@@ -2399,17 +2406,17 @@ impl App {
             }
             ActionId::Restore => self.confirm_restore_snapshot(),
             ActionId::DeleteSnapshot => self.confirm_delete_snapshot(),
-            ActionId::FocusSandboxes => {
-                self.focus = Focus::Sandboxes;
-                self.refresh_sandboxes();
+            ActionId::FocusInstances => {
+                self.focus = Focus::Instances;
+                self.refresh_instances();
                 Vec::new()
             }
-            ActionId::StartSandbox => self.open_selected(),
-            ActionId::StopSandbox => self.stop_selected_sandbox(),
-            ActionId::DeleteSandbox => self.confirm_delete_sandbox(),
-            ActionId::SandboxConfig => self.open_sandbox_config(),
+            ActionId::StartInstance => self.open_selected(),
+            ActionId::StopInstance => self.stop_selected_instance(),
+            ActionId::DeleteInstance => self.confirm_delete_instance(),
+            ActionId::InstanceConfig => self.open_instance_config(),
             ActionId::GlobalConfig => self.open_global_config(),
-            ActionId::CloneSandbox | ActionId::MultiAgent => self.open_multi_agent(),
+            ActionId::CloneInstance | ActionId::MultiAgent => self.open_multi_agent(),
             ActionId::KeepFiles => {
                 self.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             }
@@ -2498,7 +2505,7 @@ impl App {
             Some(Modal::Doctor(modal)) => Some(modal.scroll),
             Some(Modal::Security(prompt)) => Some(prompt.scroll),
             Some(Modal::Confirm(prompt)) => Some(prompt.scroll),
-            Some(Modal::DeleteSandbox(modal)) => Some(modal.scroll),
+            Some(Modal::DeleteInstance(modal)) => Some(modal.scroll),
             Some(Modal::MultiAgent(form)) => Some(form.scroll),
             Some(Modal::Error { scroll, .. }) => Some(*scroll),
             _ => None,
@@ -2511,7 +2518,7 @@ impl App {
             Some(Modal::Doctor(modal)) => modal.scroll = offset,
             Some(Modal::Security(prompt)) => prompt.scroll = offset,
             Some(Modal::Confirm(prompt)) => prompt.scroll = offset,
-            Some(Modal::DeleteSandbox(modal)) => modal.scroll = offset,
+            Some(Modal::DeleteInstance(modal)) => modal.scroll = offset,
             Some(Modal::MultiAgent(form)) => form.scroll = offset,
             Some(Modal::Error { scroll, .. }) => *scroll = offset,
             _ => {}
@@ -2653,7 +2660,7 @@ impl App {
                 {
                     self.focus = Focus::Projects;
                     self.selected = row.index;
-                    self.refresh_sandbox_filter();
+                    self.refresh_instance_filter();
                     let path = self.selected_project().map(|p| p.path.clone());
                     if let Some(path) = path {
                         let now = Instant::now();
@@ -2667,16 +2674,16 @@ impl App {
                     }
                 }
                 if let Some(row) = self
-                    .sandbox_rows
+                    .instance_rows
                     .iter()
                     .find(|row| rect_contains(row.rect, pos))
                     .copied()
                 {
-                    self.focus = Focus::Sandboxes;
-                    self.sandbox_selected = row.index;
+                    self.focus = Focus::Instances;
+                    self.instance_selected = row.index;
                     let path = self
-                        .selected_sandbox()
-                        .map(|sandbox| sandbox.config_path.clone());
+                        .selected_instance()
+                        .map(|instance| instance.config_path.clone());
                     if let Some(path) = path {
                         let now = Instant::now();
                         let double = self.last_click.as_ref().is_some_and(|(at, p)| {
@@ -2684,7 +2691,7 @@ impl App {
                         });
                         self.last_click = Some((now, path));
                         if double {
-                            return self.attach_selected_sandbox();
+                            return self.attach_selected_instance();
                         }
                     }
                 }
@@ -2863,7 +2870,7 @@ mod tests {
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
         config.templates_dir = dir.path().join("templates");
-        config.sandboxes_dir = dir.path().join("sandboxes");
+        config.instances_dir = dir.path().join("instances");
         config.profiles_dir = dir.path().join("profiles");
         config.backend = crate::config::BackendKind::Auto;
         config.auto_branch = false;
@@ -2913,7 +2920,7 @@ mod tests {
             "fake · serial"
         }
 
-        fn sandbox_name(&self) -> &str {
+        fn instance_name(&self) -> &str {
             "fake"
         }
     }
@@ -2983,7 +2990,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         assert_eq!(app.focus, Focus::Projects);
         app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.focus, Focus::Sandboxes);
+        assert_eq!(app.focus, Focus::Instances);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Snapshots);
         app.handle_key(key(KeyCode::Tab));
@@ -2995,7 +3002,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         assert_eq!(app.focus, Focus::Projects);
         app.handle_key(key(KeyCode::Char('2')));
-        assert_eq!(app.focus, Focus::Sandboxes);
+        assert_eq!(app.focus, Focus::Instances);
         app.handle_key(key(KeyCode::Char('3')));
         assert_eq!(app.focus, Focus::Snapshots);
         app.handle_key(key(KeyCode::Char('1')));
@@ -3005,16 +3012,16 @@ mod tests {
     #[test]
     fn enter_never_confirms_a_deletion() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.sandboxes_dir.join("demo").join("workspace");
-        app.focus = Focus::Sandboxes;
-        let sandbox = fake_sandbox(&app, "demo", inside);
-        install_sandboxes(&mut app, vec![sandbox]);
+        let inside = app.config.instances_dir.join("demo").join("workspace");
+        app.focus = Focus::Instances;
+        let instance = fake_instance(&app, "demo", inside);
+        install_instances(&mut app, vec![instance]);
         app.handle_key(key(KeyCode::Char('d')));
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             app.modal,
-            Some(Modal::DeleteSandbox(crate::app::DeleteSandboxModal {
-                stage: crate::app::DeleteSandboxStage::Confirm,
+            Some(Modal::DeleteInstance(crate::app::DeleteInstanceModal {
+                stage: crate::app::DeleteInstanceStage::Confirm,
                 ..
             }))
         ));
@@ -3024,8 +3031,8 @@ mod tests {
         assert!(effects.is_empty(), "Enter must not delete files");
         assert!(matches!(
             app.modal,
-            Some(Modal::DeleteSandbox(crate::app::DeleteSandboxModal {
-                stage: crate::app::DeleteSandboxStage::Files,
+            Some(Modal::DeleteInstance(crate::app::DeleteInstanceModal {
+                stage: crate::app::DeleteInstanceStage::Files,
                 ..
             }))
         ));
@@ -3159,7 +3166,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 vm_state: "Paused".into(),
                 dir: paths.dir,
-                sandbox: None,
+                instance: None,
                 project: None,
                 size_bytes: 0,
                 note: None,
@@ -3186,7 +3193,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 vm_state: "Paused".into(),
                 dir: paths.dir,
-                sandbox: None,
+                instance: None,
                 project: None,
                 size_bytes: 0,
                 note: None,
@@ -3411,7 +3418,7 @@ mod tests {
 
         help.query = "stop snapshot".into();
         assert!(
-            !help.matches("Sandboxes", "S", "stop selected sandbox"),
+            !help.matches("Instances", "S", "stop selected instance"),
             "every query term must match"
         );
 
@@ -3540,28 +3547,28 @@ mod tests {
         assert_eq!(encode_key(ctrl_bracket), Some(vec![0x1b]));
     }
 
-    fn fake_sandbox(app: &App, name: &str, workspace: PathBuf) -> SandboxSummary {
-        SandboxSummary {
+    fn fake_instance(app: &App, name: &str, workspace: PathBuf) -> InstanceSummary {
+        InstanceSummary {
             name: name.into(),
             project: app.config.projects_root.join("demo"),
             workspace,
             harness: Harness::Shell,
             ephemeral: false,
-            source_sandbox: None,
+            source_instance: None,
             state: "stopped".into(),
             vm_pid: None,
             serial_log: None,
-            config_path: app.config.sandboxes_dir.join(name).join("hegn.toml"),
+            config_path: app.config.instances_dir.join(name).join("hegn.toml"),
             vcpus: 2,
             memory_mib: 2048,
             error: None,
         }
     }
 
-    /// Install a sandbox list and select the matching fake project, so the
-    /// project-scoped sandbox filter has something to work with.
-    fn install_sandboxes(app: &mut App, sandboxes: Vec<SandboxSummary>) {
-        if let Some(project) = sandboxes.first().map(|sandbox| sandbox.project.clone()) {
+    /// Install an instance list and select the matching fake project, so the
+    /// project-scoped instance filter has something to work with.
+    fn install_instances(app: &mut App, instances: Vec<InstanceSummary>) {
+        if let Some(project) = instances.first().map(|instance| instance.project.clone()) {
             let name = project
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -3574,26 +3581,26 @@ mod tests {
             }];
             app.visible = vec![0];
             app.selected = 0;
-            app.sandbox_project = None;
+            app.instance_project = None;
         }
-        app.sandboxes = sandboxes;
-        app.refresh_sandbox_filter();
+        app.instances = instances;
+        app.refresh_instance_filter();
     }
 
     #[test]
-    fn sandbox_focus_and_delete_double_confirmation() {
+    fn instance_focus_and_delete_double_confirmation() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.sandboxes_dir.join("demo").join("workspace");
+        let inside = app.config.instances_dir.join("demo").join("workspace");
         app.handle_key(key(KeyCode::Char('b')));
-        assert_eq!(app.focus, Focus::Sandboxes);
-        let sandbox = fake_sandbox(&app, "demo", inside);
-        install_sandboxes(&mut app, vec![sandbox]);
+        assert_eq!(app.focus, Focus::Instances);
+        let instance = fake_instance(&app, "demo", inside);
+        install_instances(&mut app, vec![instance]);
 
         app.handle_key(key(KeyCode::Char('d')));
         assert!(matches!(
             app.modal,
-            Some(Modal::DeleteSandbox(crate::app::DeleteSandboxModal {
-                stage: crate::app::DeleteSandboxStage::Confirm,
+            Some(Modal::DeleteInstance(crate::app::DeleteInstanceModal {
+                stage: crate::app::DeleteInstanceStage::Confirm,
                 ..
             }))
         ));
@@ -3601,35 +3608,35 @@ mod tests {
         app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(
             app.modal,
-            Some(Modal::DeleteSandbox(crate::app::DeleteSandboxModal {
-                stage: crate::app::DeleteSandboxStage::Files,
+            Some(Modal::DeleteInstance(crate::app::DeleteInstanceModal {
+                stage: crate::app::DeleteInstanceStage::Files,
                 ..
             }))
         ));
         let effects = app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::DeleteSandbox {
-                sandbox,
+            [Effect::DeleteInstance {
+                instance,
                 delete_files: true
-            }] if sandbox == "demo"
+            }] if instance == "demo"
         ));
     }
 
     #[test]
-    fn projects_focus_delete_targets_the_project_sandbox() {
+    fn projects_focus_delete_targets_the_project_instance() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.sandboxes_dir.join("demo").join("workspace");
-        let sandbox = fake_sandbox(&app, "demo", inside);
-        install_sandboxes(&mut app, vec![sandbox]);
+        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let instance = fake_instance(&app, "demo", inside);
+        install_instances(&mut app, vec![instance]);
         app.focus = Focus::Projects;
 
         app.handle_key(key(KeyCode::Char('d')));
-        let Some(Modal::DeleteSandbox(modal)) = &app.modal else {
+        let Some(Modal::DeleteInstance(modal)) = &app.modal else {
             panic!("expected a delete confirmation");
         };
-        assert_eq!(modal.sandbox.name, "demo");
-        assert_eq!(modal.stage, DeleteSandboxStage::Confirm);
+        assert_eq!(modal.instance.name, "demo");
+        assert_eq!(modal.stage, DeleteInstanceStage::Confirm);
     }
 
     #[test]
@@ -3643,7 +3650,7 @@ mod tests {
         }];
         app.visible = vec![0];
         app.selected = 0;
-        app.sandboxes.clear();
+        app.instances.clear();
         app.focus = Focus::Projects;
 
         app.handle_key(key(KeyCode::Char('d')));
@@ -3653,24 +3660,24 @@ mod tests {
     #[test]
     fn keeping_files_emits_a_keep_effect() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.sandboxes_dir.join("demo").join("workspace");
-        app.focus = Focus::Sandboxes;
-        let sandbox = fake_sandbox(&app, "demo", inside);
-        install_sandboxes(&mut app, vec![sandbox]);
+        let inside = app.config.instances_dir.join("demo").join("workspace");
+        app.focus = Focus::Instances;
+        let instance = fake_instance(&app, "demo", inside);
+        install_instances(&mut app, vec![instance]);
         app.handle_key(key(KeyCode::Char('d')));
         app.handle_key(key(KeyCode::Char('y')));
         let effects = app.handle_key(key(KeyCode::Char('n')));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::DeleteSandbox {
-                sandbox,
+            [Effect::DeleteInstance {
+                instance,
                 delete_files: false
-            }] if sandbox == "demo"
+            }] if instance == "demo"
         ));
     }
 
     #[test]
-    fn config_menus_open_for_global_and_sandbox() {
+    fn config_menus_open_for_global_and_instance() {
         let (_dir, mut app) = test_app();
         app.handle_key(key(KeyCode::F(4)));
         match &app.modal {
@@ -3682,24 +3689,24 @@ mod tests {
             other => panic!("expected global settings, got {other:?}"),
         }
         app.modal = None;
-        let inside = app.config.sandboxes_dir.join("demo").join("workspace");
-        app.focus = Focus::Sandboxes;
-        let sandbox = fake_sandbox(&app, "demo", inside.clone());
-        let stored = crate::sandbox_config::SandboxConfig {
+        let inside = app.config.instances_dir.join("demo").join("workspace");
+        app.focus = Focus::Instances;
+        let instance = fake_instance(&app, "demo", inside.clone());
+        let stored = crate::instance_config::InstanceConfig {
             name: "demo".into(),
-            project: sandbox.project.clone(),
+            project: instance.project.clone(),
             workspace: inside,
             harness: Harness::Shell,
-            ..crate::sandbox_config::SandboxConfig::default()
+            ..crate::instance_config::InstanceConfig::default()
         };
-        crate::sandbox_config::SandboxStore::new(app.config.clone())
+        crate::instance_config::InstanceStore::new(app.config.clone())
             .save(&stored)
             .unwrap();
-        install_sandboxes(&mut app, vec![sandbox]);
+        install_instances(&mut app, vec![instance]);
         app.handle_key(key(KeyCode::F(5)));
         match &app.modal {
-            Some(Modal::Config(form)) => assert_eq!(form.kind, ConfigKind::Sandbox),
-            other => panic!("expected sandbox settings, got {other:?}"),
+            Some(Modal::Config(form)) => assert_eq!(form.kind, ConfigKind::Instance),
+            other => panic!("expected instance settings, got {other:?}"),
         }
     }
 
@@ -3776,7 +3783,7 @@ mod tests {
         let effects = app.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::CloneSandbox {
+            [Effect::CloneInstance {
                 count: 2,
                 start: true,
                 ..
@@ -3802,19 +3809,19 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_list_is_scoped_to_the_selected_project_and_includes_clones() {
+    fn instance_list_is_scoped_to_the_selected_project_and_includes_clones() {
         let (_dir, mut app) = test_app();
         let demo = app.config.projects_root.join("demo");
         let other = app.config.projects_root.join("other");
 
-        let mut base = fake_sandbox(&app, "demo", demo.join("workspace"));
+        let mut base = fake_instance(&app, "demo", demo.join("workspace"));
         base.project = demo.clone();
-        let mut clone = fake_sandbox(&app, "demo-1", demo.join("clone-1"));
+        let mut clone = fake_instance(&app, "demo-1", demo.join("clone-1"));
         clone.project = demo.clone();
         clone.ephemeral = true;
-        clone.source_sandbox = Some("demo".into());
-        let mut other_sandbox = fake_sandbox(&app, "other", other.join("workspace"));
-        other_sandbox.project = other.clone();
+        clone.source_instance = Some("demo".into());
+        let mut other_instance = fake_instance(&app, "other", other.join("workspace"));
+        other_instance.project = other.clone();
 
         let demo_project = Project {
             name: "demo".into(),
@@ -3828,25 +3835,25 @@ mod tests {
             ..demo_project.clone()
         };
         app.set_projects(vec![demo_project, other_project]);
-        app.sandboxes = vec![base, clone, other_sandbox];
+        app.instances = vec![base, clone, other_instance];
 
         app.selected = app
             .visible
             .iter()
             .position(|&index| app.projects[index].path == demo)
             .unwrap();
-        app.refresh_sandbox_filter();
-        assert_eq!(app.sandbox_visible.len(), 2);
+        app.refresh_instance_filter();
+        assert_eq!(app.instance_visible.len(), 2);
         let names: Vec<&str> = app
-            .sandbox_visible
+            .instance_visible
             .iter()
-            .map(|&index| app.sandboxes[index].name.as_str())
+            .map(|&index| app.instances[index].name.as_str())
             .collect();
         assert_eq!(names, ["demo", "demo-1"]);
         assert!(
-            app.sandbox_visible
+            app.instance_visible
                 .iter()
-                .any(|&index| app.sandboxes[index].ephemeral),
+                .any(|&index| app.instances[index].ephemeral),
             "multi-agent clones must be attachable from the list"
         );
 
@@ -3855,45 +3862,45 @@ mod tests {
             .iter()
             .position(|&index| app.projects[index].path == other)
             .unwrap();
-        app.refresh_sandbox_filter();
-        assert_eq!(app.sandbox_visible.len(), 1);
-        assert_eq!(app.selected_sandbox().unwrap().name, "other");
+        app.refresh_instance_filter();
+        assert_eq!(app.instance_visible.len(), 1);
+        assert_eq!(app.selected_instance().unwrap().name, "other");
     }
 
     #[test]
-    fn stop_shortcut_only_works_with_sandbox_focus() {
+    fn stop_shortcut_only_works_with_instance_focus() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.sandboxes_dir.join("demo").join("workspace");
-        let sandbox = fake_sandbox(&app, "demo", inside);
-        install_sandboxes(&mut app, vec![sandbox]);
+        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let instance = fake_instance(&app, "demo", inside);
+        install_instances(&mut app, vec![instance]);
         app.focus = Focus::Projects;
         let effects = app.handle_key(key(KeyCode::Char('S')));
         assert!(
             effects.is_empty(),
-            "S must not stop a sandbox from projects"
+            "S must not stop an instance from projects"
         );
-        app.focus = Focus::Sandboxes;
+        app.focus = Focus::Instances;
         let effects = app.handle_key(key(KeyCode::Char('S')));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::StopSandbox { sandbox }] if sandbox == "demo"
+            [Effect::StopInstance { instance }] if instance == "demo"
         ));
     }
 
     #[test]
     fn refresh_does_not_clear_the_starting_state() {
         let (_dir, mut app) = test_app();
-        app.sandbox.state = SandboxState::Starting;
-        app.refresh_sandboxes();
-        assert_eq!(app.sandbox.state, SandboxState::Starting);
+        app.instance.state = InstanceState::Starting;
+        app.refresh_instances();
+        assert_eq!(app.instance.state, InstanceState::Starting);
     }
 
     #[test]
-    fn sandbox_status_reflects_config() {
+    fn instance_status_reflects_config() {
         let (_dir, app) = test_app();
-        assert_eq!(app.sandbox.state, SandboxState::Stopped);
-        assert_eq!(app.sandbox.backend, "cloud-hypervisor");
-        assert_eq!(app.sandbox.vcpus, app.config.vcpus);
+        assert_eq!(app.instance.state, InstanceState::Stopped);
+        assert_eq!(app.instance.backend, "cloud-hypervisor");
+        assert_eq!(app.instance.vcpus, app.config.vcpus);
     }
 
     #[test]
@@ -3901,13 +3908,13 @@ mod tests {
         let (_dir, mut app) = test_app();
         app.fail_start("missing VM assets");
         assert!(app.session.is_none());
-        assert_eq!(app.sandbox.state, SandboxState::Failed);
+        assert_eq!(app.instance.state, InstanceState::Failed);
         assert!(!app.session_active());
         assert!(app.toast.as_ref().unwrap().text.contains("VM start failed"));
     }
 
     #[test]
-    fn open_requests_a_sandbox_and_resets_the_terminal_mode() {
+    fn open_requests_a_instance_and_resets_the_terminal_mode() {
         let (_dir, mut app) = test_app();
         let mut project = fake_project("demo");
         project.path = app.config.projects_root.join("demo");
@@ -3920,11 +3927,11 @@ mod tests {
             TerminalMode::Normal,
             "the terminal mode must reset for each VM"
         );
-        assert_eq!(app.sandbox.state, SandboxState::Starting);
+        assert_eq!(app.instance.state, InstanceState::Starting);
         assert!(app.session.is_none());
         match effects.as_slice() {
             [
-                Effect::StartProjectSandbox {
+                Effect::StartProjectInstance {
                     project: p,
                     harness,
                 },
@@ -3932,14 +3939,14 @@ mod tests {
                 assert_eq!(p, &project.path);
                 assert_eq!(*harness, app.config.harness);
             }
-            other => panic!("expected StartProjectSandbox, got {other:?}"),
+            other => panic!("expected StartProjectInstance, got {other:?}"),
         }
     }
 
     #[test]
     fn a_second_start_is_rejected_while_the_first_is_booting() {
         let (_dir, mut app) = test_app();
-        app.sandbox.state = SandboxState::Starting;
+        app.instance.state = InstanceState::Starting;
         let effects = app.open_selected();
         assert!(effects.is_empty());
         assert!(
@@ -4064,7 +4071,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
         assert_eq!(app.screen, Screen::Terminal);
-        assert_eq!(app.sandbox.state, SandboxState::Running);
+        assert_eq!(app.instance.state, InstanceState::Running);
         assert!(app.session_active());
     }
 
@@ -4090,7 +4097,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         app.fail_start("boom");
         assert!(app.session.is_none());
-        assert_eq!(app.sandbox.state, SandboxState::Failed);
+        assert_eq!(app.instance.state, InstanceState::Failed);
         assert!(!app.session_active());
     }
 }

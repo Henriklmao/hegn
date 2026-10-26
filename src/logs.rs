@@ -1,7 +1,7 @@
 //! Persistent, private serial-console logs.
 //!
 //! The detached console relay appends the guest UART to a log in
-//! `<state>/logs/`, so the full boot and session output survives `hegn sandbox
+//! `<state>/logs/`, so the full boot and session output survives `hegn instance
 //! stop` even while no terminal is attached.
 //!
 //! Log files can contain whatever an agent printed, including secrets or
@@ -209,7 +209,9 @@ impl LogStore {
                 .into_iter()
                 .next()
                 .map(|entry| entry.path)
-                .context("no serial logs yet; start a VM with `hegn open` or `hegn sandbox start`"),
+                .context(
+                    "no serial logs yet; start a VM with `hegn open` or `hegn instance start`",
+                ),
         }
     }
 

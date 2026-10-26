@@ -6,13 +6,13 @@
 //! editing the global config.
 //!
 //! The host is always the source of truth for configuration files. Skills are
-//! **copied** into a private per-sandbox bundle and exported through a second
+//! **copied** into a private per-instance bundle and exported through a second
 //! `virtiofsd`; the host's real skill directories are never mounted into the
 //! guest. Changes made in the guest can be copied back explicitly with
 //! `hegn skills sync-back`.
 //!
 //! ```text
-//! <sandboxes_dir>/<sandbox>/profile/
+//! <instances_dir>/<instance>/profile/
 //!   local.json          host-side mapping (never exported)
 //!   bundle/             exported to the guest at /run/hegn/profile
 //!     manifest          tab-separated copy plan
@@ -31,7 +31,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Harness, safe_package_name};
-use crate::sandbox_config::SandboxConfig;
+use crate::instance_config::InstanceConfig;
 
 /// virtio-fs tag of the profile share. Reserved in `config.shared_tag`.
 pub const PROFILE_SHARE_TAG: &str = "hegn-profile";
@@ -68,7 +68,7 @@ pub struct ProfileFile {
 pub struct ProfileSkill {
     /// Host skill directory. `~` expands to the user's home directory.
     pub source: PathBuf,
-    /// Absolute guest directory. The guest target links to the per-sandbox
+    /// Absolute guest directory. The guest target links to the per-instance
     /// copy, never to the host directory.
     pub target: String,
     /// Permit `hegn skills sync-back` to copy guest changes to the host.
@@ -159,7 +159,7 @@ impl Profile {
     }
 }
 
-/// What `prepare` should do with existing per-sandbox skill copies.
+/// What `prepare` should do with existing per-instance skill copies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refresh {
     /// Re-copy configuration files, keep existing skill copies.
@@ -177,7 +177,7 @@ pub struct ProfileShare {
     pub manifest_id: String,
 }
 
-/// Result of preparing a profile for a sandbox start.
+/// Result of preparing a profile for an instance start.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProfilePlan {
     /// Packages contributed by the profile.
@@ -191,7 +191,7 @@ pub struct ProfilePlan {
 /// Report from `hegn skills sync`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SyncReport {
-    pub sandbox: String,
+    pub instance: String,
     pub harness: Harness,
     pub sources: usize,
     pub copied_files: usize,
@@ -201,7 +201,7 @@ pub struct SyncReport {
 /// Report from `hegn skills sync-back`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SyncBackReport {
-    pub sandbox: String,
+    pub instance: String,
     pub harness: Harness,
     pub copied_files: usize,
     pub skipped_files: usize,
@@ -297,33 +297,33 @@ impl ProfileStore {
     }
 }
 
-/// Build the profile payload for a sandbox start.
-pub fn prepare_for_start(config: &Config, sandbox: &SandboxConfig) -> Result<ProfilePlan> {
-    materialize(config, sandbox, Refresh::Start)
+/// Build the profile payload for an instance start.
+pub fn prepare_for_start(config: &Config, instance: &InstanceConfig) -> Result<ProfilePlan> {
+    materialize(config, instance, Refresh::Start)
 }
 
-/// Copy host skill changes into an existing per-sandbox bundle.
+/// Copy host skill changes into an existing per-instance bundle.
 ///
 /// Host files win for files they contain; guest-only files are preserved. The
 /// guest target is a link to this bundle, so a running VM sees the new files
 /// immediately.
-pub fn sync_skills(config: &Config, sandbox: &SandboxConfig) -> Result<SyncReport> {
+pub fn sync_skills(config: &Config, instance: &InstanceConfig) -> Result<SyncReport> {
     let store = ProfileStore::new(config);
-    let profile = store.load(sandbox.harness)?;
+    let profile = store.load(instance.harness)?;
     let mut report = SyncReport {
-        sandbox: sandbox.name.clone(),
-        harness: sandbox.harness,
+        instance: instance.name.clone(),
+        harness: instance.harness,
         sources: 0,
         copied_files: 0,
         warnings: Vec::new(),
     };
-    let layout = ProfileLayout::new(config, sandbox)?;
+    let layout = ProfileLayout::new(config, instance)?;
     let mut state = layout
         .load_state()
-        .filter(|state| state.harness == sandbox.harness)
+        .filter(|state| state.harness == instance.harness)
         .unwrap_or_else(|| ProfileState {
             version: PROFILE_VERSION,
-            harness: sandbox.harness,
+            harness: instance.harness,
             files: Vec::new(),
             skills: Vec::new(),
         });
@@ -355,34 +355,34 @@ pub fn sync_skills(config: &Config, sandbox: &SandboxConfig) -> Result<SyncRepor
     Ok(report)
 }
 
-/// Copy changed and new skill files from the sandbox bundle back to the host.
+/// Copy changed and new skill files from the instance bundle back to the host.
 ///
 /// Only regular files are copied. Symlinks and special files are skipped, so a
 /// poisoned guest cannot redirect a host write outside the configured skill
 /// directory.
 pub fn sync_skills_back(
     config: &Config,
-    sandbox: &SandboxConfig,
+    instance: &InstanceConfig,
     dry_run: bool,
 ) -> Result<SyncBackReport> {
-    let layout = ProfileLayout::new(config, sandbox)?;
+    let layout = ProfileLayout::new(config, instance)?;
     let state = layout.load_state().with_context(|| {
         format!(
-            "sandbox '{}' has no profile copy yet; start it once or run `hegn skills sync {}`",
-            sandbox.name, sandbox.name
+            "instance '{}' has no profile copy yet; start it once or run `hegn skills sync {}`",
+            instance.name, instance.name
         )
     })?;
-    if state.harness != sandbox.harness {
+    if state.harness != instance.harness {
         bail!(
-            "sandbox '{}' has a profile copy for harness '{}' but is configured for '{}'; \
+            "instance '{}' has a profile copy for harness '{}' but is configured for '{}'; \
              start it once to rebuild the profile",
-            sandbox.name,
+            instance.name,
             state.harness.label(),
-            sandbox.harness.label()
+            instance.harness.label()
         );
     }
     let mut report = SyncBackReport {
-        sandbox: sandbox.name.clone(),
+        instance: instance.name.clone(),
         harness: state.harness,
         copied_files: 0,
         skipped_files: 0,
@@ -470,13 +470,17 @@ fn copy_back_tree(
     Ok(())
 }
 
-fn materialize(config: &Config, sandbox: &SandboxConfig, refresh: Refresh) -> Result<ProfilePlan> {
+fn materialize(
+    config: &Config,
+    instance: &InstanceConfig,
+    refresh: Refresh,
+) -> Result<ProfilePlan> {
     let store = ProfileStore::new(config);
-    let profile = store.load(sandbox.harness)?;
-    let layout = ProfileLayout::new(config, sandbox)?;
+    let profile = store.load(instance.harness)?;
+    let layout = ProfileLayout::new(config, instance)?;
     let previous = layout
         .load_state()
-        .filter(|state| state.harness == sandbox.harness);
+        .filter(|state| state.harness == instance.harness);
     let mut state = if refresh == Refresh::Skills {
         previous.clone()
     } else {
@@ -484,7 +488,7 @@ fn materialize(config: &Config, sandbox: &SandboxConfig, refresh: Refresh) -> Re
     }
     .unwrap_or_else(|| ProfileState {
         version: PROFILE_VERSION,
-        harness: sandbox.harness,
+        harness: instance.harness,
         files: Vec::new(),
         skills: Vec::new(),
     });
@@ -552,7 +556,7 @@ fn materialize(config: &Config, sandbox: &SandboxConfig, refresh: Refresh) -> Re
         }
     }
 
-    // Skills are seeded once. On later starts the per-sandbox copy is kept so
+    // Skills are seeded once. On later starts the per-instance copy is kept so
     // guest-created skills survive a reboot and can be synced back.
     for skill in profile.skills.iter() {
         let source = expand_home(&skill.source);
@@ -564,7 +568,7 @@ fn materialize(config: &Config, sandbox: &SandboxConfig, refresh: Refresh) -> Re
                     .push(format!("skill source {} is missing", source.display()));
             }
             // Keep a previous mapping when only the host source disappeared
-            // temporarily; the per-sandbox copy may still hold guest edits.
+            // temporarily; the per-instance copy may still hold guest edits.
             if dest.exists()
                 && let Some(previous) = previous
                     .as_ref()
@@ -578,7 +582,7 @@ fn materialize(config: &Config, sandbox: &SandboxConfig, refresh: Refresh) -> Re
             let (copied, mut warnings) = merge_tree(&source, &dest, false)?;
             if copied > 0 {
                 plan.warnings.push(format!(
-                    "copied {copied} file(s) from {} into the sandbox skill copy",
+                    "copied {copied} file(s) from {} into the instance skill copy",
                     source.display()
                 ));
             }
@@ -641,8 +645,8 @@ struct ProfileLayout {
 }
 
 impl ProfileLayout {
-    fn new(config: &Config, sandbox: &SandboxConfig) -> Result<Self> {
-        let root = sandbox.dir(&config.sandboxes_dir).join("profile");
+    fn new(config: &Config, instance: &InstanceConfig) -> Result<Self> {
+        let root = instance.dir(&config.instances_dir).join("profile");
         let bundle_dir = root.join(BUNDLE_DIR);
         secure_dir(&root)?;
         secure_dir(&bundle_dir)?;
@@ -851,8 +855,8 @@ fn template(harness: Harness) -> String {
 # Host paths may start with `~`. Guest targets must be absolute and stay under
 # /root, /home, /etc, /usr/local, /opt or /workspace.
 #
-# `hegn skills sync <sandbox>` copies host skill changes into the sandbox copy.
-# `hegn skills sync-back <sandbox>` copies guest changes back to the host.
+# `hegn skills sync <instance>` copies host skill changes into the instance copy.
+# `hegn skills sync-back <instance>` copies guest changes back to the host.
 version = {PROFILE_VERSION}
 
 # Extra apt packages installed on first boot, on top of the harness preset.
@@ -868,7 +872,7 @@ packages = []
 # the [environment] table above.
 {file_examples}
 # Copy skills from this machine into the guest. Skills are copied, never
-# linked; the guest target points at the per-sandbox copy. Missing source
+# linked; the guest target points at the per-instance copy. Missing source
 # directories are skipped.
 {skill_blocks}
 # Guest home for {label}: {home}
@@ -1071,8 +1075,8 @@ fn secure_dir(path: &Path) -> Result<()> {
 }
 
 /// Ensure `path` is a real directory owned by hegn. A guest can replace a
-/// per-sandbox bundle subdirectory with a symlink; following it on the host
-/// would let the guest redirect writes outside the sandbox. Remove such a
+/// per-instance bundle subdirectory with a symlink; following it on the host
+/// would let the guest redirect writes outside the instance. Remove such a
 /// plant and recreate a private directory.
 fn ensure_real_dir(path: &Path) -> Result<()> {
     if let Ok(metadata) = fs::symlink_metadata(path)
@@ -1251,24 +1255,24 @@ mod tests {
     fn config(dir: &Path) -> Config {
         let mut config = Config::default();
         config.profiles_dir = dir.join("profiles");
-        config.sandboxes_dir = dir.join("sandboxes");
+        config.instances_dir = dir.join("instances");
         config.projects_root = dir.join("projects");
         fs::create_dir_all(&config.profiles_dir).unwrap();
         config
     }
 
-    fn sandbox(config: &Config, harness: Harness) -> SandboxConfig {
+    fn instance(config: &Config, harness: Harness) -> InstanceConfig {
         let project = config.projects_root.join("demo");
         fs::create_dir_all(&project).unwrap();
-        let sandbox = SandboxConfig {
+        let instance = InstanceConfig {
             name: "demo".into(),
             project: project.clone(),
             workspace: project,
             harness,
-            ..SandboxConfig::default()
+            ..InstanceConfig::default()
         };
-        sandbox.validate().unwrap();
-        sandbox
+        instance.validate().unwrap();
+        instance
     }
 
     fn first_skill_dir(share: &ProfileShare) -> PathBuf {
@@ -1361,7 +1365,7 @@ mod tests {
     fn prepare_copies_files_skills_and_environment() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let sandbox = sandbox(&config, Harness::Opencode);
+        let instance = instance(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         store.write_templates().unwrap();
         let profile = format!(
@@ -1386,7 +1390,7 @@ OPENAI_API_KEY = "sk-test"
         fs::create_dir_all(dir.path().join("host-skills/demo")).unwrap();
         fs::write(dir.path().join("host-skills/demo/SKILL.md"), b"# demo").unwrap();
 
-        let plan = prepare_for_start(&config, &sandbox).unwrap();
+        let plan = prepare_for_start(&config, &instance).unwrap();
         assert_eq!(plan.packages, vec!["jq"]);
         let share = plan.share.expect("profile share");
         assert!(share.bundle_dir.join("manifest").is_file());
@@ -1402,7 +1406,7 @@ OPENAI_API_KEY = "sk-test"
         let guest_skill = skills.join("guest/SKILL.md");
         fs::create_dir_all(guest_skill.parent().unwrap()).unwrap();
         fs::write(&guest_skill, b"# guest").unwrap();
-        prepare_for_start(&config, &sandbox).unwrap();
+        prepare_for_start(&config, &instance).unwrap();
         assert!(guest_skill.is_file());
     }
 
@@ -1410,7 +1414,7 @@ OPENAI_API_KEY = "sk-test"
     fn skill_sync_and_sync_back_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let sandbox = sandbox(&config, Harness::Opencode);
+        let instance = instance(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         store.write_templates().unwrap();
         let host_skills = dir.path().join("host-skills");
@@ -1421,7 +1425,7 @@ OPENAI_API_KEY = "sk-test"
             source = host_skills.to_string_lossy(),
         );
         fs::write(store.path(Harness::Opencode), profile).unwrap();
-        let plan = prepare_for_start(&config, &sandbox).unwrap();
+        let plan = prepare_for_start(&config, &instance).unwrap();
         let share = plan.share.unwrap();
         let skills = first_skill_dir(&share);
 
@@ -1430,17 +1434,17 @@ OPENAI_API_KEY = "sk-test"
         fs::create_dir_all(guest.parent().unwrap()).unwrap();
         fs::write(&guest, b"# guest").unwrap();
 
-        let report = sync_skills_back(&config, &sandbox, false).unwrap();
+        let report = sync_skills_back(&config, &instance, false).unwrap();
         assert_eq!(report.copied_files, 1);
         assert_eq!(
             fs::read(host_skills.join("guest/SKILL.md")).unwrap(),
             b"# guest"
         );
 
-        // Host change is merged into the sandbox copy without deleting the
+        // Host change is merged into the instance copy without deleting the
         // guest-created skill.
         fs::write(host_skills.join("demo/SKILL.md"), b"# host-v2").unwrap();
-        let report = sync_skills(&config, &sandbox).unwrap();
+        let report = sync_skills(&config, &instance).unwrap();
         assert!(report.copied_files >= 1);
         assert_eq!(
             fs::read(skills.join("demo/SKILL.md")).unwrap(),
@@ -1453,7 +1457,7 @@ OPENAI_API_KEY = "sk-test"
     fn symlinks_are_never_copied_into_the_guest() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let sandbox = sandbox(&config, Harness::Opencode);
+        let instance = instance(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         let host_skills = dir.path().join("host-skills");
         fs::create_dir_all(&host_skills).unwrap();
@@ -1464,7 +1468,7 @@ OPENAI_API_KEY = "sk-test"
             source = host_skills.to_string_lossy(),
         );
         fs::write(store.path(Harness::Opencode), profile).unwrap();
-        let plan = prepare_for_start(&config, &sandbox).unwrap();
+        let plan = prepare_for_start(&config, &instance).unwrap();
         assert!(plan.warnings.iter().any(|w| w.contains("symlink")));
     }
 
@@ -1472,7 +1476,7 @@ OPENAI_API_KEY = "sk-test"
     fn sync_back_skips_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let sandbox = sandbox(&config, Harness::Opencode);
+        let instance = instance(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         let host_skills = dir.path().join("host-skills");
         fs::create_dir_all(&host_skills).unwrap();
@@ -1481,11 +1485,11 @@ OPENAI_API_KEY = "sk-test"
             source = host_skills.to_string_lossy(),
         );
         fs::write(store.path(Harness::Opencode), profile).unwrap();
-        let plan = prepare_for_start(&config, &sandbox).unwrap();
+        let plan = prepare_for_start(&config, &instance).unwrap();
         let share = plan.share.unwrap();
         let skills = first_skill_dir(&share);
         std::os::unix::fs::symlink("/etc/passwd", skills.join("evil")).unwrap();
-        let report = sync_skills_back(&config, &sandbox, false).unwrap();
+        let report = sync_skills_back(&config, &instance, false).unwrap();
         assert_eq!(report.copied_files, 0);
         assert!(report.warnings.iter().any(|w| w.contains("symlink")));
         assert!(!host_skills.join("evil").exists());
@@ -1495,7 +1499,7 @@ OPENAI_API_KEY = "sk-test"
     fn planted_bundle_symlinks_cannot_redirect_host_writes() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let sandbox = sandbox(&config, Harness::Opencode);
+        let instance = instance(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         let host_skills = dir.path().join("host-skills");
         fs::create_dir_all(host_skills.join("demo")).unwrap();
@@ -1505,11 +1509,11 @@ OPENAI_API_KEY = "sk-test"
             source = host_skills.to_string_lossy(),
         );
         fs::write(store.path(Harness::Opencode), profile).unwrap();
-        let plan = prepare_for_start(&config, &sandbox).unwrap();
+        let plan = prepare_for_start(&config, &instance).unwrap();
         let share = plan.share.unwrap();
 
         // A compromised guest replaces its skill copy with a symlink to a
-        // host directory outside the sandbox.
+        // host directory outside the instance.
         let trap = dir.path().join("trap");
         fs::create_dir_all(&trap).unwrap();
         fs::write(trap.join("do-not-touch"), b"host").unwrap();
@@ -1517,7 +1521,7 @@ OPENAI_API_KEY = "sk-test"
         fs::remove_dir_all(&skill_copy).unwrap();
         std::os::unix::fs::symlink(&trap, &skill_copy).unwrap();
 
-        sync_skills(&config, &sandbox).unwrap();
+        sync_skills(&config, &instance).unwrap();
         let metadata = fs::symlink_metadata(&skill_copy).unwrap();
         assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
         assert_eq!(fs::read(trap.join("do-not-touch")).unwrap(), b"host");
@@ -1525,7 +1529,7 @@ OPENAI_API_KEY = "sk-test"
         // The sync-back path also refuses the planted link.
         fs::remove_dir_all(&skill_copy).unwrap();
         std::os::unix::fs::symlink(&trap, &skill_copy).unwrap();
-        let report = sync_skills_back(&config, &sandbox, false).unwrap();
+        let report = sync_skills_back(&config, &instance, false).unwrap();
         assert_eq!(report.copied_files, 0);
         assert!(report.warnings.iter().any(|w| w.contains("real directory")));
         assert_eq!(fs::read(trap.join("do-not-touch")).unwrap(), b"host");
@@ -1560,11 +1564,11 @@ OPENAI_API_KEY = "sk-test"
     fn missing_sources_are_warnings_not_errors() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let sandbox = sandbox(&config, Harness::Opencode);
+        let instance = instance(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         let profile = "version = 1\n[[files]]\nsource = \"/definitely/missing\"\ntarget = \"/root/.config/opencode/x\"\n";
         fs::write(store.path(Harness::Opencode), profile).unwrap();
-        let plan = prepare_for_start(&config, &sandbox).unwrap();
+        let plan = prepare_for_start(&config, &instance).unwrap();
         assert!(plan.warnings.iter().any(|w| w.contains("missing")));
         assert!(plan.share.is_none());
     }

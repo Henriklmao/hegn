@@ -1,6 +1,6 @@
 # hegn
 
-**Cloud Hypervisor sandbox manager and TUI for agentic coding.**
+**Cloud Hypervisor instance manager and TUI for agentic coding.**
 
 >***hegn*** *is Norwegian/Danish for "fence" or "enclosure" – and that is exactly what this project provides: a secure, hardware-isolated enclosure for all your coding agents and research projects.*
 
@@ -39,28 +39,28 @@ fix.
   directly, so no patched hypervisor build is needed for workspace sharing.
   The generated cloud-init seed mounts the tag at `/workspace` (configurable via
   `guest_mount`).
-- **Multiple sandboxes** — run several VMs at the same time. Every sandbox has
+- **Multiple instances** — run several VMs at the same time. Every instance has
   its own `hegn.toml`, runtime sockets, serial log and private rootfs copy under
-  `sandboxes_dir`.
-- **Multi-agent clones** — clone a sandbox into independent git workspaces so
+  `instances_dir`.
+- **Multi-agent clones** — clone an instance into independent git workspaces so
   parallel agents cannot overwrite each other's commits; merge or open pull
   requests when they finish.
 - **Harness profiles** — `hegn config init` writes one profile template per
   harness under `~/.config/hegn/profiles/`. A profile can add apt packages,
   copy configuration files and API keys into the guest, and export environment
-  variables. Host skills are **copied** into a private per-sandbox bundle (never
+  variables. Host skills are **copied** into a private per-instance bundle (never
   linked), so a poisoned guest cannot modify the host's real skill directories;
   `hegn skills sync-back` copies guest-created or changed skills back on demand.
 - **Config menus** — `F4` opens an interactive settings editor for the global
-  config, `F5` for the selected sandbox's `hegn.toml`. It has a **Profiles**
+  config, `F5` for the selected instance's `hegn.toml`. It has a **Profiles**
   tab that opens the per-harness TOML (creating a missing template first).
   Navigate with the arrow keys or the mouse, change values in place, and save
   with `Ctrl-S`. A raw `$EDITOR` round-trip stays available for comments and
   advanced keys.
 - **Modal terminal** — Vim-style `i`/`a` insert mode and `Esc` to return to
   normal mode, so scrolling and shortcuts never leak keystrokes into the guest.
-- **Safe deletion** — deleting a sandbox asks twice, offers to keep clone
-  files, and never deletes the original project of a normal sandbox.
+- **Safe deletion** — deleting an instance asks twice, offers to keep clone
+  files, and never deletes the original project of a normal instance.
 - **Defence in depth** — Cloud Hypervisor runs with seccomp filters and
   Landlock filesystem sandboxing; `virtiofsd` always runs with
   `--sandbox=namespace` (or `chroot`).
@@ -104,13 +104,13 @@ fix.
   growing, so the TUI, `hegn open` and `hegn attach` can detach and re-attach
   without restarting the VM. `hegn attach` (alias `hegn a`) works like `tmux attach` and keeps a
   status bar on the bottom line with the project name, harness, VM pid and log.
-- **Private session logs** — boot and session output survive `hegn sandbox
+- **Private session logs** — boot and session output survive `hegn instance
   stop` in `state_dir/logs/` (`0700` directory, `0600` files, `O_NOFOLLOW`).
   `hegn logs list|path|show|prune` manages them.
-- **Terminal UI** — `ratatui` dashboard (project picker, sandbox status,
+- **Terminal UI** — `ratatui` dashboard (project picker, instance status,
   snapshot tree), embedded guest serial console, security modal, and a clickable
   hotkey footer.
-- **Machine-readable output** — global `--json` for projects, sandbox status,
+- **Machine-readable output** — global `--json` for projects, instance status,
   snapshots, logs, images, doctor, config and `check`, plus meaningful `check`
   and `images verify` exit codes.
 
@@ -142,8 +142,8 @@ is no local PTY fallback.
 A running session costs the configured `memory_mib` (default 2 GiB) plus roughly
 50 MiB for `virtiofsd`, the console relay and VMM bookkeeping, and ~26 MiB more
 while the TUI is open. When a harness profile exports files, skills or
-environment, a second `virtiofsd` adds about another 12 MiB. Base sandboxes and
-clones can run concurrently, so the cost scales per sandbox. On disk, the pinned
+environment, a second `virtiofsd` adds about another 12 MiB. Base instances and
+clones can run concurrently, so the cost scales per instance. On disk, the pinned
 images take ~2.2 GiB (shared by every project), the binary ~19 MiB, and a
 snapshot about as much as the guest RAM; session logs are pruned by count.
 
@@ -243,11 +243,11 @@ hegn
 
 # 4. Or drive it non-interactively
 hegn ls # alternatively `hegn projects`
-hegn sandbox list
-hegn sandbox start my-app
+hegn instance list
+hegn instance start my-app
 hegn attach my-app
-hegn sandbox clone my-app --count 2   # multi-agent clones
-hegn sandbox status my-app --json
+hegn instance clone my-app --count 2   # multi-agent clones
+hegn instance status my-app --json
 hegn snapshot create before-refactor
 hegn logs
 hegn project import /path/to/existing/repo
@@ -261,7 +261,7 @@ start runs on a worker thread, so the TUI immediately shows a spinner and keeps
 responding while the VM boots. Press `Ctrl-B` (or `Ctrl-]`) to detach without stopping the VM. The project harness is recorded in
 the session metadata and shown in the status line; launch it from the guest
 shell. `hegn open my-app --editor` and
-`--lazygit` are host-side project tools and do not start a sandbox.
+`--lazygit` are host-side project tools and do not start an instance.
 
 ### Harness presets and first-boot provisioning
 
@@ -297,7 +297,7 @@ API keys. Existing profiles are never overwritten.
 ```toml
 # ~/.config/hegn/profiles/opencode.toml
 version = 1
-packages = ["tmux", "gh"]              # extra apt packages for this sandbox
+packages = ["tmux", "gh"]              # extra apt packages for this instance
 
 [environment]
 OPENAI_API_KEY = "sk-..."              # exported to login shells and the agent
@@ -323,15 +323,15 @@ target = "/root/.agents/skills"
 
 Both `source` paths and guest `target` paths are validated. Guest targets must
 stay under `/root`, `/home`, `/etc`, `/usr/local`, `/opt` or `/workspace`.
-Missing configured sources are reported in the sandbox's `run/hegn.log` and do
+Missing configured sources are reported in the instance's `run/hegn.log` and do
 not block a start; a default skill directory that does not exist is skipped
 silently.
 
 At start hegn materializes the profile into
-`<sandboxes_dir>/<name>/profile/bundle/` and exports that **copy** through a
+`<instances_dir>/<name>/profile/bundle/` and exports that **copy** through a
 second, sandboxed `virtiofsd` at `/run/hegn/profile`. Configuration files and
 environment variables are applied on every boot; skills are seeded on the first
-start and then live in the per-sandbox copy. Package additions are installed on
+start and then live in the per-instance copy. Package additions are installed on
 the next boot without re-running the harness installer. The guest's skill
 directory is a link to that copy, not to the host directory, so guest edits
 cannot poison the host.
@@ -361,9 +361,9 @@ hegn attach --no-bar # give full-screen guest programs the whole terminal
 ```
 
 `hegn attach` never boots or restarts a VM. It fails if there is no running
-sandbox. With several VMs running, pass the sandbox name (or a project name that
-uniquely identifies the base sandbox); without an argument it attaches only when
-exactly one sandbox is running. The
+instance. With several VMs running, pass the instance name (or a project name that
+uniquely identifies the base instance); without an argument it attaches only when
+exactly one instance is running. The
 bottom line is reserved for a status bar and repainted after every burst of
 guest output, so it stays pinned even when a full-screen guest moves the cursor
 or resets the scroll region:
@@ -382,57 +382,57 @@ serial port, so the bar uses one host row and full-screen guest programs keep
 their own size; pass `--no-bar` (also accepted by `hegn open`) when a guest TUI
 needs every row.
 
-### Multiple sandboxes and multi-agent mode
+### Multiple instances and multi-agent mode
 
-hegn can run several Cloud Hypervisor VMs at the same time. Each sandbox has its
-own directory below `sandboxes_dir`:
+hegn can run several Cloud Hypervisor VMs at the same time. Each instance has its
+own directory below `instances_dir`:
 
 ```text
-~/.local/share/hegn/sandboxes/<name>/
-  hegn.toml     per-sandbox settings
+~/.local/share/hegn/instances/<name>/
+  hegn.toml     per-instance settings
   run/          API/serial/relay/virtiofs sockets, pids, lock
   profile/      copied profile, API keys and skills (never host links)
   rootfs.qcow2  private rootfs copy (created on first start)
-  workspace/    only for cloned sandboxes
+  workspace/    only for cloned instances
 ```
 
-A normal sandbox exports the original project through virtiofs. A **clone**
-(`hegn sandbox clone`, or `M` in the project's terminal view) gets an independent
+A normal instance exports the original project through virtiofs. A **clone**
+(`hegn instance clone`, or `M` in the project's terminal view) gets an independent
 git clone and its own rootfs copy, so multiple agents can work on the same
 repository without overwriting each other's commits. Merge or open pull requests
 from the clones when they are done. Multi-agent clones are intentionally scoped
 to the project: open the project in the TUI and press `M` in its terminal. They
-then appear in the sandbox list, which is filtered to the project currently
+then appear in the instance list, which is filtered to the project currently
 selected in the projects tab, and are attached with `Enter` like any other
-sandbox. Clones are real git clones and contain committed history only: commit
+instance. Clones are real git clones and contain committed history only: commit
 or stash uncommitted work before creating them. Cloning a repository with no
 commits yields an empty clone; hegn surfaces git's warning as a toast instead of
 letting it corrupt the TUI.
 
 ```bash
-hegn sandbox create ~/Projects/hegn/my-app --name my-app
-hegn sandbox start my-app
-hegn sandbox list
-hegn sandbox clone my-app --count 3          # my-app-agent-1..3, booted
-hegn sandbox clone my-app --name review --no-start
-hegn sandbox stop my-app
-hegn sandbox delete my-app-agent-1 --delete-files
+hegn instance create ~/Projects/hegn/my-app --name my-app
+hegn instance start my-app
+hegn instance list
+hegn instance clone my-app --count 3          # my-app-agent-1..3, booted
+hegn instance clone my-app --name review --no-start
+hegn instance stop my-app
+hegn instance delete my-app-agent-1 --delete-files
 ```
 
-`hegn sandbox delete` asks twice: first whether to delete the sandbox, then
-whether to delete its cloned workspace files. A normal sandbox's workspace is
+`hegn instance delete` asks twice: first whether to delete the instance, then
+whether to delete its cloned workspace files. A normal instance's workspace is
 the original project and is **never** deleted. `--keep-files` unregisters the
-sandbox and keeps the clone under `<sandboxes_dir>/<name>-files-<timestamp>/`.
+instance and keeps the clone under `<instances_dir>/<name>-files-<timestamp>/`.
 `--delete-files` removes the clone.
 
 Deleting never boots the VM and runs no host checks (no images, firewall, KVM or
-relay required), so a sandbox whose start failed can always be removed. In the
-TUI, `d` on a project row deletes that project's base sandbox (project files are
-kept), and the same modal is available from the sandboxes tab. With
+relay required), so an instance whose start failed can always be removed. In the
+TUI, `d` on a project row deletes that project's base instance (project files are
+kept), and the same modal is available from the instances tab. With
 `--yes --keep-files` the CLI can delete unattended in CI.
 
-Per-sandbox settings live in `<sandbox>/hegn.toml`. In the TUI, `F4` opens the
-global settings editor and `F5` opens the selected sandbox's editor. Both are
+Per-instance settings live in `<instance>/hegn.toml`. In the TUI, `F4` opens the
+global settings editor and `F5` opens the selected instance's editor. Both are
 interactive modals: use `↑`/`↓` or the mouse to select a row, `←`/`→`, `‹`/`›`
 or a click to change a value, and `Enter` to toggle or type. The global editor's
 **Profiles** page lists every harness profile; `Enter` creates the template if
@@ -443,14 +443,14 @@ rewrites the file from the schema, so hand-written comments are not preserved;
 the raw editor is the comment-preserving path. From the CLI:
 
 ```bash
-hegn sandbox config my-app          # print hegn.toml
-hegn sandbox config my-app --path   # print the path
-hegn sandbox config my-app --edit   # open it in $EDITOR
+hegn instance config my-app          # print hegn.toml
+hegn instance config my-app --path   # print the path
+hegn instance config my-app --edit   # open it in $EDITOR
 ```
 
-Every sandbox gets a private rootfs copy on first start (reflink on btrfs/XFS,
+Every instance gets a private rootfs copy on first start (reflink on btrfs/XFS,
 otherwise a full copy). This is required for concurrent VMs: sharing one
-writable disk would corrupt it. Existing sandboxes keep their copy until they
+writable disk would corrupt it. Existing instances keep their copy until they
 are deleted; `hegn images download` only refreshes the base image.
 
 ### Importing an existing project
@@ -515,10 +515,10 @@ hegn snapshot delete before-refactor
 A failed start leaves diagnostics in the run directory:
 
 ```bash
-# <sandboxes_dir> defaults to ~/.local/share/hegn/sandboxes
-cat ~/.local/share/hegn/sandboxes/<name>/run/hegn.log            # lifecycle + start errors
-cat ~/.local/share/hegn/sandboxes/<name>/run/cloud-hypervisor.log # VMM log
-cat ~/.local/share/hegn/sandboxes/<name>/run/console-relay.log    # relay stderr
+# <instances_dir> defaults to ~/.local/share/hegn/instances
+cat ~/.local/share/hegn/instances/<name>/run/hegn.log            # lifecycle + start errors
+cat ~/.local/share/hegn/instances/<name>/run/cloud-hypervisor.log # VMM log
+cat ~/.local/share/hegn/instances/<name>/run/console-relay.log    # relay stderr
 hegn logs list                               # serial logs, including failed starts
 hegn logs show <name>                        # VMM API/guest output
 ```
@@ -575,32 +575,32 @@ hegn [--config PATH] [--json] [COMMAND]
 
   tui                              Open the interactive TUI (default)
   projects [QUERY]                 List projects under projects_root (alias: ls)
-  project create NAME              Scaffold a project (+ AGENTS.md, README, git, .hegn.toml)
+  project create NAME              Scaffold a project (+ AGENTS.md, README, git, hegn.toml)
           [--harness H] [--template PATH] [--package P[,P...]]
   project import PATH [--name N]   Symlink an existing directory into projects_root
   project info PROJECT             Show metadata and git status
   open PROJECT                     Boot/attach the VM serial console
           [--editor | --lazygit] [--no-branch] [--no-bar]
-  attach [PROJECT|SANDBOX] [--no-bar]  Attach to a running VM (alias: a)
+  attach [PROJECT|INSTANCE] [--no-bar]  Attach to a running VM (alias: a)
   logs [list|path|show|prune]      Manage persistent serial logs (alias: log)
-  sandbox list                     List sandboxes (alias: ls)
-  sandbox create PROJECT [--name N] [--harness H] [--clone]
-  sandbox clone SOURCE [--name N] [--count N] [--harness H] [--no-start]
-  sandbox start SANDBOX [--harness H] [--clone]
-  sandbox stop [SANDBOX]
-  sandbox status [SANDBOX]
-  sandbox pause | resume SANDBOX
-  sandbox config SANDBOX [--path | --edit]
-  sandbox delete SANDBOX [--delete-files | --keep-files] [--yes]
+  instance list                     List instances (alias: ls)
+  instance create PROJECT [--name N] [--harness H] [--clone]
+  instance clone SOURCE [--name N] [--count N] [--harness H] [--no-start]
+  instance start INSTANCE [--harness H] [--clone]
+  instance stop [INSTANCE]
+  instance status [INSTANCE]
+  instance pause | resume INSTANCE
+  instance config INSTANCE [--path | --edit]
+  instance delete INSTANCE [--delete-files | --keep-files] [--yes]
   snapshot list                    List snapshots (alias: ls)
-  snapshot create [NAME] [--sandbox SANDBOX]
-  snapshot restore NAME [--sandbox SANDBOX] | delete NAME | show NAME
+  snapshot create [NAME] [--instance INSTANCE]
+  snapshot restore NAME [--instance INSTANCE] | delete NAME | show NAME
   check [--cwd PATH] CMD...        Inspect a command with tirith-core
   config show | path | init
   profile list | show HARNESS | path HARNESS [--edit] | init
-  profile sync SANDBOX             Refresh a sandbox's profile payload
-  skills sync SANDBOX              Copy host skills into the sandbox copy
-  skills sync-back SANDBOX [--dry-run] [--force]
+  profile sync INSTANCE             Refresh an instance's profile payload
+  skills sync INSTANCE              Copy host skills into the instance copy
+  skills sync-back INSTANCE [--dry-run] [--force]
   images download [--force]        Fetch missing pinned kernel/rootfs images
           [--allow-unverified]
   images status | verify           Show or re-hash the configured images
@@ -613,7 +613,7 @@ Global flags: `--config <PATH>` (or `HEGN_CONFIG`), `--json`.
 ### Environment variables
 
 `HEGN_CONFIG`, `HEGN_PROJECTS_ROOT`, `HEGN_STATE_DIR`, `HEGN_SNAPSHOTS_DIR`,
-`HEGN_TEMPLATES_DIR`, `HEGN_PROFILES_DIR`, `HEGN_SANDBOXES_DIR`,
+`HEGN_TEMPLATES_DIR`, `HEGN_PROFILES_DIR`, `HEGN_INSTANCES_DIR`,
 `HEGN_CLOUD_HYPERVISOR_BIN`, `HEGN_VIRTIOFSD_BIN`,
 `HEGN_KERNEL_IMAGE`, `HEGN_ROOTFS_IMAGE`, `HEGN_ROOTFS_FORMAT`,
 `HEGN_ROOT_DEVICE`, `HEGN_KERNEL_URL`,
@@ -633,7 +633,7 @@ rejected, so typos surface immediately. Defaults:
 projects_root   = "~/Projects/hegn"
 state_dir       = "~/.local/state/hegn"
 snapshots_dir   = "~/.local/share/hegn/snapshots"
-sandboxes_dir   = "~/.local/share/hegn/sandboxes"
+instances_dir   = "~/.local/share/hegn/instances"
 templates_dir   = "~/.config/hegn/templates"
 profiles_dir    = "~/.config/hegn/profiles"
 cloud_hypervisor_bin = "cloud-hypervisor"
@@ -675,19 +675,19 @@ security        = "enforce"   # "off", "warn" or "enforce"
 ```
 
 The package list is a list of *extras*; the harness preset and the packages from
-the sandbox's harness profile are always unioned in.
+the instance's harness profile are always unioned in.
 
-Project-level defaults live in `.hegn.toml` inside each project (written by
+Project-level defaults live in `hegn.toml` inside each project (written by
 `hegn project create`) and record the harness, package list and template used.
 
 ### Settings editor
 
-`F4` (global) and `F5` (selected sandbox) open a modal that edits the same
+`F4` (global) and `F5` (selected instance) open a modal that edits the same
 schema interactively instead of printing the file. Rows are grouped by runtime,
 storage, sharing, network/security, tools, directories and packages; the
-sandbox editor also shows its project, workspace, rootfs and TAP slot as
+instance editor also shows its project, workspace, rootfs and TAP slot as
 read-only rows. `landlock` and `seccomp` are deliberately not editable — hegn
-never weakens the Cloud Hypervisor sandboxes.
+never weakens the Cloud Hypervisor instances.
 
 | Input | Action |
 | --- | --- |
@@ -696,7 +696,7 @@ never weakens the Cloud Hypervisor sandboxes.
 | `Enter` | Toggle, cycle, start typing a value, or open a profile template |
 | `Enter` / `Esc` while typing | Apply / discard the value |
 | `Home` / `End`, `PgUp` / `PgDn` | Jump to the first / last row, page through rows |
-| `[` / `]` | Switch settings pages (General / Profiles / Local LLM; sandbox: General) |
+| `[` / `]` | Switch settings pages (General / Profiles / Local LLM; instance: General) |
 | `Ctrl-S` | Validate and save |
 | `r` | Reload the file from disk (discard unsaved changes) |
 | `e` | Open the raw TOML in `$EDITOR` (requires a clean draft) |
@@ -706,7 +706,7 @@ Inline edits are validated immediately: numbers are range-checked, paths get
 `~` expanded, package names must be valid Debian identifiers, and the same
 schema validation that guards `config.toml` runs again before the atomic save.
 
-The **Profiles** page is global (profiles are selected by a sandbox's harness).
+The **Profiles** page is global (profiles are selected by an instance's harness).
 It shows the template path or `(missing)`, creates a missing template on
 `Enter`, and returns to the same tab after the editor exits. Profile files can
 contain API keys; they stay `0600` in a `0700` directory.
@@ -724,7 +724,7 @@ When hegn invokes `sudo` or `pkexec` itself (`hegn doctor --fix`, the doctor's
 `Set up everything` action), it prints the exact command line with shell quoting
 before the password prompt, so it can be inspected first.
 
-`hegn sandbox start` is fail-closed: with `network = "guarded"` it refuses to
+`hegn instance start` is fail-closed: with `network = "guarded"` it refuses to
 boot unless `/run/hegn/network.json` exists and was written by root. Rules live
 on the host, so root in the guest cannot remove them.
 
@@ -732,7 +732,7 @@ on the host, so root in the guest cannot remove them.
 
 Ollama, LM Studio, llama.cpp and vLLM usually listen on the host's loopback.
 Inside the guest, `127.0.0.1` is the guest itself, so hegn exposes selected host
-ports on the sandbox's own TAP host address:
+ports on the instance's own TAP host address:
 
 ```toml
 [[local_endpoints]]
@@ -744,10 +744,10 @@ port = 11434      # host target: 127.0.0.1:11434
 input accept. The guest uses `http://10.213.0.<n>:11434`; host loopback is never
 bridged, other host interfaces stay unreachable, and ports below 1024 are
 rejected. Endpoints require `network = "guarded"`. After editing the list,
-re-run `sudo hegn network setup` — `hegn sandbox start` fails closed with a hint
+re-run `sudo hegn network setup` — `hegn instance start` fails closed with a hint
 until the root-owned marker matches. With `cloud_init = true`, the URLs are
 exported in the guest through `/etc/profile.d/hegn-endpoints.sh`; every endpoint
-is also available as `HEGN_ENDPOINT_<NAME>`. `hegn sandbox status` prints the
+is also available as `HEGN_ENDPOINT_<NAME>`. `hegn instance status` prints the
 guest URLs.
 
 ### AGENTS.md templates
@@ -765,31 +765,31 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 | Key | Action |
 | --- | --- |
 | `↑`/`↓`, `j`/`k` | Move selection |
-| `Enter` / `o` | Open project (projects), attach/start sandbox (sandboxes), restore snapshot |
+| `Enter` / `o` | Open project (projects), attach/start instance (instances), restore snapshot |
 | `/` | Fuzzy filter projects |
-| `1` / `2` / `3` | Jump to the projects / sandboxes / snapshots tab |
-| `Tab` | Switch projects → sandboxes → snapshots |
-| `b` | Focus the sandbox list |
+| `1` / `2` / `3` | Jump to the projects / instances / snapshots tab |
+| `Tab` | Switch projects → instances → snapshots |
+| `b` | Focus the instance list |
 | `c` | Create project (projects focus) |
 | `h` / `←` | Import an existing directory (symlink, no copy) |
-| `S` | Stop the selected sandbox |
-| `d` | Delete the project's VM (projects), sandbox (sandboxes) or snapshot (snapshots) |
+| `S` | Stop the selected instance |
+| `d` | Delete the project's VM (projects), instance (instances) or snapshot (snapshots) |
 | `F4` | Global settings editor (mouse supported, `Ctrl-S` to save) |
-| `F5` | Sandbox settings editor (mouse supported, `Ctrl-S` to save) |
+| `F5` | Instance settings editor (mouse supported, `Ctrl-S` to save) |
 | `e` | Open selected project in `$EDITOR` |
 | `g` | Open selected project in lazygit |
-| `r` | Refresh projects and sandboxes |
+| `r` | Refresh projects and instances |
 | `F3` | Doctor modal (host checks, image download) |
 | `?` / `F1` | Help |
 | `q` | Quit |
 
 Each focusable tab shows its number shortcut as a coloured `[1]`, `[2]`, `[3]`
-badge in the top-right corner of the panel. The sandbox tab is scoped to the
+badge in the top-right corner of the panel. The instance tab is scoped to the
 project selected in the projects tab: switching projects rebuilds the list, and
 multi-agent clones created for that project appear there for one-`Enter`
 attachment.
 
-Destructive actions are never confirmed with `Enter`. Deleting a sandbox or
+Destructive actions are never confirmed with `Enter`. Deleting an instance or
 snapshot and allowing a flagged command require the explicit `y` (or `a` for
 the security prompt) key; `Enter` leaves the confirmation modal open.
 
@@ -924,7 +924,7 @@ diagnostic cells use a small ANSI background color.
 7. **Recovery** — a blocked-but-allowed command can be preceded by a git
    checkpoint, and VM snapshots allow instant rollback beyond git.
 
-No sandbox is a substitute for reviewing what you run. `F2` raw passthrough
+No instance is a substitute for reviewing what you run. `F2` raw passthrough
 deliberately bypasses inspection. `hegn attach` is raw as well and marks this
 in its status bar as `INPUT DIRECT`; use `hegn check` for scripted
 pre-execution checks or the TUI for intercepted input.
@@ -932,7 +932,7 @@ pre-execution checks or the TUI for intercepted input.
 The default Cloud Hypervisor cloud image is writable and reused between
 sessions, so guest changes to the root filesystem persist. The workspace is the
 only project directory exposed through virtio-fs; a second share exposes only
-the sandbox's private profile/skill copy. If you need a truly ephemeral
+the instance's private profile/skill copy. If you need a truly ephemeral
 root, point `rootfs_image` at a per-session copy or an overlay image that you
 create and dispose of outside hegn.
 
@@ -944,7 +944,7 @@ only be used with logs you trust.
 Harness profiles are host-owned input, but they are applied as root inside the
 guest. hegn therefore validates package names, environment names/values, modes
 and guest targets before writing the apply script, and the profile bundle is
-exported from a private per-sandbox directory through its own sandboxed
+exported from a private per-instance directory through its own sandboxed
 `virtiofsd`. Skills are copied into that directory instead of mounting the
 host's real skill directories, so a compromised guest only ever edits the
 throw-away copy. `hegn skills sync-back` is an explicit, copy-only operation
@@ -971,7 +971,7 @@ src/
   security.rs    tirith-core integration + workspace guardrails
   cloud_hypervisor.rs typed Cloud Hypervisor REST client
   virtiofs.rs    hardened virtiofsd argv/process construction
-  sandbox.rs     VM lifecycle orchestration and status reporting
+  instance.rs     VM lifecycle orchestration and status reporting
   snapshot.rs    snapshot metadata store (RAM + CPU directory)
   images.rs      pinned upstream VM assets, download, SHA-256 verification
   doctor.rs      shared host prerequisite checks (CLI + TUI modal)
@@ -1006,7 +1006,7 @@ pipeline.
 | `clap` | 4 (derive, env) | CLI parsing and help |
 | `serde` | 1 (derive) | Config, metadata and API serialization |
 | `serde_json` | 1 | Cloud Hypervisor REST payloads and `--json` output |
-| `toml` | 0.9 | `config.toml` and `.hegn.toml` |
+| `toml` | 0.9 | `config.toml` and `hegn.toml` |
 | `tirith-core` | 0.4.2 | In-memory command inspection and policy engine |
 | `anyhow` | 1 | Context-rich application errors |
 | `thiserror` | 2 | Typed errors in library-facing modules |

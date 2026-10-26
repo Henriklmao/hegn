@@ -1,14 +1,14 @@
-//! Host-enforced network guard for sandboxes.
+//! Host-enforced network guard for instances.
 //!
 //! The guest never gets a bridge or a route into the host LAN. Each guarded
-//! sandbox receives a dedicated TAP device from a pre-created pool. Host
+//! instance receives a dedicated TAP device from a pre-created pool. Host
 //! nftables rules accept only outbound HTTP(S) and DNS to public resolvers;
 //! every other packet, including all RFC1918/link-local traffic and all IPv6,
 //! is dropped before it can be forwarded. Because the rules live on the host,
 //! root inside the guest cannot remove them.
 //!
 //! TAP creation and nftables need `CAP_NET_ADMIN`. `hegn network setup` is the
-//! explicit, one-time privileged step; `hegn sandbox start` is fail-closed and
+//! explicit, one-time privileged step; `hegn instance start` is fail-closed and
 //! refuses to boot a guarded VM unless the host marker shows that the firewall
 //! is active.
 
@@ -26,12 +26,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::sandbox::SandboxManager;
-use crate::sandbox_config::SandboxStore;
+use crate::instance::InstanceManager;
+use crate::instance_config::InstanceStore;
 
 /// TAP devices created by `hegn network setup`.
 pub const TAP_POOL: u8 = 16;
-/// Root of the isolated sandbox network. Each TAP gets a `/30` slice.
+/// Root of the isolated instance network. Each TAP gets a `/30` slice.
 pub const SUBNET: Ipv4Addr = Ipv4Addr::new(10, 213, 0, 0);
 /// Guest netmask for every `/30` slice.
 pub const NETMASK: &str = "255.255.255.252";
@@ -58,11 +58,11 @@ pub struct ReadyMarker {
     pub applied_at: DateTime<Utc>,
 }
 
-/// A reserved TAP device for one sandbox.
+/// A reserved TAP device for one instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Lease {
     pub index: u8,
-    pub sandbox: String,
+    pub instance: String,
     pub tap: String,
     pub mac: String,
     pub host_ip: Ipv4Addr,
@@ -153,7 +153,7 @@ pub fn status(config: &Config) -> Vec<TapStatus> {
             host_ip: host_ip(index),
             exists: tap_exists(index),
             owner: read_owner(&owner_path(config, index))
-                .map(|(sandbox, _pid)| sandbox)
+                .map(|(instance, _pid)| instance)
                 .filter(|owner| !owner.is_empty()),
         })
         .collect()
@@ -306,12 +306,15 @@ pub fn ensure_ready(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Reserve a TAP slice for a sandbox.
+/// Reserve a TAP slice for an instance.
 ///
-/// The sandbox's recorded index is preferred so a snapshot restored later sees
-/// the same device name. If the recorded owner is another running sandbox, or
+/// The instance's recorded index is preferred so a snapshot restored later sees
+/// the same device name. If the recorded owner is another running instance, or
 /// the pool is exhausted, the start fails instead of silently sharing a TAP.
-pub fn acquire(config: &Config, sandbox: &crate::sandbox_config::SandboxConfig) -> Result<Lease> {
+pub fn acquire(
+    config: &Config,
+    instance: &crate::instance_config::InstanceConfig,
+) -> Result<Lease> {
     ensure_ready(config)?;
     fs::create_dir_all(network_dir(config))
         .with_context(|| format!("failed to create {}", network_dir(config).display()))?;
@@ -321,12 +324,12 @@ pub fn acquire(config: &Config, sandbox: &crate::sandbox_config::SandboxConfig) 
         fs::set_permissions(network_dir(config), fs::Permissions::from_mode(0o700))?;
     }
 
-    let preferred = sandbox.network_index;
+    let preferred = instance.network_index;
     if let Some(index) = preferred {
         if index >= TAP_POOL {
             bail!(
-                "sandbox '{}' records network index {index}, but the TAP pool has {TAP_POOL} slots",
-                sandbox.name
+                "instance '{}' records network index {index}, but the TAP pool has {TAP_POOL} slots",
+                instance.name
             );
         }
         if !tap_exists(index) {
@@ -335,9 +338,9 @@ pub fn acquire(config: &Config, sandbox: &crate::sandbox_config::SandboxConfig) 
                 tap_name(index)
             );
         }
-        return try_claim(config, index, &sandbox.name)?.with_context(|| {
+        return try_claim(config, index, &instance.name)?.with_context(|| {
             format!(
-                "guarded TAP {} is reserved by another running sandbox",
+                "guarded TAP {} is reserved by another running instance",
                 tap_name(index)
             )
         });
@@ -347,29 +350,29 @@ pub fn acquire(config: &Config, sandbox: &crate::sandbox_config::SandboxConfig) 
         if !tap_exists(index) {
             continue;
         }
-        if let Some(lease) = try_claim(config, index, &sandbox.name)? {
+        if let Some(lease) = try_claim(config, index, &instance.name)? {
             return Ok(lease);
         }
     }
     bail!(
-        "no free guarded-network TAP is available for sandbox '{}'; increase the pool or stop \
-         another sandbox",
-        sandbox.name
+        "no free guarded-network TAP is available for instance '{}'; increase the pool or stop \
+         another instance",
+        instance.name
     )
 }
 
-fn try_claim(config: &Config, index: u8, sandbox: &str) -> Result<Option<Lease>> {
+fn try_claim(config: &Config, index: u8, instance: &str) -> Result<Option<Lease>> {
     let path = owner_path(config, index);
     let lock = lock_path(config, index);
     let _guard = FileLock::acquire(&lock)?;
 
     if let Some((owner, pid)) = read_owner(&path)
         && !owner.is_empty()
-        && owner != sandbox
+        && owner != instance
     {
         // A live hegn process may still be booting the owner VM, before its
         // session record exists. A live VM is equally authoritative.
-        if crate::sandbox::process_alive(pid) || sandbox_is_running(config, &owner) {
+        if crate::instance::process_alive(pid) || instance_is_running(config, &owner) {
             return Ok(None);
         }
         // A crashed hegn process and a stopped VM left the reservation behind.
@@ -378,21 +381,21 @@ fn try_claim(config: &Config, index: u8, sandbox: &str) -> Result<Option<Lease>>
 
     let lease = Lease {
         index,
-        sandbox: sandbox.to_string(),
+        instance: instance.to_string(),
         tap: tap_name(index),
         mac: mac(index),
         host_ip: host_ip(index),
         guest_ip: guest_ip(index),
     };
-    write_private(&path, &format!("{sandbox}\n{}\n", std::process::id()))?;
+    write_private(&path, &format!("{instance}\n{}\n", std::process::id()))?;
     Ok(Some(lease))
 }
 
-/// Release every reservation held by a sandbox, including stale ones.
-pub fn release(config: &Config, sandbox: &str) {
+/// Release every reservation held by an instance, including stale ones.
+pub fn release(config: &Config, instance: &str) {
     // Hold the per-TAP lock while checking the owner: another hegn process may
     // be claiming the same slice concurrently, and removing its fresh owner
-    // file would let a third sandbox share the TAP.
+    // file would let a third instance share the TAP.
     for index in 0..TAP_POOL {
         let path = owner_path(config, index);
         if !path.exists() {
@@ -401,30 +404,30 @@ pub fn release(config: &Config, sandbox: &str) {
         let Ok(_guard) = FileLock::acquire(&lock_path(config, index)) else {
             continue;
         };
-        if read_owner(&path).is_some_and(|(owner, _)| owner == sandbox) {
+        if read_owner(&path).is_some_and(|(owner, _)| owner == instance) {
             let _ = fs::remove_file(&path);
         }
     }
 }
 
-pub fn sandbox_is_running(config: &Config, sandbox: &str) -> bool {
-    SandboxStore::new(config.clone())
-        .load(sandbox)
-        .map(|sandbox_config| SandboxManager::new(config.clone(), sandbox_config).is_running())
+pub fn instance_is_running(config: &Config, instance: &str) -> bool {
+    InstanceStore::new(config.clone())
+        .load(instance)
+        .map(|instance_config| InstanceManager::new(config.clone(), instance_config).is_running())
         .unwrap_or(false)
 }
 
-/// Owner files contain `sandbox\npid\n`. The pid covers the window between
+/// Owner files contain `instance\npid\n`. The pid covers the window between
 /// reservation and the session record becoming visible.
 fn read_owner(path: &Path) -> Option<(String, u32)> {
     let raw = fs::read_to_string(path).ok()?;
     let mut lines = raw.lines();
-    let sandbox = lines.next()?.trim().to_string();
+    let instance = lines.next()?.trim().to_string();
     let pid = lines
         .next()
         .and_then(|line| line.trim().parse().ok())
         .unwrap_or(0);
-    Some((sandbox, pid))
+    Some((instance, pid))
 }
 
 fn tap_exists(index: u8) -> bool {
@@ -544,10 +547,10 @@ pub fn teardown_script() -> String {
 }
 
 /// nftables rules. Public HTTP(S) and public DNS only; everything else from a
-/// sandbox TAP is dropped, including RFC1918, link-local, CGNAT, multicast and
+/// instance TAP is dropped, including RFC1918, link-local, CGNAT, multicast and
 /// all IPv6.
 ///
-/// `endpoints` adds a DNAT from the sandbox's own TAP host address to the host
+/// `endpoints` adds a DNAT from the instance's own TAP host address to the host
 /// loopback on the same port, plus an input accept for those translated flows.
 /// The rules are static, so changing the list requires re-running setup.
 pub fn nft_rules(endpoints: &[u16]) -> String {
@@ -677,7 +680,7 @@ pub fn setup(user: &str, endpoints: &[u16]) -> Result<()> {
     let script = setup_script(user, &endpoints)?;
     // The script replaces the nftables table. Drop the marker first so a
     // failed re-run cannot leave a "ready" marker vouching for a guard that no
-    // longer exists; new sandbox starts then fail closed until setup succeeds.
+    // longer exists; new instance starts then fail closed until setup succeeds.
     match fs::remove_file(marker_path()) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -895,7 +898,7 @@ mod tests {
     fn guest_config_matches_the_reserved_slice() {
         let lease = Lease {
             index: 3,
-            sandbox: "demo".into(),
+            instance: "demo".into(),
             tap: tap_name(3),
             mac: mac(3),
             host_ip: host_ip(3),

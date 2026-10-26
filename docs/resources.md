@@ -27,26 +27,26 @@ The VMM maps the configured guest memory up front, so its virtual size is
 less than its configured RAM; a guest that runs a full build converges on
 `memory_mib`.
 
-Practical sizing rule for each running sandbox:
+Practical sizing rule for each running instance:
 
 ```text
-per sandbox ≈ memory_mib + ~50 MiB (virtiofsd + relay + VMM bookkeeping)
+per instance ≈ memory_mib + ~50 MiB (virtiofsd + relay + VMM bookkeeping)
               + ~12 MiB when a profile share is active
               + ~26 MiB if the TUI stays open
 ```
 
-| `memory_mib` | Host cost per sandbox (worst case) | Typical idle (estimate) |
+| `memory_mib` | Host cost per instance (worst case) | Typical idle (estimate) |
 | --- | --- | --- |
 | 1024 | ~1.1 GiB | ~0.3–0.5 GiB |
 | 2048 (default) | ~2.1 GiB | ~0.4–0.6 GiB |
 | 4096 | ~4.1 GiB | grows with guest use |
 | 8192 | ~8.1 GiB | grows with guest use |
 
-Several sandboxes can run concurrently: the base sandbox of a project plus any
+Several instances can run concurrently: the base instance of a project plus any
 clones created for parallel agents (a clone gets its own workspace copy and,
-unless configured otherwise, its own rootfs). The cost multiplies per sandbox,
+unless configured otherwise, its own rootfs). The cost multiplies per instance,
 so two default guests need roughly 4.2 GiB of host RAM in the worst case.
-`hegn benchmark` lists every running sandbox and totals their RAM.
+`hegn benchmark` lists every running instance and totals their RAM.
 
 ## CPU overhead
 
@@ -75,14 +75,14 @@ so two default guests need roughly 4.2 GiB of host RAM in the worst case.
 
 | Operation | Cost |
 | --- | --- |
-| `hegn sandbox start` | spawns virtiofsd, boots the VMM and waits for the Cloud Hypervisor API socket (15 s cap; usually well under a second on a local SSD), then starts the relay (5 s cap) |
+| `hegn instance start` | spawns virtiofsd, boots the VMM and waits for the Cloud Hypervisor API socket (15 s cap; usually well under a second on a local SSD), then starts the relay (5 s cap) |
 | Guest login prompt | a few seconds after boot on the pinned kernel |
 | First-boot cloud-init | runs in the background; measured ~91 s until "cloud-init finished" in the sample guest (it probes for a network that does not exist). The console is usable before that |
 | `hegn attach` | connects to an existing socket; effectively instant |
-| `hegn sandbox stop` | SIGTERM to the VMM, 2 s grace, then SIGKILL; the relay and virtiofsd are terminated and the run directory is cleaned |
+| `hegn instance stop` | SIGTERM to the VMM, 2 s grace, then SIGKILL; the relay and virtiofsd are terminated and the run directory is cleaned |
 | `hegn snapshot create` | pauses the VM, writes guest RAM and device state, resumes; proportional to `memory_mib` and disk write speed |
 
-Because `sandbox stop` signals the VMM rather than asking the guest to shut
+Because `instance stop` signals the VMM rather than asking the guest to shut
 down, dirty pages in the guest page cache may be lost. Finish or sync
 in-flight work before stopping; snapshots do **not** preserve disk contents.
 
@@ -143,23 +143,23 @@ around every command and snapshot-based rollback.
 `hegn benchmark` performs the measurements this document is based on:
 
 ```bash
-hegn benchmark               # running sandbox; offers to boot one when idle
-hegn benchmark my-project    # boot (or reuse) that project's sandbox
+hegn benchmark               # running instance; offers to boot one when idle
+hegn benchmark my-project    # boot (or reuse) that project's instance
 hegn benchmark --clean       # throwaway project + VM, measured, then removed
 hegn benchmark --json        # machine-readable report
 ```
 
-Without arguments and without a running sandbox, the command asks on an
+Without arguments and without a running instance, the command asks on an
 interactive terminal whether it should create a temporary test project. It
 never prompts when stdin is not a terminal or `--json` is set, so scripts and
 agents get the passive report instead.
 
 `--clean` creates `<projects_root>/hegn-benchmark-<timestamp>`, boots it,
-measures it, stops the sandbox and deletes the directory again; the report
+measures it, stops the instance and deletes the directory again; the report
 records the cleanup and refuses to delete anything that is not one of its own
-projects. `hegn benchmark <project>` leaves the sandbox running so you can
-attach to it afterwards, and reports only that project's sandbox while noting
-any others that are running. With several sandboxes (clones) active, the plain
+projects. `hegn benchmark <project>` leaves the instance running so you can
+attach to it afterwards, and reports only that project's instance while noting
+any others that are running. With several instances (clones) active, the plain
 invocation lists each one and totals their RAM; JSON exposes them as
 `sessions`.
 
@@ -182,7 +182,7 @@ images           2.1 GiB     2.2 GiB       4  /home/you/.local/share/hegn/images
 snapshots            0 B         0 B       0  /home/you/.local/share/hegn/snapshots
 logs           116.0 KiB   105.2 KiB       4  /home/you/.local/state/hegn/logs
 state          184.0 KiB     4.1 MiB      16  /home/you/.local/state/hegn
-sandboxes              -           -       -  /home/you/.local/share/hegn/sandboxes
+instances              -           -       -  /home/you/.local/share/hegn/instances
 disk total       2.1 GiB
 
 Notes:
@@ -203,11 +203,11 @@ What the columns mean:
 - **Notes** — stale session metadata, stopped processes and the configured
   guest RAM are reported here instead of failing the command.
 
-Without a running sandbox the command still reports disk usage and the
+Without a running instance the command still reports disk usage and the
 configured guest cost. For deeper checks, splurge on the raw sources:
 
 ```bash
-hegn sandbox status --json        # vcpus, memory_mib, pids, running flags
+hegn instance status --json        # vcpus, memory_mib, pids, running flags
 hegn images status                # kernel/rootfs state and size
 hegn doctor                       # resolved binaries and versions
 hegn logs list                    # session logs and sizes
@@ -223,8 +223,8 @@ free -m
 
 - Lower `memory_mib` (minimum 128) and `vcpus` (minimum 1) in `config.toml`
   for small projects; a shell-based session does not need 2 GiB.
-- Keep the TUI closed for long unattended runs; `hegn sandbox start`,
-  `hegn sandbox status --json` and `hegn logs` need a few MiB, not ~26 MiB.
+- Keep the TUI closed for long unattended runs; `hegn instance start`,
+  `hegn instance status --json` and `hegn logs` need a few MiB, not ~26 MiB.
 - Delete snapshots you no longer need: `hegn snapshot list`,
   `hegn snapshot delete <name>`. Each one costs roughly the guest RAM.
 - Prune logs: `hegn logs prune --keep 20`.

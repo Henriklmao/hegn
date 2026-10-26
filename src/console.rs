@@ -18,13 +18,13 @@ use anyhow::{Context, Result, bail};
 
 use crate::attach_bar::{OutputGate, StatusBar, detach_requested};
 use crate::config::Config;
+use crate::instance::{InstanceManager, InstancePaths, process_matches};
+use crate::instance_config::InstanceConfig;
 use crate::logs::sanitize_label;
 use crate::relay;
-use crate::sandbox::{SandboxManager, SandboxPaths, process_matches};
-use crate::sandbox_config::SandboxConfig;
 
 /// Transport used by the terminal view. Implementations must never pretend to
-/// be a sandbox when no VM is running.
+/// be an instance when no VM is running.
 pub trait TerminalConsole: Send {
     /// Send bytes to the guest serial port.
     fn send(&mut self, bytes: &[u8]) -> Result<()>;
@@ -34,7 +34,7 @@ pub trait TerminalConsole: Send {
     fn is_exited(&mut self) -> bool;
     fn project(&self) -> &Path;
     fn label(&self) -> &str;
-    fn sandbox_name(&self) -> &str;
+    fn instance_name(&self) -> &str;
 }
 
 /// A console attached to a running Cloud Hypervisor VM.
@@ -44,7 +44,7 @@ pub struct VmConsole {
     cloud_hypervisor_bin: PathBuf,
     vm_pid: u32,
     relay_pid: u32,
-    sandbox: String,
+    instance: String,
     project: PathBuf,
     harness: String,
     label: String,
@@ -54,9 +54,9 @@ pub struct VmConsole {
 
 impl VmConsole {
     /// Attach to the VM described by the current session record.
-    pub fn attach(config: &Config, sandbox: &SandboxConfig) -> Result<Self> {
-        let paths = SandboxPaths::from_sandbox(config, sandbox);
-        let manager = SandboxManager::new(config.clone(), sandbox.clone());
+    pub fn attach(config: &Config, instance: &InstanceConfig) -> Result<Self> {
+        let paths = InstancePaths::from_instance(config, instance);
+        let manager = InstanceManager::new(config.clone(), instance.clone());
         let session = match manager.session() {
             Some(session) => session,
             None if paths.session.exists() => bail!(
@@ -65,7 +65,7 @@ impl VmConsole {
                 paths.run_dir.display()
             ),
             None => bail!(
-                "no VM session in {}; start one with `hegn sandbox start <project>`",
+                "no VM session in {}; start one with `hegn instance start <project>`",
                 paths.run_dir.display()
             ),
         };
@@ -81,13 +81,13 @@ impl VmConsole {
         }
         let hegn = std::env::current_exe().context("failed to locate the hegn executable")?;
         if session.relay_pid != 0 && !relay::process_matches_relay(session.relay_pid, &hegn) {
-            bail!("the console relay is not running; restart the VM with `hegn sandbox start`");
+            bail!("the console relay is not running; restart the VM with `hegn instance start`");
         }
         let socket_ok = std::fs::symlink_metadata(&paths.console_socket)
             .map(|meta| meta.file_type().is_socket())
             .unwrap_or(false);
         if !socket_ok {
-            bail!("the console relay socket is missing; restart the VM with `hegn sandbox start`");
+            bail!("the console relay socket is missing; restart the VM with `hegn instance start`");
         }
         let stream = UnixStream::connect(&paths.console_socket).with_context(|| {
             format!(
@@ -108,7 +108,7 @@ impl VmConsole {
             cloud_hypervisor_bin: vm_binary,
             vm_pid: session.vm_pid,
             relay_pid: session.relay_pid,
-            sandbox: sandbox.name.clone(),
+            instance: instance.name.clone(),
             // Clones live in their own workspace; older records only have the
             // original project.
             project: if session.workspace.as_os_str().is_empty() {
@@ -117,7 +117,7 @@ impl VmConsole {
                 session.workspace.clone()
             },
             harness: session.harness.label().to_string(),
-            label: format!("{} · {} · serial", sandbox.name, session.harness.label()),
+            label: format!("{} · {} · serial", instance.name, session.harness.label()),
             serial_log,
             exited: false,
         })
@@ -147,9 +147,9 @@ impl VmConsole {
         self.vm_pid
     }
 
-    /// Sandbox name shown in the attach bar and TUI.
-    pub fn sandbox_name(&self) -> &str {
-        &self.sandbox
+    /// Instance name shown in the attach bar and TUI.
+    pub fn instance_name(&self) -> &str {
+        &self.instance
     }
 
     fn read_new(&mut self) -> Vec<Vec<u8>> {
@@ -232,8 +232,8 @@ impl TerminalConsole for VmConsole {
         &self.label
     }
 
-    fn sandbox_name(&self) -> &str {
-        &self.sandbox
+    fn instance_name(&self) -> &str {
+        &self.instance
     }
 }
 
@@ -334,7 +334,7 @@ pub fn run_interactive(mut console: VmConsole, bar: bool) -> Result<()> {
     let harness = console.harness().to_string();
     let pid = console.pid();
     let log = console.serial_log().map(Path::to_path_buf);
-    let sandbox = console.sandbox_name().to_string();
+    let instance = console.instance_name().to_string();
     let (cols, rows) = guard.size();
     let mut status = bar.then(|| {
         StatusBar::new(
@@ -423,12 +423,12 @@ pub fn run_interactive(mut console: VmConsole, bar: bool) -> Result<()> {
     drop(guard);
     result?;
     let project = sanitize_label(&project);
-    let sandbox = sanitize_label(&sandbox);
+    let instance = sanitize_label(&instance);
     if vm_exited {
         println!("Serial console closed: the VM for {project} exited.");
     } else {
         println!(
-            "Detached from {project}. The VM keeps running; re-attach with `hegn attach {sandbox}`."
+            "Detached from {project}. The VM keeps running; re-attach with `hegn attach {instance}`."
         );
     }
     if let Some(log) = &log {
@@ -442,45 +442,45 @@ pub fn run_interactive(mut console: VmConsole, bar: bool) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::BackendKind;
-    use crate::sandbox::{SandboxPaths, SessionRecord};
+    use crate::instance::{InstancePaths, SessionRecord};
     use chrono::Utc;
     use std::os::unix::net::UnixListener;
 
     fn config(dir: &Path) -> Config {
         let mut config = Config::default();
         config.state_dir = dir.join("state");
-        config.sandboxes_dir = dir.join("sandboxes");
+        config.instances_dir = dir.join("instances");
         config.backend = BackendKind::CloudHypervisor;
         config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
         config
     }
 
-    fn sandbox(dir: &Path) -> SandboxConfig {
-        SandboxConfig {
+    fn instance(dir: &Path) -> InstanceConfig {
+        InstanceConfig {
             name: "demo".into(),
             project: dir.to_path_buf(),
             workspace: dir.to_path_buf(),
             harness: crate::config::Harness::Opencode,
             vcpus: 1,
             memory_mib: 128,
-            ..SandboxConfig::default()
+            ..InstanceConfig::default()
         }
     }
 
     fn write_session(
         config: &Config,
-        sandbox: &SandboxConfig,
+        instance: &InstanceConfig,
         dir: &Path,
         vm_pid: u32,
         relay_pid: u32,
         log: Option<PathBuf>,
     ) {
-        let paths = SandboxPaths::from_sandbox(config, sandbox);
+        let paths = InstancePaths::from_instance(config, instance);
         paths.ensure().unwrap();
         let record = SessionRecord {
             project: dir.to_path_buf(),
             workspace: dir.to_path_buf(),
-            sandbox: sandbox.name.clone(),
+            instance: instance.name.clone(),
             harness: crate::config::Harness::Opencode,
             started_at: Utc::now(),
             vm_pid,
@@ -498,8 +498,8 @@ mod tests {
     fn attach_requires_a_session() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let sandbox = sandbox(dir.path());
-        let err = VmConsole::attach(&config, &sandbox)
+        let instance = instance(dir.path());
+        let err = VmConsole::attach(&config, &instance)
             .unwrap_err()
             .to_string();
         assert!(err.contains("no VM session"), "{err}");
@@ -509,8 +509,8 @@ mod tests {
     fn attach_reads_and_writes_the_relay_socket() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let sandbox = sandbox(dir.path());
-        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let instance = instance(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
         paths.ensure().unwrap();
         let listener = UnixListener::bind(&paths.console_socket).unwrap();
         let serial_log = dir.path().join("session-test.log");
@@ -518,7 +518,7 @@ mod tests {
         // relay_pid = 0 skips the process check; the socket is the real test.
         write_session(
             &config,
-            &sandbox,
+            &instance,
             dir.path(),
             std::process::id(),
             0,
@@ -533,7 +533,7 @@ mod tests {
             assert_eq!(&input[..read], b"ls\r");
         });
 
-        let mut console = VmConsole::attach(&config, &sandbox).unwrap();
+        let mut console = VmConsole::attach(&config, &instance).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut output = Vec::new();
         while output != b"boot complete\n" && Instant::now() < deadline {
@@ -555,9 +555,9 @@ mod tests {
     fn attach_requires_the_console_relay() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let sandbox = sandbox(dir.path());
-        write_session(&config, &sandbox, dir.path(), std::process::id(), 0, None);
-        let err = VmConsole::attach(&config, &sandbox)
+        let instance = instance(dir.path());
+        write_session(&config, &instance, dir.path(), std::process::id(), 0, None);
+        let err = VmConsole::attach(&config, &instance)
             .unwrap_err()
             .to_string();
         assert!(err.contains("console relay socket is missing"), "{err}");
@@ -567,14 +567,14 @@ mod tests {
     fn attach_rejects_a_dead_vm() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let sandbox = sandbox(dir.path());
-        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let instance = instance(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
         paths.ensure().unwrap();
         let _listener = UnixListener::bind(&paths.console_socket).unwrap();
         // Out of pid_t range: cannot be running, even after pid reuse.
-        write_session(&config, &sandbox, dir.path(), 4_000_000_000, 0, None);
+        write_session(&config, &instance, dir.path(), 4_000_000_000, 0, None);
 
-        let err = VmConsole::attach(&config, &sandbox)
+        let err = VmConsole::attach(&config, &instance)
             .unwrap_err()
             .to_string();
         assert!(err.contains("not running"), "{err}");

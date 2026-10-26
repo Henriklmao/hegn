@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// How the sandbox is selected when a project is opened.
+/// How the instance is selected when a project is opened.
 ///
 /// Both modes require a real Cloud Hypervisor VM. There is no local-shell
 /// fallback: a missing VM is always a hard error.
@@ -53,7 +53,7 @@ impl RootfsFormat {
     }
 }
 
-/// A coding harness that can be launched inside the sandbox.
+/// A coding harness that can be launched inside the instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[value(rename_all = "kebab-case")]
@@ -277,7 +277,7 @@ impl LocalEndpoint {
         name
     }
 
-    /// URL the guest uses. `host` is the sandbox's TAP host address.
+    /// URL the guest uses. `host` is the instance's TAP host address.
     pub fn url(&self, host: std::net::Ipv4Addr) -> String {
         format!("http://{host}:{}", self.port)
     }
@@ -294,7 +294,7 @@ pub fn validate_local_endpoints(endpoints: &[LocalEndpoint]) -> Result<()> {
             );
         }
         // Ports below 1024 are reserved for privileged host services (SSH,
-        // DNS, …). Exposing those to a sandbox is never an LLM passthrough.
+        // DNS, …). Exposing those to an instance is never an LLM passthrough.
         if endpoint.port < 1024 {
             bail!(
                 "local endpoint '{}' uses port {}; ports below 1024 are not exposed",
@@ -325,7 +325,7 @@ pub fn safe_package_name(name: &str) -> bool {
 ///
 /// Arch ships `/usr/lib/virtiofsd`, Fedora/RHEL use `/usr/libexec/virtiofsd`,
 /// Debian/Ubuntu keep it in `/usr/lib/qemu/`, and openSUSE uses
-/// `/usr/libexec/qemu/`. `hegn doctor` and the sandbox preflight fall back to
+/// `/usr/libexec/qemu/`. `hegn doctor` and the instance preflight fall back to
 /// these after `PATH` so a plain package install works without editing
 /// `virtiofsd_bin`.
 pub const VIRTIOFSD_FALLBACKS: &[&str] = &[
@@ -406,7 +406,7 @@ impl SecurityMode {
     }
 }
 
-/// Sandbox mode passed to virtiofsd.
+/// Instance mode passed to virtiofsd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum VirtiofsSandbox {
@@ -437,9 +437,9 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Snapshot metadata and memory files. Defaults to `~/.local/share/hegn/snapshots`.
     pub snapshots_dir: PathBuf,
-    /// Per-sandbox configuration, runtime and cloned workspaces.
-    /// Defaults to `~/.local/share/hegn/sandboxes`.
-    pub sandboxes_dir: PathBuf,
+    /// Per-instance configuration, runtime and cloned workspaces.
+    /// Defaults to `~/.local/share/hegn/instances`.
+    pub instances_dir: PathBuf,
     /// Directory containing project templates (`agents.md`, language skeletons).
     pub templates_dir: PathBuf,
     /// Directory containing per-harness profile templates
@@ -502,7 +502,7 @@ impl Default for Config {
             projects_root: home.join("Projects/hegn"),
             state_dir: state_dir.join("hegn"),
             snapshots_dir: data_dir.join("hegn/snapshots"),
-            sandboxes_dir: data_dir.join("hegn/sandboxes"),
+            instances_dir: data_dir.join("hegn/instances"),
             templates_dir: config_dir.join("hegn/templates"),
             profiles_dir: config_dir.join("hegn/profiles"),
             cloud_hypervisor_bin: PathBuf::from("cloud-hypervisor"),
@@ -555,7 +555,7 @@ impl Config {
     /// Selected environment variables override the file so `hegn` can be
     /// exercised in CI without touching the user's real directories:
     /// `HEGN_PROJECTS_ROOT`, `HEGN_STATE_DIR`, `HEGN_SNAPSHOTS_DIR`,
-    /// `HEGN_SANDBOXES_DIR`,
+    /// `HEGN_INSTANCES_DIR`,
     /// `HEGN_TEMPLATES_DIR`, `HEGN_CLOUD_HYPERVISOR_BIN`, `HEGN_VIRTIOFSD_BIN`,
     /// `HEGN_KERNEL_IMAGE` and `HEGN_ROOTFS_IMAGE`.
     pub fn load() -> Result<Self> {
@@ -592,8 +592,8 @@ impl Config {
         if let Some(value) = path_var("HEGN_SNAPSHOTS_DIR") {
             self.snapshots_dir = value;
         }
-        if let Some(value) = path_var("HEGN_SANDBOXES_DIR") {
-            self.sandboxes_dir = value;
+        if let Some(value) = path_var("HEGN_INSTANCES_DIR") {
+            self.instances_dir = value;
         }
         if let Some(value) = path_var("HEGN_TEMPLATES_DIR") {
             self.templates_dir = value;
@@ -681,7 +681,7 @@ impl Config {
         for (name, path) in [
             ("state_dir", &self.state_dir),
             ("snapshots_dir", &self.snapshots_dir),
-            ("sandboxes_dir", &self.sandboxes_dir),
+            ("instances_dir", &self.instances_dir),
             ("kernel_image", &self.kernel_image),
             ("rootfs_image", &self.rootfs_image),
         ] {
@@ -734,7 +734,7 @@ impl Config {
         for dir in [
             &self.state_dir,
             &self.snapshots_dir,
-            &self.sandboxes_dir,
+            &self.instances_dir,
             &self.profiles_dir,
         ] {
             if let Ok(metadata) = fs::symlink_metadata(dir)
@@ -835,7 +835,7 @@ impl Config {
         let mut protected = vec![
             self.state_dir.clone(),
             self.snapshots_dir.clone(),
-            self.sandboxes_dir.clone(),
+            self.instances_dir.clone(),
             self.templates_dir.clone(),
             self.profiles_dir.clone(),
         ];
@@ -927,7 +927,7 @@ impl Config {
 /// `AGENTS.md` seeded into new projects from `templates_dir`.
 pub const DEFAULT_AGENTS_MD: &str = r#"# Agent instructions
 
-This project runs inside a hegn sandbox.
+This project runs inside a hegn instance.
 
 ## Rules
 
@@ -1061,7 +1061,7 @@ root_device = "/dev/vda"
         let mut config = Config::default();
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
-        config.sandboxes_dir = dir.path().join("sandboxes");
+        config.instances_dir = dir.path().join("instances");
         config.templates_dir = dir.path().join("templates");
         config.profiles_dir = dir.path().join("profiles");
         config.projects_root = dir.path().join("projects");

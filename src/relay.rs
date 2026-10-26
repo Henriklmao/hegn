@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-/// Hidden first argument used to start the relay from [`crate::sandbox`].
+/// Hidden first argument used to start the relay from [`crate::instance`].
 pub const INTERNAL_ARG: &str = "__console-relay";
 /// Maximum number of historical bytes replayed to a newly attached client.
 const MAX_REPLAY_BYTES: u64 = 4 * 1024 * 1024;
@@ -407,7 +407,7 @@ impl Drop for SocketGuard {
 
 /// Does `pid` still run the internal console relay?
 pub fn process_matches_relay(pid: u32, binary: &Path) -> bool {
-    if !crate::sandbox::process_alive(pid) {
+    if !crate::instance::process_alive(pid) {
         return false;
     }
     let Some(expected) = binary.file_name() else {

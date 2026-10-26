@@ -23,7 +23,7 @@ use crate::provision::ProvisionPlan;
 /// 4 MiB is enough for the seed and keeps it cheap.
 const SEED_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Increment when the seed's user-data changes so existing sandboxes re-run
+/// Increment when the seed's user-data changes so existing instances re-run
 /// cloud-init on their next boot.
 pub const SEED_VERSION: u32 = 7;
 
@@ -264,7 +264,7 @@ fn write_file<IO: std::io::Read + std::io::Write + std::io::Seek>(
 /// network configuration changes, which makes cloud-init re-apply the new
 /// user-data/network-config even when the rootfs is reused.
 pub fn instance_id(
-    sandbox: &str,
+    instance: &str,
     provision: &ProvisionPlan,
     profile: Option<&ProfileShare>,
     network: Option<&Lease>,
@@ -284,7 +284,7 @@ pub fn instance_id(
         hasher.update(endpoint_env(lease, endpoints).as_bytes());
     }
     let digest = hex::encode(hasher.finalize());
-    format!("hegn-{sandbox}-v{SEED_VERSION}-{}", &digest[..12])
+    format!("hegn-{instance}-v{SEED_VERSION}-{}", &digest[..12])
 }
 
 /// The exact `--disk` value for the seed.
@@ -302,7 +302,7 @@ mod tests {
     fn lease() -> Lease {
         Lease {
             index: 0,
-            sandbox: "demo".into(),
+            instance: "demo".into(),
             tap: tap_name(0),
             mac: mac(0),
             host_ip: host_ip(0),

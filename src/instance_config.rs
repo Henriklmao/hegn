@@ -1,17 +1,17 @@
-//! Per-sandbox configuration and workspace cloning.
+//! Per-instance configuration and workspace cloning.
 //!
-//! Every sandbox lives in its own directory under `sandboxes_dir`:
+//! Every instance lives in its own directory under `instances_dir`:
 //!
 //! ```text
-//! <sandboxes_dir>/<name>/
-//!   hegn.toml     per-sandbox settings (private, 0600)
-//!   workspace/    clone for multi-agent sandboxes
+//! <instances_dir>/<name>/
+//!   hegn.toml     per-instance settings (private, 0600)
+//!   workspace/    clone for multi-agent instances
 //!   run/          runtime sockets/pids/lock (created on start)
 //! ```
 //!
-//! A normal sandbox points `workspace` at the original project; a multi-agent
-//! clone gets a private workspace inside the sandbox directory. Deleting a
-//! sandbox never deletes a workspace outside its own directory.
+//! A normal instance points `workspace` at the original project; a multi-agent
+//! clone gets a private workspace inside the instance directory. Deleting a
+//! instance never deletes a workspace outside its own directory.
 
 use std::fs;
 use std::io::Write;
@@ -32,16 +32,16 @@ const MAX_NAME_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct SandboxConfig {
+pub struct InstanceConfig {
     pub version: u32,
     pub name: String,
-    /// Original project the sandbox belongs to.
+    /// Original project the instance belongs to.
     pub project: PathBuf,
-    /// Directory exported to the guest. For normal sandboxes this is the
-    /// project itself; for clones it is `<sandbox>/workspace`.
+    /// Directory exported to the guest. For normal instances this is the
+    /// project itself; for clones it is `<instance>/workspace`.
     pub workspace: PathBuf,
-    /// Optional per-sandbox root filesystem. When absent, hegn copies the
-    /// global image into the sandbox on first start so concurrent VMs never
+    /// Optional per-instance root filesystem. When absent, hegn copies the
+    /// global image into the instance on first start so concurrent VMs never
     /// share a writable disk.
     pub rootfs_image: Option<PathBuf>,
     pub harness: Harness,
@@ -51,7 +51,7 @@ pub struct SandboxConfig {
     pub guest_mount: String,
     /// Clone created for multi-agent work.
     pub ephemeral: bool,
-    pub source_sandbox: Option<String>,
+    pub source_instance: Option<String>,
     pub created_at: DateTime<Utc>,
     pub auto_branch: bool,
     pub security: SecurityMode,
@@ -63,7 +63,7 @@ pub struct SandboxConfig {
     pub network_index: Option<u8>,
 }
 
-impl Default for SandboxConfig {
+impl Default for InstanceConfig {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
@@ -77,7 +77,7 @@ impl Default for SandboxConfig {
             shared_tag: "workspace".to_string(),
             guest_mount: "/workspace".to_string(),
             ephemeral: false,
-            source_sandbox: None,
+            source_instance: None,
             created_at: Utc::now(),
             auto_branch: true,
             security: SecurityMode::Enforce,
@@ -87,14 +87,14 @@ impl Default for SandboxConfig {
     }
 }
 
-impl SandboxConfig {
-    /// Stable sandbox name derived from a project directory.
+impl InstanceConfig {
+    /// Stable instance name derived from a project directory.
     pub fn suggested_name(project: &Path) -> String {
         let raw = project
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "sandbox".to_string());
+            .unwrap_or_else(|| "instance".to_string());
         let mut name = String::new();
         let mut last_dash = false;
         for ch in raw.chars() {
@@ -108,7 +108,7 @@ impl SandboxConfig {
         }
         let name = name.trim_matches(['-', '.']).to_string();
         if name.is_empty() {
-            "sandbox".to_string()
+            "instance".to_string()
         } else {
             name.chars().take(MAX_NAME_BYTES).collect()
         }
@@ -122,25 +122,25 @@ impl SandboxConfig {
         self.dir(root).join(CONFIG_FILE)
     }
 
-    /// Root filesystem used by this sandbox, without creating it.
+    /// Root filesystem used by this instance, without creating it.
     pub fn rootfs_path(&self, config: &Config) -> PathBuf {
         self.rootfs_image.clone().unwrap_or_else(|| {
-            self.dir(&config.sandboxes_dir)
+            self.dir(&config.instances_dir)
                 .join(format!("rootfs.{}", config.rootfs_format.as_str()))
         })
     }
 
-    /// Ensure the sandbox has a private root filesystem.
+    /// Ensure the instance has a private root filesystem.
     ///
-    /// The first start copies (or reflinks) the global image into the sandbox.
-    /// Concurrent sandboxes therefore never open the same writable disk.
+    /// The first start copies (or reflinks) the global image into the instance.
+    /// Concurrent instances therefore never open the same writable disk.
     pub fn prepare_rootfs(&self, config: &Config) -> Result<PathBuf> {
         let dest = self.rootfs_path(config);
         if crate::images::is_regular_file(&dest) {
             return Ok(dest);
         }
         if self.rootfs_image.is_some() {
-            bail!("sandbox rootfs_image {} does not exist", dest.display());
+            bail!("instance rootfs_image {} does not exist", dest.display());
         }
         if !crate::images::is_regular_file(&config.rootfs_image) {
             bail!("base rootfs {} is missing", config.rootfs_image.display());
@@ -186,91 +186,91 @@ impl SandboxConfig {
         validate_name(&self.name)?;
         if self.version != CONFIG_VERSION {
             bail!(
-                "unsupported sandbox config version {} (expected {CONFIG_VERSION})",
+                "unsupported instance config version {} (expected {CONFIG_VERSION})",
                 self.version
             );
         }
         if self.project.as_os_str().is_empty() || !self.project.is_absolute() {
-            bail!("sandbox project must be an absolute path");
+            bail!("instance project must be an absolute path");
         }
         if self.workspace.as_os_str().is_empty() || !self.workspace.is_absolute() {
-            bail!("sandbox workspace must be an absolute path");
+            bail!("instance workspace must be an absolute path");
         }
         if let Some(rootfs) = &self.rootfs_image {
             if rootfs.as_os_str().is_empty() || !rootfs.is_absolute() {
-                bail!("sandbox rootfs_image must be an absolute path");
+                bail!("instance rootfs_image must be an absolute path");
             }
             // Cloud Hypervisor packs this path into `path=...,image_type=...`.
             if rootfs.to_string_lossy().contains(',') {
-                bail!("sandbox rootfs_image must not contain a comma");
+                bail!("instance rootfs_image must not contain a comma");
             }
         }
         if self.vcpus == 0 || self.vcpus > 32 {
-            bail!("sandbox vcpus must be between 1 and 32");
+            bail!("instance vcpus must be between 1 and 32");
         }
         if self.memory_mib < 128 {
-            bail!("sandbox memory_mib must be at least 128");
+            bail!("instance memory_mib must be at least 128");
         }
         crate::cloud_init::safe_token(&self.shared_tag)
             .then_some(())
-            .context("sandbox shared_tag contains unsafe characters")?;
+            .context("instance shared_tag contains unsafe characters")?;
         if self.shared_tag == crate::profile::PROFILE_SHARE_TAG {
             bail!(
-                "sandbox shared_tag '{}' is reserved for the harness profile share",
+                "instance shared_tag '{}' is reserved for the harness profile share",
                 crate::profile::PROFILE_SHARE_TAG
             );
         }
         if self.shared_tag.len() > 36 {
-            bail!("sandbox shared_tag must be at most 36 bytes");
+            bail!("instance shared_tag must be at most 36 bytes");
         }
         crate::cloud_init::safe_mount(&self.guest_mount)
             .then_some(())
-            .context("sandbox guest_mount must be an absolute, simple path")?;
-        if let Some(source) = &self.source_sandbox {
+            .context("instance guest_mount must be an absolute, simple path")?;
+        if let Some(source) = &self.source_instance {
             validate_name(source)?;
         }
         if let Some(index) = self.network_index
             && index >= crate::network::TAP_POOL
         {
             bail!(
-                "sandbox network_index {index} is outside the {} TAP pool",
+                "instance network_index {index} is outside the {} TAP pool",
                 crate::network::TAP_POOL
             );
         }
         for package in &self.extra_packages {
             if !crate::config::safe_package_name(package) {
-                bail!("sandbox extra_packages contains an invalid name: {package:?}");
+                bail!("instance extra_packages contains an invalid name: {package:?}");
             }
         }
         Ok(())
     }
 }
 
-/// Validate a sandbox name. It becomes a directory name, so traversal and
+/// Validate an instance name. It becomes a directory name, so traversal and
 /// hidden entries are rejected.
 pub fn validate_name(name: &str) -> Result<()> {
     let name = name.trim();
     if name.is_empty() {
-        bail!("sandbox name cannot be empty");
+        bail!("instance name cannot be empty");
     }
     if name.len() > MAX_NAME_BYTES {
-        bail!("sandbox name is too long");
+        bail!("instance name is too long");
     }
     if name.starts_with('.') || name.contains('/') || name.contains('\\') {
-        bail!("sandbox name must not contain path separators or start with '.'");
+        bail!("instance name must not contain path separators or start with '.'");
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        bail!("sandbox name may only contain ASCII letters, digits, '-', '_' and '.'");
+        bail!("instance name may only contain ASCII letters, digits, '-', '_' and '.'");
     }
     Ok(())
 }
 
-/// Filesystem-only store for sandbox configuration and cloned workspaces.
+/// Filesystem-only store for instance configuration and cloned workspaces.
 #[derive(Debug, Clone)]
-pub struct SandboxStore {
+pub struct InstanceStore {
     root: PathBuf,
     defaults: Config,
 }
@@ -282,10 +282,10 @@ pub struct DeleteOutcome {
     pub kept_workspace: Option<PathBuf>,
 }
 
-/// Result of cloning a sandbox workspace.
+/// Result of cloning an instance workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloneOutcome {
-    pub sandbox: SandboxConfig,
+    pub instance: InstanceConfig,
     /// Non-fatal diagnostics from workspace creation, such as git's "cloned an
     /// empty repository" warning. Callers surface these instead of letting a
     /// child process write directly to the terminal (which would corrupt the
@@ -293,10 +293,10 @@ pub struct CloneOutcome {
     pub warnings: Vec<String>,
 }
 
-impl SandboxStore {
+impl InstanceStore {
     pub fn new(config: Config) -> Self {
         Self {
-            root: config.sandboxes_dir.clone(),
+            root: config.instances_dir.clone(),
             defaults: config,
         }
     }
@@ -310,7 +310,7 @@ impl SandboxStore {
             && metadata.file_type().is_symlink()
         {
             bail!(
-                "refusing symlinked sandboxes directory {}",
+                "refusing symlinked instances directory {}",
                 self.root.display()
             );
         }
@@ -334,17 +334,17 @@ impl SandboxStore {
         Ok(self.dir(name)?.join(CONFIG_FILE))
     }
 
-    pub fn load(&self, name: &str) -> Result<SandboxConfig> {
+    pub fn load(&self, name: &str) -> Result<InstanceConfig> {
         let dir = self.dir(name)?;
         let path = dir.join(CONFIG_FILE);
         let raw = fs::read_to_string(&path)
-            .with_context(|| format!("sandbox '{name}' has no config at {}", path.display()))?;
-        let config: SandboxConfig =
+            .with_context(|| format!("instance '{name}' has no config at {}", path.display()))?;
+        let config: InstanceConfig =
             toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
         config.validate()?;
         if config.name != name {
             bail!(
-                "sandbox config {} names '{}' but the directory is '{name}'",
+                "instance config {} names '{}' but the directory is '{name}'",
                 path.display(),
                 config.name
             );
@@ -352,7 +352,7 @@ impl SandboxStore {
         Ok(config)
     }
 
-    pub fn save(&self, config: &SandboxConfig) -> Result<()> {
+    pub fn save(&self, config: &InstanceConfig) -> Result<()> {
         config.validate()?;
         let dir = self.dir(&config.name)?;
         create_private_dir(&dir)?;
@@ -371,7 +371,7 @@ impl SandboxStore {
         Ok(())
     }
 
-    pub fn list(&self) -> Result<Vec<SandboxConfig>> {
+    pub fn list(&self) -> Result<Vec<InstanceConfig>> {
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -379,7 +379,7 @@ impl SandboxStore {
                 return Err(err).with_context(|| format!("failed to read {}", self.root.display()));
             }
         };
-        let mut sandboxes = Vec::new();
+        let mut instances = Vec::new();
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -395,27 +395,27 @@ impl SandboxStore {
                 continue;
             }
             if let Ok(config) = self.load(&name) {
-                sandboxes.push(config);
+                instances.push(config);
             }
         }
-        sandboxes.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(sandboxes)
+        instances.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(instances)
     }
 
-    /// Create a sandbox from an existing project.
+    /// Create an instance from an existing project.
     ///
-    /// With `clone = true`, the project is copied into the sandbox and marked
-    /// ephemeral. Without it, the sandbox exports the project directly.
+    /// With `clone = true`, the project is copied into the instance and marked
+    /// ephemeral. Without it, the instance exports the project directly.
     pub fn create_from_project(
         &self,
         project: &Path,
         name: Option<&str>,
         harness: Option<Harness>,
         clone: bool,
-    ) -> Result<SandboxConfig> {
+    ) -> Result<InstanceConfig> {
         Ok(self
             .create_from_project_with_warnings(project, name, harness, clone)?
-            .sandbox)
+            .instance)
     }
 
     /// Like [`Self::create_from_project`], but also returns non-fatal workspace
@@ -435,19 +435,19 @@ impl SandboxStore {
         }
         let name = name
             .map(str::to_string)
-            .unwrap_or_else(|| SandboxConfig::suggested_name(&project));
+            .unwrap_or_else(|| InstanceConfig::suggested_name(&project));
         validate_name(&name)?;
         self.ensure_root()?;
         let dir = self.root.join(&name);
         if dir.exists() {
-            bail!("sandbox '{name}' already exists");
+            bail!("instance '{name}' already exists");
         }
         let (workspace, warnings) = if clone {
             let workspace = dir.join(WORKSPACE_DIR);
             match self.clone_workspace(&project, &workspace) {
                 Ok(warnings) => (workspace, warnings),
                 Err(err) => {
-                    // A failed clone must not leave a half-initialised sandbox
+                    // A failed clone must not leave a half-initialised instance
                     // behind that blocks the next attempt with "already exists".
                     let _ = fs::remove_dir_all(&dir);
                     return Err(err);
@@ -462,15 +462,15 @@ impl SandboxStore {
             return Err(err);
         }
         Ok(CloneOutcome {
-            sandbox: config,
+            instance: config,
             warnings,
         })
     }
 
-    /// Clone an existing sandbox into a new ephemeral workspace.
+    /// Clone an existing instance into a new ephemeral workspace.
     pub fn clone_from(
         &self,
-        source: &SandboxConfig,
+        source: &InstanceConfig,
         name: &str,
         harness: Option<Harness>,
     ) -> Result<CloneOutcome> {
@@ -478,7 +478,7 @@ impl SandboxStore {
         self.ensure_root()?;
         let dir = self.root.join(name);
         if dir.exists() {
-            bail!("sandbox '{name}' already exists");
+            bail!("instance '{name}' already exists");
         }
         let workspace = dir.join(WORKSPACE_DIR);
         let warnings = match self.clone_workspace(&source.workspace, &workspace) {
@@ -502,7 +502,7 @@ impl SandboxStore {
             return Err(err);
         }
         Ok(CloneOutcome {
-            sandbox: config,
+            instance: config,
             warnings,
         })
     }
@@ -515,10 +515,10 @@ impl SandboxStore {
         workspace: PathBuf,
         harness: Option<Harness>,
         ephemeral: bool,
-        source_sandbox: Option<String>,
-        template: Option<&SandboxConfig>,
-    ) -> SandboxConfig {
-        let base = template.cloned().unwrap_or_else(|| SandboxConfig {
+        source_instance: Option<String>,
+        template: Option<&InstanceConfig>,
+    ) -> InstanceConfig {
+        let base = template.cloned().unwrap_or_else(|| InstanceConfig {
             harness: self.defaults.harness,
             vcpus: self.defaults.vcpus,
             memory_mib: self.defaults.memory_mib,
@@ -527,7 +527,7 @@ impl SandboxStore {
             auto_branch: self.defaults.auto_branch,
             security: self.defaults.security,
             extra_packages: self.defaults.extra_packages.clone(),
-            ..SandboxConfig::default()
+            ..InstanceConfig::default()
         });
         // Project-level package selections are data for the first-boot
         // provisioner. The harness preset is always unioned in later, so this
@@ -540,7 +540,7 @@ impl SandboxStore {
                 extra_packages.push(package);
             }
         }
-        SandboxConfig {
+        InstanceConfig {
             version: CONFIG_VERSION,
             name: name.to_string(),
             project: project.to_path_buf(),
@@ -552,7 +552,7 @@ impl SandboxStore {
             shared_tag: base.shared_tag,
             guest_mount: base.guest_mount,
             ephemeral,
-            source_sandbox,
+            source_instance,
             created_at: Utc::now(),
             auto_branch: base.auto_branch,
             security: base.security,
@@ -561,23 +561,23 @@ impl SandboxStore {
         }
     }
 
-    /// Lowest TAP slice not used by an existing sandbox. Assignment happens at
-    /// creation; a legacy sandbox with no index gets one on first start.
+    /// Lowest TAP slice not used by an existing instance. Assignment happens at
+    /// creation; a legacy instance with no index gets one on first start.
     fn next_network_index(&self) -> Option<u8> {
         let used: Vec<u8> = self
             .list()
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|sandbox| sandbox.network_index)
+            .filter_map(|instance| instance.network_index)
             .collect();
         (0..crate::network::TAP_POOL).find(|index| !used.contains(index))
     }
 
-    /// Remove a sandbox directory.
+    /// Remove an instance directory.
     ///
-    /// A workspace outside the sandbox directory (the original project of a
-    /// normal sandbox) is never deleted. `delete_files = false` keeps an
-    /// in-sandbox clone by renaming it to `<name>-files-<timestamp>`.
+    /// A workspace outside the instance directory (the original project of a
+    /// normal instance) is never deleted. `delete_files = false` keeps an
+    /// in-instance clone by renaming it to `<name>-files-<timestamp>`.
     pub fn delete(&self, name: &str, delete_files: bool) -> Result<DeleteOutcome> {
         let config = self.load(name)?;
         let dir = self.dir(name)?;
@@ -591,7 +591,7 @@ impl SandboxStore {
             });
         }
         if !workspace_inside {
-            // The sandbox directory only contains config/runtime; the source
+            // The instance directory only contains config/runtime; the source
             // project is outside and is left untouched.
             remove_dir_all(&dir)?;
             return Ok(DeleteOutcome {
@@ -599,13 +599,13 @@ impl SandboxStore {
                 kept_workspace: None,
             });
         }
-        // Keep the clone workspace, but unregister the sandbox. Rename first:
-        // if that fails, the original sandbox (with its hegn.toml) is still
+        // Keep the clone workspace, but unregister the instance. Rename first:
+        // if that fails, the original instance (with its hegn.toml) is still
         // intact and the delete can be retried.
         let kept = unique_kept_path(&self.root, name);
         fs::rename(&dir, &kept)
             .with_context(|| format!("failed to move {} to {}", dir.display(), kept.display()))?;
-        // The kept directory is no longer listed as a sandbox once hegn.toml
+        // The kept directory is no longer listed as an instance once hegn.toml
         // is gone; runtime sockets are removed best-effort.
         let _ = remove_runtime(&kept);
         Ok(DeleteOutcome {
@@ -826,7 +826,7 @@ mod tests {
 
     fn config(dir: &Path) -> Config {
         let mut config = Config::default();
-        config.sandboxes_dir = dir.join("sandboxes");
+        config.instances_dir = dir.join("instances");
         config.projects_root = dir.join("projects");
         config.harness = Harness::Shell;
         config
@@ -840,17 +840,17 @@ mod tests {
     }
 
     #[test]
-    fn creates_and_lists_a_normal_sandbox() {
+    fn creates_and_lists_a_normal_instance() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
-        let store = SandboxStore::new(cfg);
+        let store = InstanceStore::new(cfg);
         let project = project(dir.path(), "demo");
-        let sandbox = store
+        let instance = store
             .create_from_project(&project, None, Some(Harness::Codex), false)
             .unwrap();
-        assert_eq!(sandbox.name, "demo");
-        assert_eq!(sandbox.workspace, project.canonicalize().unwrap());
-        assert!(!sandbox.ephemeral);
+        assert_eq!(instance.name, "demo");
+        assert_eq!(instance.workspace, project.canonicalize().unwrap());
+        assert!(!instance.ephemeral);
         assert_eq!(store.list().unwrap().len(), 1);
         let loaded = store.load("demo").unwrap();
         assert_eq!(loaded.harness, Harness::Codex);
@@ -865,7 +865,7 @@ mod tests {
     fn clone_creates_an_isolated_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
-        let store = SandboxStore::new(cfg);
+        let store = InstanceStore::new(cfg);
         let project = project(dir.path(), "demo");
         let base = store
             .create_from_project(&project, None, None, false)
@@ -873,9 +873,9 @@ mod tests {
         let clone = store
             .clone_from(&base, "demo-agent-1", None)
             .unwrap()
-            .sandbox;
+            .instance;
         assert!(clone.ephemeral);
-        assert_eq!(clone.source_sandbox.as_deref(), Some("demo"));
+        assert_eq!(clone.source_instance.as_deref(), Some("demo"));
         assert!(clone.workspace.starts_with(store.root()));
         assert!(clone.workspace.join("README.md").is_file());
         // Changing the clone does not change the source project.
@@ -887,7 +887,7 @@ mod tests {
     fn deleting_never_removes_the_source_project() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
-        let store = SandboxStore::new(cfg);
+        let store = InstanceStore::new(cfg);
         let project = project(dir.path(), "demo");
         store
             .create_from_project(&project, None, None, false)
@@ -899,10 +899,10 @@ mod tests {
     }
 
     #[test]
-    fn keeping_clone_files_renames_the_sandbox() {
+    fn keeping_clone_files_renames_the_instance() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
-        let store = SandboxStore::new(cfg);
+        let store = InstanceStore::new(cfg);
         let project = project(dir.path(), "demo");
         let base = store
             .create_from_project(&project, None, None, false)
@@ -910,7 +910,7 @@ mod tests {
         let clone = store
             .clone_from(&base, "demo-agent-1", None)
             .unwrap()
-            .sandbox;
+            .instance;
         let outcome = store.delete("demo-agent-1", false).unwrap();
         let kept = outcome.kept_workspace.unwrap();
         assert!(kept.join("README.md").is_file());
@@ -922,7 +922,7 @@ mod tests {
     #[test]
     fn rejects_unsafe_names_and_duplicates() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SandboxStore::new(config(dir.path()));
+        let store = InstanceStore::new(config(dir.path()));
         let project = project(dir.path(), "demo");
         for name in ["", ".hidden", "../x", "a/b", "a b"] {
             assert!(
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn git_clone_copies_the_source_commit_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SandboxStore::new(config(dir.path()));
+        let store = InstanceStore::new(config(dir.path()));
         let project = project(dir.path(), "demo");
         let git = |args: &[&str]| {
             assert!(
@@ -970,7 +970,7 @@ mod tests {
         let clone = store
             .clone_from(&base, "demo-agent-2", None)
             .unwrap()
-            .sandbox;
+            .instance;
         assert_eq!(
             git_config_get(&clone.workspace, "user.name").as_deref(),
             Some("Demo Agent")
@@ -984,7 +984,7 @@ mod tests {
     #[test]
     fn cloning_an_empty_repository_returns_the_git_warning() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SandboxStore::new(config(dir.path()));
+        let store = InstanceStore::new(config(dir.path()));
         let project = project(dir.path(), "demo");
         // Initialised, but no commits: `git clone --quiet` still warns. The
         // warning must be captured instead of written to the TUI's terminal.
@@ -1008,9 +1008,9 @@ mod tests {
     }
 
     #[test]
-    fn failed_clone_does_not_leave_a_partial_sandbox_directory() {
+    fn failed_clone_does_not_leave_a_partial_instance_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SandboxStore::new(config(dir.path()));
+        let store = InstanceStore::new(config(dir.path()));
         let project = project(dir.path(), "demo");
         // A `.git` entry that is not a repository makes `git clone` fail.
         fs::create_dir(project.join(".git")).unwrap();
@@ -1025,7 +1025,7 @@ mod tests {
     #[test]
     fn non_git_clone_copies_files_and_symlinks() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SandboxStore::new(config(dir.path()));
+        let store = InstanceStore::new(config(dir.path()));
         let project = project(dir.path(), "demo");
         std::os::unix::fs::symlink("README.md", project.join("link")).unwrap();
         let clone = store
@@ -1037,7 +1037,7 @@ mod tests {
                 None,
             )
             .unwrap()
-            .sandbox;
+            .instance;
         assert!(clone.workspace.join("README.md").is_file());
         assert!(clone.workspace.join("link").is_symlink());
     }
@@ -1049,17 +1049,17 @@ mod tests {
         cfg.rootfs_image = dir.path().join("base.qcow2");
         cfg.rootfs_format = crate::config::RootfsFormat::Qcow2;
         fs::write(&cfg.rootfs_image, b"rootfs-bytes").unwrap();
-        let store = SandboxStore::new(cfg.clone());
+        let store = InstanceStore::new(cfg.clone());
         let project = project(dir.path(), "demo");
-        let sandbox = store
+        let instance = store
             .create_from_project(&project, None, None, false)
             .unwrap();
-        let rootfs = sandbox.prepare_rootfs(&cfg).unwrap();
+        let rootfs = instance.prepare_rootfs(&cfg).unwrap();
         assert!(rootfs.starts_with(store.dir("demo").unwrap()));
         assert_eq!(fs::read(&rootfs).unwrap(), b"rootfs-bytes");
         assert_eq!(fs::read(&cfg.rootfs_image).unwrap(), b"rootfs-bytes");
         // A second call reuses the same private copy.
-        assert_eq!(sandbox.prepare_rootfs(&cfg).unwrap(), rootfs);
+        assert_eq!(instance.prepare_rootfs(&cfg).unwrap(), rootfs);
     }
 
     #[test]
@@ -1067,13 +1067,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let store = SandboxStore::new(config(dir.path()));
+        let store = InstanceStore::new(config(dir.path()));
         let project = project(dir.path(), "demo");
-        let mut sandbox = store
+        let mut instance = store
             .create_from_project(&project, None, None, false)
             .unwrap();
-        sandbox.memory_mib = 4096;
-        store.save(&sandbox).unwrap();
+        instance.memory_mib = 4096;
+        store.save(&instance).unwrap();
         let path = store.config_path("demo").unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,

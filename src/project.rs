@@ -322,7 +322,7 @@ pub fn filter_projects(projects: &[Project], query: &str) -> Vec<usize> {
     scored.into_iter().map(|(i, _)| i).collect()
 }
 
-/// Optional per-project hegn settings stored in `.hegn.toml`.
+/// Optional per-project hegn settings stored in `hegn.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectMeta {
@@ -331,13 +331,20 @@ pub struct ProjectMeta {
     pub template: Option<String>,
 }
 
-const PROJECT_META_FILE: &str = ".hegn.toml";
+const PROJECT_META_FILE: &str = "hegn.toml";
+/// Older hegn versions wrote the project settings to `.hegn.toml`.
+const LEGACY_PROJECT_META_FILE: &str = ".hegn.toml";
 
 pub fn read_meta(path: &Path) -> ProjectMeta {
-    fs::read_to_string(path.join(PROJECT_META_FILE))
-        .ok()
-        .and_then(|raw| toml::from_str(&raw).ok())
-        .unwrap_or_default()
+    for name in [PROJECT_META_FILE, LEGACY_PROJECT_META_FILE] {
+        if let Some(meta) = fs::read_to_string(path.join(name))
+            .ok()
+            .and_then(|raw| toml::from_str(&raw).ok())
+        {
+            return meta;
+        }
+    }
+    ProjectMeta::default()
 }
 
 pub fn write_meta(path: &Path, meta: &ProjectMeta) -> Result<()> {

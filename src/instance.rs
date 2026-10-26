@@ -46,12 +46,12 @@ use serde::{Deserialize, Serialize};
 use crate::cloud_hypervisor::{CloudHypervisorClient, SnapshotConfig, VmInfo, VmState};
 use crate::cloud_init;
 use crate::config::{Config, Harness, VIRTIOFSD_FALLBACKS};
+use crate::instance_config::{CloneOutcome, DeleteOutcome, InstanceConfig, InstanceStore};
 use crate::logs::{DEFAULT_KEEP, LogStore};
 use crate::network;
 use crate::profile::{self, PROFILE_SHARE_TAG};
 use crate::provision::ProvisionPlan;
 use crate::relay::{self, RelayArgs};
-use crate::sandbox_config::{CloneOutcome, DeleteOutcome, SandboxConfig, SandboxStore};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
 use crate::virtiofs::{VirtiofsConfig, VirtiofsProcess};
 
@@ -107,13 +107,13 @@ fn snapshot_fs_tags(dir: &Path) -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
-fn profile_bundle_dir(config: &Config, sandbox: &SandboxConfig) -> Option<PathBuf> {
-    let bundle = sandbox.dir(&config.sandboxes_dir).join("profile/bundle");
+fn profile_bundle_dir(config: &Config, instance: &InstanceConfig) -> Option<PathBuf> {
+    let bundle = instance.dir(&config.instances_dir).join("profile/bundle");
     bundle.join("manifest").is_file().then_some(bundle)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxPaths {
+pub struct InstancePaths {
     pub run_dir: PathBuf,
     /// Cloud Hypervisor REST API.
     pub api_socket: PathBuf,
@@ -122,7 +122,7 @@ pub struct SandboxPaths {
     /// Relay socket consumed by the TUI and `hegn attach`.
     pub console_socket: PathBuf,
     pub virtiofs_socket: PathBuf,
-    /// Second virtiofsd socket for the per-sandbox profile/skill copy.
+    /// Second virtiofsd socket for the per-instance profile/skill copy.
     pub profile_socket: PathBuf,
     pub vm_pid: PathBuf,
     pub relay_pid: PathBuf,
@@ -141,9 +141,9 @@ pub struct SandboxPaths {
     pub cloud_init: PathBuf,
 }
 
-impl SandboxPaths {
-    pub fn from_sandbox(config: &Config, sandbox: &SandboxConfig) -> Self {
-        let run_dir = sandbox.dir(&config.sandboxes_dir).join("run");
+impl InstancePaths {
+    pub fn from_instance(config: &Config, instance: &InstanceConfig) -> Self {
+        let run_dir = instance.dir(&config.instances_dir).join("run");
         Self {
             api_socket: run_dir.join("cloud-hypervisor.sock"),
             serial_socket: run_dir.join("serial.sock"),
@@ -205,7 +205,7 @@ pub struct SessionRecord {
     #[serde(default)]
     pub workspace: PathBuf,
     #[serde(default)]
-    pub sandbox: String,
+    pub instance: String,
     pub harness: Harness,
     pub started_at: DateTime<Utc>,
     pub vm_pid: u32,
@@ -226,10 +226,10 @@ pub struct SessionRecord {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SandboxReport {
+pub struct InstanceReport {
     pub state: String,
     pub backend: String,
-    pub sandbox: String,
+    pub instance: String,
     pub project: Option<PathBuf>,
     pub workspace: PathBuf,
     pub vcpus: u8,
@@ -257,9 +257,9 @@ pub struct SandboxReport {
 }
 
 #[derive(Debug, Clone)]
-pub struct SandboxManager {
+pub struct InstanceManager {
     config: Config,
-    sandbox: SandboxConfig,
+    instance: InstanceConfig,
 }
 
 /// Exclusive lock held for the duration of a VM lifecycle operation.
@@ -270,28 +270,28 @@ struct RunLock {
     _file: File,
 }
 
-impl SandboxManager {
-    pub fn new(config: Config, sandbox: SandboxConfig) -> Self {
-        Self { config, sandbox }
+impl InstanceManager {
+    pub fn new(config: Config, instance: InstanceConfig) -> Self {
+        Self { config, instance }
     }
 
-    pub fn sandbox(&self) -> &SandboxConfig {
-        &self.sandbox
+    pub fn instance(&self) -> &InstanceConfig {
+        &self.instance
     }
 
     /// Persist a newly assigned guarded-network slice so later boots and
     /// snapshot restores use the same TAP device.
     fn persist_network_index(&self, index: u8) -> Result<()> {
-        if self.sandbox.network_index == Some(index) {
+        if self.instance.network_index == Some(index) {
             return Ok(());
         }
-        let mut sandbox = self.sandbox.clone();
-        sandbox.network_index = Some(index);
-        SandboxStore::new(self.config.clone()).save(&sandbox)
+        let mut instance = self.instance.clone();
+        instance.network_index = Some(index);
+        InstanceStore::new(self.config.clone()).save(&instance)
     }
 
-    pub fn paths(&self) -> SandboxPaths {
-        SandboxPaths::from_sandbox(&self.config, &self.sandbox)
+    pub fn paths(&self) -> InstancePaths {
+        InstancePaths::from_instance(&self.config, &self.instance)
     }
 
     pub fn session(&self) -> Option<SessionRecord> {
@@ -321,9 +321,9 @@ impl SandboxManager {
 
     /// Take the exclusive VM lifecycle lock.
     ///
-    /// A second `hegn open`/`sandbox start` must not recreate the API or serial
+    /// A second `hegn open`/`instance start` must not recreate the API or serial
     /// socket underneath a VM that is already booting.
-    fn lock(&self, paths: &SandboxPaths) -> Result<RunLock> {
+    fn lock(&self, paths: &InstancePaths) -> Result<RunLock> {
         paths.ensure()?;
         let file = OpenOptions::new()
             .create(true)
@@ -348,30 +348,30 @@ impl SandboxManager {
     ///
     /// Lifecycle errors are appended to `run/hegn.log` so a failed start can
     /// be diagnosed even when the guest never reached userspace.
-    pub fn start(&self) -> Result<SandboxReport> {
+    pub fn start(&self) -> Result<InstanceReport> {
         let result = self.start_inner();
         let paths = self.paths();
         // `start_inner` may fail before it creates the run directory.
         let _ = paths.ensure();
         let message = match &result {
             Ok(report) => format!(
-                "started sandbox={} project={} harness={} vm_pid={}",
-                report.sandbox,
+                "started instance={} project={} harness={} vm_pid={}",
+                report.instance,
                 report.workspace.display(),
-                self.sandbox.harness.label(),
+                self.instance.harness.label(),
                 report.vm_pid.unwrap_or(0)
             ),
             Err(err) => format!(
-                "start failed sandbox={} project={}: {err:#}",
-                self.sandbox.name,
-                self.sandbox.workspace.display()
+                "start failed instance={} project={}: {err:#}",
+                self.instance.name,
+                self.instance.workspace.display()
             ),
         };
         append_event_log(&paths.event_log, &message);
         result.map_err(|err| anyhow::anyhow!("{err:#} (VM log: {})", paths.event_log.display()))
     }
 
-    fn start_inner(&self) -> Result<SandboxReport> {
+    fn start_inner(&self) -> Result<InstanceReport> {
         let paths = self.paths();
         // A missing VM is always a hard error: there is no host-process fallback.
         self.config.require_vm_assets()?;
@@ -380,9 +380,9 @@ impl SandboxManager {
         // create time.
         self.config.ensure_dirs()?;
         SnapshotStore::new(&self.config.snapshots_dir).ensure_staging()?;
-        let project = &self.sandbox.workspace;
+        let project = &self.instance.workspace;
         if !project.is_dir() {
-            bail!("sandbox workspace {} does not exist", project.display());
+            bail!("instance workspace {} does not exist", project.display());
         }
         // Preflight every binary before spawning anything, so a typo in the
         // configuration cannot leave a stray virtiofsd (or a VM without a
@@ -412,47 +412,47 @@ impl SandboxManager {
             );
         }
         if self.is_running() {
-            bail!("a sandbox is already running (use `hegn sandbox stop` first)");
+            bail!("an instance is already running (use `hegn instance stop` first)");
         }
         if self.session().is_some() {
             self.cleanup_stale();
         }
         if self.config.network == crate::config::NetworkMode::Off
             && self.config.cloud_init
-            && self.sandbox.harness != Harness::Shell
+            && self.instance.harness != Harness::Shell
         {
             bail!(
                 "harness '{}' needs the guarded network for its first-boot install; enable \
                  `network = \"guarded\"` or use a pre-provisioned rootfs with `cloud_init = false`",
-                self.sandbox.harness.label()
+                self.instance.harness.label()
             );
         }
         // Materialize the harness profile before reserving the network so a
         // bad profile cannot leave a TAP reservation behind.
-        let profile_plan = profile::prepare_for_start(&self.config, &self.sandbox)?;
+        let profile_plan = profile::prepare_for_start(&self.config, &self.instance)?;
         for warning in &profile_plan.warnings {
             append_event_log(&paths.event_log, &format!("profile: {warning}"));
         }
-        let mut packages = self.sandbox.extra_packages.clone();
+        let mut packages = self.instance.extra_packages.clone();
         packages.extend(profile_plan.packages.iter().cloned());
-        let provision = ProvisionPlan::new(self.sandbox.harness, &packages)?;
+        let provision = ProvisionPlan::new(self.instance.harness, &packages)?;
         // Reserve the guarded-network slice before any process is spawned.
         // `acquire` also verifies that the host firewall marker is present, so
         // an unconfigured guard fails before virtiofsd or the VMM can start.
         let network_lease = match self.config.network {
             crate::config::NetworkMode::Guarded => {
-                Some(network::acquire(&self.config, &self.sandbox)?)
+                Some(network::acquire(&self.config, &self.instance)?)
             }
             crate::config::NetworkMode::Off => None,
         };
         if let Some(lease) = &network_lease
             && let Err(err) = self.persist_network_index(lease.index)
         {
-            network::release(&self.config, &self.sandbox.name);
+            network::release(&self.config, &self.instance.name);
             return Err(err);
         }
         if let Err(err) = paths.ensure() {
-            network::release(&self.config, &self.sandbox.name);
+            network::release(&self.config, &self.instance.name);
             return Err(err);
         }
         // Build the runtime before spawning anything so a failure here cannot
@@ -463,7 +463,7 @@ impl SandboxManager {
         {
             Ok(runtime) => runtime,
             Err(err) => {
-                network::release(&self.config, &self.sandbox.name);
+                network::release(&self.config, &self.instance.name);
                 return Err(err).context("failed to build async runtime");
             }
         };
@@ -479,7 +479,7 @@ impl SandboxManager {
         let serial_log = match logs.create_session(project, started_at, std::process::id()) {
             Ok(path) => path,
             Err(err) => {
-                network::release(&self.config, &self.sandbox.name);
+                network::release(&self.config, &self.instance.name);
                 return Err(err);
             }
         };
@@ -488,7 +488,7 @@ impl SandboxManager {
         let mut virtiofs = match spawn_virtiofsd(&self.config, &paths, project) {
             Ok(process) => process,
             Err(err) => {
-                network::release(&self.config, &self.sandbox.name);
+                network::release(&self.config, &self.instance.name);
                 return Err(err);
             }
         };
@@ -496,7 +496,7 @@ impl SandboxManager {
         if let Err(err) = write_private(&paths.virtiofs_pid, virtiofs_pid.to_string()) {
             virtiofs.kill();
             cleanup_files(&paths);
-            network::release(&self.config, &self.sandbox.name);
+            network::release(&self.config, &self.instance.name);
             return Err(err).context("failed to record the virtiofsd pid");
         }
 
@@ -508,7 +508,7 @@ impl SandboxManager {
                 Err(err) => {
                     virtiofs.kill();
                     cleanup_files(&paths);
-                    network::release(&self.config, &self.sandbox.name);
+                    network::release(&self.config, &self.instance.name);
                     return Err(err);
                 }
             }
@@ -521,7 +521,7 @@ impl SandboxManager {
                 }
                 virtiofs.kill();
                 cleanup_files(&paths);
-                network::release(&self.config, &self.sandbox.name);
+                network::release(&self.config, &self.instance.name);
                 return Err(err).context("failed to record the profile virtiofsd pid");
             }
         }
@@ -535,10 +535,10 @@ impl SandboxManager {
         if self.config.cloud_init
             && let Err(err) = cloud_init::write_seed(
                 &paths.cloud_init,
-                &self.sandbox.shared_tag,
-                &self.sandbox.guest_mount,
+                &self.instance.shared_tag,
+                &self.instance.guest_mount,
                 &cloud_init::instance_id(
-                    &self.sandbox.name,
+                    &self.instance.name,
                     &provision,
                     profile_plan.share.as_ref(),
                     network_lease.as_ref(),
@@ -555,14 +555,14 @@ impl SandboxManager {
                 process.kill();
             }
             cleanup_files(&paths);
-            network::release(&self.config, &self.sandbox.name);
+            network::release(&self.config, &self.instance.name);
             return Err(err);
         }
 
         // 3. Cloud Hypervisor. Children outlive this CLI call.
         let mut vm = match spawn_cloud_hypervisor(
             &self.config,
-            &self.sandbox,
+            &self.instance,
             &paths,
             &vm_binary,
             None,
@@ -579,7 +579,7 @@ impl SandboxManager {
                     process.kill();
                 }
                 cleanup_files(&paths);
-                network::release(&self.config, &self.sandbox.name);
+                network::release(&self.config, &self.instance.name);
                 return Err(err);
             }
         };
@@ -597,7 +597,7 @@ impl SandboxManager {
                     process.kill();
                 }
                 cleanup_files(&paths);
-                network::release(&self.config, &self.sandbox.name);
+                network::release(&self.config, &self.instance.name);
                 return Err(err);
             }
         };
@@ -613,15 +613,15 @@ impl SandboxManager {
                 process.kill();
             }
             cleanup_files(&paths);
-            network::release(&self.config, &self.sandbox.name);
+            network::release(&self.config, &self.instance.name);
             return Err(err).context("failed to boot Cloud Hypervisor");
         }
 
         let record = SessionRecord {
-            project: self.sandbox.project.clone(),
-            workspace: self.sandbox.workspace.clone(),
-            sandbox: self.sandbox.name.clone(),
-            harness: self.sandbox.harness,
+            project: self.instance.project.clone(),
+            workspace: self.instance.workspace.clone(),
+            instance: self.instance.name.clone(),
+            harness: self.instance.harness,
             started_at,
             vm_pid,
             vm_binary: Some(vm_binary.clone()),
@@ -648,8 +648,8 @@ impl SandboxManager {
                 process.kill();
             }
             cleanup_files(&paths);
-            network::release(&self.config, &self.sandbox.name);
-            return Err(err).context("failed to record the sandbox session");
+            network::release(&self.config, &self.instance.name);
+            return Err(err).context("failed to record the instance session");
         }
 
         // Do not kill the children on drop.
@@ -659,14 +659,14 @@ impl SandboxManager {
             std::mem::forget(process);
         }
 
-        Ok(SandboxReport {
+        Ok(InstanceReport {
             state: "running".into(),
             backend: "cloud-hypervisor".into(),
-            sandbox: self.sandbox.name.clone(),
-            project: Some(self.sandbox.project.clone()),
-            workspace: self.sandbox.workspace.clone(),
-            vcpus: self.sandbox.vcpus,
-            memory_mib: self.sandbox.memory_mib,
+            instance: self.instance.name.clone(),
+            project: Some(self.instance.project.clone()),
+            workspace: self.instance.workspace.clone(),
+            vcpus: self.instance.vcpus,
+            memory_mib: self.instance.memory_mib,
             api_socket: paths.api_socket,
             serial_socket: paths.serial_socket,
             console_socket: paths.console_socket,
@@ -690,14 +690,14 @@ impl SandboxManager {
                 .unwrap_or_default(),
             note: Some(format!(
                 "guest workspace mounted at {}",
-                self.sandbox.guest_mount
+                self.instance.guest_mount
             )),
         })
     }
 
     /// Attach the TUI/CLI terminal to the running guest serial console.
     pub fn attach_console(&self) -> Result<crate::console::VmConsole> {
-        crate::console::VmConsole::attach(&self.config, &self.sandbox)
+        crate::console::VmConsole::attach(&self.config, &self.instance)
     }
 
     /// Boot a VM if needed, then attach its console.
@@ -712,7 +712,7 @@ impl SandboxManager {
     pub fn stop(&self) -> Result<()> {
         let paths = self.paths();
         if !paths.run_dir.is_dir() {
-            bail!("no sandbox session found in {}", paths.run_dir.display());
+            bail!("no instance session found in {}", paths.run_dir.display());
         }
         let _lock = self.lock(&paths)?;
         let hegn = hegn_binary()?;
@@ -748,7 +748,7 @@ impl SandboxManager {
             && virtiofs_pid.is_none()
             && profile_virtiofs_pid.is_none()
         {
-            bail!("no sandbox session found in {}", paths.run_dir.display());
+            bail!("no instance session found in {}", paths.run_dir.display());
         }
         let vm_binary = session
             .as_ref()
@@ -768,7 +768,7 @@ impl SandboxManager {
             terminate(pid, &self.config.virtiofsd_bin);
         }
         cleanup_files(&paths);
-        network::release(&self.config, &self.sandbox.name);
+        network::release(&self.config, &self.instance.name);
         Ok(())
     }
 
@@ -791,7 +791,7 @@ impl SandboxManager {
         CloudHypervisorClient::new(&paths.api_socket).info().await
     }
 
-    pub fn status(&self) -> Result<SandboxReport> {
+    pub fn status(&self) -> Result<InstanceReport> {
         let paths = self.paths();
         let session = self.session();
         let virtiofs_running = session
@@ -853,23 +853,23 @@ impl SandboxManager {
             );
         }
 
-        Ok(SandboxReport {
+        Ok(InstanceReport {
             state,
             backend: "cloud-hypervisor".into(),
-            sandbox: self.sandbox.name.clone(),
+            instance: self.instance.name.clone(),
             project: session
                 .as_ref()
                 .map(|s| s.project.clone())
-                .or_else(|| Some(self.sandbox.project.clone())),
-            workspace: self.sandbox.workspace.clone(),
-            vcpus: self.sandbox.vcpus,
-            memory_mib: self.sandbox.memory_mib,
+                .or_else(|| Some(self.instance.project.clone())),
+            workspace: self.instance.workspace.clone(),
+            vcpus: self.instance.vcpus,
+            memory_mib: self.instance.memory_mib,
             api_socket: paths.api_socket,
             serial_socket: paths.serial_socket,
             console_socket: paths.console_socket,
             virtiofs_socket: paths.virtiofs_socket,
             virtiofs_running,
-            profile_share: profile_bundle_dir(&self.config, &self.sandbox)
+            profile_share: profile_bundle_dir(&self.config, &self.instance)
                 .filter(|dir| dir.is_dir()),
             profile_virtiofs_pid: session
                 .as_ref()
@@ -883,7 +883,7 @@ impl SandboxManager {
             started_at: session.as_ref().map(|s| s.started_at),
             serial_log: session.as_ref().and_then(|s| s.serial_log.clone()),
             local_endpoints: self
-                .sandbox
+                .instance
                 .network_index
                 .map(|index| endpoint_urls(&self.config, network::host_ip(index)))
                 .unwrap_or_default(),
@@ -939,8 +939,8 @@ impl SandboxManager {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: prepared.final_dir.clone(),
-            sandbox: Some(self.sandbox.name.clone()),
-            project: Some(self.sandbox.project.clone()),
+            instance: Some(self.instance.name.clone()),
+            project: Some(self.instance.project.clone()),
             size_bytes: size,
             note: None,
         };
@@ -964,25 +964,25 @@ impl SandboxManager {
     /// project so the restored guest finds a healthy backend on the same
     /// socket path.
     pub async fn restore_snapshot(&self, snapshot: &SnapshotMeta) -> Result<()> {
-        // The snapshot config embeds the disk paths from the sandbox that
-        // created it. Restoring it elsewhere would make two sandboxes share one
-        // writable rootfs, so only the owning sandbox may load it.
-        if let Some(owner) = &snapshot.sandbox
-            && owner != &self.sandbox.name
+        // The snapshot config embeds the disk paths from the instance that
+        // created it. Restoring it elsewhere would make two instances share one
+        // writable rootfs, so only the owning instance may load it.
+        if let Some(owner) = &snapshot.instance
+            && owner != &self.instance.name
         {
             bail!(
-                "snapshot '{}' belongs to sandbox '{}'; restore it into that sandbox",
+                "snapshot '{}' belongs to instance '{}'; restore it into that instance",
                 snapshot.name,
                 owner
             );
         }
-        // The name alone is not enough: a deleted sandbox can be recreated for
+        // The name alone is not enough: a deleted instance can be recreated for
         // a different project, and its old snapshot must not be loaded there.
         if let Some(project) = &snapshot.project
-            && !same_project(project, &self.sandbox.project)
+            && !same_project(project, &self.instance.project)
         {
             bail!(
-                "snapshot '{}' belongs to {}; restore it into a sandbox for that project",
+                "snapshot '{}' belongs to {}; restore it into an instance for that project",
                 snapshot.name,
                 project.display()
             );
@@ -1004,12 +1004,12 @@ impl SandboxManager {
             }
         }
         let existing = self.session();
-        let project = self.sandbox.workspace.clone();
+        let project = self.instance.workspace.clone();
         if !project.is_dir() {
-            bail!("sandbox workspace {} no longer exists", project.display());
+            bail!("instance workspace {} no longer exists", project.display());
         }
         // Preflight the binaries before stopping a running VM, so a typo in
-        // the configuration does not cost the user their current sandbox.
+        // the configuration does not cost the user their current instance.
         let vm_binary = self.config.resolved_cloud_hypervisor().with_context(|| {
             format!(
                 "cloud-hypervisor binary {} was not found; hegn also accepts `{}`",
@@ -1039,7 +1039,7 @@ impl SandboxManager {
         // The snapshot embeds its device tree. Prepare the profile before
         // stopping the current VM so a bad profile cannot cost the user their
         // running session.
-        let profile_plan = profile::prepare_for_start(&self.config, &self.sandbox)?;
+        let profile_plan = profile::prepare_for_start(&self.config, &self.instance)?;
         let snapshot_fs = snapshot_fs_tags(&snapshot.dir)?;
         let needs_profile = snapshot_fs.iter().any(|tag| tag == PROFILE_SHARE_TAG);
         if needs_profile && profile_plan.share.is_none() {
@@ -1052,38 +1052,38 @@ impl SandboxManager {
         for warning in &profile_plan.warnings {
             append_event_log(&paths.event_log, &format!("profile: {warning}"));
         }
-        let mut packages = self.sandbox.extra_packages.clone();
+        let mut packages = self.instance.extra_packages.clone();
         packages.extend(profile_plan.packages.iter().cloned());
-        let provision = ProvisionPlan::new(self.sandbox.harness, &packages)?;
+        let provision = ProvisionPlan::new(self.instance.harness, &packages)?;
         if self.config.network == crate::config::NetworkMode::Off
             && self.config.cloud_init
-            && self.sandbox.harness != Harness::Shell
+            && self.instance.harness != Harness::Shell
         {
             bail!(
                 "harness '{}' needs the guarded network for its first-boot install; enable \
                  `network = \"guarded\"` or use a pre-provisioned rootfs with `cloud_init = false`",
-                self.sandbox.harness.label()
+                self.instance.harness.label()
             );
         }
         let network_lease = match self.config.network {
             crate::config::NetworkMode::Guarded => {
-                Some(network::acquire(&self.config, &self.sandbox)?)
+                Some(network::acquire(&self.config, &self.instance)?)
             }
             crate::config::NetworkMode::Off => None,
         };
         if let Some(lease) = &network_lease
             && let Err(err) = self.persist_network_index(lease.index)
         {
-            network::release(&self.config, &self.sandbox.name);
+            network::release(&self.config, &self.instance.name);
             return Err(err);
         }
         // The snapshot embeds its device tree. Never silently restore a NIC
         // that contradicts the current policy, and never attach a snapshot to
-        // a different sandbox TAP than the one it was created with.
+        // a different instance TAP than the one it was created with.
         let snapshot_taps = match snapshot_network_taps(&snapshot.dir) {
             Ok(taps) => taps,
             Err(err) => {
-                network::release(&self.config, &self.sandbox.name);
+                network::release(&self.config, &self.instance.name);
                 return Err(err);
             }
         };
@@ -1104,14 +1104,14 @@ impl SandboxManager {
                 ),
             ),
             (Some(lease), taps) if taps.iter().any(|tap| tap != &lease.tap) => {
-                // Leave the sandbox's reservation intact: an old VM may still be
+                // Leave the instance's reservation intact: an old VM may still be
                 // running on that TAP, and the next start will reuse it.
                 bail!(
-                    "snapshot '{}' expects TAP {}, but sandbox '{}' owns {}; restore it in the \
-                     sandbox that created it",
+                    "snapshot '{}' expects TAP {}, but instance '{}' owns {}; restore it in the \
+                     instance that created it",
                     snapshot.name,
                     taps.join(", "),
-                    self.sandbox.name,
+                    self.instance.name,
                     lease.tap
                 );
             }
@@ -1150,7 +1150,7 @@ impl SandboxManager {
             Ok(process) => process,
             Err(err) => {
                 cleanup_files(&paths);
-                network::release(&self.config, &self.sandbox.name);
+                network::release(&self.config, &self.instance.name);
                 return Err(err);
             }
         };
@@ -1158,7 +1158,7 @@ impl SandboxManager {
         if let Err(err) = write_private(&paths.virtiofs_pid, virtiofs_pid.to_string()) {
             virtiofs.kill();
             cleanup_files(&paths);
-            network::release(&self.config, &self.sandbox.name);
+            network::release(&self.config, &self.instance.name);
             return Err(err).context("failed to record the virtiofsd pid");
         }
 
@@ -1169,7 +1169,7 @@ impl SandboxManager {
                 Err(err) => {
                     virtiofs.kill();
                     cleanup_files(&paths);
-                    network::release(&self.config, &self.sandbox.name);
+                    network::release(&self.config, &self.instance.name);
                     return Err(err);
                 }
             }
@@ -1182,7 +1182,7 @@ impl SandboxManager {
                 }
                 virtiofs.kill();
                 cleanup_files(&paths);
-                network::release(&self.config, &self.sandbox.name);
+                network::release(&self.config, &self.instance.name);
                 return Err(err).context("failed to record the profile virtiofsd pid");
             }
         }
@@ -1199,10 +1199,10 @@ impl SandboxManager {
         if self.config.cloud_init
             && let Err(err) = cloud_init::write_seed(
                 &paths.cloud_init,
-                &self.sandbox.shared_tag,
-                &self.sandbox.guest_mount,
+                &self.instance.shared_tag,
+                &self.instance.guest_mount,
                 &cloud_init::instance_id(
-                    &self.sandbox.name,
+                    &self.instance.name,
                     &provision,
                     profile_share,
                     network_lease.as_ref(),
@@ -1219,7 +1219,7 @@ impl SandboxManager {
                 process.kill();
             }
             cleanup_files(&paths);
-            network::release(&self.config, &self.sandbox.name);
+            network::release(&self.config, &self.instance.name);
             return Err(err);
         }
 
@@ -1239,14 +1239,14 @@ impl SandboxManager {
                     process.kill();
                 }
                 cleanup_files(&paths);
-                network::release(&self.config, &self.sandbox.name);
+                network::release(&self.config, &self.instance.name);
                 return Err(err);
             }
         };
 
         let mut vm = match spawn_cloud_hypervisor(
             &self.config,
-            &self.sandbox,
+            &self.instance,
             &paths,
             &vm_binary,
             Some(snapshot),
@@ -1260,7 +1260,7 @@ impl SandboxManager {
                     process.kill();
                 }
                 cleanup_files(&paths);
-                network::release(&self.config, &self.sandbox.name);
+                network::release(&self.config, &self.instance.name);
                 return Err(err);
             }
         };
@@ -1275,7 +1275,7 @@ impl SandboxManager {
                     process.kill();
                 }
                 cleanup_files(&paths);
-                network::release(&self.config, &self.sandbox.name);
+                network::release(&self.config, &self.instance.name);
                 return Err(err);
             }
         };
@@ -1289,18 +1289,18 @@ impl SandboxManager {
                 process.kill();
             }
             cleanup_files(&paths);
-            network::release(&self.config, &self.sandbox.name);
+            network::release(&self.config, &self.instance.name);
             return Err(err).context("failed to restore the Cloud Hypervisor snapshot");
         }
 
         let record = SessionRecord {
-            project: self.sandbox.project.clone(),
-            workspace: self.sandbox.workspace.clone(),
-            sandbox: self.sandbox.name.clone(),
+            project: self.instance.project.clone(),
+            workspace: self.instance.workspace.clone(),
+            instance: self.instance.name.clone(),
             harness: existing
                 .as_ref()
                 .map(|session| session.harness)
-                .unwrap_or(self.sandbox.harness),
+                .unwrap_or(self.instance.harness),
             started_at,
             vm_pid,
             vm_binary: Some(vm_binary.clone()),
@@ -1325,8 +1325,8 @@ impl SandboxManager {
                 process.kill();
             }
             cleanup_files(&paths);
-            network::release(&self.config, &self.sandbox.name);
-            return Err(err).context("failed to record the restored sandbox session");
+            network::release(&self.config, &self.instance.name);
+            return Err(err).context("failed to record the restored instance session");
         }
 
         // The restored VM runs for the rest of the hegn session.
@@ -1374,14 +1374,14 @@ impl SandboxManager {
             }
         }
         cleanup_files(&paths);
-        network::release(&self.config, &self.sandbox.name);
+        network::release(&self.config, &self.instance.name);
     }
 }
 
 #[cfg(test)]
 fn virtiofs_config(
     config: &Config,
-    paths: &SandboxPaths,
+    paths: &InstancePaths,
     project: &Path,
 ) -> Result<VirtiofsConfig> {
     virtiofs_config_at(config, project, &paths.virtiofs_socket)
@@ -1407,15 +1407,15 @@ fn virtiofs_config_at(
     Ok(virtiofs)
 }
 
-/// A sandbox entry shown in the CLI and TUI.
+/// An instance entry shown in the CLI and TUI.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct SandboxSummary {
+pub struct InstanceSummary {
     pub name: String,
     pub project: PathBuf,
     pub workspace: PathBuf,
     pub harness: Harness,
     pub ephemeral: bool,
-    pub source_sandbox: Option<String>,
+    pub source_instance: Option<String>,
     pub state: String,
     pub vm_pid: Option<u32>,
     pub serial_log: Option<PathBuf>,
@@ -1425,17 +1425,17 @@ pub struct SandboxSummary {
     pub error: Option<String>,
 }
 
-/// Multi-sandbox registry. Each sandbox owns its config, runtime directory and
+/// Multi-instance registry. Each instance owns its config, runtime directory and
 /// workspace; the global [`Config`] only supplies machine-wide settings.
 #[derive(Debug, Clone)]
-pub struct SandboxRegistry {
+pub struct InstanceRegistry {
     config: Config,
-    store: SandboxStore,
+    store: InstanceStore,
 }
 
-impl SandboxRegistry {
+impl InstanceRegistry {
     pub fn new(config: Config) -> Self {
-        let store = SandboxStore::new(config.clone());
+        let store = InstanceStore::new(config.clone());
         Self { config, store }
     }
 
@@ -1443,19 +1443,19 @@ impl SandboxRegistry {
         &self.config
     }
 
-    pub fn store(&self) -> &SandboxStore {
+    pub fn store(&self) -> &InstanceStore {
         &self.store
     }
 
-    pub fn list(&self) -> Result<Vec<SandboxConfig>> {
+    pub fn list(&self) -> Result<Vec<InstanceConfig>> {
         self.store.list()
     }
 
-    pub fn manager(&self, sandbox: SandboxConfig) -> SandboxManager {
-        SandboxManager::new(self.config.clone(), sandbox)
+    pub fn manager(&self, instance: InstanceConfig) -> InstanceManager {
+        InstanceManager::new(self.config.clone(), instance)
     }
 
-    pub fn manager_by_name(&self, name: &str) -> Result<SandboxManager> {
+    pub fn manager_by_name(&self, name: &str) -> Result<InstanceManager> {
         Ok(self.manager(self.store.load(name)?))
     }
 
@@ -1465,7 +1465,7 @@ impl SandboxRegistry {
         name: Option<&str>,
         harness: Option<Harness>,
         clone: bool,
-    ) -> Result<SandboxConfig> {
+    ) -> Result<InstanceConfig> {
         self.store
             .create_from_project(project, name, harness, clone)
     }
@@ -1485,38 +1485,38 @@ impl SandboxRegistry {
 
     pub fn clone_from(
         &self,
-        source: &SandboxConfig,
+        source: &InstanceConfig,
         name: &str,
         harness: Option<Harness>,
     ) -> Result<CloneOutcome> {
         self.store.clone_from(source, name, harness)
     }
 
-    /// Resolve a sandbox by name, or by project name/path.
-    pub fn resolve(&self, selector: &str) -> Result<SandboxConfig> {
+    /// Resolve an instance by name, or by project name/path.
+    pub fn resolve(&self, selector: &str) -> Result<InstanceConfig> {
         if let Ok(config) = self.store.load(selector) {
             return Ok(config);
         }
         let project = resolve_project_selector(&self.config, selector)?;
-        let mut matches: Vec<SandboxConfig> = self
+        let mut matches: Vec<InstanceConfig> = self
             .store
             .list()?
             .into_iter()
-            .filter(|sandbox| same_project(&sandbox.project, &project))
+            .filter(|instance| same_project(&instance.project, &project))
             .collect();
-        // Prefer the non-ephemeral base sandbox when clones share a project.
-        matches.sort_by_key(|sandbox| sandbox.ephemeral);
+        // Prefer the non-ephemeral base instance when clones share a project.
+        matches.sort_by_key(|instance| instance.ephemeral);
         matches.into_iter().next().with_context(|| {
             format!(
-                "no sandbox for {}; create one with `hegn sandbox create {}`",
+                "no instance for {}; create one with `hegn instance create {}`",
                 project.display(),
                 project.display()
             )
         })
     }
 
-    /// Return the base sandbox for a project, creating it if necessary.
-    pub fn ensure_for_project(&self, project: &Path, harness: Harness) -> Result<SandboxConfig> {
+    /// Return the base instance for a project, creating it if necessary.
+    pub fn ensure_for_project(&self, project: &Path, harness: Harness) -> Result<InstanceConfig> {
         let project = project
             .canonicalize()
             .with_context(|| format!("project {} does not exist", project.display()))?;
@@ -1524,17 +1524,17 @@ impl SandboxRegistry {
             .store
             .list()?
             .into_iter()
-            .find(|sandbox| !sandbox.ephemeral && same_project(&sandbox.project, &project))
+            .find(|instance| !instance.ephemeral && same_project(&instance.project, &project))
         {
             return Ok(existing);
         }
-        let base = SandboxConfig::suggested_name(&project);
+        let base = InstanceConfig::suggested_name(&project);
         let name = self.unique_name(&base)?;
         self.store
             .create_from_project(&project, Some(&name), Some(harness), false)
     }
 
-    /// Find a free sandbox name starting at `base`.
+    /// Find a free instance name starting at `base`.
     pub fn unique_name(&self, base: &str) -> Result<String> {
         let base = crate::logs::sanitize_segment(base, 48);
         let mut candidate = base.clone();
@@ -1544,19 +1544,19 @@ impl SandboxRegistry {
             }
             candidate = format!("{base}-{suffix}");
         }
-        bail!("could not allocate a free sandbox name for '{base}'")
+        bail!("could not allocate a free instance name for '{base}'")
     }
 
-    pub fn summaries(&self) -> Result<Vec<SandboxSummary>> {
+    pub fn summaries(&self) -> Result<Vec<InstanceSummary>> {
         self.store
             .list()?
             .into_iter()
-            .map(|sandbox| Ok(self.summary(&sandbox)))
+            .map(|instance| Ok(self.summary(&instance)))
             .collect()
     }
 
-    pub fn summary(&self, sandbox: &SandboxConfig) -> SandboxSummary {
-        let manager = self.manager(sandbox.clone());
+    pub fn summary(&self, instance: &InstanceConfig) -> InstanceSummary {
+        let manager = self.manager(instance.clone());
         let paths = manager.paths();
         let session = manager.session();
         let vm_pid = session.as_ref().map(|session| session.vm_pid);
@@ -1566,13 +1566,13 @@ impl SandboxRegistry {
             .unwrap_or_else(|| self.config.vm_binary());
         let alive = vm_pid.is_some_and(|pid| process_matches(pid, &binary));
         let state = if alive { "running" } else { "stopped" }.to_string();
-        SandboxSummary {
-            name: sandbox.name.clone(),
-            project: sandbox.project.clone(),
-            workspace: sandbox.workspace.clone(),
-            harness: sandbox.harness,
-            ephemeral: sandbox.ephemeral,
-            source_sandbox: sandbox.source_sandbox.clone(),
+        InstanceSummary {
+            name: instance.name.clone(),
+            project: instance.project.clone(),
+            workspace: instance.workspace.clone(),
+            harness: instance.harness,
+            ephemeral: instance.ephemeral,
+            source_instance: instance.source_instance.clone(),
             state,
             vm_pid: vm_pid.filter(|pid| process_matches(*pid, &binary)),
             serial_log: session.and_then(|session| session.serial_log),
@@ -1581,8 +1581,8 @@ impl SandboxRegistry {
                 .parent()
                 .unwrap_or(Path::new(""))
                 .join("hegn.toml"),
-            vcpus: sandbox.vcpus,
-            memory_mib: sandbox.memory_mib,
+            vcpus: instance.vcpus,
+            memory_mib: instance.memory_mib,
             error: None,
         }
     }
@@ -1591,8 +1591,8 @@ impl SandboxRegistry {
         self.manager_by_name(name)?.stop()
     }
 
-    /// Delete a sandbox. The source project of a normal sandbox is never
-    /// deleted; only an in-sandbox clone can be removed or kept.
+    /// Delete an instance. The source project of a normal instance is never
+    /// deleted; only an in-instance clone can be removed or kept.
     pub fn delete(&self, name: &str, delete_files: bool) -> Result<DeleteOutcome> {
         let manager = self.manager_by_name(name)?;
         if manager.is_running() {
@@ -1613,7 +1613,7 @@ fn resolve_project_selector(config: &Config, selector: &str) -> Result<PathBuf> 
         return Ok(candidate.canonicalize().unwrap_or(candidate));
     }
     bail!(
-        "no sandbox named '{selector}' and no project at {} or {}",
+        "no instance named '{selector}' and no project at {} or {}",
         direct.display(),
         candidate.display()
     )
@@ -1621,7 +1621,7 @@ fn resolve_project_selector(config: &Config, selector: &str) -> Result<PathBuf> 
 
 fn spawn_virtiofsd(
     config: &Config,
-    paths: &SandboxPaths,
+    paths: &InstancePaths,
     project: &Path,
 ) -> Result<VirtiofsProcess> {
     spawn_virtiofsd_at(config, project, &paths.virtiofs_socket)
@@ -1644,8 +1644,8 @@ fn spawn_virtiofsd_at(
 /// Build the hardened command line for a normal boot.
 fn cloud_hypervisor_args(
     config: &Config,
-    sandbox: &SandboxConfig,
-    paths: &SandboxPaths,
+    instance: &InstanceConfig,
+    paths: &InstancePaths,
     rootfs: &Path,
     network: Option<&network::Lease>,
     profile_socket: Option<&Path>,
@@ -1670,14 +1670,14 @@ fn cloud_hypervisor_args(
     }
 
     args.push("--cpus".into());
-    args.push(format!("boot={},max={}", sandbox.vcpus, sandbox.vcpus).into());
+    args.push(format!("boot={},max={}", instance.vcpus, instance.vcpus).into());
     args.push("--memory".into());
-    args.push(format!("size={}M,shared=on", sandbox.memory_mib).into());
+    args.push(format!("size={}M,shared=on", instance.memory_mib).into());
     args.push("--fs".into());
     args.push(
         format!(
             "tag={},socket={},num_queues=1,queue_size=1024",
-            sandbox.shared_tag,
+            instance.shared_tag,
             paths.virtiofs_socket.display()
         )
         .into(),
@@ -1701,7 +1701,7 @@ fn cloud_hypervisor_args(
         // `/sys/devices/virtual/net/<tap>/tun_flags`. Its own Landlock ruleset
         // only grants `/dev/net/tun`, so that read fails with EACCES and the VM
         // dies while creating the virtio-net device. Grant exactly this
-        // sandbox's TAP directory, read-only: other interfaces and the rest of
+        // instance's TAP directory, read-only: other interfaces and the rest of
         // /sys stay invisible to the VMM.
         if config.landlock {
             args.push("--landlock-rules".into());
@@ -1717,14 +1717,14 @@ fn cloud_hypervisor_args(
 
 /// Build the command line for a restore. The VM configuration comes from the
 /// snapshot itself, so only VMM-level options are set here.
-fn restore_args(config: &Config, paths: &SandboxPaths, snapshot: &SnapshotMeta) -> Vec<OsString> {
+fn restore_args(config: &Config, paths: &InstancePaths, snapshot: &SnapshotMeta) -> Vec<OsString> {
     let mut args = common_args(config, paths, false);
     args.push("--restore".into());
     args.push(format!("source_url={},resume=true", snapshot.source_url()).into());
     args
 }
 
-fn common_args(config: &Config, paths: &SandboxPaths, landlock: bool) -> Vec<OsString> {
+fn common_args(config: &Config, paths: &InstancePaths, landlock: bool) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "--api-socket".into(),
         paths.api_socket.clone().into_os_string(),
@@ -1746,8 +1746,8 @@ fn common_args(config: &Config, paths: &SandboxPaths, landlock: bool) -> Vec<OsS
 
 fn spawn_cloud_hypervisor(
     config: &Config,
-    sandbox: &SandboxConfig,
-    paths: &SandboxPaths,
+    instance: &InstanceConfig,
+    paths: &InstancePaths,
     binary: &Path,
     restore: Option<&SnapshotMeta>,
     network: Option<&network::Lease>,
@@ -1767,8 +1767,8 @@ fn spawn_cloud_hypervisor(
     let args = match restore {
         Some(snapshot) => restore_args(config, paths, snapshot),
         None => {
-            let rootfs = sandbox.prepare_rootfs(config)?;
-            cloud_hypervisor_args(config, sandbox, paths, &rootfs, network, profile_socket)
+            let rootfs = instance.prepare_rootfs(config)?;
+            cloud_hypervisor_args(config, instance, paths, &rootfs, network, profile_socket)
         }
     };
     Command::new(binary)
@@ -1785,7 +1785,7 @@ fn spawn_cloud_hypervisor(
         })
 }
 
-fn start_relay(paths: &SandboxPaths, serial_log: &Path, vm: &mut Child) -> Result<u32> {
+fn start_relay(paths: &InstancePaths, serial_log: &Path, vm: &mut Child) -> Result<u32> {
     remove_socket(&paths.console_socket)?;
     let args = RelayArgs {
         backend: paths.serial_socket.clone(),
@@ -1868,7 +1868,7 @@ async fn wait_for_vm(socket: &Path, child: &mut Child, timeout: Duration) -> Res
 fn ensure_socket(path: &Path) -> Result<()> {
     if !path.exists() {
         bail!(
-            "no Cloud Hypervisor API socket at {} — start a sandbox first",
+            "no Cloud Hypervisor API socket at {} — start an instance first",
             path.display()
         );
     }
@@ -1991,7 +1991,7 @@ fn read_pid(path: &Path) -> Option<u32> {
 ///
 /// The TUI discovers projects as `<projects_root>/<name>` while the CLI
 /// canonicalizes them, so a symlinked projects root would otherwise look like a
-/// different project (and trigger a bogus "sandbox already running" error).
+/// different project (and trigger a bogus "instance already running" error).
 pub fn same_project(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
@@ -2069,7 +2069,7 @@ fn signal_and_wait(pid: u32, still_running: impl Fn() -> bool) {
     }
 }
 
-fn cleanup_files(paths: &SandboxPaths) {
+fn cleanup_files(paths: &InstancePaths) {
     for path in [
         &paths.api_socket,
         &paths.serial_socket,
@@ -2098,7 +2098,7 @@ mod tests {
         config.state_dir = dir.join("state");
         config.projects_root = dir.join("projects");
         config.snapshots_dir = dir.join("snapshots");
-        config.sandboxes_dir = dir.join("sandboxes");
+        config.instances_dir = dir.join("instances");
         config.profiles_dir = dir.join("profiles");
         config.templates_dir = dir.join("templates");
         config.kernel_image = dir.join("vmlinux");
@@ -2120,34 +2120,34 @@ mod tests {
             .collect()
     }
 
-    fn sandbox_for(workspace: &Path) -> SandboxConfig {
+    fn instance_for(workspace: &Path) -> InstanceConfig {
         std::fs::create_dir_all(workspace).unwrap();
-        SandboxConfig {
+        InstanceConfig {
             name: "demo".into(),
             project: workspace.to_path_buf(),
             workspace: workspace.to_path_buf(),
             harness: Harness::Shell,
             vcpus: 1,
             memory_mib: 128,
-            ..SandboxConfig::default()
+            ..InstanceConfig::default()
         }
     }
 
-    fn manager_for(config: Config, workspace: &Path) -> SandboxManager {
-        SandboxManager::new(config, sandbox_for(workspace))
+    fn manager_for(config: Config, workspace: &Path) -> InstanceManager {
+        InstanceManager::new(config, instance_for(workspace))
     }
 
-    fn manager(config: Config, dir: &Path) -> SandboxManager {
+    fn manager(config: Config, dir: &Path) -> InstanceManager {
         manager_for(config, &dir.join("project"))
     }
 
     #[test]
-    fn paths_live_under_sandbox_dir() {
+    fn paths_live_under_instance_dir() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
-        let sandbox = sandbox_for(&dir.path().join("project"));
-        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
-        assert_eq!(paths.run_dir, config.sandboxes_dir.join("demo").join("run"));
+        let instance = instance_for(&dir.path().join("project"));
+        let paths = InstancePaths::from_instance(&config, &instance);
+        assert_eq!(paths.run_dir, config.instances_dir.join("demo").join("run"));
         assert_eq!(
             paths.api_socket.file_name().unwrap(),
             "cloud-hypervisor.sock"
@@ -2325,7 +2325,7 @@ mod tests {
         let record = SessionRecord {
             project: dir.path().join("p"),
             workspace: dir.path().join("p"),
-            sandbox: "demo".into(),
+            instance: "demo".into(),
             harness: Harness::Codex,
             started_at: Utc::now(),
             vm_pid: 1234,
@@ -2415,7 +2415,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: dir.path().join("missing"),
-            sandbox: Some("demo".into()),
+            instance: Some("demo".into()),
             project: Some(dir.path().join("project")),
             size_bytes: 0,
             note: None,
@@ -2447,7 +2447,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: snap_dir,
-            sandbox: Some("demo".into()),
+            instance: Some("demo".into()),
             project: None,
             size_bytes: 0,
             note: None,
@@ -2467,7 +2467,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_refuses_a_snapshot_from_another_sandbox() {
+    fn restore_refuses_a_snapshot_from_another_instance() {
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(config_with_assets(dir.path()), dir.path());
         let snapshot = SnapshotMeta {
@@ -2475,7 +2475,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: dir.path().join("snap"),
-            sandbox: Some("someone-else".into()),
+            instance: Some("someone-else".into()),
             project: Some(dir.path().join("project")),
             size_bytes: 0,
             note: None,
@@ -2488,11 +2488,11 @@ mod tests {
             .block_on(manager.restore_snapshot(&snapshot))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("belongs to sandbox 'someone-else'"), "{err}");
+        assert!(err.contains("belongs to instance 'someone-else'"), "{err}");
     }
 
     #[test]
-    fn session_records_from_before_multi_sandbox_still_load() {
+    fn session_records_from_before_multi_instance_still_load() {
         let legacy = serde_json::json!({
             "project": "/projects/demo",
             "harness": "shell",
@@ -2504,7 +2504,7 @@ mod tests {
         });
         let record: SessionRecord = serde_json::from_value(legacy).unwrap();
         assert!(record.workspace.as_os_str().is_empty());
-        assert!(record.sandbox.is_empty());
+        assert!(record.instance.is_empty());
         assert_eq!(record.vm_pid, 123);
     }
 
@@ -2519,7 +2519,7 @@ mod tests {
         let record = SessionRecord {
             project: dir.path().join("project"),
             workspace: dir.path().join("project"),
-            sandbox: "demo".into(),
+            instance: "demo".into(),
             harness: Harness::Shell,
             started_at: Utc::now(),
             vm_pid: std::process::id(),
@@ -2554,7 +2554,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: snap_dir,
-            sandbox: Some("demo".into()),
+            instance: Some("demo".into()),
             project: Some(dir.path().join("project")),
             size_bytes: 0,
             note: None,
@@ -2591,7 +2591,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: snap_dir,
-            sandbox: Some("demo".into()),
+            instance: Some("demo".into()),
             project: Some(dir.path().join("project")),
             size_bytes: 0,
             note: None,
@@ -2613,8 +2613,8 @@ mod tests {
         let mut config = config_with_assets(dir.path());
         config.virtiofsd_bin = std::env::current_exe().unwrap();
         config.virtiofs_sandbox = crate::config::VirtiofsSandbox::Chroot;
-        let sandbox = sandbox_for(dir.path());
-        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
         let virtiofs = virtiofs_config(&config, &paths, dir.path()).unwrap();
         assert_eq!(virtiofs.sandbox, crate::config::VirtiofsSandbox::Chroot);
     }
@@ -2623,13 +2623,13 @@ mod tests {
     fn cloud_hypervisor_args_are_hardened_and_use_native_virtiofs() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
-        let sandbox = sandbox_for(dir.path());
-        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
         let args = strings(&cloud_hypervisor_args(
             &config,
-            &sandbox,
+            &instance,
             &paths,
-            &sandbox.rootfs_path(&config),
+            &instance.rootfs_path(&config),
             None,
             None,
         ));
@@ -2693,11 +2693,11 @@ mod tests {
     fn guarded_network_adds_only_a_tap_and_mac() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
-        let sandbox = sandbox_for(dir.path());
-        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
         let lease = crate::network::Lease {
             index: 2,
-            sandbox: sandbox.name.clone(),
+            instance: instance.name.clone(),
             tap: crate::network::tap_name(2),
             mac: crate::network::mac(2),
             host_ip: crate::network::host_ip(2),
@@ -2705,9 +2705,9 @@ mod tests {
         };
         let joined = strings(&cloud_hypervisor_args(
             &config,
-            &sandbox,
+            &instance,
             &paths,
-            &sandbox.rootfs_path(&config),
+            &instance.rootfs_path(&config),
             Some(&lease),
             None,
         ))
@@ -2735,14 +2735,14 @@ mod tests {
     fn profile_share_is_a_second_sandboxed_device() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
-        let sandbox = sandbox_for(dir.path());
-        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
         let socket = dir.path().join("profile.sock");
         let args = strings(&cloud_hypervisor_args(
             &config,
-            &sandbox,
+            &instance,
             &paths,
-            &sandbox.rootfs_path(&config),
+            &instance.rootfs_path(&config),
             None,
             Some(&socket),
         ));
@@ -2774,13 +2774,13 @@ mod tests {
     fn sysfs_tap_rule_is_absent_without_a_network_device() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
-        let sandbox = sandbox_for(dir.path());
-        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
         let joined = strings(&cloud_hypervisor_args(
             &config,
-            &sandbox,
+            &instance,
             &paths,
-            &sandbox.rootfs_path(&config),
+            &instance.rootfs_path(&config),
             None,
             None,
         ))
@@ -2793,11 +2793,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
         config.landlock = false;
-        let sandbox = sandbox_for(dir.path());
-        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
         let lease = crate::network::Lease {
             index: 2,
-            sandbox: sandbox.name.clone(),
+            instance: instance.name.clone(),
             tap: crate::network::tap_name(2),
             mac: crate::network::mac(2),
             host_ip: crate::network::host_ip(2),
@@ -2805,9 +2805,9 @@ mod tests {
         };
         let joined = strings(&cloud_hypervisor_args(
             &config,
-            &sandbox,
+            &instance,
             &paths,
-            &sandbox.rootfs_path(&config),
+            &instance.rootfs_path(&config),
             Some(&lease),
             None,
         ))
@@ -2820,13 +2820,13 @@ mod tests {
     fn air_gapped_boot_has_no_network_device() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
-        let sandbox = sandbox_for(dir.path());
-        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
         let joined = strings(&cloud_hypervisor_args(
             &config,
-            &sandbox,
+            &instance,
             &paths,
-            &sandbox.rootfs_path(&config),
+            &instance.rootfs_path(&config),
             None,
             None,
         ))
@@ -2840,13 +2840,13 @@ mod tests {
         let mut config = config_with_assets(dir.path());
         config.seccomp = false;
         config.landlock = false;
-        let sandbox = sandbox_for(dir.path());
-        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
         let joined = strings(&cloud_hypervisor_args(
             &config,
-            &sandbox,
+            &instance,
             &paths,
-            &sandbox.rootfs_path(&config),
+            &instance.rootfs_path(&config),
             None,
             None,
         ))
@@ -2859,15 +2859,15 @@ mod tests {
     fn restore_args_come_from_the_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
-        let sandbox = sandbox_for(dir.path());
-        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
         let snap_dir = dir.path().join("snap");
         let snapshot = SnapshotMeta {
             name: "demo".into(),
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: snap_dir.clone(),
-            sandbox: Some("demo".into()),
+            instance: Some("demo".into()),
             project: None,
             size_bytes: 0,
             note: None,
@@ -2942,13 +2942,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
         config.cloud_init = false;
-        let sandbox = sandbox_for(dir.path());
-        let paths = SandboxPaths::from_sandbox(&config, &sandbox);
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
         let args = strings(&cloud_hypervisor_args(
             &config,
-            &sandbox,
+            &instance,
             &paths,
-            &sandbox.rootfs_path(&config),
+            &instance.rootfs_path(&config),
             None,
             None,
         ));
@@ -2959,10 +2959,10 @@ mod tests {
     }
 
     #[test]
-    fn registry_allows_multiple_sandboxes_and_resolves_projects() {
+    fn registry_allows_multiple_instances_and_resolves_projects() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
-        let registry = SandboxRegistry::new(config.clone());
+        let registry = InstanceRegistry::new(config.clone());
         let project = dir.path().join("projects/demo");
         std::fs::create_dir_all(&project).unwrap();
         let base = registry
@@ -2970,7 +2970,7 @@ mod tests {
             .unwrap();
         assert_eq!(base.name, "demo");
         assert!(!base.ephemeral);
-        // A second call reuses the base sandbox.
+        // A second call reuses the base instance.
         assert_eq!(
             registry
                 .ensure_for_project(&project, Harness::Shell)
@@ -2986,7 +2986,7 @@ mod tests {
         let clone = registry
             .clone_from(&base, "demo-agent-1", Some(Harness::Codex))
             .unwrap()
-            .sandbox;
+            .instance;
         assert!(clone.ephemeral);
         assert_eq!(registry.list().unwrap().len(), 2);
         let summaries = registry.summaries().unwrap();

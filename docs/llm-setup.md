@@ -18,14 +18,14 @@ missing VM is always a hard error.
    (ABI v3, Linux 6.2+) and `cloud-hypervisor` plus `virtiofsd`. If the host
    cannot provide them, stop and report the gap instead of substituting another
    runtime.
-2. **Never weaken the sandbox.** Do not set `landlock = false`, `seccomp =
+2. **Never weaken the instance.** Do not set `landlock = false`, `seccomp =
    false`, `security = "off"` or `virtiofs_sandbox = "chroot"` to get past an
    error. Report the failure and let the user decide.
 3. **Ask before system-wide changes.** Package installation, `usermod` and
    writes outside the user's home need explicit confirmation.
 4. **Stay non-interactive.** Do not launch the TUI (`hegn` without a
    subcommand) or `hegn open`/`hegn attach` from an agent; they block on a
-   terminal. Use `hegn sandbox start`, `hegn sandbox status --json` and
+   terminal. Use `hegn instance start`, `hegn instance status --json` and
    `hegn logs`.
 5. **Verify, do not assume.** Every step below ends in a command whose exit
    code decides whether you continue.
@@ -250,7 +250,7 @@ hegn doctor --json       # machine-readable, one object per check
 **Gate:** exit code `0`. `hegn doctor` must report all required checks as ok:
 `cloud-hypervisor`, `virtiofsd`, `git`, `kvm`, `landlock`, `kernel image`,
 `rootfs image` and `projects root` (`serial logs` is optional). If `landlock`
-fails, the kernel is too old — do not disable the sandbox; report the kernel
+fails, the kernel is too old — do not disable the instance; report the kernel
 version.
 
 ---
@@ -259,13 +259,13 @@ version.
 
 ```bash
 hegn project create smoke-test --harness shell --package git
-hegn sandbox start smoke-test
-hegn sandbox status --json
+hegn instance start smoke-test
+hegn instance status --json
 hegn logs list
-hegn sandbox stop smoke-test
+hegn instance stop smoke-test
 ```
 
-`hegn sandbox start` launches `virtiofsd` and Cloud Hypervisor. A failure leaves
+`hegn instance start` launches `virtiofsd` and Cloud Hypervisor. A failure leaves
 diagnostics behind:
 
 ```bash
@@ -276,8 +276,8 @@ cat ~/.local/state/hegn/run/cloud-hypervisor.log
 Remove the temporary project directory afterwards if the user does not want to
 keep it (it lives under `projects_root`, see `hegn config show`).
 
-**Gate:** `hegn sandbox status --json` reports a running VM with a Cloud
-Hypervisor pid, and `hegn sandbox stop` succeeds. A "started" state without a
+**Gate:** `hegn instance status --json` reports a running VM with a Cloud
+Hypervisor pid, and `hegn instance stop` succeeds. A "started" state without a
 VM is not a success.
 
 ---
@@ -314,7 +314,7 @@ Measured on a default 2 vCPU / 2048 MiB guest:
   guest never touched pages); disk contents are not included.
 - **Logs:** a few tens of KiB per interactive session, retention 50 files,
   `hegn logs prune --keep 20`.
-- Only one sandbox runs at a time, so this is the whole host cost.
+- Only one instance runs at a time, so this is the whole host cost.
 
 Before downloading, confirm free space with `df -h ~`, and report it to the
 user. Full measurements, the native-vs-VM comparison and cleanup tips are in
@@ -332,7 +332,7 @@ user. Full measurements, the native-vs-VM comparison and cleanup tips are in
 | `/dev/kvm` missing or permission denied | Virtualisation disabled, nested virt off, or user not in `kvm` | Fix firmware/hypervisor settings, add the group, start a new session. |
 | AUR helper wants to build `cloud-hypervisor` | AUR-only dependency | Accept it, or install `cloud-hypervisor-bin` first. |
 | Download refuses to run | No SHA-256 for a custom image | Restore the pinned images or use `--allow-unverified` only on explicit request. |
-| Attach fails after a reboot | Stale pid/socket in `state_dir/run` | `hegn sandbox status`; stop the stale session and remove `state_dir/run` only if no VMM is alive. |
+| Attach fails after a reboot | Stale pid/socket in `state_dir/run` | `hegn instance status`; stop the stale session and remove `state_dir/run` only if no VMM is alive. |
 | `hegn check` exits `1` | Command blocked by policy | Report the finding; do not add `--raw` workarounds or disable `security`. |
 
 Exit codes: `hegn doctor` → `1` when a required check fails; `hegn check` → `0`
