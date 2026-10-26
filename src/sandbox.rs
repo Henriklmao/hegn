@@ -924,7 +924,6 @@ impl SandboxManager {
         match (&network_lease, snapshot_taps.as_slice()) {
             (None, []) => {}
             (None, [_, ..]) => {
-                network::release(&self.config, &self.sandbox.name);
                 bail!(
                     "snapshot '{}' contains a network device but `network = \"off\"`; enable \
                      guarded networking or restore an air-gapped snapshot",
@@ -939,7 +938,8 @@ impl SandboxManager {
                 ),
             ),
             (Some(lease), taps) if taps.iter().any(|tap| tap != &lease.tap) => {
-                network::release(&self.config, &self.sandbox.name);
+                // Leave the sandbox's reservation intact: an old VM may still be
+                // running on that TAP, and the next start will reuse it.
                 bail!(
                     "snapshot '{}' expects TAP {}, but sandbox '{}' owns {}; restore it in the \
                      sandbox that created it",
