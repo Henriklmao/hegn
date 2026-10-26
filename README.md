@@ -350,6 +350,12 @@ the original project and is **never** deleted. `--keep-files` unregisters the
 sandbox and keeps the clone under `<sandboxes_dir>/<name>-files-<timestamp>/`.
 `--delete-files` removes the clone.
 
+Deleting never boots the VM and runs no host checks (no images, firewall, KVM or
+relay required), so a sandbox whose start failed can always be removed. In the
+TUI, `d` on a project row deletes that project's base sandbox (project files are
+kept), and the same modal is available from the sandboxes tab. With
+`--yes --keep-files` the CLI can delete unattended in CI.
+
 Per-sandbox settings live in `<sandbox>/hegn.toml`. In the TUI, `F4` opens the
 global settings editor and `F5` opens the selected sandbox's editor. Both are
 interactive modals: use `↑`/`↓` or the mouse to select a row, `←`/`→`, `‹`/`›`
@@ -643,7 +649,7 @@ Place templates in `~/.config/hegn/templates/`. `hegn project create` copies
 | `c` | Create project (projects focus) |
 | `h` / `←` | Import an existing directory (symlink, no copy) |
 | `S` | Stop the selected sandbox |
-| `d` | Delete sandbox (sandboxes) or snapshot (snapshots) |
+| `d` | Delete the project's VM (projects), sandbox (sandboxes) or snapshot (snapshots) |
 | `F4` | Global settings editor (mouse supported, `Ctrl-S` to save) |
 | `F5` | Sandbox settings editor (mouse supported, `Ctrl-S` to save) |
 | `e` | Open selected project in `$EDITOR` |

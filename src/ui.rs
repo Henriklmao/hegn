@@ -2084,7 +2084,10 @@ fn render_help(
                 ("b", "focus sandbox list (selected project only)"),
                 ("Enter", "attach/start selected sandbox or clone"),
                 ("S", "stop selected sandbox"),
-                ("d", "delete sandbox (double confirmation)"),
+                (
+                    "d",
+                    "delete sandbox, or selected project's VM (project files kept)",
+                ),
                 ("F5", "sandbox settings (arrows/mouse · Ctrl-S saves)"),
                 ("F4", "global settings"),
             ],

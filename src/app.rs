@@ -986,7 +986,7 @@ impl App {
             KeyCode::Char('d') => match self.focus {
                 Focus::Snapshots => self.confirm_delete_snapshot(),
                 Focus::Sandboxes => self.confirm_delete_sandbox(),
-                Focus::Projects => Vec::new(),
+                Focus::Projects => self.confirm_delete_project_sandbox(),
             },
             KeyCode::Char('n') if self.focus == Focus::Snapshots => {
                 self.handle_action(ActionId::NewSnapshot)
@@ -1860,6 +1860,40 @@ impl App {
     fn confirm_delete_sandbox(&mut self) -> Vec<Effect> {
         let Some(sandbox) = self.selected_sandbox().cloned() else {
             self.toast("no sandbox selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        self.modal = Some(Modal::DeleteSandbox(DeleteSandboxModal {
+            sandbox,
+            stage: DeleteSandboxStage::Confirm,
+            error: None,
+            scroll: 0,
+        }));
+        Vec::new()
+    }
+
+    /// Delete the VM/sandbox of the selected project without starting it.
+    ///
+    /// The project directory itself is never touched. This is the dashboard
+    /// counterpart of `hegn sandbox delete`, and importantly it does not run
+    /// any host prerequisite checks: a VM whose start failed (missing images,
+    /// inactive firewall, broken relay) can still be removed.
+    fn confirm_delete_project_sandbox(&mut self) -> Vec<Effect> {
+        let Some(project) = self.selected_project().cloned() else {
+            self.toast("no project selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        let sandbox = self
+            .sandboxes
+            .iter()
+            .filter(|sandbox| crate::sandbox::same_project(&sandbox.project, &project.path))
+            // Prefer the base sandbox over multi-agent clones.
+            .min_by_key(|sandbox| sandbox.ephemeral)
+            .cloned();
+        let Some(sandbox) = sandbox else {
+            self.toast(
+                format!("no VM for {} — nothing to delete", project.name),
+                ToastLevel::Warn,
+            );
             return Vec::new();
         };
         self.modal = Some(Modal::DeleteSandbox(DeleteSandboxModal {
@@ -3525,6 +3559,40 @@ mod tests {
                 delete_files: true
             }] if sandbox == "demo"
         ));
+    }
+
+    #[test]
+    fn projects_focus_delete_targets_the_project_sandbox() {
+        let (_dir, mut app) = test_app();
+        let inside = app.config.sandboxes_dir.join("demo").join("workspace");
+        let sandbox = fake_sandbox(&app, "demo", inside);
+        install_sandboxes(&mut app, vec![sandbox]);
+        app.focus = Focus::Projects;
+
+        app.handle_key(key(KeyCode::Char('d')));
+        let Some(Modal::DeleteSandbox(modal)) = &app.modal else {
+            panic!("expected a delete confirmation");
+        };
+        assert_eq!(modal.sandbox.name, "demo");
+        assert_eq!(modal.stage, DeleteSandboxStage::Confirm);
+    }
+
+    #[test]
+    fn project_delete_without_a_vm_only_warns() {
+        let (_dir, mut app) = test_app();
+        app.projects = vec![Project {
+            name: "empty".into(),
+            path: app.config.projects_root.join("empty"),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+        app.sandboxes.clear();
+        app.focus = Focus::Projects;
+
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(app.modal.is_none());
     }
 
     #[test]
