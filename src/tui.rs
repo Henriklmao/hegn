@@ -91,6 +91,7 @@ fn run_loop(
         app.snapshot_rows = hits.snapshots;
         app.config_rows = hits.config;
         app.config_steppers = hits.config_steppers;
+        app.modal_scroll = hits.modal_scroll;
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {

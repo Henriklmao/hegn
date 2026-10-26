@@ -10,7 +10,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     ActionId, App, ConfigStepHit, CreateFocus, DeleteSandboxStage, Focus, FooterHit, HelpState,
-    Modal, RowHit, SandboxState, Screen, TerminalMode, ToastLevel,
+    Modal, RowHit, SandboxState, Screen, ScrollHit, TerminalMode, ToastLevel,
 };
 use crate::config_form::{ConfigField, ConfigForm, ConfigRow, FieldKind};
 
@@ -35,6 +35,8 @@ pub struct UiHits {
     /// Settings rows and `‹ ›` steppers inside the configuration modal.
     pub config: Vec<RowHit>,
     pub config_steppers: Vec<ConfigStepHit>,
+    /// Scrollbar track of the open modal, when its body overflows.
+    pub modal_scroll: Option<ScrollHit>,
 }
 
 #[derive(Default)]
@@ -42,6 +44,7 @@ struct ModalHits {
     footer: Vec<FooterHit>,
     config: Vec<RowHit>,
     config_steppers: Vec<ConfigStepHit>,
+    scroll: Option<ScrollHit>,
 }
 
 impl ModalHits {
@@ -81,11 +84,13 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
     let mut footer = render_footer(frame, app, chunks[2]);
     let mut config = Vec::new();
     let mut config_steppers = Vec::new();
+    let mut modal_scroll = None;
     if let Some(modal) = &app.modal {
         let modal_hits = render_modal(frame, app, modal, area);
         footer.extend(modal_hits.footer);
         config = modal_hits.config;
         config_steppers = modal_hits.config_steppers;
+        modal_scroll = modal_hits.scroll;
     }
     render_toast(frame, app, chunks[1]);
 
@@ -96,6 +101,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
         snapshots: hits.2,
         config,
         config_steppers,
+        modal_scroll,
     }
 }
 
@@ -1352,34 +1358,63 @@ fn hint_buttons(frame: &mut Frame, app: &App, area: Rect, buttons: &[FooterDef])
 }
 
 fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> ModalHits {
-    if let Modal::Config(form) = modal {
-        return render_config_form(frame, app, form, area);
-    }
-    ModalHits::buttons(render_modal_buttons(frame, app, modal, area))
-}
-
-fn render_modal_buttons(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Vec<FooterHit> {
     match modal {
-        Modal::Help(help) => render_help(frame, app, help, area),
-        Modal::Error { title, message } => render_message(
-            frame,
-            app,
-            area,
-            60,
-            30,
-            1,
+        Modal::Config(form) => render_config_form(frame, app, form, area),
+        Modal::Help(help) => {
+            let (footer, scroll) = render_help(frame, app, help, area);
+            ModalHits {
+                footer,
+                scroll,
+                ..ModalHits::default()
+            }
+        }
+        Modal::Doctor(modal) => {
+            let (footer, scroll) = render_doctor(frame, app, modal, area);
+            ModalHits {
+                footer,
+                scroll,
+                ..ModalHits::default()
+            }
+        }
+        Modal::Security(prompt) => {
+            let (footer, scroll) = render_security(frame, app, prompt, area);
+            ModalHits {
+                footer,
+                scroll,
+                ..ModalHits::default()
+            }
+        }
+        Modal::Error {
             title,
             message,
-            RED,
-            &[FooterDef {
-                key: "Esc",
-                label: "Close",
-                action: ActionId::Close,
-            }],
-        ),
+            scroll,
+        } => {
+            let (footer, scroll) = render_message(
+                frame,
+                app,
+                area,
+                60,
+                30,
+                1,
+                title,
+                message,
+                RED,
+                *scroll,
+                &[FooterDef {
+                    key: "Esc",
+                    label: "Close",
+                    action: ActionId::Close,
+                }],
+            );
+            ModalHits {
+                footer,
+                scroll,
+                ..ModalHits::default()
+            }
+        }
         Modal::Confirm(prompt) => {
             let body = format!("{}\n\nConfirm: {}", prompt.message, prompt.confirm_label);
-            render_message(
+            let (footer, scroll) = render_message(
                 frame,
                 app,
                 area,
@@ -1389,6 +1424,7 @@ fn render_modal_buttons(frame: &mut Frame, app: &App, modal: &Modal, area: Rect)
                 &prompt.title,
                 &body,
                 YELLOW,
+                prompt.scroll,
                 &[
                     FooterDef {
                         key: "y",
@@ -1401,14 +1437,24 @@ fn render_modal_buttons(frame: &mut Frame, app: &App, modal: &Modal, area: Rect)
                         action: ActionId::Cancel,
                     },
                 ],
-            )
+            );
+            ModalHits {
+                footer,
+                scroll,
+                ..ModalHits::default()
+            }
         }
-        Modal::CreateProject(form) => render_create_form(frame, app, form, area),
-        Modal::ImportProject(form) => render_import_form(frame, app, form, area),
-        Modal::Doctor(modal) => render_doctor(frame, app, modal, area),
-        Modal::Security(prompt) => render_security(frame, app, prompt, area),
-        // Rendered by `render_config_form` before this dispatcher.
-        Modal::Config(_) => Vec::new(),
+        Modal::CreateProject(form) => {
+            let (footer, scroll) = render_create_form(frame, app, form, area);
+            ModalHits {
+                footer,
+                scroll,
+                ..ModalHits::default()
+            }
+        }
+        Modal::ImportProject(form) => {
+            ModalHits::buttons(render_import_form(frame, app, form, area))
+        }
         Modal::DeleteSandbox(modal) => {
             let (body, color, buttons): (String, Color, &[FooterDef]) = match modal.stage {
                 DeleteSandboxStage::Confirm => (
@@ -1457,7 +1503,7 @@ fn render_modal_buttons(frame: &mut Frame, app: &App, modal: &Modal, area: Rect)
                     ],
                 ),
             };
-            let hits = render_message(
+            let (footer, scroll) = render_message(
                 frame,
                 app,
                 area,
@@ -1467,6 +1513,7 @@ fn render_modal_buttons(frame: &mut Frame, app: &App, modal: &Modal, area: Rect)
                 "delete sandbox",
                 &body,
                 color,
+                modal.scroll,
                 buttons,
             );
             if let Some(error) = &modal.error {
@@ -1481,7 +1528,11 @@ fn render_modal_buttons(frame: &mut Frame, app: &App, modal: &Modal, area: Rect)
                     },
                 );
             }
-            hits
+            ModalHits {
+                footer,
+                scroll,
+                ..ModalHits::default()
+            }
         }
         Modal::MultiAgent(form) => {
             let body = format!(
@@ -1491,7 +1542,7 @@ fn render_modal_buttons(frame: &mut Frame, app: &App, modal: &Modal, area: Rect)
                 form.harness.label(),
                 if form.start { "yes" } else { "no" }
             );
-            let hits = render_message(
+            let (footer, scroll) = render_message(
                 frame,
                 app,
                 area,
@@ -1501,6 +1552,7 @@ fn render_modal_buttons(frame: &mut Frame, app: &App, modal: &Modal, area: Rect)
                 "multi-agent clones",
                 &body,
                 CYAN,
+                form.scroll,
                 &[
                     FooterDef {
                         key: "↑",
@@ -1551,7 +1603,11 @@ fn render_modal_buttons(frame: &mut Frame, app: &App, modal: &Modal, area: Rect)
                     },
                 );
             }
-            hits
+            ModalHits {
+                footer,
+                scroll,
+                ..ModalHits::default()
+            }
         }
     }
 }
@@ -1559,6 +1615,8 @@ fn render_modal_buttons(frame: &mut Frame, app: &App, modal: &Modal, area: Rect)
 const CONFIG_LABEL_WIDTH: usize = 20;
 /// ` ‹ ›` plus the value column: two chevrons with breathing room.
 const CONFIG_CONTROLS_WIDTH: usize = 4;
+/// Below this list width the settings form stacks label and value.
+const CONFIG_NARROW_WIDTH: u16 = 48;
 
 fn render_config_form(frame: &mut Frame, app: &App, form: &ConfigForm, area: Rect) -> ModalHits {
     let rect = centered(area, 84, 88);
@@ -1593,24 +1651,30 @@ fn render_config_form(frame: &mut Frame, app: &App, form: &ConfigForm, area: Rec
             Constraint::Length(1),
         ])
         .split(inner);
-    let list = chunks[0];
-    let height = list.height.max(1) as usize;
+    // Narrow terminals stack the label above the value instead of drawing a
+    // label column beside a value column.
+    let narrow = chunks[0].width < CONFIG_NARROW_WIDTH;
+    let row_height = if narrow { 2 } else { 1 };
+    let height = chunks[0].height.max(1) as usize;
     let rows = form.rows();
     let selected = form.selected_row();
+    let visible_rows = (height / row_height).max(1);
     // Stateless scrolling: keep the cursor visible. The wheel moves the
     // selection, so the viewport follows automatically.
-    let offset = selected.saturating_sub(height.saturating_sub(1));
+    let offset = selected.saturating_sub(visible_rows.saturating_sub(1));
+    let pane = scroll_pane(chunks[0], rows.len() * row_height, offset * row_height);
+    let list = pane.content;
 
-    let mut lines = Vec::with_capacity(height);
+    let mut lines = Vec::with_capacity(visible_rows * row_height);
     let mut config_hits = Vec::new();
     let mut steppers = Vec::new();
-    for (index, row) in rows.iter().enumerate().skip(offset).take(height) {
-        let y = list.y + (index - offset) as u16;
+    for (index, row) in rows.iter().enumerate().skip(offset).take(visible_rows) {
+        let y = list.y + ((index - offset) * row_height) as u16;
         let row_rect = Rect {
             x: list.x,
             y,
             width: list.width,
-            height: 1,
+            height: row_height as u16,
         };
         match row {
             ConfigRow::Group(name) => {
@@ -1625,21 +1689,27 @@ fn render_config_form(frame: &mut Frame, app: &App, form: &ConfigForm, area: Rec
                     ),
                     Span::styled("─".repeat(fill), Style::default().fg(BORDER)),
                 ]));
+                if narrow {
+                    lines.push(Line::default());
+                }
             }
             ConfigRow::Note(note) => {
                 lines.push(Line::from(Span::styled(
                     truncate(&format!("   {note}"), list.width as usize),
                     Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
                 )));
+                if narrow {
+                    lines.push(Line::default());
+                }
             }
             ConfigRow::Field(field) => {
                 config_hits.push(RowHit {
                     rect: row_rect,
                     index,
                 });
-                let (line, mut row_steppers) =
-                    config_field_line(app, form, *field, index, row_rect);
-                lines.push(line);
+                let (field_lines, mut row_steppers) =
+                    config_field_lines(app, form, *field, index, row_rect, narrow);
+                lines.extend(field_lines);
                 steppers.append(&mut row_steppers);
             }
         }
@@ -1648,6 +1718,7 @@ fn render_config_form(frame: &mut Frame, app: &App, form: &ConfigForm, area: Rec
         Paragraph::new(Text::from(lines)).style(Style::default()),
         list,
     );
+    render_scrollbar(frame, app, &pane);
 
     // File path on the left, dirty/saved marker on the right.
     let info = chunks[1];
@@ -1701,7 +1772,10 @@ fn render_config_form(frame: &mut Frame, app: &App, form: &ConfigForm, area: Rec
             Style::default().fg(MUTED),
         )
     };
-    frame.render_widget(Paragraph::new(hint), chunks[2]);
+    frame.render_widget(
+        Paragraph::new(fit_line(Line::from(hint), chunks[2].width as usize)),
+        chunks[2],
+    );
 
     let footer = hint_buttons(
         frame,
@@ -1735,17 +1809,20 @@ fn render_config_form(frame: &mut Frame, app: &App, form: &ConfigForm, area: Rec
         footer,
         config: config_hits,
         config_steppers: steppers,
+        scroll: pane.hit,
     }
 }
 
-/// Build one settings row and its chevron hit boxes.
-fn config_field_line(
+/// Build a settings row (or two stacked lines on narrow terminals) and its
+/// chevron hit boxes.
+fn config_field_lines(
     app: &App,
     form: &ConfigForm,
     field: ConfigField,
     index: usize,
     rect: Rect,
-) -> (Line<'static>, Vec<ConfigStepHit>) {
+    narrow: bool,
+) -> (Vec<Line<'static>>, Vec<ConfigStepHit>) {
     let selected = index == form.selected_row();
     let hovered = app.config_hover == Some(index) && !selected;
     let base = if selected {
@@ -1785,9 +1862,13 @@ fn config_field_line(
 
     let width = rect.width as usize;
     let label_width = CONFIG_LABEL_WIDTH.min(width.saturating_sub(CONFIG_CONTROLS_WIDTH + 4));
-    let value_width = width
-        .saturating_sub(3 + label_width + CONFIG_CONTROLS_WIDTH)
-        .max(2);
+    let value_width = if narrow {
+        width.saturating_sub(3 + CONFIG_CONTROLS_WIDTH).max(2)
+    } else {
+        width
+            .saturating_sub(3 + label_width + CONFIG_CONTROLS_WIDTH)
+            .max(2)
+    };
     let kind = field.kind();
 
     let raw = form.value(field);
@@ -1802,16 +1883,23 @@ fn config_field_line(
     let mut value = shown.clone();
     value.push_str(&" ".repeat(value_width.saturating_sub(shown.width())));
 
-    let label = format!("{:<label_width$}", field.label());
     let marker = if selected { "▸" } else { " " };
-    let mut spans = vec![
-        Span::styled(format!(" {marker} "), base),
-        Span::styled(label, base),
-        Span::styled(value, value_style),
-    ];
+    let mut spans = if narrow {
+        vec![
+            Span::styled("   ", base),
+            Span::styled(value.clone(), value_style),
+        ]
+    } else {
+        vec![
+            Span::styled(format!(" {marker} "), base),
+            Span::styled(format!("{:<label_width$}", field.label()), base),
+            Span::styled(value, value_style),
+        ]
+    };
 
     let mut steppers = Vec::new();
     let right = rect.x + rect.width.saturating_sub(1);
+    let value_y = if narrow { rect.y + 1 } else { rect.y };
     match kind {
         FieldKind::Choice | FieldKind::Integer { .. } => {
             spans.push(Span::styled(" ", base));
@@ -1821,7 +1909,7 @@ fn config_field_line(
             steppers.push(ConfigStepHit {
                 rect: Rect {
                     x: right.saturating_sub(2),
-                    y: rect.y,
+                    y: value_y,
                     width: 1,
                     height: 1,
                 },
@@ -1831,7 +1919,7 @@ fn config_field_line(
             steppers.push(ConfigStepHit {
                 rect: Rect {
                     x: right,
-                    y: rect.y,
+                    y: value_y,
                     width: 1,
                     height: 1,
                 },
@@ -1843,7 +1931,18 @@ fn config_field_line(
         FieldKind::Bool | FieldKind::Text => spans.push(Span::styled("    ", base)),
     }
 
-    (Line::from(spans), steppers)
+    let lines = if narrow {
+        vec![
+            Line::from(vec![
+                Span::styled(format!(" {marker} "), base),
+                Span::styled(field.label().to_string(), base),
+            ]),
+            Line::from(spans),
+        ]
+    } else {
+        vec![Line::from(spans)]
+    };
+    (lines, steppers)
 }
 
 /// Last `max` display columns of `text`, so an inline editor keeps the cursor
@@ -1876,8 +1975,9 @@ fn render_message(
     title: &str,
     body: &str,
     color: Color,
+    offset: usize,
     buttons: &[FooterDef],
-) -> Vec<FooterHit> {
+) -> (Vec<FooterHit>, Option<ScrollHit>) {
     let rect = centered(area, width_pct, height_pct);
     frame.render_widget(Clear, rect);
     let block = Block::default()
@@ -1895,16 +1995,24 @@ fn render_message(
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(2), Constraint::Length(hint_rows.max(1))])
         .split(inner);
-    frame.render_widget(
-        Paragraph::new(body)
-            .style(Style::default().fg(TEXT))
-            .wrap(Wrap { trim: false }),
-        chunks[0],
-    );
-    hint_buttons(frame, app, chunks[1], buttons)
+    let width = chunks[0].width as usize;
+    let lines: Vec<Line<'static>> = body
+        .lines()
+        .flat_map(|line| wrap_text(line, width))
+        .map(|line| Line::from(Span::styled(line, Style::default().fg(TEXT))))
+        .collect();
+    let pane = scroll_pane(chunks[0], lines.len(), offset);
+    render_scrolled(frame, app, &pane, lines);
+    let footer = hint_buttons(frame, app, chunks[1], buttons);
+    (footer, pane.hit)
 }
 
-fn render_help(frame: &mut Frame, app: &App, help: &HelpState, area: Rect) -> Vec<FooterHit> {
+fn render_help(
+    frame: &mut Frame,
+    app: &App,
+    help: &HelpState,
+    area: Rect,
+) -> (Vec<FooterHit>, Option<ScrollHit>) {
     let rect = centered(area, 72, 90);
     frame.render_widget(Clear, rect);
     let block = Block::default()
@@ -1947,7 +2055,8 @@ fn render_help(frame: &mut Frame, app: &App, help: &HelpState, area: Rect) -> Ve
         search_spans.push(Span::styled("▌", Style::default().fg(CYAN)));
     }
     frame.render_widget(
-        Paragraph::new(Line::from(search_spans)).style(Style::default()),
+        Paragraph::new(fit_line(Line::from(search_spans), chunks[0].width as usize))
+            .style(Style::default()),
         chunks[0],
     );
 
@@ -2020,12 +2129,17 @@ fn render_help(frame: &mut Frame, app: &App, help: &HelpState, area: Rect) -> Ve
             &[
                 ("/", "search these keybindings"),
                 ("Esc", "clear the search, then close"),
+                ("↑/↓ j/k", "scroll the list"),
+                ("PgUp/PgDn", "scroll one page"),
             ],
         ),
     ];
 
+    // Narrow terminals get one column: the key on its own line, then the
+    // description, instead of a key column beside a description column.
+    let narrow = chunks[1].width < HELP_NARROW_WIDTH;
     let total: usize = sections.iter().map(|(_, entries)| entries.len()).sum();
-    let mut lines = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
     let mut shown = 0usize;
     for (title, entries) in sections {
         let matches: Vec<&(&str, &str)> = entries
@@ -2041,31 +2155,52 @@ fn render_help(frame: &mut Frame, app: &App, help: &HelpState, area: Rect) -> Ve
             Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
         )));
         for (key, description) in matches {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<12}"), Style::default().fg(ACCENT)),
-                Span::styled(*description, Style::default().fg(TEXT)),
-            ]));
+            if narrow {
+                lines.push(Line::from(Span::styled(
+                    format!("  {key}"),
+                    Style::default().fg(ACCENT),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("    {description}"),
+                    Style::default().fg(TEXT),
+                )));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {key:<12}"), Style::default().fg(ACCENT)),
+                    Span::styled(*description, Style::default().fg(TEXT)),
+                ]));
+            }
         }
         lines.push(Line::default());
     }
+
+    let tail_rows = if shown == 0 { 2 } else { 1 };
+    let pane = scroll_pane(chunks[1], lines.len() + tail_rows, help.scroll);
+    let width = pane.content.width as usize;
     if shown == 0 {
         lines.push(Line::from(Span::styled(
-            format!(" no keybindings match \"{}\"", help.query.trim()),
+            truncate(
+                &format!(" no keybindings match \"{}\"", help.query.trim()),
+                width,
+            ),
             Style::default().fg(MUTED),
         )));
         lines.push(Line::from(Span::styled(
-            " Esc clears the search",
+            truncate(" Esc clears the search", width),
             Style::default().fg(MUTED),
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            format!(
-                " {shown}/{total} keybindings · all actions are also available non-interactively: hegn --help"
+            truncate(
+                &format!(
+                    " {shown}/{total} keybindings · all actions are also available non-interactively: hegn --help"
+                ),
+                width,
             ),
             Style::default().fg(MUTED),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).style(Style::default()), chunks[1]);
+    render_scrolled(frame, app, &pane, lines);
 
     let buttons = if help.searching {
         vec![FooterDef {
@@ -2087,7 +2222,7 @@ fn render_help(frame: &mut Frame, app: &App, help: &HelpState, area: Rect) -> Ve
             },
         ]
     };
-    hint_buttons(frame, app, chunks[2], &buttons)
+    (hint_buttons(frame, app, chunks[2], &buttons), pane.hit)
 }
 
 fn render_create_form(
@@ -2095,7 +2230,7 @@ fn render_create_form(
     app: &App,
     form: &crate::app::CreateProjectForm,
     area: Rect,
-) -> Vec<FooterHit> {
+) -> (Vec<FooterHit>, Option<ScrollHit>) {
     let rect = centered(area, 74, 84);
     frame.render_widget(Clear, rect);
     let block = Block::default()
@@ -2195,6 +2330,11 @@ fn render_create_form(
         .style(Style::default());
     let pkg_inner = pkg_block.inner(chunks[2]);
     frame.render_widget(pkg_block, chunks[2]);
+    let visible = pkg_inner.height.max(1) as usize;
+    let pkg_offset = form
+        .package_cursor
+        .saturating_sub(visible.saturating_sub(1));
+    let pkg_pane = scroll_pane(pkg_inner, form.packages.len() + 2, pkg_offset);
     let mut pkg_lines = Vec::new();
     for (index, package) in form.packages.iter().enumerate() {
         let cursor = index == form.package_cursor && form.focus == CreateFocus::Packages;
@@ -2227,7 +2367,7 @@ fn render_create_form(
         ),
         Style::default().fg(MUTED),
     )));
-    frame.render_widget(Paragraph::new(pkg_lines), pkg_inner);
+    render_scrolled(frame, app, &pkg_pane, pkg_lines);
 
     // Errors + clickable keybinding hints.
     let mut bottom = Vec::new();
@@ -2244,7 +2384,7 @@ fn render_create_form(
             ..chunks[3]
         },
     );
-    hint_buttons(
+    let footer = hint_buttons(
         frame,
         app,
         Rect {
@@ -2269,7 +2409,8 @@ fn render_create_form(
                 action: ActionId::Close,
             },
         ],
-    )
+    );
+    (footer, pkg_pane.hit)
 }
 
 fn render_import_form(
@@ -2425,7 +2566,7 @@ fn render_doctor(
     app: &App,
     modal: &crate::app::DoctorModal,
     area: Rect,
-) -> Vec<FooterHit> {
+) -> (Vec<FooterHit>, Option<ScrollHit>) {
     let rect = centered(area, 92, 82);
     frame.render_widget(Clear, rect);
     let block = Block::default()
@@ -2529,12 +2670,8 @@ fn render_doctor(
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(6), Constraint::Length(2)])
         .split(inner);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default())
-            .wrap(Wrap { trim: false }),
-        inner_chunks[0],
-    );
+    let pane = scroll_pane(inner_chunks[0], lines.len(), modal.scroll);
+    render_scrolled(frame, app, &pane, lines);
     let mut buttons = Vec::new();
     if modal.report.can_setup() && !modal.downloading && !modal.setting_up {
         buttons.push(FooterDef {
@@ -2560,7 +2697,10 @@ fn render_doctor(
         label: "Close",
         action: ActionId::Close,
     });
-    hint_buttons(frame, app, inner_chunks[1], &buttons)
+    (
+        hint_buttons(frame, app, inner_chunks[1], &buttons),
+        pane.hit,
+    )
 }
 
 fn render_security(
@@ -2568,7 +2708,7 @@ fn render_security(
     app: &App,
     prompt: &crate::app::SecurityPrompt,
     area: Rect,
-) -> Vec<FooterHit> {
+) -> (Vec<FooterHit>, Option<ScrollHit>) {
     let rect = centered(area, 82, 80);
     frame.render_widget(Clear, rect);
     let blocked = prompt.inspection.decision == crate::security::Decision::Block;
@@ -2595,25 +2735,31 @@ fn render_security(
         .spacing(1)
         .split(inner);
 
+    let header = vec![
+        Line::from(vec![
+            Span::styled(" decision ", Style::default().fg(MUTED)),
+            Span::styled(
+                if blocked { "BLOCKED" } else { "REVIEW" },
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   project ", Style::default().fg(MUTED)),
+            Span::styled(
+                prompt.project.display().to_string(),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" command  ", Style::default().fg(MUTED)),
+            Span::styled(prompt.command.clone(), Style::default().fg(TEXT)),
+        ]),
+    ];
     frame.render_widget(
-        Paragraph::new(Text::from(vec![
-            Line::from(vec![
-                Span::styled(" decision ", Style::default().fg(MUTED)),
-                Span::styled(
-                    if blocked { "BLOCKED" } else { "REVIEW" },
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("   project ", Style::default().fg(MUTED)),
-                Span::styled(
-                    prompt.project.display().to_string(),
-                    Style::default().fg(TEXT),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(" command  ", Style::default().fg(MUTED)),
-                Span::styled(prompt.command.clone(), Style::default().fg(TEXT)),
-            ]),
-        ])),
+        Paragraph::new(
+            header
+                .into_iter()
+                .map(|line| fit_line(line, chunks[0].width as usize))
+                .collect::<Vec<_>>(),
+        ),
         chunks[0],
     );
 
@@ -2655,9 +2801,10 @@ fn render_security(
             Style::default().fg(RED),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[1]);
+    let pane = scroll_pane(chunks[1], lines.len(), prompt.scroll);
+    render_scrolled(frame, app, &pane, lines);
 
-    hint_buttons(
+    let footer = hint_buttons(
         frame,
         app,
         chunks[2],
@@ -2678,7 +2825,8 @@ fn render_security(
                 action: ActionId::Deny,
             },
         ],
-    )
+    );
+    (footer, pane.hit)
 }
 
 fn render_toast(frame: &mut Frame, app: &App, area: Rect) {
@@ -2753,24 +2901,197 @@ fn spinner(tick: u64) -> &'static str {
     FRAMES[(tick as usize / 2) % FRAMES.len()]
 }
 
+/// Preferred minimum size for a modal. Narrower terminals use the full width.
+const MODAL_MIN_WIDTH: u16 = 48;
+const MODAL_MIN_HEIGHT: u16 = 10;
+/// Below this body width the help table stacks key and description.
+const HELP_NARROW_WIDTH: u16 = 56;
+
+/// Responsive modal geometry: honour the preferred percentage, but grow to the
+/// available space on small terminals and never exceed the screen.
 fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - height_pct) / 2),
-            Constraint::Percentage(height_pct),
-            Constraint::Percentage((100 - height_pct) / 2),
-        ])
-        .split(area);
-    let horizontal = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - width_pct) / 2),
-            Constraint::Percentage(width_pct),
-            Constraint::Percentage((100 - width_pct) / 2),
-        ])
-        .split(vertical[1]);
-    horizontal[1]
+    let margin_x = if area.width >= 60 { 2 } else { 0 };
+    let margin_y = if area.height >= 16 { 1 } else { 0 };
+    let max_width = area.width.saturating_sub(margin_x * 2).max(1);
+    let max_height = area.height.saturating_sub(margin_y * 2).max(1);
+    let preferred_width = (area.width as u32 * width_pct as u32 / 100) as u16;
+    let width = if max_width <= MODAL_MIN_WIDTH {
+        max_width
+    } else {
+        preferred_width.max(MODAL_MIN_WIDTH).min(max_width)
+    };
+    let preferred_height = (area.height as u32 * height_pct as u32 / 100) as u16;
+    let height = preferred_height
+        .max(MODAL_MIN_HEIGHT.min(max_height))
+        .min(max_height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+/// A scrollable modal body: the content area (shrunk by the scrollbar column)
+/// and the track geometry returned to the application for hover and drag.
+struct ScrollPane {
+    content: Rect,
+    hit: Option<ScrollHit>,
+    total: usize,
+}
+
+fn scroll_pane(area: Rect, total: usize, offset: usize) -> ScrollPane {
+    let page = area.height as usize;
+    let max = total.saturating_sub(page);
+    if area.width < 6 || area.height == 0 || max == 0 {
+        return ScrollPane {
+            content: area,
+            hit: None,
+            total,
+        };
+    }
+    let content = Rect {
+        width: area.width - 1,
+        ..area
+    };
+    ScrollPane {
+        content,
+        hit: Some(ScrollHit {
+            rect: Rect {
+                x: area.x + content.width,
+                y: area.y,
+                width: 1,
+                height: area.height,
+            },
+            max,
+            page,
+            offset: offset.min(max),
+        }),
+        total,
+    }
+}
+
+/// Draw the track and thumb. The thumb inverts under the pointer or while it
+/// is dragged, like every other mouse-interactive element in the TUI.
+fn render_scrollbar(frame: &mut Frame, app: &App, pane: &ScrollPane) {
+    let Some(hit) = pane.hit else { return };
+    let track = hit.rect.height as usize;
+    if track == 0 {
+        return;
+    }
+    let thumb = ((hit.page * track) / pane.total.max(1)).clamp(1, track);
+    let position = hit
+        .offset
+        .saturating_mul(track - thumb)
+        .checked_div(hit.max)
+        .unwrap_or(0);
+    let hovered = app.scroll_hover || app.scroll_dragging;
+    for row in 0..track {
+        let in_thumb = row >= position && row < position + thumb;
+        let (symbol, style) = if in_thumb {
+            if hovered {
+                (
+                    "█",
+                    Style::default()
+                        .fg(ON_ACCENT)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("█", Style::default().fg(ACCENT))
+            }
+        } else {
+            ("│", Style::default().fg(BORDER))
+        };
+        frame.render_widget(
+            Paragraph::new(symbol).style(style),
+            Rect {
+                x: hit.rect.x,
+                y: hit.rect.y + row as u16,
+                width: 1,
+                height: 1,
+            },
+        );
+    }
+}
+
+/// Render a scrollable body without wrapping, so one logical line is one row
+/// and the scrollbar offset stays exact. Overlong lines are ellipsized.
+fn render_scrolled(frame: &mut Frame, app: &App, pane: &ScrollPane, lines: Vec<Line<'static>>) {
+    let width = pane.content.width as usize;
+    let lines: Vec<Line<'static>> = lines
+        .into_iter()
+        .map(|line| fit_line(line, width))
+        .collect();
+    let offset = pane.hit.map_or(0, |hit| hit.offset);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        pane.content,
+    );
+    render_scrollbar(frame, app, pane);
+}
+
+/// Word-wrap plain text to `max` display columns, hard-splitting words (for
+/// long paths) when a single word cannot fit.
+fn wrap_text(text: &str, max: usize) -> Vec<String> {
+    if max == 0 {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for word in text.split(' ') {
+        let word_width = word.width();
+        if current_width > 0 && current_width + 1 + word_width > max {
+            out.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        if current_width > 0 {
+            current.push(' ');
+            current_width += 1;
+        }
+        for ch in word.chars() {
+            let char_width = ch.width().unwrap_or(0);
+            if current_width + char_width > max {
+                out.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += char_width;
+        }
+    }
+    if !current.is_empty() || out.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Ellipsize a styled line to `max` display columns.
+fn fit_line(line: Line<'static>, max: usize) -> Line<'static> {
+    if line.width() <= max {
+        return line;
+    }
+    if max == 0 {
+        return Line::default();
+    }
+    let style = line.style;
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    for span in line.spans {
+        let remaining = max.saturating_sub(used);
+        if remaining == 0 {
+            break;
+        }
+        let width = span.content.width();
+        if width <= remaining {
+            used += width;
+            spans.push(span);
+        } else {
+            spans.push(Span::styled(truncate(&span.content, remaining), span.style));
+            break;
+        }
+    }
+    Line::from(spans).style(style)
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -2833,7 +3154,11 @@ mod tests {
     }
 
     fn render(app: &App) -> (String, UiHits) {
-        let backend = TestBackend::new(120, 42);
+        render_sized(app, 120, 42)
+    }
+
+    fn render_sized(app: &App, width: u16, height: u16) -> (String, UiHits) {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut hits = UiHits::default();
         terminal
@@ -2876,6 +3201,7 @@ mod tests {
             message: "Delete 'demo'?".into(),
             confirm_label: "Delete".into(),
             action: crate::app::ConfirmAction::DeleteSnapshot("demo".into()),
+            scroll: 0,
         }));
         let (text, hits) = render(&app);
         assert!(text.contains("<y> Confirm"), "{text}");
@@ -2893,6 +3219,7 @@ mod tests {
             project: PathBuf::from("/projects/demo"),
             inspection: engine.inspect("rm -rf /workspace", None),
             error: None,
+            scroll: 0,
         }));
         let (text, hits) = render(&app);
         assert!(text.contains("<a> Allow once"), "{text}");
@@ -2989,6 +3316,7 @@ mod tests {
         app.modal = Some(Modal::Help(HelpState {
             query: "checkpoint".into(),
             searching: true,
+            ..HelpState::default()
         }));
         let (text, hits) = render(&app);
         assert!(text.contains("checkpoint"), "matching row is kept");
@@ -3003,6 +3331,7 @@ mod tests {
         app.modal = Some(Modal::Help(HelpState {
             query: "zzz".into(),
             searching: false,
+            ..HelpState::default()
         }));
         let (text, hits) = render(&app);
         assert!(text.contains("no keybindings match"), "{text}");
@@ -3011,6 +3340,99 @@ mod tests {
                 .iter()
                 .any(|hit| hit.action == ActionId::HelpSearch)
         );
+    }
+
+    #[test]
+    fn help_modal_stacks_key_and_description_on_narrow_terminals() {
+        let (_dir, mut app) = app();
+        app.modal = Some(Modal::Help(HelpState::default()));
+        let (text, hits) = render_sized(&app, 60, 24);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines.windows(2).any(|window| {
+                window[0].contains("↑/↓ j/k")
+                    && !window[0].contains("move selection")
+                    && window[1].contains("move selection")
+            }),
+            "narrow help stacks key and description:\n{text}"
+        );
+        let scroll = hits
+            .modal_scroll
+            .expect("a long help list needs a scrollbar");
+        assert!(scroll.max > 0);
+        assert!(scroll.offset == 0);
+        assert!(scroll.rect.width == 1);
+        assert!(scroll.rect.height > 1);
+    }
+
+    #[test]
+    fn help_modal_keeps_two_columns_on_wide_terminals() {
+        let (_dir, mut app) = app();
+        app.modal = Some(Modal::Help(HelpState::default()));
+        let (text, hits) = render_sized(&app, 120, 42);
+        assert!(
+            text.lines()
+                .any(|line| line.contains("↑/↓ j/k") && line.contains("move selection")),
+            "wide help keeps the key column"
+        );
+        assert!(hits.modal_scroll.is_some());
+    }
+
+    #[test]
+    fn help_modal_fits_tiny_terminals() {
+        let (_dir, mut app) = app();
+        app.modal = Some(Modal::Help(HelpState::default()));
+        let (text, hits) = render_sized(&app, 36, 10);
+        assert!(text.contains("hegn help"), "{text}");
+        let scroll = hits.modal_scroll.expect("an overflowing help list scrolls");
+        assert!(scroll.rect.x + scroll.rect.width <= 36);
+        assert!(scroll.rect.y + scroll.rect.height <= 10);
+    }
+
+    #[test]
+    fn tiny_terminals_render_modals_without_panicking() {
+        let (_dir, mut app) = app();
+        let path = app.config.state_dir.join("config.toml");
+        for (width, height) in [(40, 10), (24, 8), (16, 6)] {
+            app.modal = Some(Modal::Help(HelpState::default()));
+            let _ = render_sized(&app, width, height);
+            app.modal = Some(Modal::CreateProject(crate::app::CreateProjectForm::new(
+                crate::config::Harness::Shell,
+            )));
+            let _ = render_sized(&app, width, height);
+            app.modal = Some(Modal::Config(crate::config_form::ConfigForm::global(
+                app.config.clone(),
+                path.clone(),
+            )));
+            let _ = render_sized(&app, width, height);
+        }
+    }
+
+    #[test]
+    fn config_modal_stacks_label_and_value_when_narrow() {
+        let (_dir, mut app) = app();
+        let path = app.config.state_dir.join("config.toml");
+        app.modal = Some(Modal::Config(crate::config_form::ConfigForm::global(
+            app.config.clone(),
+            path,
+        )));
+        let (text, hits) = render_sized(&app, 50, 24);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines.iter().any(|line| line.contains("▸ Harness")),
+            "the selected label gets its own line:\n{text}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("▸ Harness") && !line.contains("shell")),
+            "the value moves below the label:\n{text}"
+        );
+        assert!(
+            hits.config.iter().any(|row| row.rect.height == 2),
+            "stacked settings rows are two lines tall"
+        );
+        assert!(hits.modal_scroll.is_some());
     }
 
     #[test]
@@ -3096,6 +3518,7 @@ mod tests {
             project: PathBuf::from("/projects/demo"),
             inspection: engine.inspect("rm -rf /workspace", None),
             error: None,
+            scroll: 0,
         }));
         let (text, _) = render(&app);
         assert!(text.contains("security alert"));
@@ -3156,6 +3579,16 @@ mod tests {
         assert!(wide.width() <= 4, "{wide:?} has width {}", wide.width());
         let narrow = truncate("abcdef", 4);
         assert_eq!(narrow, "abc…");
+    }
+
+    #[test]
+    fn wrap_text_wraps_words_and_hard_splits_long_paths() {
+        assert_eq!(wrap_text("hello world", 6), vec!["hello", "world"]);
+        assert_eq!(wrap_text("", 5), vec![String::new()]);
+        let path = "/very/long/path";
+        let lines = wrap_text(path, 5);
+        assert!(lines.iter().all(|line| line.width() <= 5), "{lines:?}");
+        assert_eq!(lines.concat(), path);
     }
 
     #[test]

@@ -239,6 +239,19 @@ pub struct RowHit {
     pub index: usize,
 }
 
+/// Scrollbar geometry and bounds recorded by the renderer for the open modal.
+/// The rectangle is the full track, so clicks and drags map to offsets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScrollHit {
+    pub rect: Rect,
+    /// Largest valid scroll offset in lines.
+    pub max: usize,
+    /// Visible rows, used for page-wise keyboard scrolling.
+    pub page: usize,
+    /// Offset that was actually rendered (already clamped).
+    pub offset: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct PackageOption {
     pub name: &'static str,
@@ -365,6 +378,7 @@ pub struct SecurityPrompt {
     pub project: PathBuf,
     pub inspection: Inspection,
     pub error: Option<String>,
+    pub scroll: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +394,7 @@ pub struct ConfirmPrompt {
     pub message: String,
     pub confirm_label: String,
     pub action: ConfirmAction,
+    pub scroll: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -389,6 +404,7 @@ pub struct DoctorModal {
     pub setting_up: bool,
     /// The failure that opened the modal, if any.
     pub error: Option<String>,
+    pub scroll: usize,
 }
 
 impl DoctorModal {
@@ -398,6 +414,7 @@ impl DoctorModal {
             downloading: false,
             setting_up: false,
             error: None,
+            scroll: 0,
         }
     }
 
@@ -407,6 +424,7 @@ impl DoctorModal {
             downloading: false,
             setting_up: false,
             error: Some(error.into()),
+            scroll: 0,
         }
     }
 }
@@ -429,6 +447,7 @@ pub struct DeleteSandboxModal {
     pub sandbox: SandboxSummary,
     pub stage: DeleteSandboxStage,
     pub error: Option<String>,
+    pub scroll: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -438,6 +457,7 @@ pub struct MultiAgentForm {
     pub harness: Harness,
     pub start: bool,
     pub error: Option<String>,
+    pub scroll: usize,
 }
 
 impl MultiAgentForm {
@@ -448,6 +468,7 @@ impl MultiAgentForm {
             harness,
             start: true,
             error: None,
+            scroll: 0,
         }
     }
 }
@@ -458,6 +479,7 @@ impl MultiAgentForm {
 pub struct HelpState {
     pub query: String,
     pub searching: bool,
+    pub scroll: usize,
 }
 
 impl HelpState {
@@ -484,7 +506,11 @@ pub enum Modal {
     DeleteSandbox(DeleteSandboxModal),
     MultiAgent(MultiAgentForm),
     Help(HelpState),
-    Error { title: String, message: String },
+    Error {
+        title: String,
+        message: String,
+        scroll: usize,
+    },
 }
 
 /// Main TUI state.
@@ -524,6 +550,12 @@ pub struct App {
     pub config_hover: Option<usize>,
     /// Footer button under the mouse pointer, for the inverted hover style.
     pub hovered: Option<ActionId>,
+    /// Scrollbar geometry of the open modal, recorded by the renderer.
+    pub modal_scroll: Option<ScrollHit>,
+    /// Pointer is over the modal scrollbar track.
+    pub scroll_hover: bool,
+    /// Left mouse button is dragging the modal scrollbar.
+    pub scroll_dragging: bool,
     pub should_quit: bool,
     pub loading: bool,
     pub session_closed_reported: bool,
@@ -576,6 +608,9 @@ impl App {
             config_steppers: Vec::new(),
             config_hover: None,
             hovered: None,
+            modal_scroll: None,
+            scroll_hover: false,
+            scroll_dragging: false,
             should_quit: false,
             loading: true,
             session_closed_reported: false,
@@ -826,6 +861,8 @@ impl App {
         if self.modal.is_some() {
             return self.handle_modal_key(key);
         }
+        self.scroll_hover = false;
+        self.scroll_dragging = false;
         match self.screen {
             Screen::Dashboard => self.handle_dashboard_key(key),
             Screen::Terminal => self.handle_terminal_key(key),
@@ -1147,6 +1184,7 @@ impl App {
                     project: cwd.unwrap_or_else(|| PathBuf::from(".")),
                     inspection,
                     error: None,
+                    scroll: 0,
                 }));
             }
         }
@@ -1203,18 +1241,39 @@ impl App {
         match modal {
             Modal::Help(mut help) => {
                 if help.searching {
+                    let scroll = match key.code {
+                        KeyCode::Up => Some(-1),
+                        KeyCode::Down => Some(1),
+                        _ => None,
+                    };
+                    let page = match key.code {
+                        KeyCode::PageUp => Some(-1),
+                        KeyCode::PageDown => Some(1),
+                        _ => None,
+                    };
                     match key.code {
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             help.query.clear();
+                            help.scroll = 0;
                         }
-                        KeyCode::Char(c) => help.query.push(c),
+                        KeyCode::Char(c) => {
+                            help.query.push(c);
+                            help.scroll = 0;
+                        }
                         KeyCode::Backspace => {
                             help.query.pop();
+                            help.scroll = 0;
                         }
                         KeyCode::Esc | KeyCode::Enter => help.searching = false,
                         _ => {}
                     }
                     self.modal = Some(Modal::Help(help));
+                    if let Some(delta) = scroll {
+                        self.scroll_modal(delta);
+                    }
+                    if let Some(pages) = page {
+                        self.scroll_modal_page(pages);
+                    }
                     return Vec::new();
                 }
                 match key.code {
@@ -1222,8 +1281,25 @@ impl App {
                         help.searching = true;
                         self.modal = Some(Modal::Help(help));
                     }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.modal = Some(Modal::Help(help));
+                        self.scroll_modal(1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.modal = Some(Modal::Help(help));
+                        self.scroll_modal(-1);
+                    }
+                    KeyCode::PageDown => {
+                        self.modal = Some(Modal::Help(help));
+                        self.scroll_modal_page(1);
+                    }
+                    KeyCode::PageUp => {
+                        self.modal = Some(Modal::Help(help));
+                        self.scroll_modal_page(-1);
+                    }
                     KeyCode::Esc if !help.query.is_empty() => {
                         help.query.clear();
+                        help.scroll = 0;
                         self.modal = Some(Modal::Help(help));
                     }
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
@@ -1274,6 +1350,26 @@ impl App {
                     }]
                 }
                 KeyCode::Char('n') => Vec::new(),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.modal = Some(Modal::DeleteSandbox(modal));
+                    self.scroll_modal(1);
+                    Vec::new()
+                }
+                KeyCode::Char('k') | KeyCode::Up if modal.stage == DeleteSandboxStage::Confirm => {
+                    self.modal = Some(Modal::DeleteSandbox(modal));
+                    self.scroll_modal(-1);
+                    Vec::new()
+                }
+                KeyCode::PageDown => {
+                    self.modal = Some(Modal::DeleteSandbox(modal));
+                    self.scroll_modal_page(1);
+                    Vec::new()
+                }
+                KeyCode::PageUp => {
+                    self.modal = Some(Modal::DeleteSandbox(modal));
+                    self.scroll_modal_page(-1);
+                    Vec::new()
+                }
                 _ => {
                     self.modal = Some(Modal::DeleteSandbox(modal));
                     Vec::new()
@@ -1310,6 +1406,16 @@ impl App {
                     self.modal = Some(Modal::MultiAgent(form));
                     Vec::new()
                 }
+                KeyCode::PageDown => {
+                    self.modal = Some(Modal::MultiAgent(form));
+                    self.scroll_modal_page(1);
+                    Vec::new()
+                }
+                KeyCode::PageUp => {
+                    self.modal = Some(Modal::MultiAgent(form));
+                    self.scroll_modal_page(-1);
+                    Vec::new()
+                }
                 KeyCode::Enter => vec![Effect::CloneSandbox {
                     source: form.source,
                     count: form.count,
@@ -1326,6 +1432,7 @@ impl App {
                 KeyCode::Char('r') => {
                     modal.report = crate::doctor::run(&self.config);
                     modal.downloading = false;
+                    modal.scroll = 0;
                     self.modal = Some(Modal::Doctor(modal));
                     Vec::new()
                 }
@@ -1339,6 +1446,26 @@ impl App {
                 {
                     self.modal = Some(Modal::Doctor(modal));
                     self.open_setup_confirmation()
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.modal = Some(Modal::Doctor(modal));
+                    self.scroll_modal(1);
+                    Vec::new()
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.modal = Some(Modal::Doctor(modal));
+                    self.scroll_modal(-1);
+                    Vec::new()
+                }
+                KeyCode::PageDown => {
+                    self.modal = Some(Modal::Doctor(modal));
+                    self.scroll_modal_page(1);
+                    Vec::new()
+                }
+                KeyCode::PageUp => {
+                    self.modal = Some(Modal::Doctor(modal));
+                    self.scroll_modal_page(-1);
+                    Vec::new()
                 }
                 _ => {
                     self.modal = Some(Modal::Doctor(modal));
@@ -1547,6 +1674,29 @@ impl App {
     }
 
     fn handle_confirm_key(&mut self, key: KeyEvent, prompt: ConfirmPrompt) -> Vec<Effect> {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.modal = Some(Modal::Confirm(prompt));
+                self.scroll_modal(1);
+                return Vec::new();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.modal = Some(Modal::Confirm(prompt));
+                self.scroll_modal(-1);
+                return Vec::new();
+            }
+            KeyCode::PageDown => {
+                self.modal = Some(Modal::Confirm(prompt));
+                self.scroll_modal_page(1);
+                return Vec::new();
+            }
+            KeyCode::PageUp => {
+                self.modal = Some(Modal::Confirm(prompt));
+                self.scroll_modal_page(-1);
+                return Vec::new();
+            }
+            _ => {}
+        }
         // Destructive confirmation must be explicit: Enter never confirms.
         let confirmed = matches!(key.code, KeyCode::Char('y'));
         let cancelled = matches!(key.code, KeyCode::Char('n') | KeyCode::Esc);
@@ -1612,6 +1762,26 @@ impl App {
                 self.toast("command blocked", ToastLevel::Warn);
                 Vec::new()
             }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.modal = Some(Modal::Security(prompt));
+                self.scroll_modal(1);
+                Vec::new()
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.modal = Some(Modal::Security(prompt));
+                self.scroll_modal(-1);
+                Vec::new()
+            }
+            KeyCode::PageDown => {
+                self.modal = Some(Modal::Security(prompt));
+                self.scroll_modal_page(1);
+                Vec::new()
+            }
+            KeyCode::PageUp => {
+                self.modal = Some(Modal::Security(prompt));
+                self.scroll_modal_page(-1);
+                Vec::new()
+            }
             _ => {
                 self.modal = Some(Modal::Security(prompt));
                 Vec::new()
@@ -1630,6 +1800,7 @@ impl App {
                 ),
                 confirm_label: "Delete".into(),
                 action: ConfirmAction::DeleteSnapshot(snapshot.name),
+                scroll: 0,
             }));
         } else {
             self.toast("no snapshot selected", ToastLevel::Warn);
@@ -1647,6 +1818,7 @@ impl App {
                 ),
                 confirm_label: "Restore".into(),
                 action: ConfirmAction::RestoreSnapshot(Box::new(snapshot)),
+                scroll: 0,
             }));
         }
         Vec::new()
@@ -1694,6 +1866,7 @@ impl App {
             sandbox,
             stage: DeleteSandboxStage::Confirm,
             error: None,
+            scroll: 0,
         }));
         Vec::new()
     }
@@ -1996,6 +2169,7 @@ impl App {
             message: lines.join("\n"),
             confirm_label: "Set up".into(),
             action: ConfirmAction::SetupEnvironment,
+            scroll: 0,
         }));
         Vec::new()
     }
@@ -2243,7 +2417,81 @@ impl App {
             ActionId::ToggleCloneStart => self.multi_agent_key(KeyCode::Char(' ')),
             ActionId::Close => {
                 self.modal = None;
+                self.scroll_hover = false;
+                self.scroll_dragging = false;
                 Vec::new()
+            }
+        }
+    }
+
+    /// Scroll offset of the open modal, if its body scrolls independently.
+    fn modal_scroll_offset(&self) -> Option<usize> {
+        match &self.modal {
+            Some(Modal::Help(help)) => Some(help.scroll),
+            Some(Modal::Doctor(modal)) => Some(modal.scroll),
+            Some(Modal::Security(prompt)) => Some(prompt.scroll),
+            Some(Modal::Confirm(prompt)) => Some(prompt.scroll),
+            Some(Modal::DeleteSandbox(modal)) => Some(modal.scroll),
+            Some(Modal::MultiAgent(form)) => Some(form.scroll),
+            Some(Modal::Error { scroll, .. }) => Some(*scroll),
+            _ => None,
+        }
+    }
+
+    fn set_modal_scroll(&mut self, offset: usize) {
+        match self.modal.as_mut() {
+            Some(Modal::Help(help)) => help.scroll = offset,
+            Some(Modal::Doctor(modal)) => modal.scroll = offset,
+            Some(Modal::Security(prompt)) => prompt.scroll = offset,
+            Some(Modal::Confirm(prompt)) => prompt.scroll = offset,
+            Some(Modal::DeleteSandbox(modal)) => modal.scroll = offset,
+            Some(Modal::MultiAgent(form)) => form.scroll = offset,
+            Some(Modal::Error { scroll, .. }) => *scroll = offset,
+            _ => {}
+        }
+    }
+
+    /// Move the open modal's body by `delta` lines, clamped to its track.
+    fn scroll_modal(&mut self, delta: isize) {
+        let Some(hit) = self.modal_scroll else { return };
+        let Some(current) = self.modal_scroll_offset() else {
+            return;
+        };
+        let current = current.min(hit.max);
+        self.set_modal_scroll(current.saturating_add_signed(delta).min(hit.max));
+    }
+
+    fn scroll_modal_page(&mut self, pages: isize) {
+        let Some(hit) = self.modal_scroll else { return };
+        let step = hit.page.max(1) as isize;
+        self.scroll_modal(step * pages);
+    }
+
+    /// Map a click or drag row on the scrollbar to an offset. The settings form
+    /// and the create form follow their selection, so the bar moves the
+    /// selection instead of a free offset.
+    fn jump_modal_scroll(&mut self, row: u16) {
+        let Some(hit) = self.modal_scroll else { return };
+        let track = hit.rect.height.max(1) as usize;
+        let relative = row.saturating_sub(hit.rect.y) as usize;
+        let span = track.saturating_sub(1).max(1);
+        match self.modal.as_mut() {
+            Some(Modal::Config(form)) => {
+                let rows = form.rows().len();
+                if rows > 1 {
+                    form.select_row(relative * (rows - 1) / span);
+                }
+            }
+            Some(Modal::CreateProject(form)) => {
+                let rows = form.packages.len();
+                if rows > 1 {
+                    form.package_cursor = relative * (rows - 1) / span;
+                    form.focus = CreateFocus::Packages;
+                }
+            }
+            _ => {
+                let offset = relative * hit.max / span;
+                self.set_modal_scroll(offset.min(hit.max));
             }
         }
     }
@@ -2263,11 +2511,19 @@ impl App {
                     .iter()
                     .find(|row| rect_contains(row.rect, pos))
                     .map(|row| row.index);
+                self.scroll_hover = self.scroll_dragging
+                    || self
+                        .modal_scroll
+                        .is_some_and(|hit| rect_contains(hit.rect, pos));
                 Vec::new()
             }
             MouseEventKind::ScrollUp => {
                 if let Some(Modal::Config(form)) = self.modal.as_mut() {
                     form.select_delta(-1);
+                } else if let Some(Modal::CreateProject(form)) = self.modal.as_mut() {
+                    form.package_cursor = form.package_cursor.saturating_sub(1);
+                } else if self.modal.is_some() {
+                    self.scroll_modal(-3);
                 } else if self.screen == Screen::Terminal {
                     self.scroll = self.scroll.saturating_add(3).min(self.terminal.len());
                 } else {
@@ -2278,11 +2534,27 @@ impl App {
             MouseEventKind::ScrollDown => {
                 if let Some(Modal::Config(form)) = self.modal.as_mut() {
                     form.select_delta(1);
+                } else if let Some(Modal::CreateProject(form)) = self.modal.as_mut() {
+                    form.package_cursor =
+                        (form.package_cursor + 1).min(form.packages.len().saturating_sub(1));
+                } else if self.modal.is_some() {
+                    self.scroll_modal(3);
                 } else if self.screen == Screen::Terminal {
                     self.scroll = self.scroll.saturating_sub(3);
                 } else {
                     self.select_next(1);
                 }
+                Vec::new()
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.scroll_dragging {
+                    self.scroll_hover = true;
+                    self.jump_modal_scroll(mouse.row);
+                }
+                Vec::new()
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.scroll_dragging = false;
                 Vec::new()
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -2294,6 +2566,14 @@ impl App {
                     .copied()
                 {
                     return self.handle_action(hit.action);
+                }
+                if let Some(hit) = self.modal_scroll
+                    && rect_contains(hit.rect, pos)
+                {
+                    self.scroll_dragging = true;
+                    self.scroll_hover = true;
+                    self.jump_modal_scroll(pos.1);
+                    return Vec::new();
                 }
                 if matches!(self.modal, Some(Modal::Config(_))) {
                     return self.click_config_row(pos);
@@ -2670,6 +2950,7 @@ mod tests {
             message: "Delete 'demo'?".into(),
             confirm_label: "Delete".into(),
             action: ConfirmAction::DeleteSnapshot("demo".into()),
+            scroll: 0,
         }));
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.modal, Some(Modal::Confirm(_))));
@@ -2679,6 +2960,7 @@ mod tests {
             project: PathBuf::from("/tmp"),
             inspection: app.security_engine().inspect("rm -rf /workspace", None),
             error: None,
+            scroll: 0,
         }));
         app.handle_key(key(KeyCode::Enter));
         assert!(
@@ -2733,6 +3015,7 @@ mod tests {
             project: PathBuf::from("/tmp"),
             inspection: app.security_engine().inspect("rm -rf /workspace", None),
             error: None,
+            scroll: 0,
         }));
         app.handle_key(key(KeyCode::Char('d')));
         assert!(app.modal.is_none());
@@ -2746,6 +3029,7 @@ mod tests {
             project: PathBuf::from("/tmp"),
             inspection: app.security_engine().inspect("rm -rf /workspace", None),
             error: None,
+            scroll: 0,
         }));
         app.handle_key(key(KeyCode::Char('a')));
         assert!(app.modal.is_none());
@@ -2765,6 +3049,7 @@ mod tests {
             project: PathBuf::from("/tmp"),
             inspection: app.security_engine().inspect("rm -rf /workspace", None),
             error: None,
+            scroll: 0,
         }));
         app.handle_key(key(KeyCode::Char('c')));
         match &app.modal {
@@ -3090,6 +3375,65 @@ mod tests {
         };
         app.handle_mouse(event);
         assert_eq!(app.selected, 1);
+    }
+
+    fn help_scroll(app: &mut App) -> usize {
+        match &app.modal {
+            Some(Modal::Help(help)) => help.scroll,
+            other => panic!("expected the help modal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_scrolls_with_keys_and_clamps_to_the_track() {
+        let (_dir, mut app) = test_app();
+        app.modal = Some(Modal::Help(HelpState::default()));
+        app.modal_scroll = Some(ScrollHit {
+            rect: Rect::new(10, 2, 1, 10),
+            max: 6,
+            page: 10,
+            offset: 0,
+        });
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(help_scroll(&mut app), 1);
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(help_scroll(&mut app), 6, "clamped to the track maximum");
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(help_scroll(&mut app), 0);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(help_scroll(&mut app), 0, "cannot scroll above the top");
+    }
+
+    #[test]
+    fn modal_scrollbar_hovers_and_drags() {
+        let (_dir, mut app) = test_app();
+        app.modal = Some(Modal::Help(HelpState::default()));
+        app.modal_scroll = Some(ScrollHit {
+            rect: Rect::new(40, 2, 1, 11),
+            max: 10,
+            page: 5,
+            offset: 0,
+        });
+        let event = |kind, row| MouseEvent {
+            kind,
+            column: 40,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.handle_mouse(event(MouseEventKind::Moved, 4));
+        assert!(app.scroll_hover, "the track highlights under the pointer");
+
+        app.handle_mouse(event(MouseEventKind::Down(MouseButton::Left), 7));
+        assert!(app.scroll_dragging);
+        assert_eq!(help_scroll(&mut app), 5, "mid-track maps to mid-offset");
+
+        app.handle_mouse(event(MouseEventKind::Drag(MouseButton::Left), 2));
+        assert_eq!(help_scroll(&mut app), 0);
+
+        app.handle_mouse(event(MouseEventKind::Up(MouseButton::Left), 2));
+        assert!(!app.scroll_dragging);
     }
 
     #[test]

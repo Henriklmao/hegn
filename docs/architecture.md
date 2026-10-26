@@ -494,6 +494,15 @@ The help modal filters its keybinding sections with a case-insensitive query
 entered after `/`; section titles, keys and descriptions all match, and every
 whitespace-separated term must occur.
 
+Modals are responsive. `centered` grows small dialogs to the available width
+and height, the help key/description table and the settings label/value rows
+collapse to one column below their narrow thresholds, and overflowing bodies
+get a one-column scrollbar. The renderer returns the track rectangle as a
+`ScrollHit`; `app.rs` turns wheel events, `j`/`k`, arrows, `PgUp`/`PgDn`, clicks
+and drags into offset changes, and the thumb inverts while hovered or dragged.
+Long lines are ellipsized by `fit_line` rather than wrapped, so one logical line
+is always one row and the scrollbar offset stays exact.
+
 The three focusable dashboard tabs are also addressable by number: `1` for
 projects, `2` for sandboxes and `3` for snapshots. Each panel title carries a
 colored `[n]` badge in its top-right corner.

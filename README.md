@@ -671,10 +671,23 @@ titles, keys and descriptions; every typed term must match. `Esc` stops
 searching and keeps the results, the next `Esc` clears the query, and a final
 `Esc` closes the modal.
 
+On narrow terminals the key column collapses: the key sits on its own line and
+the description below it. When the list is taller than the window a scrollbar
+appears on the right; drag it with the mouse or use `↑`/`↓`, `j`/`k` and
+`PgUp`/`PgDn`. Hovering the thumb inverts it, like every other clickable
+element.
+
 | Key | Action |
 | --- | --- |
 | `/` | Search the keybinding list |
 | `Esc` | Stop searching, then clear the query, then close |
+| `↑`/`↓`, `j`/`k` | Scroll the list |
+| `PgUp` / `PgDn` | Scroll one page |
+
+The doctor and security modals scroll the same way (mouse wheel and drag
+always work, in every modal that overflows). All modals size themselves to the
+terminal and keep their footer buttons inside the window, wrapping them onto
+another row when necessary.
 
 ### Snapshot panel
 
