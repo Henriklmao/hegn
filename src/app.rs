@@ -189,6 +189,8 @@ pub enum ActionId {
     Lazygit,
     Refresh,
     Help,
+    HelpSearch,
+    HelpSearchStop,
     Quit,
     Back,
     ToggleRaw,
@@ -450,6 +452,27 @@ impl MultiAgentForm {
     }
 }
 
+/// Search state for the help modal. `/` starts editing the query, so typed
+/// characters filter the keybinding list instead of triggering shortcuts.
+#[derive(Debug, Clone, Default)]
+pub struct HelpState {
+    pub query: String,
+    pub searching: bool,
+}
+
+impl HelpState {
+    /// Case-insensitive search across the section title, keybinding and
+    /// description. Every whitespace-separated term must match somewhere.
+    pub fn matches(&self, section: &str, key: &str, description: &str) -> bool {
+        let query = self.query.trim().to_lowercase();
+        if query.is_empty() {
+            return true;
+        }
+        let haystack = format!("{section} {key} {description}").to_lowercase();
+        query.split_whitespace().all(|term| haystack.contains(term))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Modal {
     CreateProject(CreateProjectForm),
@@ -460,7 +483,7 @@ pub enum Modal {
     Config(ConfigForm),
     DeleteSandbox(DeleteSandboxModal),
     MultiAgent(MultiAgentForm),
-    Help,
+    Help(HelpState),
     Error { title: String, message: String },
 }
 
@@ -861,7 +884,7 @@ impl App {
                 Vec::new()
             }
             KeyCode::Char('?') | KeyCode::F(1) => {
-                self.modal = Some(Modal::Help);
+                self.modal = Some(Modal::Help(HelpState::default()));
                 Vec::new()
             }
             KeyCode::F(3) => {
@@ -1178,14 +1201,35 @@ impl App {
             return Vec::new();
         };
         match modal {
-            Modal::Help => {
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter
-                ) {
-                    // closed
-                } else {
-                    self.modal = Some(Modal::Help);
+            Modal::Help(mut help) => {
+                if help.searching {
+                    match key.code {
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            help.query.clear();
+                        }
+                        KeyCode::Char(c) => help.query.push(c),
+                        KeyCode::Backspace => {
+                            help.query.pop();
+                        }
+                        KeyCode::Esc | KeyCode::Enter => help.searching = false,
+                        _ => {}
+                    }
+                    self.modal = Some(Modal::Help(help));
+                    return Vec::new();
+                }
+                match key.code {
+                    KeyCode::Char('/') => {
+                        help.searching = true;
+                        self.modal = Some(Modal::Help(help));
+                    }
+                    KeyCode::Esc if !help.query.is_empty() => {
+                        help.query.clear();
+                        self.modal = Some(Modal::Help(help));
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
+                        // closed
+                    }
+                    _ => self.modal = Some(Modal::Help(help)),
                 }
                 Vec::new()
             }
@@ -2066,7 +2110,19 @@ impl App {
                 None => Vec::new(),
             },
             ActionId::Help => {
-                self.modal = Some(Modal::Help);
+                self.modal = Some(Modal::Help(HelpState::default()));
+                Vec::new()
+            }
+            ActionId::HelpSearch => {
+                if let Some(Modal::Help(help)) = self.modal.as_mut() {
+                    help.searching = true;
+                }
+                Vec::new()
+            }
+            ActionId::HelpSearchStop => {
+                if let Some(Modal::Help(help)) = self.modal.as_mut() {
+                    help.searching = false;
+                }
                 Vec::new()
             }
             ActionId::Quit => {
@@ -2961,7 +3017,63 @@ mod tests {
     fn footer_help_action_opens_modal() {
         let (_dir, mut app) = test_app();
         app.handle_action(ActionId::Help);
-        assert!(matches!(app.modal, Some(Modal::Help)));
+        assert!(matches!(app.modal, Some(Modal::Help(_))));
+        app.handle_action(ActionId::HelpSearch);
+        assert!(matches!(&app.modal, Some(Modal::Help(help)) if help.searching));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(&app.modal, Some(Modal::Help(help)) if !help.searching));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn help_search_matches_all_terms_case_insensitively() {
+        let mut help = HelpState::default();
+        assert!(help.matches("Projects", "c", "create project"));
+
+        help.query = "CHECKPOINT".into();
+        assert!(help.matches("Security", "c", "create git checkpoint, then allow"));
+        assert!(!help.matches("Snapshots", "Enter", "restore selected snapshot"));
+
+        help.query = "stop snapshot".into();
+        assert!(
+            !help.matches("Sandboxes", "S", "stop selected sandbox"),
+            "every query term must match"
+        );
+
+        help.query = "terminal".into();
+        assert!(
+            help.matches("Terminal", "F2", "toggle raw passthrough"),
+            "the section title is searchable too"
+        );
+    }
+
+    #[test]
+    fn help_search_mode_captures_typing_and_clears_in_steps() {
+        let (_dir, mut app) = test_app();
+        app.modal = Some(Modal::Help(HelpState::default()));
+        app.handle_key(key(KeyCode::Char('/')));
+        assert!(matches!(&app.modal, Some(Modal::Help(help)) if help.searching));
+
+        for c in "sq".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        let Some(Modal::Help(help)) = &app.modal else {
+            panic!("typing must not close the help modal");
+        };
+        assert_eq!(help.query, "sq");
+
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Esc));
+        let Some(Modal::Help(help)) = &app.modal else {
+            panic!("the first Esc stops searching");
+        };
+        assert!(!help.searching);
+        assert_eq!(help.query, "s");
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(&app.modal, Some(Modal::Help(help)) if help.query.is_empty()));
+
         app.handle_key(key(KeyCode::Esc));
         assert!(app.modal.is_none());
     }

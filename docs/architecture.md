@@ -490,6 +490,10 @@ the pointer inside their rectangle. Destructive confirmations (delete sandbox,
 delete/restore snapshot, allow a flagged command) accept only their explicit
 key — `Enter` deliberately leaves the modal open.
 
+The help modal filters its keybinding sections with a case-insensitive query
+entered after `/`; section titles, keys and descriptions all match, and every
+whitespace-separated term must occur.
+
 The three focusable dashboard tabs are also addressable by number: `1` for
 projects, `2` for sandboxes and `3` for snapshots. Each panel title carries a
 colored `[n]` badge in its top-right corner.

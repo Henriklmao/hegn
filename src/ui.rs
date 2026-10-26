@@ -9,8 +9,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    ActionId, App, ConfigStepHit, CreateFocus, DeleteSandboxStage, Focus, FooterHit, Modal, RowHit,
-    SandboxState, Screen, TerminalMode, ToastLevel,
+    ActionId, App, ConfigStepHit, CreateFocus, DeleteSandboxStage, Focus, FooterHit, HelpState,
+    Modal, RowHit, SandboxState, Screen, TerminalMode, ToastLevel,
 };
 use crate::config_form::{ConfigField, ConfigForm, ConfigRow, FieldKind};
 
@@ -1135,7 +1135,24 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 action: ActionId::Cancel,
             },
         ],
-        Some(Modal::Help | Modal::Error { .. }) => {
+        Some(Modal::Help(help)) if help.searching => vec![FooterDef {
+            key: "Esc",
+            label: "Stop search",
+            action: ActionId::HelpSearchStop,
+        }],
+        Some(Modal::Help(_)) => vec![
+            FooterDef {
+                key: "/",
+                label: "Search",
+                action: ActionId::HelpSearch,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Close",
+                action: ActionId::Close,
+            },
+        ],
+        Some(Modal::Error { .. }) => {
             vec![FooterDef {
                 key: "Esc",
                 label: "Close",
@@ -1343,7 +1360,7 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Moda
 
 fn render_modal_buttons(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Vec<FooterHit> {
     match modal {
-        Modal::Help => render_help(frame, app, area),
+        Modal::Help(help) => render_help(frame, app, help, area),
         Modal::Error { title, message } => render_message(
             frame,
             app,
@@ -1887,7 +1904,7 @@ fn render_message(
     hint_buttons(frame, app, chunks[1], buttons)
 }
 
-fn render_help(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
+fn render_help(frame: &mut Frame, app: &App, help: &HelpState, area: Rect) -> Vec<FooterHit> {
     let rect = centered(area, 72, 90);
     frame.render_widget(Clear, rect);
     let block = Block::default()
@@ -1903,8 +1920,36 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
     frame.render_widget(block, rect);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
         .split(inner);
+
+    let mut search_spans = vec![Span::styled(
+        " / ",
+        Style::default().fg(if help.searching { CYAN } else { MUTED }),
+    )];
+    if help.query.is_empty() {
+        search_spans.push(Span::styled(
+            if help.searching {
+                "type to search keybindings…"
+            } else {
+                "search keybindings"
+            },
+            Style::default().fg(MUTED),
+        ));
+    } else {
+        search_spans.push(Span::styled(help.query.clone(), Style::default().fg(TEXT)));
+    }
+    if help.searching {
+        search_spans.push(Span::styled("▌", Style::default().fg(CYAN)));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(search_spans)).style(Style::default()),
+        chunks[0],
+    );
 
     let sections: Vec<(&str, &[(&str, &str)])> = vec![
         (
@@ -1970,15 +2015,32 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
                 ("d", "deny command"),
             ],
         ),
+        (
+            "Help",
+            &[
+                ("/", "search these keybindings"),
+                ("Esc", "clear the search, then close"),
+            ],
+        ),
     ];
 
+    let total: usize = sections.iter().map(|(_, entries)| entries.len()).sum();
     let mut lines = Vec::new();
+    let mut shown = 0usize;
     for (title, entries) in sections {
+        let matches: Vec<&(&str, &str)> = entries
+            .iter()
+            .filter(|(key, description)| help.matches(title, key, description))
+            .collect();
+        if matches.is_empty() {
+            continue;
+        }
+        shown += matches.len();
         lines.push(Line::from(Span::styled(
             title,
             Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
         )));
-        for (key, description) in entries {
+        for (key, description) in matches {
             lines.push(Line::from(vec![
                 Span::styled(format!("  {key:<12}"), Style::default().fg(ACCENT)),
                 Span::styled(*description, Style::default().fg(TEXT)),
@@ -1986,21 +2048,46 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) -> Vec<FooterHit> {
         }
         lines.push(Line::default());
     }
-    lines.push(Line::from(Span::styled(
-        " All actions are also available non-interactively: hegn --help",
-        Style::default().fg(MUTED),
-    )));
-    frame.render_widget(Paragraph::new(lines).style(Style::default()), chunks[0]);
-    hint_buttons(
-        frame,
-        app,
-        chunks[1],
-        &[FooterDef {
+    if shown == 0 {
+        lines.push(Line::from(Span::styled(
+            format!(" no keybindings match \"{}\"", help.query.trim()),
+            Style::default().fg(MUTED),
+        )));
+        lines.push(Line::from(Span::styled(
+            " Esc clears the search",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {shown}/{total} keybindings · all actions are also available non-interactively: hegn --help"
+            ),
+            Style::default().fg(MUTED),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).style(Style::default()), chunks[1]);
+
+    let buttons = if help.searching {
+        vec![FooterDef {
             key: "Esc",
-            label: "Close",
-            action: ActionId::Close,
-        }],
-    )
+            label: "Stop search",
+            action: ActionId::HelpSearchStop,
+        }]
+    } else {
+        vec![
+            FooterDef {
+                key: "/",
+                label: "Search",
+                action: ActionId::HelpSearch,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Close",
+                action: ActionId::Close,
+            },
+        ]
+    };
+    hint_buttons(frame, app, chunks[2], &buttons)
 }
 
 fn render_create_form(
@@ -2883,11 +2970,47 @@ mod tests {
     #[test]
     fn help_modal_renders_keybindings() {
         let (_dir, mut app) = app();
-        app.modal = Some(Modal::Help);
-        let (text, _) = render(&app);
+        app.modal = Some(Modal::Help(HelpState::default()));
+        let (text, hits) = render(&app);
         assert!(text.contains("hegn help"));
         assert!(text.contains("fuzzy filter"));
         assert!(text.contains("checkpoint"));
+        assert!(text.contains("search keybindings"));
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::HelpSearch)
+        );
+    }
+
+    #[test]
+    fn help_modal_search_filters_sections_and_offers_stop() {
+        let (_dir, mut app) = app();
+        app.modal = Some(Modal::Help(HelpState {
+            query: "checkpoint".into(),
+            searching: true,
+        }));
+        let (text, hits) = render(&app);
+        assert!(text.contains("checkpoint"), "matching row is kept");
+        assert!(!text.contains("fuzzy filter"), "other rows are hidden");
+        assert!(text.contains("Stop search"));
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::HelpSearchStop)
+        );
+
+        app.modal = Some(Modal::Help(HelpState {
+            query: "zzz".into(),
+            searching: false,
+        }));
+        let (text, hits) = render(&app);
+        assert!(text.contains("no keybindings match"), "{text}");
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::HelpSearch)
+        );
     }
 
     #[test]

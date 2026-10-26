@@ -664,6 +664,18 @@ Every keybinding hint inside a modal is rendered as a clickable button, just
 like the footer buttons. Hovering one inverts its colors for immediate feedback;
 keyboard input clears the hover state.
 
+### Help modal
+
+Open it with `?` or `F1`. `/` starts a case-insensitive search across section
+titles, keys and descriptions; every typed term must match. `Esc` stops
+searching and keeps the results, the next `Esc` clears the query, and a final
+`Esc` closes the modal.
+
+| Key | Action |
+| --- | --- |
+| `/` | Search the keybinding list |
+| `Esc` | Stop searching, then clear the query, then close |
+
 ### Snapshot panel
 
 | Key | Action |
