@@ -1,4 +1,4 @@
-//! Small persistent UI state (recent projects, last selection).
+//! Small persistent UI state (recent projects, last selection, hidden projects).
 
 use std::collections::HashMap;
 use std::fs;

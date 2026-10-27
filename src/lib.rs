@@ -4,7 +4,7 @@
 //!
 //! - [`config`] — user configuration, paths and defaults
 //! - [`config_form`] — interactive settings editor for the TUI modal
-//! - [`project`] — project discovery, fuzzy filtering and git summaries
+//! - [`project`] — project discovery, removal, fuzzy filtering and git summaries
 //! - [`security`] — `tirith-core` integration and workspace guardrails
 //! - [`cloud_hypervisor`] — typed Cloud Hypervisor REST client
 //! - [`cloud_init`] — NoCloud seed for the official cloud images
@@ -21,7 +21,7 @@
 //! - [`console`] — Cloud Hypervisor serial-console transport (no host fallback)
 //! - [`attach_bar`] — bottom status bar and sequence-safe output gate for attach
 //! - [`terminal`] — ANSI-aware scrollback buffer
-//! - [`state`] — persisted recent-project state
+//! - [`state`] — persisted recent and hidden project state
 //! - [`app`] — TUI application state and event handling
 //! - [`ui`] — ratatui rendering
 //! - [`tui`] — terminal lifecycle and event loop

@@ -185,7 +185,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `cli.rs` | Clap command surface, JSON/text output, exit codes | Every TUI operation has a CLI counterpart; no fallback paths |
 | `config.rs` | Schema, defaults, env overrides, validation, XDG paths, tool lookup | Unknown keys rejected; SHA-256 and HTTPS URL validation; log dir `0700`; `virtiofsd` resolved via `PATH` then distribution dirs; writes are validated and installed with an atomic tmp+rename |
 | `config_form.rs` | Interactive settings editor for the `F4`/`F5` modal | Edits a validated working copy; schema validation before saving; locked Landlock/seccomp; global Profiles tab opens harness templates in `$EDITOR`; inline text edits never touch disk until `Ctrl-S` |
-| `project.rs` | Discovery, fuzzy filter, git summaries, create, import, checkpoints | Import only creates a symlink; dangerous targets rejected; discovery skips links to `/`, `$HOME` and root ancestors |
+| `project.rs` | Discovery, removal, fuzzy filter, git summaries, create, import, checkpoints | Import only creates a symlink; dangerous targets rejected; discovery skips links to `/`, `$HOME` and root ancestors; deletion is limited to direct children of `projects_root` and never follows import links |
 | `security.rs` | `tirith-core` integration and hegn workspace rules | Empty commands allowed; off mode still keeps destructive-operation guard |
 | `cloud_hypervisor.rs` | Typed REST client over `/api/v1` | Frames responses by `Content-Length`/chunked encoding, accepts bodyless `204`, bounded response sizes, pause/resume/info/snapshot only |
 | `cloud_init.rs` | NoCloud seed generation | FAT volume labelled `CIDATA`; serial root autologin; first-boot provisioner and guest network config; no secrets; `0600` and `O_NOFOLLOW` |
@@ -204,7 +204,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `attach_bar.rs` | Bottom status bar overlay and sequence-safe output gate | Clamps DECSTBM so the bar stays pinned; repaints after every output burst; never injects into a split escape sequence or UTF-8 character |
 | `logs.rs` | Log naming, listing, resolve, tail, prune | `O_NOFOLLOW`, regular files only, no foreign files deleted, active log protected |
 | `terminal.rs` | ANSI-aware scrollback | Strips CSI/OSC; handles CRLF without losing lines; caps line bytes and scrollback |
-| `state.rs` | Recent-project persistence | Atomic tmp+rename |
+| `state.rs` | Recent and hidden-project persistence | Atomic tmp+rename |
 | `app.rs` | TUI state machine, modals, key/mouse handling, effects | Pure state transitions; side effects returned as `Effect` |
 | `ui.rs` | Ratatui rendering | Pure renderer; footer, row and settings-stepper hit rectangles; all modals testable with `TestBackend` |
 | `tui.rs` | Terminal lifecycle, event loop, background jobs | Restores terminal on every exit path; project scan and image download off the UI thread |
@@ -890,7 +890,7 @@ src/
   benchmark.rs   measured host cost and disk usage
   config.rs      schema, defaults, env overrides, validation
   config_form.rs interactive settings editor model (F4/F5 modal)
-  project.rs     discovery, import, templates, git helpers
+  project.rs     discovery, removal, import, templates, git helpers
   profile.rs     per-harness profiles, copied skill bundles, sync-back
   security.rs    tirith-core + hegn workspace guardrails
   cloud_hypervisor.rs typed REST client
@@ -908,7 +908,7 @@ src/
   attach_bar.rs  status bar overlay + sequence-safe output gate
   logs.rs        persistent logs, tail, prune
   terminal.rs    ANSI-aware scrollback
-  state.rs       recent-project state
+  state.rs       recent and hidden project state
   app.rs         TUI state machine
   ui.rs          ratatui renderer
   tui.rs         terminal loop and effects
