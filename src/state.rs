@@ -24,6 +24,9 @@ pub struct PersistedState {
     pub recent: Vec<RecentEntry>,
     #[serde(default)]
     pub last_project: Option<PathBuf>,
+    /// Projects removed from the picker while keeping their directory on disk.
+    #[serde(default)]
+    pub hidden_projects: Vec<PathBuf>,
 }
 
 impl Default for PersistedState {
@@ -32,6 +35,7 @@ impl Default for PersistedState {
             version: state_version(),
             recent: Vec::new(),
             last_project: None,
+            hidden_projects: Vec::new(),
         }
     }
 }
@@ -59,6 +63,30 @@ impl PersistedState {
             .iter()
             .map(|entry| (entry.path.clone(), entry.opened_at))
             .collect()
+    }
+
+    pub fn is_hidden(&self, path: &Path) -> bool {
+        self.hidden_projects.iter().any(|hidden| hidden == path)
+    }
+
+    pub fn hide_project(&mut self, path: &Path) {
+        if !self.is_hidden(path) {
+            self.hidden_projects.push(path.to_path_buf());
+        }
+    }
+
+    pub fn unhide_project(&mut self, path: &Path) {
+        self.hidden_projects.retain(|hidden| hidden != path);
+    }
+
+    /// Forget a project that no longer exists: it can neither be recent nor
+    /// hidden from the picker.
+    pub fn forget_project(&mut self, path: &Path) {
+        self.recent.retain(|entry| entry.path != path);
+        if self.last_project.as_deref() == Some(path) {
+            self.last_project = None;
+        }
+        self.unhide_project(path);
     }
 }
 
@@ -90,6 +118,26 @@ impl StateStore {
     pub fn touch(&mut self, path: &Path) -> Result<()> {
         self.state.touch(path);
         self.save()
+    }
+
+    /// Hide or unhide a project in the picker and persist the change.
+    pub fn set_project_hidden(&mut self, path: &Path, hidden: bool) -> Result<()> {
+        if hidden {
+            self.state.hide_project(path);
+        } else {
+            self.state.unhide_project(path);
+        }
+        self.save()
+    }
+
+    /// Remove a project from recent state and the hidden list.
+    pub fn forget_project(&mut self, path: &Path) -> Result<()> {
+        self.state.forget_project(path);
+        self.save()
+    }
+
+    pub fn is_hidden(&self, path: &Path) -> bool {
+        self.state.is_hidden(path)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -170,5 +218,42 @@ mod tests {
         state.touch(Path::new("/p/a"));
         let map = state.opened_at();
         assert!(map.contains_key(Path::new("/p/a")));
+    }
+
+    #[test]
+    fn hidden_projects_persist_and_forget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut store = StateStore::load(&path);
+        store.touch(Path::new("/projects/a")).unwrap();
+        store
+            .set_project_hidden(Path::new("/projects/a"), true)
+            .unwrap();
+
+        let reloaded = StateStore::load(&path);
+        assert!(reloaded.is_hidden(Path::new("/projects/a")));
+        assert_eq!(reloaded.state().hidden_projects.len(), 1);
+
+        let mut reloaded = reloaded;
+        reloaded.forget_project(Path::new("/projects/a")).unwrap();
+        assert!(!reloaded.is_hidden(Path::new("/projects/a")));
+        assert!(reloaded.state().last_project.is_none());
+        assert!(reloaded.state().recent.is_empty());
+    }
+
+    #[test]
+    fn hiding_is_idempotent() {
+        let mut store = StateStore::load(tempfile::tempdir().unwrap().path().join("state.json"));
+        store
+            .set_project_hidden(Path::new("/projects/a"), true)
+            .unwrap();
+        store
+            .set_project_hidden(Path::new("/projects/a"), true)
+            .unwrap();
+        assert_eq!(store.state().hidden_projects.len(), 1);
+        store
+            .set_project_hidden(Path::new("/projects/a"), false)
+            .unwrap();
+        assert!(store.state().hidden_projects.is_empty());
     }
 }

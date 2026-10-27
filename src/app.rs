@@ -146,6 +146,12 @@ pub enum Effect {
         instance: String,
         delete_files: bool,
     },
+    /// Remove a project from the dashboard, its instances and optionally its
+    /// files. Instances are deleted first.
+    DeleteProject {
+        project: PathBuf,
+        delete_files: bool,
+    },
     CloneInstance {
         source: String,
         count: usize,
@@ -319,6 +325,8 @@ pub enum ActionId {
     StopInstance,
     CloneInstance,
     DeleteInstance,
+    DeleteProject,
+    DeleteProjectFiles,
     InstanceConfig,
     GlobalConfig,
     MultiAgent,
@@ -579,6 +587,16 @@ pub struct DeleteInstanceModal {
 }
 
 #[derive(Debug, Clone)]
+pub struct DeleteProjectModal {
+    pub project: Project,
+    /// Git state shown before deletion so the user can decide about files.
+    pub git: GitSummary,
+    /// Instances that will be stopped and removed with the project.
+    pub instances: Vec<String>,
+    pub scroll: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct MultiAgentForm {
     pub source: String,
     pub count: usize,
@@ -632,6 +650,7 @@ pub enum Modal {
     Confirm(ConfirmPrompt),
     Config(ConfigForm),
     DeleteInstance(DeleteInstanceModal),
+    DeleteProject(DeleteProjectModal),
     MultiAgent(MultiAgentForm),
     Help(HelpState),
     Error {
@@ -783,6 +802,7 @@ impl App {
 
     /// Install a fresh project list (usually from the background scanner).
     pub fn set_projects(&mut self, mut projects: Vec<Project>) {
+        projects.retain(|project| !self.store.is_hidden(&project.path));
         let opened = self.store.state().opened_at();
         for project in &mut projects {
             project.last_opened = opened.get(&project.path).copied();
@@ -805,6 +825,14 @@ impl App {
 
     pub fn add_project(&mut self, project: Project) {
         let path = project.path.clone();
+        // Creating or importing a project that was previously removed with
+        // "keep files" makes it visible again.
+        if let Err(err) = self.store.set_project_hidden(&path, false) {
+            self.toast(
+                format!("could not update the project list: {err}"),
+                ToastLevel::Warn,
+            );
+        }
         self.projects.retain(|p| p.path != project.path);
         self.projects.push(project);
         self.projects
@@ -1256,23 +1284,13 @@ impl App {
             KeyCode::Char('d') => match self.focus {
                 Focus::Instances => self.confirm_delete_instance(),
                 Focus::Snapshots => self.confirm_delete_snapshot(),
-                Focus::Projects | Focus::Health | Focus::Git => {
-                    self.confirm_delete_project_instance()
-                }
+                Focus::Projects | Focus::Health | Focus::Git => self.confirm_delete_project(),
             },
             KeyCode::Char('n') if self.focus == Focus::Snapshots => {
                 self.handle_action(ActionId::NewSnapshot)
             }
-            KeyCode::Char('b') | KeyCode::Char('2') => {
-                let effects = self.open_project();
-                self.focus = Focus::Instances;
-                effects
-            }
-            KeyCode::Char('s') | KeyCode::Char('3') => {
-                let effects = self.open_project();
-                self.focus = Focus::Snapshots;
-                effects
-            }
+            KeyCode::Char('b') | KeyCode::Char('2') => self.open_project_section(Focus::Instances),
+            KeyCode::Char('s') | KeyCode::Char('3') => self.open_project_section(Focus::Snapshots),
             KeyCode::Char('p') | KeyCode::Char('1') => {
                 self.focus = Focus::Projects;
                 Vec::new()
@@ -1318,6 +1336,18 @@ impl App {
         }
         self.enter_project(project.path);
         Vec::new()
+    }
+
+    /// Open the selected project on a section, or do nothing when the picker
+    /// has no selection. Dashboard section shortcuts must never change focus
+    /// into a project view that was not actually opened.
+    fn open_project_section(&mut self, focus: Focus) -> Vec<Effect> {
+        if self.selected_project().is_none() {
+            return Vec::new();
+        }
+        let effects = self.open_project();
+        self.focus = focus;
+        effects
     }
 
     fn enter_project(&mut self, path: PathBuf) {
@@ -1826,6 +1856,35 @@ impl App {
                     Vec::new()
                 }
             },
+            Modal::DeleteProject(modal) => match key.code {
+                KeyCode::Char('y') => self.delete_project_effect(modal, false),
+                KeyCode::Char('f') => self.delete_project_effect(modal, true),
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => Vec::new(),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.modal = Some(Modal::DeleteProject(modal));
+                    self.scroll_modal(1);
+                    Vec::new()
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.modal = Some(Modal::DeleteProject(modal));
+                    self.scroll_modal(-1);
+                    Vec::new()
+                }
+                KeyCode::PageDown => {
+                    self.modal = Some(Modal::DeleteProject(modal));
+                    self.scroll_modal_page(1);
+                    Vec::new()
+                }
+                KeyCode::PageUp => {
+                    self.modal = Some(Modal::DeleteProject(modal));
+                    self.scroll_modal_page(-1);
+                    Vec::new()
+                }
+                _ => {
+                    self.modal = Some(Modal::DeleteProject(modal));
+                    Vec::new()
+                }
+            },
             Modal::MultiAgent(mut form) => match key.code {
                 KeyCode::Esc => Vec::new(),
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -2325,38 +2384,64 @@ impl App {
         Vec::new()
     }
 
-    /// Delete the VM/instance of the selected project without starting it.
+    /// Ask before removing a project from the dashboard.
     ///
-    /// The project directory itself is never touched. This is the dashboard
-    /// counterpart of `hegn instance delete`, and importantly it does not run
-    /// any host prerequisite checks: a VM whose start failed (missing images,
-    /// inactive firewall, broken relay) can still be removed.
-    fn confirm_delete_project_instance(&mut self) -> Vec<Effect> {
+    /// The modal shows git state (so uncommitted work is visible) and the
+    /// instances that will be stopped and deleted. `y` unregisters the project
+    /// and keeps its files; `f` also deletes the project directory.
+    fn confirm_delete_project(&mut self) -> Vec<Effect> {
         let Some(project) = self.selected_project().cloned() else {
             self.toast("no project selected", ToastLevel::Warn);
             return Vec::new();
         };
-        let instance = self
+        let git = project::read_git_summary(&project.path);
+        let instances = self
             .instances
             .iter()
-            .filter(|instance| crate::instance::same_project(&instance.project, &project.path))
-            // Prefer the base instance over multi-agent clones.
-            .min_by_key(|instance| instance.ephemeral)
-            .cloned();
-        let Some(instance) = instance else {
-            self.toast(
-                format!("no VM for {} — nothing to delete", project.name),
-                ToastLevel::Warn,
-            );
-            return Vec::new();
-        };
-        self.modal = Some(Modal::DeleteInstance(DeleteInstanceModal {
-            instance,
-            stage: DeleteInstanceStage::Confirm,
-            error: None,
+            .filter(|instance| {
+                crate::instance::same_project(&instance.project, &project.path)
+                    || crate::instance::same_project(&instance.workspace, &project.path)
+            })
+            .map(|instance| instance.name.clone())
+            .collect();
+        self.modal = Some(Modal::DeleteProject(DeleteProjectModal {
+            project,
+            git,
+            instances,
             scroll: 0,
         }));
         Vec::new()
+    }
+
+    fn delete_project_effect(
+        &mut self,
+        modal: DeleteProjectModal,
+        delete_files: bool,
+    ) -> Vec<Effect> {
+        let path = modal.project.path.clone();
+        self.toast(
+            format!("deleting project {}…", modal.project.name),
+            ToastLevel::Info,
+        );
+        vec![Effect::DeleteProject {
+            project: path,
+            delete_files,
+        }]
+    }
+
+    /// Drop a project from the in-memory dashboard right after its deletion so
+    /// the user does not have to wait for (or trigger) a project rescan.
+    pub fn forget_project_locally(&mut self, path: &Path) {
+        self.projects.retain(|project| project.path != path);
+        if self.open_project.as_deref() == Some(path) {
+            self.leave_project();
+        }
+        self.refresh_filter();
+    }
+
+    /// Reload recent/hidden project state after a background worker changed it.
+    pub fn reload_state(&mut self) {
+        self.store = StateStore::load(self.config.state_dir.join("state.json"));
     }
 
     fn workspace_is_inside_instance(&self, instance: &InstanceSummary) -> bool {
@@ -2747,7 +2832,7 @@ impl App {
                 Some(Modal::MultiAgent(_)) => {
                     self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 }
-                Some(Modal::Confirm(_) | Modal::DeleteInstance(_)) => {
+                Some(Modal::Confirm(_) | Modal::DeleteInstance(_) | Modal::DeleteProject(_)) => {
                     self.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
                 }
                 _ => Vec::new(),
@@ -2755,7 +2840,12 @@ impl App {
             ActionId::Cancel => {
                 if matches!(
                     self.modal,
-                    Some(Modal::Confirm(_) | Modal::DeleteInstance(_) | Modal::MultiAgent(_))
+                    Some(
+                        Modal::Confirm(_)
+                            | Modal::DeleteInstance(_)
+                            | Modal::DeleteProject(_)
+                            | Modal::MultiAgent(_)
+                    )
                 ) {
                     self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
                 } else {
@@ -2878,6 +2968,14 @@ impl App {
             ActionId::StartInstance => self.open_selected(),
             ActionId::StopInstance => self.stop_selected_instance(),
             ActionId::DeleteInstance => self.confirm_delete_instance(),
+            ActionId::DeleteProject => self.confirm_delete_project(),
+            ActionId::DeleteProjectFiles => {
+                if matches!(self.modal, Some(Modal::DeleteProject(_))) {
+                    self.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+                } else {
+                    Vec::new()
+                }
+            }
             ActionId::InstanceConfig => self.open_instance_config(),
             ActionId::GlobalConfig => self.open_global_config(),
             ActionId::CloneInstance | ActionId::MultiAgent => self.open_multi_agent(),
@@ -2970,6 +3068,7 @@ impl App {
             Some(Modal::Security(prompt)) => Some(prompt.scroll),
             Some(Modal::Confirm(prompt)) => Some(prompt.scroll),
             Some(Modal::DeleteInstance(modal)) => Some(modal.scroll),
+            Some(Modal::DeleteProject(modal)) => Some(modal.scroll),
             Some(Modal::MultiAgent(form)) => Some(form.scroll),
             Some(Modal::Error { scroll, .. }) => Some(*scroll),
             _ => None,
@@ -2983,6 +3082,7 @@ impl App {
             Some(Modal::Security(prompt)) => prompt.scroll = offset,
             Some(Modal::Confirm(prompt)) => prompt.scroll = offset,
             Some(Modal::DeleteInstance(modal)) => modal.scroll = offset,
+            Some(Modal::DeleteProject(modal)) => modal.scroll = offset,
             Some(Modal::MultiAgent(form)) => form.scroll = offset,
             Some(Modal::Error { scroll, .. }) => *scroll = offset,
             _ => {}
@@ -3462,6 +3562,23 @@ mod tests {
         app.refresh_filter();
         assert_eq!(app.visible.len(), 1);
         assert_eq!(app.selected_project().unwrap().name, "alpha");
+    }
+
+    #[test]
+    fn hidden_projects_stay_out_of_the_dashboard() {
+        let (_dir, mut app) = test_app();
+        let mut a = fake_project("alpha");
+        a.path = app.config.projects_root.join("alpha");
+        let mut b = fake_project("beta");
+        b.path = app.config.projects_root.join("beta");
+        app.store.set_project_hidden(&b.path, true).unwrap();
+        app.set_projects(vec![a.clone(), b]);
+        assert_eq!(app.visible.len(), 1);
+        assert_eq!(app.selected_project().unwrap().name, "alpha");
+
+        app.forget_project_locally(&a.path);
+        assert!(app.projects.is_empty());
+        assert!(app.visible.is_empty());
     }
 
     #[test]
@@ -4105,8 +4222,7 @@ mod tests {
     fn instance_focus_and_delete_double_confirmation() {
         let (_dir, mut app) = test_app();
         let inside = app.config.instances_dir.join("demo").join("workspace");
-        app.handle_key(key(KeyCode::Char('b')));
-        assert_eq!(app.focus, Focus::Instances);
+        app.focus = Focus::Instances;
         let instance = fake_instance(&app, "demo", inside);
         install_instances(&mut app, vec![instance]);
 
@@ -4138,23 +4254,31 @@ mod tests {
     }
 
     #[test]
-    fn projects_focus_delete_targets_the_project_instance() {
+    fn projects_focus_delete_opens_the_project_delete_modal() {
         let (_dir, mut app) = test_app();
         let inside = app.config.instances_dir.join("demo").join("workspace");
         let instance = fake_instance(&app, "demo", inside);
         install_instances(&mut app, vec![instance]);
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path: app.config.projects_root.join("demo"),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
         app.focus = Focus::Projects;
 
         app.handle_key(key(KeyCode::Char('d')));
-        let Some(Modal::DeleteInstance(modal)) = &app.modal else {
-            panic!("expected a delete confirmation");
+        let Some(Modal::DeleteProject(modal)) = &app.modal else {
+            panic!("expected a project delete confirmation");
         };
-        assert_eq!(modal.instance.name, "demo");
-        assert_eq!(modal.stage, DeleteInstanceStage::Confirm);
+        assert_eq!(modal.project.name, "demo");
+        assert_eq!(modal.instances, vec!["demo".to_string()]);
     }
 
     #[test]
-    fn project_delete_without_a_vm_only_warns() {
+    fn project_delete_without_a_vm_does_not_need_an_instance() {
         let (_dir, mut app) = test_app();
         app.projects = vec![Project {
             name: "empty".into(),
@@ -4168,7 +4292,104 @@ mod tests {
         app.focus = Focus::Projects;
 
         app.handle_key(key(KeyCode::Char('d')));
+        let Some(Modal::DeleteProject(modal)) = &app.modal else {
+            panic!("expected a project delete confirmation");
+        };
+        assert!(modal.instances.is_empty());
+    }
+
+    #[test]
+    fn delete_project_asks_about_files_and_shows_git_state() {
+        let (_dir, mut app) = test_app();
+        let path = app.config.projects_root.join("dirty");
+        std::fs::create_dir_all(&path).unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(path.join("untracked.txt"), "work in progress").unwrap();
+        app.projects = vec![Project {
+            name: "dirty".into(),
+            path: path.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+
+        app.handle_key(key(KeyCode::Char('d')));
+        let Some(Modal::DeleteProject(modal)) = &app.modal else {
+            panic!("expected a project delete confirmation");
+        };
+        assert!(modal.git.is_repo);
+        assert_eq!(modal.git.untracked, 1);
+
+        // Enter never confirms a destructive prompt.
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert!(effects.is_empty());
+        assert!(matches!(app.modal, Some(Modal::DeleteProject(_))));
+
+        let effects = app.handle_key(key(KeyCode::Char('f')));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::DeleteProject { project, delete_files: true }] if project == &path
+        ));
         assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn keeping_project_files_emits_a_keep_effect() {
+        let (_dir, mut app) = test_app();
+        let path = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&path).unwrap();
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path: path.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+
+        app.handle_key(key(KeyCode::Char('d')));
+        let effects = app.handle_key(key(KeyCode::Char('y')));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::DeleteProject { project, delete_files: false }] if project == &path
+        ));
+    }
+
+    #[test]
+    fn number_keys_do_nothing_without_a_selected_project() {
+        let (_dir, mut app) = test_app();
+        app.set_projects(vec![]);
+        app.screen = Screen::Dashboard;
+        app.focus = Focus::Projects;
+
+        assert!(app.handle_key(key(KeyCode::Char('2'))).is_empty());
+        assert_eq!(app.screen, Screen::Dashboard);
+        assert_eq!(app.focus, Focus::Projects);
+        assert!(app.toast.is_none());
+
+        assert!(app.handle_key(key(KeyCode::Char('3'))).is_empty());
+        assert_eq!(app.screen, Screen::Dashboard);
+        assert_eq!(app.focus, Focus::Projects);
+    }
+
+    #[test]
+    fn number_keys_open_a_selected_project_on_that_section() {
+        let (_dir, mut app) = test_app();
+        let mut project = fake_project("demo");
+        project.path = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project.path).unwrap();
+        app.set_projects(vec![project]);
+
+        app.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(app.screen, Screen::Project);
+        assert_eq!(app.focus, Focus::Instances);
     }
 
     #[test]

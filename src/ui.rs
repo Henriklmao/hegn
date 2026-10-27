@@ -796,7 +796,7 @@ fn render_project_split(frame: &mut Frame, app: &App, area: Rect) -> RenderHits 
         .constraints([Constraint::Percentage(left), Constraint::Percentage(right)])
         .split(area);
     let mut hits = if app.project_view == ProjectView::Section {
-        render_section_expanded(frame, app, columns[0], app.project_section())
+        render_section_stack(frame, app, columns[0])
     } else {
         render_section_headers(frame, app, columns[0])
     };
@@ -853,6 +853,52 @@ fn render_section_headers(frame: &mut Frame, app: &App, area: Rect) -> RenderHit
             height: 1,
         };
         frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+        hits.sections.push(SectionHit { rect, section });
+    }
+    hits
+}
+
+/// Section view keeps every section visible: the focused one gets the remaining
+/// height, every other section collapses to its tab border and one content row.
+fn render_section_stack(frame: &mut Frame, app: &App, area: Rect) -> RenderHits {
+    let active = app.project_section();
+    let compact = 3u16;
+    let total = ProjectSection::ALL.len() as u16;
+    // Too little height for four readable panels: keep the focused section
+    // usable instead of drawing one-row slivers.
+    if area.height < compact * total {
+        return render_section_expanded(frame, app, area, active);
+    }
+    let reserved = compact * (total - 1);
+    let expanded = area.height - reserved;
+    let constraints: Vec<Constraint> = ProjectSection::ALL
+        .iter()
+        .map(|section| {
+            Constraint::Length(if *section == active {
+                expanded
+            } else {
+                compact
+            })
+        })
+        .collect();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    let mut hits = RenderHits::default();
+    for (index, section) in ProjectSection::ALL.iter().copied().enumerate() {
+        let rect = rows[index];
+        match section {
+            ProjectSection::Instances => {
+                hits.instances = render_instances(frame, app, rect, section.number());
+            }
+            ProjectSection::Snapshots => {
+                hits.snapshots = render_snapshots(frame, app, rect, section.number());
+            }
+            ProjectSection::Health => render_health(frame, app, rect, section.number()),
+            ProjectSection::Git => render_git(frame, app, rect, section.number()),
+        }
         hits.sections.push(SectionHit { rect, section });
     }
     hits
@@ -1416,6 +1462,23 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 },
             ],
         },
+        Some(Modal::DeleteProject(_)) => vec![
+            FooterDef {
+                key: "y",
+                label: "Remove, keep files",
+                action: ActionId::Confirm,
+            },
+            FooterDef {
+                key: "f",
+                label: "Delete files",
+                action: ActionId::DeleteProjectFiles,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Cancel",
+                action: ActionId::Cancel,
+            },
+        ],
         Some(Modal::MultiAgent(_)) => vec![
             FooterDef {
                 key: "Enter",
@@ -1572,6 +1635,11 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                         key: "e",
                         label: "Editor",
                         action: ActionId::Edit,
+                    },
+                    FooterDef {
+                        key: "d",
+                        label: "Delete project",
+                        action: ActionId::DeleteProject,
                     },
                 ],
                 Focus::Instances => vec![
@@ -1870,6 +1938,81 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Moda
                     },
                 );
             }
+            ModalHits {
+                footer,
+                scroll,
+                ..ModalHits::default()
+            }
+        }
+        Modal::DeleteProject(modal) => {
+            let git = &modal.git;
+            let git_line = if git.is_repo {
+                format!(
+                    "{} ↑{} ↓{} · {} staged · {} modified · {} untracked",
+                    git.badge(),
+                    git.ahead,
+                    git.behind,
+                    git.staged,
+                    git.modified,
+                    git.untracked
+                )
+            } else if let Some(error) = &git.error {
+                format!("not a git repository ({error})")
+            } else {
+                "not a git repository".to_string()
+            };
+            let mut body = format!(
+                "Delete project '{}'?\n\nPath: {}\nGit:  {}\n",
+                modal.project.name,
+                modal.project.path.display(),
+                git_line
+            );
+            if git.is_dirty() {
+                body.push_str(
+                    "\nWARNING: uncommitted changes will be lost if the files are deleted.\n",
+                );
+            }
+            if !modal.instances.is_empty() {
+                body.push_str(&format!(
+                    "\nInstances to remove: {}\n",
+                    modal.instances.join(", ")
+                ));
+            }
+            body.push_str(
+                "\n[y] remove from the dashboard and keep every project file\n\
+                 [f] delete the project directory as well\n\n\
+                 Imported projects only lose their picker symlink; the original directory is never touched.",
+            );
+            let color = if git.is_dirty() { RED } else { YELLOW };
+            let (footer, scroll) = render_message(
+                frame,
+                app,
+                area,
+                72,
+                48,
+                1,
+                "delete project",
+                &body,
+                color,
+                modal.scroll,
+                &[
+                    FooterDef {
+                        key: "y",
+                        label: "Remove, keep files",
+                        action: ActionId::Confirm,
+                    },
+                    FooterDef {
+                        key: "f",
+                        label: "Delete files",
+                        action: ActionId::DeleteProjectFiles,
+                    },
+                    FooterDef {
+                        key: "Esc",
+                        label: "Cancel",
+                        action: ActionId::Cancel,
+                    },
+                ],
+            );
             ModalHits {
                 footer,
                 scroll,
@@ -2461,6 +2604,7 @@ fn render_help(
                 ("s / 3", "open the project screen on snapshots"),
                 ("c", "create project"),
                 ("h / ←", "import existing project"),
+                ("d", "delete project (git status · keep or delete files)"),
                 ("F4", "global settings (arrows/mouse · Ctrl-S saves)"),
                 ("e", "open in $EDITOR"),
                 ("g", "open in lazygit"),
@@ -3787,6 +3931,64 @@ mod tests {
         assert!(text.contains("[1]"), "{text}");
         assert!(hits.terminal.is_some());
         assert_eq!(hits.sections.len(), 4);
+    }
+
+    #[test]
+    fn section_view_keeps_every_section_visible_with_the_terminal_open() {
+        let (_dir, mut app) = app();
+        app.screen = Screen::Project;
+        app.open_project = Some(PathBuf::from("/projects/demo"));
+        app.project_view = ProjectView::Section;
+        app.focus = Focus::Snapshots;
+        let (text, hits) = render(&app);
+        for needle in [
+            "[1]",
+            "[2]",
+            "[3]",
+            "[4]",
+            "instances",
+            "snapshots",
+            "health",
+            "git",
+        ] {
+            assert!(text.contains(needle), "missing {needle} in:\n{text}");
+        }
+        assert!(hits.terminal.is_some());
+        assert_eq!(hits.sections.len(), 4);
+    }
+
+    #[test]
+    fn delete_project_modal_shows_git_status_and_file_choices() {
+        let (_dir, mut app) = app();
+        let project = app.selected_project().cloned().unwrap();
+        app.modal = Some(Modal::DeleteProject(crate::app::DeleteProjectModal {
+            project,
+            git: GitSummary {
+                is_repo: true,
+                branch: Some("main".into()),
+                modified: 2,
+                untracked: 1,
+                ..GitSummary::default()
+            },
+            instances: vec!["demo".into()],
+            scroll: 0,
+        }));
+        let (text, hits) = render(&app);
+        assert!(text.contains("delete project"), "{text}");
+        assert!(text.contains("main"), "{text}");
+        assert!(text.contains("uncommitted changes"), "{text}");
+        assert!(text.contains("Remove, keep files"), "{text}");
+        assert!(text.contains("Delete files"), "{text}");
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::Confirm)
+        );
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::DeleteProjectFiles)
+        );
     }
 
     #[test]

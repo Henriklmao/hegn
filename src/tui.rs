@@ -547,6 +547,31 @@ fn handle_effects(
                     Err(err) => app.toast(format!("delete failed: {err}"), ToastLevel::Error),
                 }
             }
+            Effect::DeleteProject {
+                project,
+                delete_files,
+            } => match crate::project::delete_project(&app.config, &project, delete_files) {
+                Ok(outcome) => {
+                    app.reload_state();
+                    app.forget_project_locally(&project);
+                    app.refresh_instances();
+                    let files = if outcome.files_deleted {
+                        "files deleted"
+                    } else {
+                        "files kept"
+                    };
+                    let instances = if outcome.instances.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · removed {}", outcome.instances.join(", "))
+                    };
+                    app.toast(
+                        format!("project {} deleted ({files}){instances}", project.display()),
+                        ToastLevel::Info,
+                    );
+                }
+                Err(err) => app.toast(format!("delete project failed: {err:#}"), ToastLevel::Error),
+            },
             Effect::CloneInstance {
                 source,
                 count,

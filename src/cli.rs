@@ -184,6 +184,26 @@ pub enum ProjectCommands {
     },
     /// Print project metadata and git status.
     Info { project: String },
+    /// Remove a project from the picker and delete its instances.
+    ///
+    /// Git status is printed first. `--delete-files` also removes the project
+    /// directory; `--keep-files` only unregisters it. Imported projects are
+    /// symlinks and their original directory is never deleted.
+    Delete {
+        project: String,
+        /// Delete the project directory (import symlinks are removed, not
+        /// followed).
+        #[arg(long, conflicts_with = "keep_files")]
+        delete_files: bool,
+        /// Remove the project from the picker but keep its files.
+        #[arg(long, conflicts_with = "delete_files")]
+        keep_files: bool,
+        /// Skip interactive prompts (a file policy flag is still required).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show a project that `project delete --keep-files` hid from the picker.
+    Restore { project: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -436,8 +456,12 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
             Ok(0)
         }
         Commands::Projects { query } => {
+            let store = crate::state::StateStore::load(config.state_dir.join("state.json"));
             let projects =
-                project::discover_protected(&config.projects_root, &config.protected_paths())?;
+                project::discover_protected(&config.projects_root, &config.protected_paths())?
+                    .into_iter()
+                    .filter(|project| !store.is_hidden(&project.path))
+                    .collect::<Vec<_>>();
             let indices = project::filter_projects(&projects, query.as_deref().unwrap_or(""));
             let selected: Vec<&project::Project> = indices.iter().map(|&i| &projects[i]).collect();
             if json {
@@ -624,6 +648,99 @@ fn project_command(command: ProjectCommands, config: Config, json: bool) -> Resu
             }
             Ok(0)
         }
+        ProjectCommands::Delete {
+            project: selector,
+            delete_files,
+            keep_files,
+            yes,
+        } => {
+            let entry = resolve_project_entry(&config, &selector)?;
+            let info = project::Project::load(entry.clone());
+            print_project_git(&entry, &info, json);
+            if !yes
+                && !prompt_yes(&format!(
+                    "Remove project '{}' from the picker and delete its instances?",
+                    info.name
+                ))?
+            {
+                return Ok(0);
+            }
+            let delete_files = if delete_files {
+                true
+            } else if keep_files {
+                false
+            } else if std::io::stdin().is_terminal() {
+                prompt_yes(&format!(
+                    "Also delete the project files at {}?",
+                    entry.display()
+                ))?
+            } else {
+                bail!("choose --delete-files or --keep-files in non-interactive mode");
+            };
+            let outcome = project::delete_project(&config, &entry, delete_files)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "project": entry,
+                        "files_deleted": outcome.files_deleted,
+                        "instances": outcome.instances,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Removed {} ({}); {}",
+                    info.name,
+                    if outcome.instances.is_empty() {
+                        "no instances".to_string()
+                    } else {
+                        format!("instances: {}", outcome.instances.join(", "))
+                    },
+                    if outcome.files_deleted {
+                        "project files deleted"
+                    } else {
+                        "project files kept"
+                    }
+                );
+            }
+            Ok(0)
+        }
+        ProjectCommands::Restore { project: selector } => {
+            let entry = resolve_project_entry(&config, &selector)?;
+            let mut store = crate::state::StateStore::load(config.state_dir.join("state.json"));
+            store.set_project_hidden(&entry, false)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "project": entry,
+                        "hidden": false,
+                    }))?
+                );
+            } else {
+                println!("Restored {} to the picker", entry.display());
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn print_project_git(path: &Path, info: &project::Project, json: bool) {
+    if json {
+        return;
+    }
+    println!("{}", info.name);
+    println!("  path     {}", path.display());
+    println!("  git      {}", info.git.badge());
+    if let Some(error) = &info.git.error {
+        println!("  git note {error}");
+    }
+    if info.git.is_dirty() {
+        println!(
+            "  changes  {} staged, {} modified, {} untracked",
+            info.git.staged, info.git.modified, info.git.untracked
+        );
+        println!("  warning  uncommitted changes are lost if the files are deleted");
     }
 }
 
@@ -1666,6 +1783,21 @@ pub fn resolve_project(config: &Config, arg: &str) -> Result<PathBuf> {
     )
 }
 
+pub fn resolve_project_entry(config: &Config, arg: &str) -> Result<PathBuf> {
+    let candidate = config.projects_root.join(arg);
+    if std::fs::symlink_metadata(&candidate).is_ok() {
+        return Ok(candidate);
+    }
+    let direct = PathBuf::from(arg);
+    if std::fs::symlink_metadata(&direct).is_ok() {
+        return Ok(direct);
+    }
+    bail!(
+        "project '{arg}' not found in {}",
+        config.projects_root.display()
+    )
+}
+
 fn print_findings(inspection: &crate::security::Inspection) {
     for finding in &inspection.findings {
         println!(
@@ -1985,6 +2117,88 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(config.import_project(Path::new("/"), None).is_err());
+    }
+
+    #[test]
+    fn project_delete_keeps_or_removes_files_and_can_be_restored() {
+        let (_dir, config) = config();
+        let project = config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("README.md"), b"demo").unwrap();
+
+        let code = project_command(
+            ProjectCommands::Delete {
+                project: "demo".into(),
+                delete_files: false,
+                keep_files: true,
+                yes: true,
+            },
+            config.clone(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(project.join("README.md").is_file(), "files must be kept");
+        let store = crate::state::StateStore::load(config.state_dir.join("state.json"));
+        assert!(store.is_hidden(&project));
+
+        let code = project_command(
+            ProjectCommands::Restore {
+                project: "demo".into(),
+            },
+            config.clone(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        let store = crate::state::StateStore::load(config.state_dir.join("state.json"));
+        assert!(!store.is_hidden(&project));
+
+        let code = project_command(
+            ProjectCommands::Delete {
+                project: "demo".into(),
+                delete_files: true,
+                keep_files: false,
+                yes: true,
+            },
+            config,
+            true,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(!project.exists());
+    }
+
+    #[test]
+    fn project_delete_never_follows_an_import_link() {
+        let (dir, config) = config();
+        let source = dir.path().join("outside/demo");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("README.md"), b"demo").unwrap();
+        project_command(
+            ProjectCommands::Import {
+                path: source.clone(),
+                name: None,
+            },
+            config.clone(),
+            true,
+        )
+        .unwrap();
+        let link = config.projects_root.join("demo");
+
+        project_command(
+            ProjectCommands::Delete {
+                project: "demo".into(),
+                delete_files: true,
+                keep_files: false,
+                yes: true,
+            },
+            config,
+            true,
+        )
+        .unwrap();
+        assert!(!link.exists());
+        assert!(source.join("README.md").is_file());
     }
 
     #[test]

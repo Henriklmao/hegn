@@ -425,10 +425,23 @@ instance and keeps the clone under `<instances_dir>/<name>-files-<timestamp>/`.
 `--delete-files` removes the clone.
 
 Deleting never boots the VM and runs no host checks (no images, firewall, KVM or
-relay required), so an instance whose start failed can always be removed. In the
-TUI, `d` on a project row deletes that project's base instance (project files are
-kept), and the same modal is available from the project screen. With
-`--yes --keep-files` the CLI can delete unattended in CI.
+relay required), so an instance whose start failed can always be removed. The
+same modal is available from the project screen. With `--yes --keep-files` the
+CLI can delete unattended in CI.
+
+On the dashboard, `d` deletes a whole project after showing its git status. It
+asks whether to delete the project files too: `y` removes the picker entry and
+the project's instances but keeps the files (the entry is hidden from future
+scans), while `f` also removes the directory. Imported projects only lose the
+symlink in `projects_root`; their original directory is never deleted. The
+dashboard drops the project as soon as the deletion finishes. The CLI equivalent
+is:
+
+```bash
+hegn project delete my-app --keep-files --yes
+hegn project delete my-app --delete-files --yes
+hegn project restore my-app          # show a kept project again
+```
 
 Per-instance settings live in `<instance>/hegn.toml`. In the TUI, `F4` opens the
 global settings editor and `F5` opens the selected instance's editor. Both are
@@ -578,6 +591,9 @@ hegn [--config PATH] [--json] [COMMAND]
           [--harness H] [--template PATH] [--package P[,P...]]
   project import PATH [--name N]   Symlink an existing directory into projects_root
   project info PROJECT             Show metadata and git status
+  project delete PROJECT [--delete-files | --keep-files] [--yes]
+                                   Remove a project (+ its instances); --keep-files hides it
+  project restore PROJECT          Show a project removed with --keep-files
   open PROJECT                     Boot/attach the VM serial console
           [--editor | --lazygit] [--no-branch] [--no-bar]
   attach [PROJECT|INSTANCE] [--no-bar]  Attach to a running VM (alias: a)
@@ -769,11 +785,11 @@ project. It never boots a VM.
 | `↑`/`↓`, `j`/`k` | Move selection |
 | `Enter` / `o` | Open the project screen (does not boot) |
 | `/` | Fuzzy filter projects |
-| `b` / `2` | Open the project screen on instances |
-| `s` / `3` | Open the project screen on snapshots |
+| `b` / `2` | Open the project screen on instances (if a project is selected) |
+| `s` / `3` | Open the project screen on snapshots (if a project is selected) |
 | `c` | Create project |
 | `h` / `←` | Import an existing directory (symlink, no copy) |
-| `d` | Delete the project's VM (project files kept) |
+| `d` | Delete project: shows git status, then asks whether to delete its files |
 | `F4` | Global settings editor (mouse supported, `Ctrl-S` to save) |
 | `e` | Open selected project in `$EDITOR` |
 | `g` | Open selected project in lazygit |
@@ -811,13 +827,18 @@ open it.
 | `?` / `F1` | Help |
 
 Opening the terminal moves it to the right at 55%. Pressing a section number
-expands that section and shrinks the terminal to 30%; focusing the terminal
-again restores 55%. The collapsed strip shows the selected instance and whether
-it is running.
+expands that section and shrinks the terminal to 30%; all four sections stay
+visible, with the unselected ones collapsed to a compact header row. Focusing
+the terminal again restores 55%. The collapsed strip shows the selected instance
+and whether it is running.
 
-Destructive actions are never confirmed with `Enter`. Deleting an instance or
-snapshot and allowing a flagged command require the explicit `y` (or `a` for
-the security prompt) key; `Enter` leaves the confirmation modal open.
+Destructive actions are never confirmed with `Enter`. Deleting an instance,
+snapshot or project and allowing a flagged command require the explicit `y`
+(or `a` for the security prompt) key; `Enter` leaves the confirmation modal open.
+The project delete modal shows the project's branch, sync state and changed-file
+counts first. `y` removes the project from the dashboard and keeps its files;
+`f` also deletes the project directory. Imported projects only lose their picker
+symlink — the original directory is never touched.
 
 Every keybinding hint inside a modal is rendered as a clickable button, just
 like the footer buttons. Hovering one inverts its colors for immediate feedback;

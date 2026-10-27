@@ -542,12 +542,21 @@ and `root_device`; the official qcow2 image uses `/dev/vda1`.
   region on normal exit and on panic unwinding.
 
 Modals: create project, import project, doctor, security prompt, confirm,
-help and error. Every footer button and every keybinding hint drawn inside a
-modal has an `ActionId` and is clicked through the same `handle_action` path as
-its keybinding. Both invert their colors while `MouseEventKind::Moved` reports
-the pointer inside their rectangle. Destructive confirmations (delete instance,
-delete/restore snapshot, allow a flagged command) accept only their explicit
-key — `Enter` deliberately leaves the modal open.
+delete project, help and error. Every footer button and every keybinding hint
+drawn inside a modal has an `ActionId` and is clicked through the same
+`handle_action` path as its keybinding. Both invert their colors while
+`MouseEventKind::Moved` reports the pointer inside their rectangle. Destructive
+confirmations (delete instance, delete project, delete/restore snapshot, allow a
+flagged command) accept only their explicit key — `Enter` deliberately leaves
+the modal open.
+
+The project delete modal re-reads git status before it opens, shows the project's
+branch, sync state and changed-file counts, and lists the instances that will be
+stopped. `y` unregisters the project and keeps its files (a real directory is
+recorded in the persisted hidden-project list; an import symlink is removed);
+`f` also deletes the project directory. Deletion runs the instance registry
+first, drops the project from the in-memory dashboard immediately, and reloads
+the persisted state so the next scan does not re-add a kept directory.
 
 The help modal filters its keybinding sections with a case-insensitive query
 entered after `/`; section titles, keys and descriptions all match, and every
@@ -570,7 +579,9 @@ instances and snapshots on the left and health and git on the right.
 
 The terminal starts as a one-line strip. `i`, `Enter` or a click opens it on the
 right at 55%; pressing a section number expands that section on the left and
-shrinks the terminal to 30%. Refocusing the terminal restores 55%. `Esc` in
+shrinks the terminal to 30%. All four sections remain visible in that view: the
+focused one takes the remaining height and the others collapse to a tab-sized
+header plus one content row. Refocusing the terminal restores 55%. `Esc` in
 insert mode returns to normal; `Esc` in normal mode returns focus to the section
 headers while keeping the pane open. `←` and the clickable `← all projects`
 breadcrumb return to the dashboard; `Ctrl-B`/`Ctrl-]` do so from every mode and
@@ -638,6 +649,8 @@ matters when hegn runs inside tmux and `Ctrl-B` is consumed as the tmux prefix.
 | List projects | dashboard | `hegn projects` |
 | Create project | `c` | `hegn project create` |
 | Import project | `h` / `←` | `hegn project import` |
+| Delete project | `d` on the dashboard | `hegn project delete` |
+| Restore a kept project | — | `hegn project restore` |
 | Open/attach VM | `Enter` | `hegn open`, `hegn attach` |
 | Stop VM | — | `hegn instance stop` |
 | Status | header/sidebar | `hegn instance status` |
