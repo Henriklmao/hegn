@@ -1784,16 +1784,23 @@ pub fn resolve_project(config: &Config, arg: &str) -> Result<PathBuf> {
 }
 
 pub fn resolve_project_entry(config: &Config, arg: &str) -> Result<PathBuf> {
-    let candidate = config.projects_root.join(arg);
-    if std::fs::symlink_metadata(&candidate).is_ok() {
-        return Ok(candidate);
-    }
-    let direct = PathBuf::from(arg);
-    if std::fs::symlink_metadata(&direct).is_ok() {
-        return Ok(direct);
+    let root = config
+        .projects_root
+        .canonicalize()
+        .unwrap_or_else(|_| config.projects_root.clone());
+    for candidate in [config.projects_root.join(arg), PathBuf::from(arg)] {
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            continue;
+        }
+        let parent = candidate
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok());
+        if parent.as_ref() == Some(&root) {
+            return Ok(candidate);
+        }
     }
     bail!(
-        "project '{arg}' not found in {}",
+        "project '{arg}' not found directly inside {}",
         config.projects_root.display()
     )
 }
@@ -2186,6 +2193,10 @@ mod tests {
         .unwrap();
         let link = config.projects_root.join("demo");
 
+        assert!(
+            resolve_project_entry(&config, &source.display().to_string()).is_err(),
+            "deletion must only target picker entries"
+        );
         project_command(
             ProjectCommands::Delete {
                 project: "demo".into(),

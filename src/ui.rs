@@ -1632,14 +1632,14 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                         action: ActionId::Import,
                     },
                     FooterDef {
-                        key: "e",
-                        label: "Editor",
-                        action: ActionId::Edit,
-                    },
-                    FooterDef {
                         key: "d",
                         label: "Delete project",
                         action: ActionId::DeleteProject,
+                    },
+                    FooterDef {
+                        key: "e",
+                        label: "Editor",
+                        action: ActionId::Edit,
                     },
                 ],
                 Focus::Instances => vec![
