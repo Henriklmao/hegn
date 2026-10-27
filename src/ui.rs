@@ -3387,10 +3387,15 @@ fn render_scrollbar(frame: &mut Frame, app: &App, pane: &ScrollPane) {
         let in_thumb = row >= position && row < position + thumb;
         let (symbol, style) = if in_thumb {
             if hovered {
+                // Invert the accent instead of using the button foreground: the
+                // thumb is a full block, so a dark foreground paints the whole
+                // column black and the accent background never shows. The
+                // terminal's default text color keeps the bar visible on the
+                // track and still reads as the accent inverted.
                 (
                     "█",
                     Style::default()
-                        .fg(ON_ACCENT)
+                        .fg(TEXT)
                         .bg(ACCENT)
                         .add_modifier(Modifier::BOLD),
                 )
@@ -3523,6 +3528,7 @@ mod tests {
     use crate::security::SecurityEngine;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use std::path::PathBuf;
 
     fn app() -> (tempfile::TempDir, App) {
@@ -3556,6 +3562,11 @@ mod tests {
     }
 
     fn render_sized(app: &App, width: u16, height: u16) -> (String, UiHits) {
+        let (text, hits, _) = render_buffer(app, width, height);
+        (text, hits)
+    }
+
+    fn render_buffer(app: &App, width: u16, height: u16) -> (String, UiHits, Buffer) {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut hits = UiHits::default();
@@ -3572,7 +3583,7 @@ mod tests {
             }
             text.push('\n');
         }
-        (text, hits)
+        (text, hits, buffer)
     }
 
     #[test]
@@ -3808,6 +3819,43 @@ mod tests {
             "wide help keeps the key column"
         );
         assert!(hits.modal_scroll.is_some());
+    }
+
+    #[test]
+    fn hovered_scrollbar_thumb_inverts_without_going_black() {
+        let (_dir, mut app) = app();
+        app.modal = Some(Modal::Help(HelpState::default()));
+
+        let (_, hits, buffer) = render_buffer(&app, 60, 24);
+        let scroll = hits.modal_scroll.expect("the help list overflows");
+        let idle = &buffer[(scroll.rect.x, scroll.rect.y)];
+        assert_eq!(idle.symbol(), "█");
+        assert_eq!(idle.fg, ACCENT, "the idle thumb is drawn in the accent");
+
+        app.scroll_hover = true;
+        let (_, hits, buffer) = render_buffer(&app, 60, 24);
+        let scroll = hits.modal_scroll.expect("the help list overflows");
+        let hovered = &buffer[(scroll.rect.x, scroll.rect.y)];
+        assert_eq!(hovered.symbol(), "█");
+        assert_eq!(
+            hovered.fg, TEXT,
+            "the accent is inverted into the text color"
+        );
+        assert_eq!(hovered.bg, ACCENT);
+        assert_ne!(
+            hovered.fg, ON_ACCENT,
+            "a black block glyph would paint the track solid black"
+        );
+        assert!(
+            hovered.modifier.contains(Modifier::BOLD),
+            "the hovered thumb stays emphasized"
+        );
+
+        app.scroll_dragging = true;
+        let (_, hits, buffer) = render_buffer(&app, 60, 24);
+        let scroll = hits.modal_scroll.expect("the help list overflows");
+        let dragged = &buffer[(scroll.rect.x, scroll.rect.y)];
+        assert_eq!(dragged.fg, TEXT, "dragging keeps the inverted style");
     }
 
     #[test]
