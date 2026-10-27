@@ -14,6 +14,7 @@ use crate::app::{
     SectionHit, TerminalMode, ToastLevel,
 };
 use crate::config_form::{ConfigField, ConfigForm, ConfigRow, FieldKind};
+use crate::images::DownloadProgress;
 
 // Use the terminal's own palette and default background. Only ANSI colors
 // are selected here; the user's terminal theme decides how they look.
@@ -186,11 +187,6 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
                     .fg(ON_ACCENT)
                     .bg(ACCENT)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                "Cloud Hypervisor instances for coding agents",
-                Style::default().fg(MUTED),
             ),
             Span::raw("  "),
             Span::styled(
@@ -3227,7 +3223,17 @@ fn render_security(
 }
 
 fn render_toast(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(toast) = &app.toast else { return };
+    let toast = render_toast_notification(frame, app, area);
+    if let Some(progress) = &app.download {
+        let bottom = toast.map_or(area.y + area.height, |rect| rect.y);
+        render_download_progress(frame, progress, app.tick(), area, bottom);
+    }
+}
+
+/// Draw the transient toast, returning its rectangle so a download
+/// notification can stack above it.
+fn render_toast_notification(frame: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
+    let toast = app.toast.as_ref()?;
     let color = match toast.level {
         ToastLevel::Info => GREEN,
         ToastLevel::Warn => YELLOW,
@@ -3263,6 +3269,99 @@ fn render_toast(frame: &mut Frame, app: &App, area: Rect) {
         ),
         rect,
     );
+    Some(rect)
+}
+
+/// Bottom-right notification for an in-flight VM image download: the asset
+/// name, its completion and a bar that fills as bytes arrive.
+fn render_download_progress(
+    frame: &mut Frame,
+    progress: &DownloadProgress,
+    tick: u64,
+    area: Rect,
+    bottom: u16,
+) {
+    let height = 4;
+    if bottom < area.y + height || area.width < 24 {
+        return;
+    }
+    let fraction = progress.fraction();
+    let detail = match fraction {
+        Some(fraction) => format!("{}%", (fraction * 100.0).floor() as u16),
+        None => format!("{} MiB", progress.received / (1024 * 1024)),
+    };
+    let label = format!(" downloading {} · {detail} ", progress.asset);
+    let width = (label.width() as u16 + 4)
+        .min(area.width.saturating_sub(4))
+        .max(24);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(width + 2),
+        y: bottom - height,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center),
+        rows[0],
+    );
+    render_progress_bar(frame, rows[1], fraction, tick);
+}
+
+/// Fill `area` with a bar: exact when `fraction` is known, a sliding segment
+/// while the server has not advertised a length.
+fn render_progress_bar(frame: &mut Frame, area: Rect, fraction: Option<f64>, tick: u64) {
+    let width = area.width as usize;
+    if width == 0 {
+        return;
+    }
+    let (start, end) = match fraction {
+        Some(fraction) => (
+            0,
+            (width as f64 * fraction.clamp(0.0, 1.0)).round() as usize,
+        ),
+        None => {
+            // Unknown length: slide a segment across the empty track.
+            let segment = (width / 4).max(1);
+            let offset = (tick as usize / 2) % (width + segment);
+            (offset.saturating_sub(segment).min(width), offset.min(width))
+        }
+    };
+    let end = end.min(width).max(start);
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled("░".repeat(start), Style::default().fg(BORDER)));
+    }
+    if end > start {
+        spans.push(Span::styled(
+            "█".repeat(end - start),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if end < width {
+        spans.push(Span::styled(
+            "░".repeat(width - end),
+            Style::default().fg(BORDER),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn panel_block(title: String, active: bool) -> Block<'static> {
@@ -3584,6 +3683,60 @@ mod tests {
             text.push('\n');
         }
         (text, hits, buffer)
+    }
+
+    #[test]
+    fn header_drops_the_tagline_on_the_dashboard() {
+        let (_dir, app) = app();
+        let (text, _) = render(&app);
+        assert!(text.contains("hegn"), "{text}");
+        assert!(text.contains("[dashboard]"), "{text}");
+        assert!(
+            !text.contains("Cloud Hypervisor instances for coding agents"),
+            "the dashboard header no longer repeats the tagline:\n{text}"
+        );
+    }
+
+    #[test]
+    fn image_download_shows_a_progress_notification() {
+        let (_dir, mut app) = app();
+        app.set_download_progress(DownloadProgress {
+            asset: "rootfs",
+            received: 512 * 1024 * 1024,
+            total: Some(1024 * 1024 * 1024),
+        });
+        let (text, _) = render(&app);
+        let rows: Vec<&str> = text.lines().collect();
+        let label = rows
+            .iter()
+            .position(|row| row.contains("downloading rootfs"))
+            .expect("the notification names the asset");
+        assert!(rows[label].contains("50%"), "{text}");
+        assert!(
+            label > rows.len() / 2,
+            "the notification is anchored at the bottom:\n{text}"
+        );
+        assert!(
+            rows[label + 1].contains('█'),
+            "the bar fills proportionally:\n{text}"
+        );
+        assert!(
+            rows[label + 1].contains('░'),
+            "the unfilled track stays visible:\n{text}"
+        );
+    }
+
+    #[test]
+    fn image_download_progress_clears_when_the_worker_reports_back() {
+        let (_dir, mut app) = app();
+        app.set_download_progress(DownloadProgress {
+            asset: "kernel",
+            received: 1024,
+            total: None,
+        });
+        app.clear_download_progress();
+        let (text, _) = render(&app);
+        assert!(!text.contains("downloading kernel"), "{text}");
     }
 
     #[test]

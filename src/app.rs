@@ -687,6 +687,8 @@ pub struct App {
     pub terminal_mode: TerminalMode,
     pub scroll: usize,
     pub toast: Option<Toast>,
+    /// In-flight VM image download, rendered as a progress notification.
+    pub download: Option<crate::images::DownloadProgress>,
     pub footer_hits: Vec<FooterHit>,
     /// Settings rows and `‹ ›` steppers recorded by the renderer.
     pub config_rows: Vec<RowHit>,
@@ -759,6 +761,7 @@ impl App {
             terminal_mode: TerminalMode::Normal,
             scroll: 0,
             toast: None,
+            download: None,
             footer_hits: Vec::new(),
             config_rows: Vec::new(),
             config_steppers: Vec::new(),
@@ -1089,6 +1092,16 @@ impl App {
 
     pub fn toast(&mut self, text: impl Into<String>, level: ToastLevel) {
         self.toast = Some(Toast::new(text, level));
+    }
+
+    /// Record the latest image download progress shown in the notification.
+    pub fn set_download_progress(&mut self, progress: crate::images::DownloadProgress) {
+        self.download = Some(progress);
+    }
+
+    /// Drop the download notification once the worker has reported back.
+    pub fn clear_download_progress(&mut self) {
+        self.download = None;
     }
 
     pub fn set_viewport(&mut self, cols: u16, rows: u16) {

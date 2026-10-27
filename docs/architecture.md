@@ -394,7 +394,11 @@ The TUI opens the doctor modal on the first launch when automatic setup is
 available or a required check fails, and from `App::fail_start` (VM
 start/attach failure). `F3` opens it manually.
 `d` triggers a background download through `Effect::DownloadImages`; `r`
-re-runs the checks. `s` asks for explicit confirmation and then runs
+re-runs the checks. The worker streams `images::DownloadProgress` values over
+the scan channel (throttled to 256 KiB), which `App::set_download_progress`
+turns into a bottom-right notification with a progress bar; the notification is
+cleared when the worker reports the finished doctor run. `s` asks for explicit
+confirmation and then runs
 `Effect::SetupEnvironment`: create directories, write the default config,
 download/verify images, and call the guarded-network setup through
 `sudo`/`pkexec` with the terminal temporarily restored for the password prompt.

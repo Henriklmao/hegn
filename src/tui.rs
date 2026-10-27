@@ -41,6 +41,8 @@ enum ScanMessage {
         report: DoctorReport,
         note: Option<String>,
     },
+    /// Byte progress for an in-flight image download.
+    DownloadProgress(crate::images::DownloadProgress),
     Error(String),
 }
 
@@ -151,7 +153,11 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 app.refresh_instances();
                 app.toast(err, ToastLevel::Error);
             }
-            Ok(ScanMessage::Doctor { report, note }) => app.show_doctor(report, note),
+            Ok(ScanMessage::Doctor { report, note }) => {
+                app.clear_download_progress();
+                app.show_doctor(report, note);
+            }
+            Ok(ScanMessage::DownloadProgress(progress)) => app.set_download_progress(progress),
             Ok(ScanMessage::Error(err)) => {
                 app.loading = false;
                 app.toast(format!("project scan failed: {err}"), ToastLevel::Error);
@@ -188,7 +194,11 @@ fn spawn_image_download(config: Config, tx: mpsc::Sender<ScanMessage>) {
     let spawned = std::thread::Builder::new()
         .name("hegn-images".into())
         .spawn(move || {
-            let result = crate::images::download_missing(&config, false);
+            let progress_tx = thread_tx.clone();
+            let result =
+                crate::images::download_missing_with_progress(&config, false, &mut |progress| {
+                    let _ = progress_tx.send(ScanMessage::DownloadProgress(progress));
+                });
             let report = crate::doctor::run(&config);
             let note = Some(match result {
                 Ok(_) => "VM images downloaded and verified".to_string(),

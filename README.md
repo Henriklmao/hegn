@@ -892,7 +892,9 @@ The doctor opens automatically on the first TUI launch when setup is available
 or a required check fails, and after a VM start/attach failure. `s` is the single setup entry point:
 it creates missing directories and config, downloads the pinned images, and
 applies the guarded network through `sudo`/`pkexec` when needed. Every step is
-idempotent. The same workflow is available non-interactively as
+idempotent. Image downloads run in the background; while they stream, a
+notification in the bottom-right corner shows the asset, a progress bar and the
+percentage (or the received MiB when the server does not advertise a length). The same workflow is available non-interactively as
 `hegn doctor --fix`. Optional tools (lazygit, `$EDITOR`) never make the report
 fail and are not installed automatically.
 

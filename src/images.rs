@@ -24,6 +24,29 @@ use crate::config::Config;
 pub const MAX_ASSET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Report download progress at most every 256 KiB, so a multi-gigabyte asset
+/// does not flood the channel that feeds the TUI.
+const PROGRESS_STEP: u64 = 256 * 1024;
+
+/// Bytes streamed for one asset while a download is in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadProgress {
+    /// Asset name as reported by [`status`] ("kernel" or "rootfs").
+    pub asset: &'static str,
+    /// Bytes written so far.
+    pub received: u64,
+    /// Expected size from the response, when the server advertises one.
+    pub total: Option<u64>,
+}
+
+impl DownloadProgress {
+    /// Completion in `0.0..=1.0`, when the server advertised a length.
+    pub fn fraction(&self) -> Option<f64> {
+        self.total
+            .filter(|total| *total > 0)
+            .map(|total| (self.received.min(total) as f64) / (total as f64))
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 mod pinned {
@@ -131,11 +154,30 @@ pub fn is_sha256(value: &str) -> bool {
 /// atomically renamed; on any error the temporary file is removed. Existing
 /// destinations are only replaced when `force` is set.
 pub fn install_from_reader(
+    reader: impl Read,
+    dest: &Path,
+    expected_sha256: &str,
+    force: bool,
+    allow_unverified: bool,
+) -> Result<u64> {
+    install_from_reader_with_progress(
+        reader,
+        dest,
+        expected_sha256,
+        force,
+        allow_unverified,
+        &mut |_| {},
+    )
+}
+
+/// [`install_from_reader`] with a progress callback invoked while streaming.
+pub fn install_from_reader_with_progress(
     mut reader: impl Read,
     dest: &Path,
     expected_sha256: &str,
     force: bool,
     allow_unverified: bool,
+    on_progress: &mut dyn FnMut(u64),
 ) -> Result<u64> {
     let expected = expected_sha256.trim().to_ascii_lowercase();
     if expected.is_empty() && !allow_unverified {
@@ -179,6 +221,7 @@ pub fn install_from_reader(
     let result = (|| -> Result<u64> {
         let mut hasher = Sha256::new();
         let mut total = 0u64;
+        let mut reported = 0u64;
         let mut buffer = [0u8; 64 * 1024];
         loop {
             let read = reader.read(&mut buffer)?;
@@ -194,7 +237,12 @@ pub fn install_from_reader(
             }
             hasher.update(&buffer[..read]);
             file.write_all(&buffer[..read])?;
+            if total - reported >= PROGRESS_STEP {
+                reported = total;
+                on_progress(total);
+            }
         }
+        on_progress(total);
         file.flush()?;
         file.sync_all()?;
         let actual = hex::encode(hasher.finalize());
@@ -228,6 +276,26 @@ pub fn download_to(
     force: bool,
     allow_unverified: bool,
 ) -> Result<u64> {
+    download_to_with_progress(
+        url,
+        dest,
+        expected_sha256,
+        force,
+        allow_unverified,
+        &mut |_, _| {},
+    )
+}
+
+/// [`download_to`] with a progress callback receiving bytes read and the
+/// response's advertised length.
+pub fn download_to_with_progress(
+    url: &str,
+    dest: &Path,
+    expected_sha256: &str,
+    force: bool,
+    allow_unverified: bool,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<u64> {
     if url.is_empty() {
         bail!("no download URL configured for {}", dest.display());
     }
@@ -247,12 +315,14 @@ pub fn download_to(
     if !status.is_success() {
         bail!("download of {url} failed with HTTP {status}");
     }
-    install_from_reader(
+    let total = response.content_length();
+    install_from_reader_with_progress(
         &mut response,
         dest,
         expected_sha256,
         force,
         allow_unverified,
+        &mut |received| on_progress(received, total),
     )
 }
 
@@ -261,12 +331,31 @@ pub fn download_missing(config: &Config, allow_unverified: bool) -> Result<Vec<A
     download_all(config, false, allow_unverified)
 }
 
+/// [`download_missing`] with a progress callback for the TUI notification.
+pub fn download_missing_with_progress(
+    config: &Config,
+    allow_unverified: bool,
+    on_progress: &mut dyn FnMut(DownloadProgress),
+) -> Result<Vec<AssetStatus>> {
+    download_all_with_progress(config, false, allow_unverified, on_progress)
+}
+
 /// Download configured assets. With `force`, existing files are replaced only
 /// after the replacement download verified successfully.
 pub fn download_all(
     config: &Config,
     force: bool,
     allow_unverified: bool,
+) -> Result<Vec<AssetStatus>> {
+    download_all_with_progress(config, force, allow_unverified, &mut |_| {})
+}
+
+/// [`download_all`] with a progress callback for every asset it streams.
+pub fn download_all_with_progress(
+    config: &Config,
+    force: bool,
+    allow_unverified: bool,
+    on_progress: &mut dyn FnMut(DownloadProgress),
 ) -> Result<Vec<AssetStatus>> {
     for asset in status(config) {
         if let Ok(metadata) = fs::symlink_metadata(&asset.path)
@@ -281,12 +370,20 @@ pub fn download_all(
         if asset.exists && !force {
             continue;
         }
-        download_to(
+        let name = asset.name;
+        download_to_with_progress(
             &asset.url,
             &asset.path,
             &asset.sha256,
             force,
             allow_unverified,
+            &mut |received, total| {
+                on_progress(DownloadProgress {
+                    asset: name,
+                    received,
+                    total,
+                });
+            },
         )?;
     }
     Ok(status(config))
@@ -394,6 +491,58 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(dir_mode, 0o700);
+    }
+
+    #[test]
+    fn streaming_reports_progress_and_the_final_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("kernel");
+        let mut seen = Vec::new();
+        let payload = vec![b'x'; (PROGRESS_STEP * 3 + 17) as usize];
+        let sha = hex::encode(Sha256::digest(&payload));
+        let written = install_from_reader_with_progress(
+            Cursor::new(payload.clone()),
+            &dest,
+            &sha,
+            false,
+            false,
+            &mut |received| seen.push(received),
+        )
+        .unwrap();
+        assert_eq!(written, payload.len() as u64);
+        assert!(!seen.is_empty(), "progress must be reported at least once");
+        assert_eq!(seen.last().copied(), Some(payload.len() as u64));
+        assert!(
+            seen.windows(2).all(|pair| pair[0] < pair[1]),
+            "progress only moves forward: {seen:?}"
+        );
+        assert!(seen.len() < 10, "progress is throttled: {seen:?}");
+    }
+
+    #[test]
+    fn download_fraction_clamps_to_the_advertised_length() {
+        let progress = DownloadProgress {
+            asset: "rootfs",
+            received: 512,
+            total: Some(1024),
+        };
+        assert_eq!(progress.fraction(), Some(0.5));
+        let overshoot = DownloadProgress {
+            received: 2048,
+            ..progress
+        };
+        assert_eq!(overshoot.fraction(), Some(1.0));
+        let unknown = DownloadProgress {
+            asset: "kernel",
+            received: 5,
+            total: None,
+        };
+        assert_eq!(unknown.fraction(), None);
+        let empty = DownloadProgress {
+            total: Some(0),
+            ..unknown
+        };
+        assert_eq!(empty.fraction(), None);
     }
 
     #[test]
