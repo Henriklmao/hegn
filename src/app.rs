@@ -2717,6 +2717,15 @@ impl App {
         }]
     }
 
+    /// Drop the embedded console before another client attaches.
+    ///
+    /// The relay accepts one frontend at a time: a second `hegn attach` kicks
+    /// the TUI's socket, which used to leave the terminal in a half-dead state.
+    pub fn detach_console(&mut self) {
+        self.session = None;
+        self.terminal_mode = TerminalMode::Normal;
+    }
+
     /// Install a console for a successfully started/attached VM.
     pub fn attach_console(&mut self, console: Box<dyn TerminalConsole>) {
         self.instance.state = InstanceState::Running;
@@ -4008,6 +4017,17 @@ mod tests {
         assert_eq!(app.terminal_mode, TerminalMode::Insert);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::Project);
+    }
+
+    #[test]
+    fn detaching_drops_the_embedded_console_before_an_external_attach() {
+        let (_dir, mut app) = test_app();
+        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
+        app.terminal_mode = TerminalMode::Insert;
+        app.detach_console();
+        assert!(app.session.is_none());
+        assert_eq!(app.terminal_mode, TerminalMode::Normal);
+        assert_eq!(app.instance.state, InstanceState::Running);
     }
 
     #[test]

@@ -604,18 +604,32 @@ fn handle_effects(
             }
             Effect::AttachConsole { instance } => {
                 let registry = crate::instance::InstanceRegistry::new(app.config.clone());
+                // Release the embedded client first. Otherwise the external
+                // attach replaces it in the relay and the TUI keeps a dead
+                // socket when the user comes back.
+                app.detach_console();
                 let result = with_suspended_terminal(terminal, || {
                     let config = registry.resolve(&instance)?;
                     let console = registry.manager(config).ensure_console()?;
                     crate::console::run_interactive(console, true)
                 });
-                match result {
-                    Ok(()) => {
-                        app.project_view = crate::app::ProjectView::Split;
-                        app.terminal_focus = true;
-                        app.toast("detached from console", ToastLevel::Info);
+                let reattached = registry
+                    .resolve(&instance)
+                    .ok()
+                    .and_then(|config| registry.manager(config).attach_console().ok());
+                if let Some(console) = reattached {
+                    app.attach_console(Box::new(console));
+                    app.project_view = crate::app::ProjectView::Split;
+                    app.terminal_focus = true;
+                } else {
+                    match result {
+                        Ok(()) => {
+                            app.project_view = crate::app::ProjectView::Split;
+                            app.terminal_focus = true;
+                            app.toast("detached from console", ToastLevel::Info);
+                        }
+                        Err(err) => app.toast(format!("attach failed: {err}"), ToastLevel::Error),
                     }
-                    Err(err) => app.toast(format!("attach failed: {err}"), ToastLevel::Error),
                 }
             }
             Effect::StopInstance { instance } => {
