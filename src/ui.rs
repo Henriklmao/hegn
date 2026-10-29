@@ -3122,10 +3122,20 @@ fn render_doctor(
 
     let mut lines = Vec::new();
     if let Some(error) = &modal.error {
-        lines.push(Line::from(Span::styled(
-            format!(" failure: {error}"),
-            Style::default().fg(RED).add_modifier(Modifier::BOLD),
-        )));
+        // Wrap instead of ellipsizing: the failure usually contains a long path
+        // plus the real cause, and the modal scrolls, so there is room for it.
+        let prefix = " failure: ";
+        // Leave the rightmost column for the scrollbar when the modal scrolls.
+        let width = (inner.width.saturating_sub(1) as usize)
+            .saturating_sub(prefix.width())
+            .max(1);
+        for (index, chunk) in wrap_text(error, width).into_iter().enumerate() {
+            let lead = if index == 0 { prefix } else { "          " };
+            lines.push(Line::from(Span::styled(
+                format!("{lead}{chunk}"),
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            )));
+        }
         lines.push(Line::default());
     }
     for check in &modal.report.checks {
@@ -4110,6 +4120,30 @@ mod tests {
             hits.footer
                 .iter()
                 .any(|hit| hit.action == ActionId::SubmitImport)
+        );
+    }
+
+    #[test]
+    fn doctor_modal_wraps_the_full_failure_message() {
+        let (_dir, mut app) = app();
+        let report = crate::doctor::DoctorReport {
+            ok: false,
+            checks: Vec::new(),
+            assets: Vec::new(),
+            setup: crate::doctor::SetupActions::default(),
+        };
+        let error = format!(
+            "failed to grow the instance rootfs /home/henrik/.local/share/hegn/instances/oc-test/rootfs.qcow2 ({}): END-OF-ERROR",
+            "very-long-segment-".repeat(12)
+        );
+        app.modal = Some(Modal::Doctor(crate::app::DoctorModal::with_error(
+            report, error,
+        )));
+        let (text, _) = render(&app);
+        assert!(text.contains("failure:"), "{text}");
+        assert!(
+            text.contains("END-OF-ERROR"),
+            "the modal must wrap instead of ellipsizing: {text}"
         );
     }
 

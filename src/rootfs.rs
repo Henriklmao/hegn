@@ -26,7 +26,6 @@ pub const MIN_INSTANCE_ROOTFS_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 const QCOW2_MAGIC: u32 = 0x5146_49fb;
 const HEADER_BYTES: usize = 104;
-const INCOMPAT_DIRTY: u64 = 1 << 0;
 const INCOMPAT_CORRUPT: u64 = 1 << 1;
 const INCOMPAT_EXTERNAL_DATA: u64 = 1 << 2;
 const INCOMPAT_COMPRESSION_TYPE: u64 = 1 << 3;
@@ -184,8 +183,10 @@ fn grow_qcow2(path: &Path, target: u64) -> Result<bool> {
         bail!("qcow2 images with internal snapshots are not resized in-process");
     }
     let incompatible = header.incompatible_features;
-    if incompatible & (INCOMPAT_DIRTY | INCOMPAT_CORRUPT) != 0 {
-        bail!("qcow2 image is dirty or corrupt; refusing to resize it");
+    // Cloud Hypervisor leaves the dirty flag set after a VM stops. The image is
+    // still writable and boots normally, so only a corrupt image is rejected.
+    if incompatible & INCOMPAT_CORRUPT != 0 {
+        bail!("qcow2 image is corrupt; refusing to resize it");
     }
     if incompatible & INCOMPAT_EXTERNAL_DATA != 0 {
         bail!("qcow2 images with external data files are not resized in-process");
@@ -265,11 +266,12 @@ fn grow_qcow2(path: &Path, target: u64) -> Result<bool> {
     Ok(true)
 }
 
-/// Pick a free cluster for the new L1 table and mark it allocated.
+/// Pick the cluster for the new L1 table and mark it allocated.
 ///
-/// Existing holes are preferred so the image does not have to grow its
-/// refcount table. When no hole is available, a cluster is appended as long as
-/// the current refcount table already covers it.
+/// The table is always appended past the current end of the image. Reusing a
+/// refcount-zero hole would be cheaper in file size, but a dirty image (Cloud
+/// Hypervisor leaves that flag set after shutdown) may have stale refcounts, so
+/// appending is the only choice that cannot overwrite existing guest data.
 fn allocate_l1_cluster(
     file: &fs::File,
     header: &Header,
@@ -284,38 +286,7 @@ fn allocate_l1_cluster(
     let table_entries =
         header.refcount_table_clusters as usize * cluster_size as usize / size_of::<u64>();
     let coverage = table_entries as u64 * entries_per_block as u64;
-    let file_len = file.metadata()?.len();
-
-    for block_index in 0..table_entries {
-        let block_offset = refcount_block_offset(file, header, block_index)?;
-        if block_offset == 0 {
-            continue;
-        }
-        let mut block = vec![0u8; cluster_size as usize];
-        file.read_exact_at(&mut block, block_offset)
-            .with_context(|| {
-                format!(
-                    "failed to read qcow2 refcount block {block_index} at {block_offset} \
-                 (file is {} bytes)",
-                    file_len
-                )
-            })?;
-        for entry in 0..entries_per_block {
-            if read_refcount(&block, entry, entry_bytes) != 0 {
-                continue;
-            }
-            let cluster = block_index as u64 * entries_per_block as u64 + entry as u64;
-            // Never touch a cluster that the refcount table cannot describe.
-            // Cluster zero holds the header, so a zero refcount there means the
-            // image is already inconsistent; do not overwrite it.
-            if cluster == 0 || cluster >= coverage {
-                continue;
-            }
-            return Ok((cluster, entry_bytes));
-        }
-    }
-
-    let cluster = file_len.div_ceil(cluster_size);
+    let cluster = file.metadata()?.len().div_ceil(cluster_size);
     if cluster >= coverage {
         bail!("qcow2 refcount table is full; cannot append an L1 table");
     }
@@ -379,7 +350,7 @@ fn write_refcount(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::Write;
 
     const CLUSTER: usize = 512;
 
@@ -446,7 +417,7 @@ mod tests {
         let l1_size = read_u32(&file, 36);
         let l1_offset = read_u64(&file, 40);
         assert_eq!(l1_size, 32);
-        assert_eq!(l1_offset % CLUSTER as u64, 0);
+        assert_eq!(l1_offset, (CLUSTER * 6) as u64);
         // The new L1 cluster is allocated with a big-endian refcount of one.
         let refcount_table = read_u64(&file, CLUSTER as u64);
         let mut refcount = [0u8; 2];
@@ -511,27 +482,23 @@ mod tests {
     }
 
     #[test]
-    fn append_falls_back_to_a_hole_when_eof_is_outside_the_refcount_table() {
-        // Keep the helper honest: a file with an allocated cluster count at the
-        // refcount coverage boundary must still find an earlier hole instead of
-        // appending a cluster it cannot describe.
+    fn dirty_images_still_grow() {
+        // Cloud Hypervisor leaves the qcow2 dirty flag set after shutdown. That
+        // must not stop the first boot from growing the disk.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("disk.qcow2");
         synthetic_qcow2(&path);
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
-        // Make cluster 6 look allocated, leaving cluster 7 as the first hole.
-        let refcount = CLUSTER * 2;
-        file.seek(SeekFrom::Start(refcount as u64 + 6 * 2)).unwrap();
-        file.write_all(&1u16.to_be_bytes()).unwrap();
+        file.write_all_at(&1u64.to_be_bytes(), 72).unwrap();
         file.sync_all().unwrap();
         let target = 1024 * 1024;
-        grow(&path, RootfsFormat::Qcow2, target).unwrap();
+        assert!(grow(&path, RootfsFormat::Qcow2, target).unwrap());
         let file = OpenOptions::new().read(true).open(&path).unwrap();
-        let l1_offset = read_u64(&file, 40);
-        assert_eq!(l1_offset, (CLUSTER * 7) as u64);
+        assert_eq!(read_u64(&file, 24), target);
+        assert_eq!(read_u32(&file, 36), 32);
     }
 }
