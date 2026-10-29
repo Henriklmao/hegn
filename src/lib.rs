@@ -26,6 +26,7 @@
 //! - [`ui`] — ratatui rendering
 //! - [`tui`] — terminal lifecycle and event loop
 //! - [`benchmark`] — measured host cost and disk usage
+//! - [`rootfs`] — growing per-instance root filesystems before the first boot
 //! - [`cli`] — non-interactive command surface
 
 pub mod app;
@@ -47,6 +48,7 @@ pub mod profile;
 pub mod project;
 pub mod provision;
 pub mod relay;
+pub mod rootfs;
 pub mod security;
 pub mod snapshot;
 pub mod state;

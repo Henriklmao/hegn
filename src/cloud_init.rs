@@ -25,7 +25,7 @@ const SEED_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Increment when the seed's user-data changes so existing instances re-run
 /// cloud-init on their next boot.
-pub const SEED_VERSION: u32 = 7;
+pub const SEED_VERSION: u32 = 8;
 
 fn meta_data(instance_id: &str) -> String {
     format!("instance-id: {instance_id}\nlocal-hostname: hegn\n")

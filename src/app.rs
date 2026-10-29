@@ -708,6 +708,8 @@ pub struct App {
     pub toast: Option<Toast>,
     /// In-flight VM image download, rendered as a progress notification.
     pub download: Option<crate::images::DownloadProgress>,
+    /// First-boot harness provisioning, rendered above the download/toast.
+    pub provision: Option<crate::provision::ProvisionProgress>,
     pub footer_hits: Vec<FooterHit>,
     /// Settings rows and `‹ ›` steppers recorded by the renderer.
     pub config_rows: Vec<RowHit>,
@@ -781,6 +783,7 @@ impl App {
             scroll: 0,
             toast: None,
             download: None,
+            provision: None,
             footer_hits: Vec::new(),
             config_rows: Vec::new(),
             config_steppers: Vec::new(),
@@ -1130,6 +1133,26 @@ impl App {
     /// Drop the download notification once the worker has reported back.
     pub fn clear_download_progress(&mut self) {
         self.download = None;
+    }
+
+    /// Record the latest first-boot provisioning stage.
+    pub fn set_provision_progress(&mut self, progress: crate::provision::ProvisionProgress) {
+        self.provision = Some(progress);
+    }
+
+    /// The guest finished installing the harness preset.
+    pub fn provision_ready(&mut self) {
+        self.provision = None;
+        self.toast("harness preset ready", ToastLevel::Info);
+    }
+
+    /// Provisioning stopped before the marker was written.
+    pub fn provision_failed(&mut self, message: String) {
+        self.provision = None;
+        self.toast(
+            format!("harness setup failed: {message}"),
+            ToastLevel::Error,
+        );
     }
 
     pub fn set_viewport(&mut self, cols: u16, rows: u16) {

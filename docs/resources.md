@@ -91,7 +91,7 @@ in-flight work before stopping; snapshots do **not** preserve disk contents.
 | Item | Size (measured) | Notes |
 | --- | --- | --- |
 | Guest kernel | 46 MiB | `vmlinux-x86_64`, pinned and SHA-256 verified |
-| Guest rootfs | 1.9 GiB | qcow2 cloud image, shared by all projects, writable and persistent |
+| Guest rootfs | 1.9 GiB base, 16 GiB virtual per instance | the pinned qcow2 is copied (reflink where supported) per instance and grown sparsely for the harness packages; only written blocks consume host space |
 | `images/` total | 2.2 GiB | after the pre-Cloud-Hypervisor migration a checkout may still contain the old `rootfs.ext4` (300 MiB) and `vmlinux.bin` (42 MiB); they can be deleted |
 | `hegn` binary | 19 MiB | stripped release build |
 | `cloud-hypervisor-static` | 7 MiB | upstream static binary |
@@ -103,21 +103,19 @@ in-flight work before stopping; snapshots do **not** preserve disk contents.
 | Development checkout | ~9.3 GiB `target/` (this repository) | debug and release artifacts; `cargo clean` reclaims it |
 
 Minimum free space for a usable install: **~2.5 GiB** (images plus tools), plus
-whatever the guest writes into its rootfs, plus snapshots. Budget **5 GiB** if
-snapshots of the default 2 GiB guest are part of the workflow.
+whatever the guest writes into its rootfs, plus snapshots. The 16 GiB instance
+size is sparse; a fully provisioned OpenCode guest typically uses a few GiB.
+Budget **5 GiB** if snapshots of the default 2 GiB guest are part of the
+workflow.
 
 ### Lifecycle of the rootfs
 
-The qcow2 image is mounted read-write and reused by every project. Guest
-changes (installed packages, edited dotfiles, experiment leftovers) persist and
-grow the image; snapshots capture RAM, not the disk. To get a clean rootfs back,
-re-download the pinned image:
-
-```bash
-hegn images download --force   # replaces the qcow2 with the pristine pinned image
-```
-
-That discards everything installed in the guest.
+Each instance gets its own writable rootfs copy on first start. Guest changes
+(installed packages, edited dotfiles, experiment leftovers) persist in that
+instance and are not shared with other projects. Snapshots capture RAM, not the
+disk. To get a clean rootfs back, delete the instance; the next start copies
+the pristine pinned image again. `hegn images download --force` only replaces
+the shared base image.
 
 ## Compared with working natively
 

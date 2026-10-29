@@ -60,6 +60,7 @@ is the minimum bar.
 - `src/snapshot.rs` / `src/state.rs` — persisted metadata under XDG dirs.
 - `src/images.rs` / `src/doctor.rs` — pinned upstream VM assets and shared
   prerequisite checks.
+- `src/rootfs.rs` — sparse per-instance disk growth (raw and qcow2).
 - `docs/architecture.md` — detailed module, lifecycle, safety and CI documentation.
 - `src/app.rs` / `src/ui.rs` / `src/tui.rs` — state machine, rendering, terminal
   event loop.

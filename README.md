@@ -272,21 +272,28 @@ the guest on first boot (tracked by `/var/lib/hegn/provisioned`):
 | Preset | Installs |
 | --- | --- |
 | `shell` | base CLI tools (git, curl, ripgrep, fd, jq, less) |
-| `opencode` | Node.js 22 + `opencode-ai` |
-| `claude-code` | Node.js 22 + `@anthropic-ai/claude-code` |
-| `codex` | Node.js 22 + `@openai/codex` |
-| `pi` | Node.js 22 + `@earendil-works/pi-coding-agent` |
+| `opencode` | Node.js 22 + npm + `opencode-ai` |
+| `claude-code` | Node.js 22 + npm + `@anthropic-ai/claude-code` |
+| `codex` | Node.js 22 + npm + `@openai/codex` |
+| `pi` | Node.js 22 + npm + `@earendil-works/pi-coding-agent` |
 | `prime-agent` | Python + the official Prime Agent installer |
 | `aider` | Python + `aider-chat` |
-| `gemini-cli` | Node.js 22 + `@google/gemini-cli` |
+| `gemini-cli` | Node.js 22 + npm + `@google/gemini-cli` |
 
-Provisioning runs as a systemd oneshot on every boot until it succeeds. Node
-presets upgrade Jammy's old package to Node.js 22 from NodeSource inside the
-guest. Package selections from the create form/`--package` are additive: the
-preset can never lose its runtime because a user deselected a box. The install
-log appears on the serial console and in the journal; attach and wait for
-`hegn: preset ready` on the first boot. Presets that need packages require the
-guarded network, because installation happens inside the guest.
+Provisioning runs as a systemd oneshot on every boot until it succeeds. Before
+the first boot, each instance's disk is extended to a 16 GiB *sparse* virtual
+size (only written blocks consume host space), so Node.js and the requested
+packages fit. Node presets upgrade Jammy's old package to Node.js 22 from
+NodeSource inside the guest. Package selections from the create form/`--package`
+are additive: the preset can never lose its runtime because a user deselected a
+box.
+
+The TUI shows a progress notification with the current stage and a rough ETA
+while the preset is being installed, and `hegn open` draws the same bar on the
+terminal before attaching. The install log is also on the serial console and in
+the journal; wait for `hegn: preset ready` on the first boot. The provisioner
+waits for guest DNS, retries apt, and requires the guarded network because
+installation happens inside the guest.
 
 ### Harness profiles and skill sync
 

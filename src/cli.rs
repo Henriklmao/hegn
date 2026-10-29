@@ -4,6 +4,7 @@
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -17,6 +18,7 @@ use crate::images::{self, AssetStatus};
 use crate::instance::{InstanceRegistry, InstanceReport, InstanceSummary, process_alive};
 use crate::logs::{self, DEFAULT_KEEP, LogStore};
 use crate::project::{self, ProjectMeta};
+use crate::provision::{ProvisionPlan, ProvisionProgress, ProvisionWatcher};
 use crate::security::{Decision, SecurityEngine};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
 use crate::terminal::TerminalBuffer;
@@ -1624,8 +1626,19 @@ fn open(
     let harness = meta.harness.unwrap_or(config.harness);
     let registry = InstanceRegistry::new(config.clone());
     let instance = registry.ensure_for_project(&path, harness)?;
+    let plan = ProvisionPlan::new(instance.harness, &instance.extra_packages).ok();
     let manager = registry.manager(instance.clone());
-    let console = manager.ensure_console()?;
+    let report = if manager.is_running() {
+        manager.status().ok()
+    } else {
+        Some(manager.start()?)
+    };
+    if config.cloud_init
+        && let (Some(report), Some(plan)) = (&report, plan)
+    {
+        wait_for_provision(report.serial_log.as_deref(), &plan);
+    }
+    let console = manager.attach_console()?;
 
     // Only mutate the workspace repository once a VM is actually available.
     let workspace = instance.workspace.clone();
@@ -1639,6 +1652,77 @@ fn open(
 
     crate::console::run_interactive(console, !no_bar)?;
     Ok(0)
+}
+
+/// Wait for the guest provisioner while showing a rough progress bar.
+///
+/// Pre-provisioned images never emit progress, so the wait is bounded: after a
+/// short grace period `hegn open` attaches normally.
+fn wait_for_provision(log: Option<&Path>, plan: &ProvisionPlan) {
+    let Some(log) = log else {
+        return;
+    };
+    let Ok(mut watcher) = ProvisionWatcher::open(log, plan) else {
+        return;
+    };
+    let tty = std::io::stderr().is_terminal();
+    let started = Instant::now();
+    let mut last_update = started;
+    let mut last_label = String::new();
+    loop {
+        match watcher.poll() {
+            Ok(events) if !events.is_empty() => last_update = Instant::now(),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if watcher.saw_progress() {
+            let progress = watcher.progress();
+            if tty {
+                draw_cli_provision(progress);
+            } else {
+                let label = progress.stage_label();
+                if label != last_label {
+                    eprintln!("hegn: {label}");
+                    last_label = label.to_string();
+                }
+            }
+        }
+        if watcher.finished() {
+            break;
+        }
+        if !watcher.saw_progress() && started.elapsed() > Duration::from_secs(20) {
+            break;
+        }
+        // A guest that stops reporting for several minutes is better watched
+        // through the console than through a frozen bar.
+        if watcher.saw_progress() && last_update.elapsed() > Duration::from_secs(5 * 60) {
+            break;
+        }
+        if started.elapsed() > Duration::from_secs(15 * 60) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if tty && watcher.saw_progress() {
+        eprint!("\r\x1b[2K");
+        let _ = std::io::stderr().flush();
+    }
+}
+
+fn draw_cli_provision(progress: &ProvisionProgress) {
+    const WIDTH: usize = 28;
+    let filled = (progress.fraction() * WIDTH as f64).round() as usize;
+    let bar = format!(
+        "{}{}",
+        "█".repeat(filled.min(WIDTH)),
+        "░".repeat(WIDTH.saturating_sub(filled))
+    );
+    eprint!(
+        "\r\x1b[2K setting up {}  [{bar}]  {}  ",
+        progress.harness_label(),
+        progress.eta_label()
+    );
+    let _ = std::io::stderr().flush();
 }
 
 fn attach(project: Option<String>, no_bar: bool, config: Config) -> Result<i32> {

@@ -21,6 +21,7 @@ use crate::config::{Config, Harness};
 use crate::console::TerminalConsole;
 use crate::doctor::DoctorReport;
 use crate::project;
+use crate::provision::{ProvisionEvent, ProvisionPlan, ProvisionProgress, ProvisionWatcher};
 use crate::ui;
 
 const TICK: Duration = Duration::from_millis(50);
@@ -43,6 +44,10 @@ enum ScanMessage {
     },
     /// Byte progress for an in-flight image download.
     DownloadProgress(crate::images::DownloadProgress),
+    /// Live first-boot harness provisioning progress.
+    Provision(ProvisionProgress),
+    ProvisionReady,
+    ProvisionFailed(String),
     Error(String),
 }
 
@@ -158,6 +163,9 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 app.show_doctor(report, note);
             }
             Ok(ScanMessage::DownloadProgress(progress)) => app.set_download_progress(progress),
+            Ok(ScanMessage::Provision(progress)) => app.set_provision_progress(progress),
+            Ok(ScanMessage::ProvisionReady) => app.provision_ready(),
+            Ok(ScanMessage::ProvisionFailed(err)) => app.provision_failed(err),
             Ok(ScanMessage::Error(err)) => {
                 app.loading = false;
                 app.toast(format!("project scan failed: {err}"), ToastLevel::Error);
@@ -340,8 +348,25 @@ fn spawn_start(
             };
             let workspace = instance.workspace.clone();
             let auto_branch = instance.auto_branch;
+            let plan = ProvisionPlan::new(instance.harness, &instance.extra_packages).ok();
             let manager = registry.manager(instance);
-            match manager.ensure_console() {
+            let started = if manager.is_running() {
+                manager.status().ok()
+            } else {
+                match manager.start() {
+                    Ok(report) => Some(report),
+                    Err(err) => {
+                        let _ = thread_tx.send(ScanMessage::StartFailed(err.to_string()));
+                        return;
+                    }
+                }
+            };
+            if let (Some(report), Some(plan)) = (&started, plan)
+                && let Some(log) = &report.serial_log
+            {
+                spawn_provision_watch(log.clone(), plan, thread_tx.clone());
+            }
+            match manager.attach_console() {
                 Ok(console) => {
                     let branch = if auto_branch && project::read_git_summary(&workspace).is_repo {
                         Some(
@@ -366,6 +391,85 @@ fn spawn_start(
             "could not start the VM start thread: {err}"
         )));
     }
+}
+
+/// Follow the session log while cloud-init installs the harness preset.
+///
+/// The watcher never owns the console socket; it only reads the relay's log, so
+/// the user can attach immediately and still see the progress notification.
+fn spawn_provision_watch(
+    log: std::path::PathBuf,
+    plan: ProvisionPlan,
+    tx: mpsc::Sender<ScanMessage>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("hegn-provision-watch".into())
+        .spawn(move || {
+            let Ok(mut watcher) = ProvisionWatcher::open(&log, &plan) else {
+                return;
+            };
+            let started = Instant::now();
+            let mut announced = false;
+            loop {
+                let events = match watcher.poll() {
+                    Ok(events) => events,
+                    Err(err) => {
+                        if announced {
+                            let _ = tx.send(ScanMessage::ProvisionFailed(format!(
+                                "could not read the provisioning log: {err}"
+                            )));
+                        }
+                        return;
+                    }
+                };
+                if !events.is_empty() {
+                    announced = true;
+                    if tx
+                        .send(ScanMessage::Provision(watcher.progress().clone()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                for event in events {
+                    match event {
+                        ProvisionEvent::Stage(_) => {}
+                        ProvisionEvent::Ready => {
+                            let _ = tx.send(ScanMessage::ProvisionReady);
+                            return;
+                        }
+                        ProvisionEvent::Failed { code, message } => {
+                            let detail = message.unwrap_or_else(|| {
+                                code.map_or_else(
+                                    || "the guest provisioner failed".to_string(),
+                                    |code| format!("exit status {code}"),
+                                )
+                            });
+                            let _ = tx.send(ScanMessage::ProvisionFailed(detail));
+                            return;
+                        }
+                    }
+                }
+                if watcher.finished() {
+                    return;
+                }
+                // A pre-provisioned image (or `cloud_init = false`) never emits
+                // progress. Stop quietly instead of leaving a thread behind.
+                if !announced && started.elapsed() > Duration::from_secs(60) {
+                    return;
+                }
+                if started.elapsed() > Duration::from_secs(60 * 60) {
+                    let _ = tx.send(ScanMessage::ProvisionFailed(
+                        "timed out waiting for the harness preset".into(),
+                    ));
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        });
+    // The VM is already running. Progress is best-effort; never turn a
+    // watcher failure into a start failure.
+    let _ = spawned;
 }
 
 fn handle_effects(

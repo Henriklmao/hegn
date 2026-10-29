@@ -189,7 +189,8 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `security.rs` | `tirith-core` integration and hegn workspace rules | Empty commands allowed; off mode still keeps destructive-operation guard |
 | `cloud_hypervisor.rs` | Typed REST client over `/api/v1` | Frames responses by `Content-Length`/chunked encoding, accepts bodyless `204`, bounded response sizes, pause/resume/info/snapshot only |
 | `cloud_init.rs` | NoCloud seed generation | FAT volume labelled `CIDATA`; serial root autologin; first-boot provisioner and guest network config; no secrets; `0600` and `O_NOFOLLOW` |
-| `provision.rs` | Harness preset install plans and first-boot script | Preset packages are always unioned; package names validated; only static install commands; verifies the CLI exists before writing the marker |
+| `provision.rs` | Harness preset install plans and first-boot script | Preset packages are always unioned; package names validated; only static install commands; waits for DNS, retries apt, emits serial progress stages and verifies the CLI before writing the marker |
+| `rootfs.rs` | Per-instance disk growth | Extends raw images sparsely and grows qcow2 virtual size in place; `qemu-img` fallback for unsupported layouts |
 | `profile.rs` | Per-harness profile templates, guest payload materialization, skill sync | Source/target/mode/env validation; config files refreshed every start; skills seeded once into a private per-instance copy; a second sandboxed virtiofsd exports only that copy; sync-back copies regular files and skips symlinks/special files |
 | `network.rs` | Guarded host network: TAP pool reservation, nftables rules, setup marker | Root-only marker; anti-spoof; private/IPv6/guest-to-host drop; HTTP(S)+public DNS allow-list; per-instance `/30` slice; stale reservations reclaimed only when the owning VM is not running; opt-in loopback endpoints are DNATed per TAP with `route_localnet` and cannot write; TAP pool exempted from ufw/firewalld/iptables routed policies because netfilter applies every `forward` base chain |
 | `relay.rs` | Detached serial relay | Sole VMM serial client; append-only log; replays the log tail on attach; bounded buffers; refuses to replace non-socket paths; stderr goes to `run/console-relay.log` because it has no terminal |
@@ -223,7 +224,9 @@ All state paths can be overridden in `config.toml` or by environment variables
 4. If a stale session exists, clean up its run files and any verified children.
 5. Create the session log (`LogStore::create_session`); prune old logs
    best-effort. Give the instance a private rootfs copy on first start (reflink or
-   full copy).
+   full copy) and extend it to a 16 GiB sparse virtual size so the first-boot
+   package installation has room. qcow2 images get a larger L1 table without
+   rewriting existing clusters.
 6. Materialize the harness profile into
    `<instance>/profile/bundle`: refresh configuration files and environment from
    the host, keep existing skill copies, and compute the manifest id. Missing
@@ -352,7 +355,11 @@ cannot export the host filesystem or runtime state through virtiofsd.
    each skill target at the per-instance copy, and installs `env.sh` in
    `/etc/profile.d`. The provisioning oneshot runs it on every boot, before its
    install marker check.
-6. `hegn skills sync` merges new/changed host files into the existing skill
+6. The provisioner grows the root partition/filesystem, waits for guest DNS,
+   retries `apt-get`, and emits `hegn-progress:` JSON lines on the serial
+   console. The TUI/`hegn open` tail the session log and render those stages as
+   a progress bar with a rough ETA.
+7. `hegn skills sync` merges new/changed host files into the existing skill
    copy. `hegn skills sync-back` walks the copy and writes changed/new regular
    files to the configured host source, refusing symlinks and special files; it
    refuses a live VM unless `--force` is given.
@@ -907,7 +914,8 @@ src/
   security.rs    tirith-core + hegn workspace guardrails
   cloud_hypervisor.rs typed REST client
   cloud_init.rs   NoCloud seed generation
-  provision.rs    harness preset installers and first-boot script
+  provision.rs    harness preset installers, progress stages and first-boot script
+  rootfs.rs       sparse raw/ qcow2 growth for per-instance disks
   network.rs      guarded TAP pool, nftables rules and reservations
   relay.rs        detached serial relay
   virtiofs.rs    hardened virtiofsd process construction

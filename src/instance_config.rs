@@ -138,6 +138,10 @@ impl InstanceConfig {
     pub fn prepare_rootfs(&self, config: &Config) -> Result<PathBuf> {
         let dest = self.rootfs_path(config);
         if crate::images::is_regular_file(&dest) {
+            // An instance that was prepared by an older hegn version may still
+            // be at the cloud image's 2.2 GiB. Grow it before the next boot so
+            // the provisioner has room for Node.js and the harness.
+            self.grow_rootfs(config, &dest)?;
             return Ok(dest);
         }
         if self.rootfs_image.is_some() {
@@ -180,7 +184,24 @@ impl InstanceConfig {
             let _ = fs::remove_file(&tmp);
         }
         result?;
+        self.grow_rootfs(config, &dest)?;
         Ok(dest)
+    }
+
+    /// Grow the guest disk before the first boot. Cloud-init installs the
+    /// harness inside the guest, so the upstream 2.2 GiB image is too small.
+    fn grow_rootfs(&self, config: &Config, path: &Path) -> Result<()> {
+        if !config.cloud_init {
+            return Ok(());
+        }
+        crate::rootfs::grow_to_minimum(path, config.rootfs_format).with_context(|| {
+            format!(
+                "failed to grow the instance rootfs {} (the first boot needs room for the \
+                 harness preset)",
+                path.display()
+            )
+        })?;
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -1049,6 +1070,9 @@ mod tests {
         let mut cfg = config(dir.path());
         cfg.rootfs_image = dir.path().join("base.qcow2");
         cfg.rootfs_format = crate::config::RootfsFormat::Qcow2;
+        // This fixture is not a real qcow2 image, so disable the first-boot
+        // growth path and assert the plain copy behaviour.
+        cfg.cloud_init = false;
         fs::write(&cfg.rootfs_image, b"rootfs-bytes").unwrap();
         let store = InstanceStore::new(cfg.clone());
         let project = project(dir.path(), "demo");
