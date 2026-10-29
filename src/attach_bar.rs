@@ -27,7 +27,7 @@ use crate::logs::sanitize_label;
 ///
 /// `^B` is the tmux-style detach key. `^]` is the classic serial-console
 /// escape: a nested tmux consumes `^B` as its own prefix before hegn sees it.
-pub const DETACH_HINT: &str = " INPUT DIRECT · Ctrl-B/^] detach";
+pub const DETACH_HINT: &str = " INPUT DIRECT · Ctrl-B/Ctrl-] detach";
 
 /// Whether a key event asks to detach without stopping the VM.
 ///
