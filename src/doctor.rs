@@ -202,10 +202,8 @@ pub fn run(config: &Config) -> DoctorReport {
         config.projects_root.display().to_string(),
     ));
     let guarded = config.network == crate::config::NetworkMode::Guarded;
-    let taps = crate::network::status(config);
-    let guard_ready = crate::network::ready_marker().is_some()
-        && taps.len() == usize::from(crate::network::TAP_POOL)
-        && taps.iter().all(|tap| tap.exists);
+    let marker = crate::network::ready_marker();
+    let guard_ready = crate::network::guard_ready(config);
     checks.push(Check::new(
         "network guard",
         guard_ready || !guarded,
@@ -214,7 +212,7 @@ pub fn run(config: &Config) -> DoctorReport {
             "disabled in config (air-gapped guest)".to_string()
         } else if guard_ready {
             let endpoints = config.local_endpoints.len();
-            if endpoints == 0 {
+            let mut detail = if endpoints == 0 {
                 format!(
                     "guarded egress: public HTTP(S)+DNS only, {} TAP slices",
                     crate::network::TAP_POOL
@@ -224,9 +222,30 @@ pub fn run(config: &Config) -> DoctorReport {
                     "guarded egress + {endpoints} local endpoint(s), {} TAP slices",
                     crate::network::TAP_POOL
                 )
+            };
+            if let Some(firewall) = marker
+                .as_ref()
+                .map(|marker| marker.host_firewall)
+                .filter(|firewall| *firewall != crate::network::HostFirewall::None)
+            {
+                // Without the carve-out a host firewall's routed policy drops
+                // everything hegn accepted, which looks like the guest being
+                // offline. Naming it here turns that into a one-line answer.
+                detail.push_str(&format!("; routed through {}", firewall.label()));
             }
+            detail
+        } else if marker
+            .as_ref()
+            .is_some_and(|marker| marker.endpoints != config.endpoint_ports())
+        {
+            "local endpoints changed; re-run `sudo hegn network setup --user $USER`".to_string()
+        } else if marker.is_some() {
+            "TAP pool incomplete (deleted or renamed); re-run `sudo hegn network setup --user \
+             $USER`"
+                .to_string()
         } else {
-            "not configured or the endpoint list changed; run `sudo hegn network setup --user $USER`"
+            "not configured (or written by an older hegn); run `sudo hegn network setup --user \
+             $USER`"
                 .to_string()
         },
     ));

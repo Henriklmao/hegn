@@ -66,8 +66,9 @@ fix.
   `--sandbox=namespace` (or `chroot`).
 - **Guarded networking** — guests only reach the public web: host nftables
   allows public HTTP(S) + DNS and drops the LAN, IPv6 and all guest→host
-  traffic. Presets install their real CLI (Node 22, Python, etc.) in the guest
-  on first boot.
+  traffic. Host firewalls (ufw, firewalld, plain iptables) are exempted for the
+  TAP pool so their routed policy cannot silently black-hole the guest. Presets
+  install their real CLI (Node 22, Python, etc.) in the guest on first boot.
 - **Zero-copy workspace sharing** — a per-session `virtiofsd` exports only the
   selected project, always sandboxed (`--sandbox=namespace` by default,
   `chroot` optional), and mounts it at `/workspace` in the guest.
@@ -573,6 +574,24 @@ Landlock enabled; if you must run without this layer, set `landlock = false` in
 The TUI doctor modal also opens automatically after a start failure so the
 remaining host checks and image state are visible.
 
+### Guest has no network ("Temporary failure in name resolution")
+
+A host firewall installed *after* `hegn network setup`, or a `ufw reset`, can
+leave its own `forward` rules in place without hegn's TAP exemption. netfilter
+runs every `forward` base chain, so the host firewall then drops the traffic
+hegn already accepted. Re-run the setup once; it is idempotent and re-adds the
+exemption:
+
+```bash
+sudo hegn network setup --user "$USER"
+hegn doctor            # `network guard` names the firewall it routed through
+```
+
+The kernel log shows which rule set dropped a packet:
+`hegn-egress-drop` means hegn's own allow-list denied it (ICMP, the LAN, IPv6
+and guest→host traffic are blocked by design — test with `curl` or `apt`, not
+`ping`), while `[UFW BLOCK]`/`[UFW DOCKER BLOCK]` means the host firewall did.
+
 ### Guardrail exit codes
 
 `hegn check` exits `0` for allow, `1` for block and `2` for warn, so it can be
@@ -734,6 +753,14 @@ hegn network status                      # marker, taps and reservations
 hegn network setup --dry-run --user "$USER"  # inspect the exact script
 sudo hegn network teardown               # remove taps and rules
 ```
+
+Setup also exempts the TAP pool from the active host firewall (ufw `route`
+rules, firewalld direct rules, or `FORWARD` accepts for plain iptables), because
+a firewall with its own routed drop policy would otherwise discard the traffic
+hegn allowed. The exemption is a blanket per-interface accept in *that* firewall
+only; the HTTP(S)/DNS allow-list stays in hegn's table, so the guest's reach is
+unchanged. Re-run setup after installing, enabling or resetting a host firewall,
+and after upgrading from a hegn release whose marker is a previous version.
 
 When hegn invokes `sudo` or `pkexec` itself (`hegn doctor --fix`, the doctor's
 `Set up everything` action), it prints the exact command line with shell quoting
@@ -963,7 +990,10 @@ diagnostic cells use a small ANSI background color.
    and DNS to `1.1.1.1`/`9.9.9.9`; RFC1918, CGNAT, link-local, multicast,
    anti-spoofed sources and all IPv6 are dropped, and all guest→host traffic is
    dropped. The guest's only route is the host `/30` gateway, and NAT exposes
-   nothing inbound. Rules are host-side, so guest root cannot disable them.
+   nothing inbound. Rules are host-side, so guest root cannot disable them. If
+   the host runs a firewall that also filters `forward` (ufw, firewalld, plain
+   iptables), setup exempts the TAP pool from that firewall too — a blanket
+   per-interface accept there, while hegn's table remains the only allow-list.
    `network = "off"` removes the NIC entirely.
 5. **Interception** — in the project terminal, input is buffered into a command
    line and passed to `tirith-core` plus hegn's own workspace guardrails before

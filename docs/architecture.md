@@ -191,7 +191,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `cloud_init.rs` | NoCloud seed generation | FAT volume labelled `CIDATA`; serial root autologin; first-boot provisioner and guest network config; no secrets; `0600` and `O_NOFOLLOW` |
 | `provision.rs` | Harness preset install plans and first-boot script | Preset packages are always unioned; package names validated; only static install commands; verifies the CLI exists before writing the marker |
 | `profile.rs` | Per-harness profile templates, guest payload materialization, skill sync | Source/target/mode/env validation; config files refreshed every start; skills seeded once into a private per-instance copy; a second sandboxed virtiofsd exports only that copy; sync-back copies regular files and skips symlinks/special files |
-| `network.rs` | Guarded host network: TAP pool reservation, nftables rules, setup marker | Root-only marker; anti-spoof; private/IPv6/guest-to-host drop; HTTP(S)+public DNS allow-list; per-instance `/30` slice; stale reservations reclaimed only when the owning VM is not running; opt-in loopback endpoints are DNATed per TAP with `route_localnet` and cannot write |
+| `network.rs` | Guarded host network: TAP pool reservation, nftables rules, setup marker | Root-only marker; anti-spoof; private/IPv6/guest-to-host drop; HTTP(S)+public DNS allow-list; per-instance `/30` slice; stale reservations reclaimed only when the owning VM is not running; opt-in loopback endpoints are DNATed per TAP with `route_localnet` and cannot write; TAP pool exempted from ufw/firewalld/iptables routed policies because netfilter applies every `forward` base chain |
 | `relay.rs` | Detached serial relay | Sole VMM serial client; append-only log; replays the log tail on attach; bounded buffers; refuses to replace non-socket paths; stderr goes to `run/console-relay.log` because it has no terminal |
 | `virtiofs.rs` | virtiofsd argv/process construction | Shared dir canonicalized; always sandboxed; `--cache=never` by default; sockets scoped to run dir |
 | `instance_config.rs` | Per-instance `hegn.toml`, clone/copy workspaces, rootfs copies | Names validated; source project never deleted; git identity copied; clone child output is captured (warnings go to the UI, never the terminal); reflink rootfs with copy fallback |
@@ -455,6 +455,18 @@ These are product requirements, not implementation details.
   resolvers, drops all RFC1918/CGNAT/link-local/multicast destinations, drops
   IPv6 and drops every packet from a TAP addressed to the host. Guest root
   cannot remove host rules. `network = "off"` removes the device entirely.
+- netfilter evaluates every base chain hooked at `forward`, and a drop in any of
+  them wins, so `table inet hegn` can only ever *allow* a packet. A host
+  firewall with a routed drop policy (ufw sets `DEFAULT_FORWARD_POLICY="DROP"`,
+  firewalld drops unassigned interfaces) would therefore discard exactly the
+  traffic hegn accepted, which presents as a guest with no DNS or HTTP. Setup
+  exempts the TAP pool from whichever firewall is active (`ufw route allow in
+  on hegnN`, a firewalld `FORWARD` direct rule, or an iptables `-I FORWARD`
+  accept). The exemption is a blanket per-interface accept *in the host
+  firewall*; it cannot widen what a guest reaches, because hegn's own table
+  still has to accept the same packet. Teardown removes the exemptions again,
+  and the marker version is bumped so an older guard cannot vouch for rules that
+  lack them.
 - The only guest-to-host exception is the configured
   `local_endpoints` list: those TCP ports are DNATed from the instance's own TAP
   host address to `127.0.0.1` and accepted in the input chain, and

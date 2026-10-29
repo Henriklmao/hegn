@@ -1463,8 +1463,11 @@ fn network_command(command: NetworkCommands, config: Config, json: bool) -> Resu
             } else {
                 match &marker {
                     Some(marker) => println!(
-                        "guard: ready (subnet {}, {} TAPs, applied {})",
-                        marker.subnet, marker.pool, marker.applied_at
+                        "guard: ready (subnet {}, {} TAPs, host firewall {}, applied {})",
+                        marker.subnet,
+                        marker.pool,
+                        marker.host_firewall.label(),
+                        marker.applied_at
                     ),
                     None => println!(
                         "guard: not configured; run `sudo hegn network setup --user $USER`"

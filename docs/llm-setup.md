@@ -217,7 +217,9 @@ custom, unhashed images.
 
 This is a host firewall change and needs root. Ask the user before running it.
 It creates a pool of TAP devices owned by the invoking user and installs an
-nftables table that allows only public HTTP(S) and public DNS.
+nftables table that allows only public HTTP(S) and public DNS. It also exempts
+the TAP pool from an active ufw/firewalld/iptables routed policy, which would
+otherwise drop the traffic hegn allows.
 
 The normal path is the automatic doctor setup, which also creates directories,
 writes the default config and downloads the pinned images:

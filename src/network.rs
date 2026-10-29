@@ -7,6 +7,14 @@
 //! is dropped before it can be forwarded. Because the rules live on the host,
 //! root inside the guest cannot remove them.
 //!
+//! netfilter evaluates *every* base chain hooked at `forward` and a drop in any
+//! of them wins, so hegn's own table can only ever allow a packet: a host
+//! firewall such as ufw (`DEFAULT_FORWARD_POLICY="DROP"`) or firewalld would
+//! still drop it. Setup therefore also exempts the TAP pool from the active
+//! host firewall. That exemption is a blanket accept *in the host firewall*;
+//! the HTTP(S)/DNS allow-list stays in hegn's table, which still has to accept
+//! the packet.
+//!
 //! TAP creation and nftables need `CAP_NET_ADMIN`. `hegn network setup` is the
 //! explicit, one-time privileged step; `hegn instance start` is fail-closed and
 //! refuses to boot a guarded VM unless the host marker shows that the firewall
@@ -42,9 +50,39 @@ pub const DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(9, 9, 9
 pub const MARKER: &str = "/run/hegn/network.json";
 /// Bumped only for incompatible rule generations. `endpoints` defaults to an
 /// empty list, so a marker written before local endpoints existed stays valid
-/// for a configuration without endpoints.
-const MARKER_VERSION: u32 = 1;
+/// for a configuration without endpoints. Version 2 added the host-firewall
+/// carve-out: a version 1 guard predates it and would silently drop all guest
+/// traffic on hosts whose firewall also filters `forward`.
+const MARKER_VERSION: u32 = 2;
 const NETWORK_DIR: &str = "network";
+
+/// Host firewalls that filter the netfilter `forward` hook in their own base
+/// chain. Recorded in the marker for `doctor`/`status` output only; the setup
+/// script re-checks at apply time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostFirewall {
+    /// No host firewall with a routed drop policy was detected.
+    #[default]
+    None,
+    /// `ufw` with `Status: active`; its routed policy is usually `DROP`.
+    Ufw,
+    /// A running `firewalld`.
+    Firewalld,
+    /// Plain `iptables` with `-P FORWARD DROP`.
+    Iptables,
+}
+
+impl HostFirewall {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Ufw => "ufw",
+            Self::Firewalld => "firewalld",
+            Self::Iptables => "iptables",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadyMarker {
@@ -55,6 +93,10 @@ pub struct ReadyMarker {
     /// TCP ports DNATed to the host loopback for the guest.
     #[serde(default)]
     pub endpoints: Vec<u16>,
+    /// Host firewall the TAP pool was carved out of. Informational: readiness
+    /// does not depend on it, because detection needs root.
+    #[serde(default)]
+    pub host_firewall: HostFirewall,
     pub applied_at: DateTime<Utc>,
 }
 
@@ -283,6 +325,46 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Which host firewall the TAP pool has to be exempted from.
+///
+/// `ufw status` and `iptables -S` need root, so this is only meaningful inside
+/// [`setup`]. The result is recorded in the marker for reporting; it never
+/// decides whether the guard is ready, so an unprivileged reader (doctor,
+/// `network status`) does not get a false negative. [`setup_script`] repeats
+/// the same checks at apply time, which keeps the `--dry-run` output honest.
+pub fn detect_host_firewall() -> HostFirewall {
+    if command_exists("ufw")
+        && command_stdout("ufw", &["status"])
+            .is_some_and(|out| out.lines().any(|line| line.trim() == "Status: active"))
+    {
+        return HostFirewall::Ufw;
+    }
+    if command_exists("firewall-cmd")
+        && command_stdout("firewall-cmd", &["--state"]).is_some_and(|out| out.trim() == "running")
+    {
+        return HostFirewall::Firewalld;
+    }
+    if command_exists("iptables")
+        && command_stdout("iptables", &["-w", "-S", "FORWARD"])
+            .is_some_and(|out| out.lines().any(|line| line.trim() == "-P FORWARD DROP"))
+    {
+        return HostFirewall::Iptables;
+    }
+    HostFirewall::None
+}
+
 /// Fail closed when guarded networking is configured but not applied.
 pub fn ensure_ready(config: &Config) -> Result<()> {
     if crate::config::NetworkMode::Guarded != config.network {
@@ -489,7 +571,8 @@ pub fn is_privileged() -> bool {
 /// `user` must pass [`safe_user`]; it is embedded in the script deliberately.
 /// `endpoints` are the TCP ports exposed from the host loopback; ports below
 /// 1024 are rejected by [`crate::config::validate_local_endpoints`] before this
-/// function is reached.
+/// function is reached. The script also exempts the TAP pool from the host
+/// firewall's routed policy; see [`host_firewall_coexistence`].
 pub fn setup_script(user: &str, endpoints: &[u16]) -> Result<String> {
     if !safe_user(user) {
         bail!("invalid user name for TAP ownership: {user:?}");
@@ -531,7 +614,72 @@ pub fn setup_script(user: &str, endpoints: &[u16]) -> Result<String> {
     );
     script.push_str(&nft_rules(endpoints));
     script.push_str("HEGN_NFT\n");
+    script.push_str(&host_firewall_coexistence());
     Ok(script)
+}
+
+/// Exempt the TAP pool from the host firewall that owns the `forward` hook.
+///
+/// netfilter applies every base chain at a hook, so hegn's `accept` cannot
+/// overrule a foreign `policy drop`. The exemption is intentionally a blanket
+/// per-interface accept: duplicating the port allow-list in every host firewall
+/// would create a second place to keep in sync, and hegn's own table still has
+/// to accept the packet. The checks are repeated here (instead of trusting
+/// [`detect_host_firewall`]) so `hegn network setup --dry-run` prints exactly
+/// what a real run would do.
+fn host_firewall_coexistence() -> String {
+    let mut script = String::from(
+        "# A host firewall with its own `forward` policy drop wins over hegn's\n\
+         # accept, so exempt the TAP pool from whichever firewall is active.\n\
+         # hegn's table above stays the only allow-list; this only stops the\n\
+         # host firewall from dropping what hegn already accepted.\n\
+         hegn_firewall_handled=0\n\
+         if command -v ufw >/dev/null 2>&1 && \\\n\
+         \x20  ufw status 2>/dev/null | grep -qx 'Status: active'; then\n\
+         \x20 hegn_firewall_handled=1\n",
+    );
+    for index in 0..TAP_POOL {
+        script.push_str(&format!(
+            "  ufw route allow in on {} >/dev/null\n",
+            tap_name(index)
+        ));
+    }
+    script.push_str(
+        "fi\n\
+         if command -v firewall-cmd >/dev/null 2>&1 && \\\n\
+         \x20  firewall-cmd --state >/dev/null 2>&1; then\n\
+         \x20 hegn_firewall_handled=1\n",
+    );
+    for index in 0..TAP_POOL {
+        let tap = tap_name(index);
+        // Query first so a failure means a real error instead of the normal
+        // "rule already exists" case: setup must not report success while the
+        // guest stays unreachable.
+        script.push_str(&format!(
+            "  firewall-cmd --quiet --permanent --direct --query-rule ipv4 filter FORWARD 0 \
+             -i {tap} -j ACCEPT || \\\n\
+             \x20   firewall-cmd --quiet --permanent --direct --add-rule ipv4 filter FORWARD 0 \
+             -i {tap} -j ACCEPT\n\
+             \x20 firewall-cmd --quiet --direct --query-rule ipv4 filter FORWARD 0 -i {tap} \
+             -j ACCEPT || \\\n\
+             \x20   firewall-cmd --quiet --direct --add-rule ipv4 filter FORWARD 0 -i {tap} \
+             -j ACCEPT\n"
+        ));
+    }
+    script.push_str(
+        "fi\n\
+         if [ \"$hegn_firewall_handled\" -eq 0 ] && command -v iptables >/dev/null 2>&1 && \\\n\
+         \x20  iptables -w -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP'; then\n",
+    );
+    for index in 0..TAP_POOL {
+        let tap = tap_name(index);
+        script.push_str(&format!(
+            "  iptables -w -C FORWARD -i {tap} -j ACCEPT 2>/dev/null || \\\n\
+             \x20   iptables -w -I FORWARD 1 -i {tap} -j ACCEPT\n"
+        ));
+    }
+    script.push_str("fi\n");
+    script
 }
 
 pub fn teardown_script() -> String {
@@ -542,7 +690,36 @@ pub fn teardown_script() -> String {
             tap_name(index)
         ));
     }
+    script.push_str(&host_firewall_cleanup());
     script.push_str("rm -f /run/hegn/network.json\n");
+    script
+}
+
+/// Symmetric cleanup for [`host_firewall_coexistence`]. Missing rule sets and
+/// absent tools are ignored; teardown must always reach the TAP deletion.
+fn host_firewall_cleanup() -> String {
+    let mut script = String::new();
+    for index in 0..TAP_POOL {
+        script.push_str(&format!(
+            "ufw route delete allow in on {} >/dev/null 2>&1 || true\n",
+            tap_name(index)
+        ));
+    }
+    for index in 0..TAP_POOL {
+        let tap = tap_name(index);
+        script.push_str(&format!(
+            "firewall-cmd --quiet --permanent --direct --remove-rule ipv4 filter FORWARD 0 \
+             -i {tap} -j ACCEPT >/dev/null 2>&1 || true\n\
+             firewall-cmd --quiet --direct --remove-rule ipv4 filter FORWARD 0 -i {tap} \
+             -j ACCEPT >/dev/null 2>&1 || true\n"
+        ));
+    }
+    for index in 0..TAP_POOL {
+        script.push_str(&format!(
+            "iptables -w -D FORWARD -i {} -j ACCEPT >/dev/null 2>&1 || true\n",
+            tap_name(index)
+        ));
+    }
     script
 }
 
@@ -696,6 +873,9 @@ pub fn setup(user: &str, endpoints: &[u16]) -> Result<()> {
         subnet: SUBNET.to_string(),
         dns: DNS.iter().map(ToString::to_string).collect(),
         endpoints,
+        // Detected after the script ran: it reports what the guard had to
+        // coexist with, not what it hoped to find.
+        host_firewall: detect_host_firewall(),
         applied_at: Utc::now(),
     };
     write_marker(marker_path(), &marker)
@@ -843,6 +1023,85 @@ mod tests {
     }
 
     #[test]
+    fn setup_script_exempts_the_tap_pool_from_the_host_firewall() {
+        let script = setup_script("alice", &[]).unwrap();
+        // The carve-out only ever runs when the host firewall is active, so a
+        // plain host without one is left untouched.
+        assert!(script.contains("ufw status 2>/dev/null | grep -qx 'Status: active'"));
+        assert!(script.contains("firewall-cmd --state >/dev/null 2>&1"));
+        assert!(script.contains("grep -qx -- '-P FORWARD DROP'"));
+        for index in 0..TAP_POOL {
+            let tap = tap_name(index);
+            assert!(
+                script.contains(&format!("ufw route allow in on {tap} >/dev/null")),
+                "missing ufw exemption for {tap}"
+            );
+            assert!(
+                script.contains(&format!(
+                    "firewall-cmd --quiet --direct --add-rule ipv4 filter FORWARD 0 -i {tap} \
+                     -j ACCEPT"
+                )),
+                "missing firewalld exemption for {tap}"
+            );
+            assert!(
+                script.contains(&format!("iptables -w -I FORWARD 1 -i {tap} -j ACCEPT")),
+                "missing iptables exemption for {tap}"
+            );
+        }
+        // The guard itself must stay the only allow-list.
+        assert!(script.contains("tcp dport { 80, 443 } accept"), "{script}");
+    }
+
+    #[test]
+    fn teardown_script_removes_the_host_firewall_exemptions() {
+        let script = teardown_script();
+        for index in 0..TAP_POOL {
+            let tap = tap_name(index);
+            assert!(script.contains(&format!("ufw route delete allow in on {tap}")));
+            assert!(script.contains(&format!(
+                "firewall-cmd --quiet --direct --remove-rule ipv4 filter FORWARD 0 -i {tap} \
+                 -j ACCEPT"
+            )));
+            assert!(script.contains(&format!("iptables -w -D FORWARD -i {tap} -j ACCEPT")));
+            assert!(script.contains(&format!("ip link del dev {tap}")));
+        }
+        assert!(script.ends_with("rm -f /run/hegn/network.json\n"));
+    }
+
+    #[test]
+    fn setup_and_teardown_scripts_are_valid_shell() {
+        for script in [
+            setup_script("alice", &[]).unwrap(),
+            setup_script("alice", &[11434]).unwrap(),
+            teardown_script(),
+        ] {
+            let parsed = Command::new("sh")
+                .args(["-n", "-c", &script])
+                .status()
+                .expect("sh must be available");
+            assert!(parsed.success(), "shell syntax error:\n{script}");
+        }
+    }
+
+    #[test]
+    fn host_firewall_labels_and_serde_stay_in_sync() {
+        for (firewall, label) in [
+            (HostFirewall::None, "none"),
+            (HostFirewall::Ufw, "ufw"),
+            (HostFirewall::Firewalld, "firewalld"),
+            (HostFirewall::Iptables, "iptables"),
+        ] {
+            assert_eq!(firewall.label(), label);
+            assert_eq!(
+                serde_json::to_string(&firewall).unwrap(),
+                format!("\"{label}\"")
+            );
+            let parsed: HostFirewall = serde_json::from_str(&format!("\"{label}\"")).unwrap();
+            assert_eq!(parsed, firewall);
+        }
+    }
+
+    #[test]
     fn rejects_unsafe_tap_owners() {
         for bad in ["root; reboot", "$(id)", "-rf", "a/b", ""] {
             assert!(setup_script(bad, &[]).is_err(), "{bad:?} must be rejected");
@@ -862,6 +1121,7 @@ mod tests {
             subnet: SUBNET.to_string(),
             dns: DNS.iter().map(ToString::to_string).collect(),
             endpoints: Vec::new(),
+            host_firewall: HostFirewall::Ufw,
             applied_at: Utc::now(),
         };
         write_marker(&path, &marker).unwrap();
@@ -872,6 +1132,8 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         let parsed: ReadyMarker = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed.pool, TAP_POOL);
+        assert_eq!(parsed.host_firewall, HostFirewall::Ufw);
+        assert!(raw.contains("\"host_firewall\": \"ufw\""), "{raw}");
     }
 
     #[test]
