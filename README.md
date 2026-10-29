@@ -370,7 +370,7 @@ guest output, so it stays pinned even when a full-screen guest moves the cursor
 or resets the scroll region:
 
 ```
- hegn ▸ my-app · OpenCode · pid 4242 · log session-…-my-app-4242.log   INPUT DIRECT · Ctrl-B/^] detach
+ hegn ▸ my-app · OpenCode · pid 4242 · log session-…-my-app-4242.log   INPUT DIRECT · Ctrl-B/Ctrl-] detach
 ```
 
 `Ctrl-B` detaches without stopping the VM. When hegn runs inside tmux (where

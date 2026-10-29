@@ -577,7 +577,7 @@ mod tests {
         assert!(line.contains("demo"), "{line}");
         assert!(line.contains("OpenCode"), "{line}");
         assert!(line.contains("INPUT DIRECT"), "{line}");
-        assert!(line.contains("Ctrl-B/^] detach"), "{line}");
+        assert!(line.contains("Ctrl-B/Ctrl-] detach"), "{line}");
     }
 
     #[test]
@@ -599,11 +599,20 @@ mod tests {
 
     #[test]
     fn bar_line_keeps_the_hint_on_a_narrow_terminal() {
-        let line = bar_line("demo", "OpenCode", 1, None, 32);
+        // The hint is the whole bar once the terminal is only as wide as it.
+        let hint = DETACH_HINT.width() as u16;
+        let line = bar_line("demo", "OpenCode", 1, None, hint);
         assert_eq!(line, DETACH_HINT);
-        let line = bar_line("demo", "OpenCode", 1, None, 36);
-        assert_eq!(line.width(), 36);
+
+        let line = bar_line("demo", "OpenCode", 1, None, hint + 4);
+        assert_eq!(line.width(), usize::from(hint) + 4);
         assert!(line.ends_with(DETACH_HINT), "{line}");
+
+        // Narrower than the hint: it is truncated instead of overflowing.
+        let line = bar_line("demo", "OpenCode", 1, None, 20);
+        assert_eq!(line.width(), 20);
+        assert!(DETACH_HINT.starts_with(line.trim_end()), "{line:?}");
+        assert!(!line.contains("demo"), "{line}");
     }
 
     #[test]
