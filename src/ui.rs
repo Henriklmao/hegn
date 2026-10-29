@@ -1597,6 +1597,11 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 }],
             };
             buttons.push(FooterDef {
+                key: "L",
+                label: "Launch",
+                action: ActionId::Launch,
+            });
+            buttons.push(FooterDef {
                 key: "F2",
                 label: "Attach",
                 action: ActionId::ToggleRaw,
@@ -2620,6 +2625,7 @@ fn render_help(
                 ("i / a / Enter", "open the terminal or attach the instance"),
                 ("Esc", "sections → split; ×2 back to dashboard"),
                 ("←", "back to dashboard (VM keeps running)"),
+                ("L", "launch the configured agent/command"),
                 ("F2", "real attach mode (Ctrl-B/^] detaches)"),
                 ("S", "stop selected instance"),
                 ("n", "start a new instance / new snapshot"),
@@ -2634,6 +2640,7 @@ fn render_help(
             "Terminal",
             &[
                 ("i / a", "insert mode — write in the guest terminal"),
+                ("L", "launch the configured agent/command"),
                 ("Esc", "normal mode, then back to the sections"),
                 (
                     "Enter",

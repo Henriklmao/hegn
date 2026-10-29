@@ -110,7 +110,11 @@ fix.
   `hegn logs list|path|show|prune` manages them.
 - **Terminal UI** — `ratatui` dashboard (project picker, instance status,
   snapshot tree), embedded guest serial console, security modal, and a clickable
-  hotkey footer.
+  hotkey footer. Starting a VM launches the configured agent in a real terminal
+  (current terminal, tmux, or herdr); `L` repeats the launch.
+- **Modular launch integrations** — named commands and `embedded`, `external`,
+  `tmux`, `herdr`, or `auto` display targets. The command always runs inside the
+  VM; the integration only chooses where the serial console is shown.
 - **Machine-readable output** — global `--json` for projects, instance status,
   snapshots, logs, images, doctor, config and `check`, plus meaningful `check`
   and `images verify` exit codes.
@@ -621,8 +625,11 @@ hegn [--config PATH] [--json] [COMMAND]
                                    Remove a project (+ its instances); --keep-files hides it
   project restore PROJECT          Show a project removed with --keep-files
   open PROJECT                     Boot/attach the VM serial console
-          [--editor | --lazygit] [--no-branch] [--no-bar]
-  attach [PROJECT|INSTANCE] [--no-bar]  Attach to a running VM (alias: a)
+          [--editor | --lazygit] [--no-branch] [--no-bar] [--command C]
+  attach [PROJECT|INSTANCE] [--no-bar] [--command C]
+                                   Attach to a running VM (alias: a)
+  launch [PROJECT|INSTANCE] [--command NAME] [--integration I] [--no-bar]
+                                   Launch the configured agent/command
   logs [list|path|show|prune]      Manage persistent serial logs (alias: log)
   instance list                     List instances (alias: ls)
   instance create PROJECT [--name N] [--harness H] [--clone]
@@ -707,6 +714,19 @@ extra_packages  = []
 auto_branch     = true
 security        = "enforce"   # "off", "warn" or "enforce"
 
+# Launch the agent (or another command) after Enter boots a VM.
+[launch]
+default         = "harness"  # "harness", "shell", or a name from commands
+integration     = "auto"     # auto | embedded | external | tmux | herdr
+auto_start      = true
+
+# Optional extra commands. They are typed into the guest shell.
+[[launch.commands]]
+name            = "review"
+command         = "opencode"
+integration     = "tmux"
+bar             = false      # full-screen commands should own every row
+
 # Optional: host-loopback services the guest may reach (local LLM servers).
 # The guest URL is http://<tap-ip>:<port>; the host must listen on
 # 127.0.0.1:<port>. Re-run `sudo hegn network setup` after changing this list.
@@ -717,6 +737,52 @@ security        = "enforce"   # "off", "warn" or "enforce"
 
 The package list is a list of *extras*; the harness preset and the packages from
 the instance's harness profile are always unioned in.
+
+### Launch commands and terminal integrations
+
+The embedded project terminal is the **maintenance shell**: it is a scrollback
+pane, not a full-screen terminal emulator. Pressing `Enter` to start a VM
+therefore also launches the configured agent in a real terminal. `L` launches
+it again later.
+
+`launch.default = "harness"` resolves to the instance harness (`opencode`,
+`claude`, `codex`, `pi`, `gemini`), `"shell"` only opens the maintenance shell,
+and any other value refers to a `[[launch.commands]]` entry. Commands are typed
+into the guest shell; they never run on the host.
+
+Launch commands are trusted, user-owned configuration and are sent directly to
+the guest shell, like `hegn attach` input. The TUI's line-buffered
+`tirith-core` interception applies to commands typed in insert mode; use
+`hegn check` first for anything you do not trust.
+
+`integration` decides where the serial console is displayed:
+
+| Value | Behaviour |
+| --- | --- |
+| `auto` | Prefer `herdr` when running inside herdr, then `tmux` when inside tmux, otherwise the current terminal. |
+| `embedded` | Keep the command in the TUI's embedded terminal. |
+| `external` | Leave the TUI and attach the current terminal through `hegn attach`. |
+| `tmux` | Open a new tmux window running `hegn attach`; requires hegn to run inside tmux. |
+| `herdr` | Split a herdr pane and run `hegn attach` in it; requires `HERDR_ENV=1`. |
+
+TUI auto-launch waits for the first-boot provisioner, so the agent binary is
+installed before the command is typed. `hegn launch` is the non-interactive
+counterpart:
+
+```bash
+hegn launch my-app                         # configured default
+hegn launch my-app --command review        # named command
+hegn launch my-app --integration tmux      # override the integration
+hegn open my-app --command opencode        # attach and type one command
+hegn attach my-app --command opencode --no-bar
+```
+
+Per-project overrides live in the project's `hegn.toml`:
+
+```toml
+launch = "review"
+integration = "herdr"
+```
 
 Project-level defaults live in `hegn.toml` inside each project (written by
 `hegn project create`) and record the harness, package list and template used.
@@ -847,6 +913,7 @@ open it.
 | `Enter` (instances) | Attach the selected instance, or boot the default one |
 | `Enter` (snapshots) | Restore the selected snapshot |
 | `i` / `a` / `t` | Open/focus the terminal (starts an instance if needed) |
+| `L` | Launch the configured agent/command in its terminal integration |
 | `Esc` | Insert → normal; normal → section headers (pane stays at 55%) |
 | `←` | Back to the dashboard (the VM keeps running) |
 | `F2` | Leave the TUI for the real `hegn attach` client |
@@ -921,6 +988,7 @@ the section headers while the pane stays open.
 | Key | Action |
 | --- | --- |
 | `i` / `a` / `t` | Open or focus the terminal and enter insert mode |
+| `L` | Launch the configured agent/command |
 | `Esc` | Insert → normal; normal → section headers |
 | `←` | Return to the dashboard (the VM keeps running) |
 | `M` | Multi-agent clones for the open project |

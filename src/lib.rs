@@ -26,6 +26,7 @@
 //! - [`ui`] — ratatui rendering
 //! - [`tui`] — terminal lifecycle and event loop
 //! - [`benchmark`] — measured host cost and disk usage
+//! - [`launch`] — modular agent launch commands and terminal integrations
 //! - [`rootfs`] — growing per-instance root filesystems before the first boot
 //! - [`cli`] — non-interactive command surface
 
@@ -42,6 +43,7 @@ pub mod doctor;
 pub mod images;
 pub mod instance;
 pub mod instance_config;
+pub mod launch;
 pub mod logs;
 pub mod network;
 pub mod profile;

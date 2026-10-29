@@ -326,7 +326,18 @@ impl Drop for TerminalGuard {
 /// persistent serial log while the guest uses the lines above it. The guest has
 /// no window-size channel, so full-screen guest programs keep their own
 /// geometry; pass `bar = false` to give them the whole host terminal.
-pub fn run_interactive(mut console: VmConsole, bar: bool) -> Result<()> {
+pub fn run_interactive(console: VmConsole, bar: bool) -> Result<()> {
+    run_interactive_with_command(console, bar, None)
+}
+
+/// Like [`run_interactive`], but types `command` into the guest after the
+/// console is live. Used by the launch integrations so `tmux`/`herdr` panes can
+/// open the agent instead of a bare shell.
+pub fn run_interactive_with_command(
+    mut console: VmConsole,
+    bar: bool,
+    initial_command: Option<&str>,
+) -> Result<()> {
     use crossterm::event::{self, Event, KeyEventKind};
 
     let mut guard = TerminalGuard::enter()?;
@@ -355,6 +366,13 @@ pub fn run_interactive(mut console: VmConsole, bar: bool) -> Result<()> {
         if let Some(status) = &status {
             status.reserve_region(&mut out)?;
             status.paint(&mut out)?;
+        }
+        if let Some(command) = initial_command {
+            let command = command.trim_end_matches(['\r', '\n']);
+            if !command.is_empty() {
+                console.send(command.as_bytes())?;
+                console.send(b"\n")?;
+            }
         }
 
         loop {

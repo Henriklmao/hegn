@@ -246,6 +246,7 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
         harness: Some(config.harness),
         packages: packages_for(config.harness),
         template: template.map(|path| path.display().to_string()),
+        ..project::ProjectMeta::default()
     };
     // `hegn.toml` is optional; never leave the throwaway project behind
     // because its metadata could not be written.

@@ -329,6 +329,11 @@ pub struct ProjectMeta {
     pub harness: Option<crate::config::Harness>,
     pub packages: Vec<String>,
     pub template: Option<String>,
+    /// Launch command override for this project (`harness`, `shell`, or a
+    /// command name from the global `[launch]` table).
+    pub launch: Option<String>,
+    /// Terminal integration override for this project.
+    pub integration: Option<crate::launch::Integration>,
 }
 
 const PROJECT_META_FILE: &str = "hegn.toml";
@@ -1003,6 +1008,7 @@ mod tests {
             harness: Some(crate::config::Harness::Codex),
             packages: vec!["nodejs".into(), "git".into()],
             template: Some("rust".into()),
+            ..ProjectMeta::default()
         };
         write_meta(dir.path(), &meta).unwrap();
         let loaded = read_meta(dir.path());

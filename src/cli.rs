@@ -16,6 +16,7 @@ use crate::config::{Config, Harness};
 use crate::doctor;
 use crate::images::{self, AssetStatus};
 use crate::instance::{InstanceRegistry, InstanceReport, InstanceSummary, process_alive};
+use crate::launch::{self, Integration, LaunchAction};
 use crate::logs::{self, DEFAULT_KEEP, LogStore};
 use crate::project::{self, ProjectMeta};
 use crate::provision::{ProvisionPlan, ProvisionProgress, ProvisionWatcher};
@@ -76,6 +77,9 @@ pub enum Commands {
         /// Do not reserve a status bar line (for full-screen guest programs).
         #[arg(long)]
         no_bar: bool,
+        /// Command to type into the guest after attaching (for example an agent).
+        #[arg(long, value_name = "COMMAND")]
+        command: Option<String>,
     },
     /// Attach to the serial console of the already running VM (tmux-style).
     ///
@@ -86,6 +90,24 @@ pub enum Commands {
         /// Optional project name or path; must match the running session.
         project: Option<String>,
         /// Do not reserve a status bar line (for full-screen guest programs).
+        #[arg(long)]
+        no_bar: bool,
+        /// Command to type into the guest after attaching.
+        #[arg(long, value_name = "COMMAND")]
+        command: Option<String>,
+    },
+    /// Launch the configured agent or maintenance command in a VM.
+    Launch {
+        /// Instance name, project name or project path (defaults to the only
+        /// running instance).
+        selector: Option<String>,
+        /// Named command from the `[launch]` configuration.
+        #[arg(long, value_name = "NAME")]
+        command: Option<String>,
+        /// Override the terminal integration.
+        #[arg(long, value_enum)]
+        integration: Option<Integration>,
+        /// Do not reserve a status bar line.
         #[arg(long)]
         no_bar: bool,
     },
@@ -432,6 +454,15 @@ pub enum SkillCommands {
 
 /// Run the CLI. Returns the process exit code.
 pub fn run(cli: Cli) -> Result<i32> {
+    // Launch integrations re-execute `hegn attach` in tmux/herdr panes. Pass
+    // the same config through the environment so a custom `--config` path is
+    // not silently replaced by the default one in the child.
+    if let Some(path) = &cli.config {
+        let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // Safety: this runs before any worker thread or terminal event loop is
+        // started, so no other thread can access the environment concurrently.
+        unsafe { std::env::set_var("HEGN_CONFIG", path) };
+    }
     let config = load_config(&cli)?;
     match cli.command {
         None | Some(Commands::Tui) => {
@@ -493,8 +524,19 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
             lazygit,
             no_branch,
             no_bar,
-        } => open(project, editor, lazygit, no_branch, no_bar, config),
-        Commands::Attach { project, no_bar } => attach(project, no_bar, config),
+            command,
+        } => open(project, editor, lazygit, no_branch, no_bar, command, config),
+        Commands::Attach {
+            project,
+            no_bar,
+            command,
+        } => attach(project, no_bar, command, config),
+        Commands::Launch {
+            selector,
+            command,
+            integration,
+            no_bar,
+        } => launch_command(selector, command, integration, no_bar, config),
         Commands::Logs { command } => {
             logs_command(command.unwrap_or(LogCommands::List), config, json)
         }
@@ -562,6 +604,7 @@ fn project_command(command: ProjectCommands, config: Config, json: bool) -> Resu
                 harness: Some(harness),
                 packages: packages.clone(),
                 template: template.map(|p| p.display().to_string()),
+                ..ProjectMeta::default()
             };
             project::write_meta(&path, &meta)?;
             if json {
@@ -1608,6 +1651,7 @@ fn open(
     lazygit: bool,
     no_branch: bool,
     no_bar: bool,
+    command: Option<String>,
     config: Config,
 ) -> Result<i32> {
     let path = resolve_project(&config, &project)?;
@@ -1650,7 +1694,7 @@ fn open(
         }
     }
 
-    crate::console::run_interactive(console, !no_bar)?;
+    crate::console::run_interactive_with_command(console, !no_bar, command.as_deref())?;
     Ok(0)
 }
 
@@ -1725,7 +1769,12 @@ fn draw_cli_provision(progress: &ProvisionProgress) {
     let _ = std::io::stderr().flush();
 }
 
-fn attach(project: Option<String>, no_bar: bool, config: Config) -> Result<i32> {
+fn attach(
+    project: Option<String>,
+    no_bar: bool,
+    command: Option<String>,
+    config: Config,
+) -> Result<i32> {
     let registry = InstanceRegistry::new(config.clone());
     let instance = match project {
         Some(selector) => registry.resolve(&selector)?,
@@ -1733,7 +1782,82 @@ fn attach(project: Option<String>, no_bar: bool, config: Config) -> Result<i32> 
     };
     // VmConsole::attach re-verifies the recorded pid, VM binary and relay.
     let console = registry.manager(instance).attach_console()?;
-    crate::console::run_interactive(console, !no_bar)?;
+    crate::console::run_interactive_with_command(console, !no_bar, command.as_deref())?;
+    Ok(0)
+}
+
+fn launch_command(
+    selector: Option<String>,
+    command: Option<String>,
+    integration: Option<Integration>,
+    no_bar: bool,
+    config: Config,
+) -> Result<i32> {
+    let registry = InstanceRegistry::new(config.clone());
+    let instance = match selector {
+        Some(selector) => match registry.resolve(&selector) {
+            Ok(instance) => instance,
+            Err(_) => {
+                let path = resolve_project(&config, &selector)?;
+                let meta = project::read_meta(&path);
+                let harness = meta.harness.unwrap_or(config.harness);
+                registry.ensure_for_project(&path, harness)?
+            }
+        },
+        None => only_running_instance(&registry)?,
+    };
+
+    let manager = registry.manager(instance.clone());
+    let started_now = !manager.is_running();
+    let report = if started_now {
+        Some(manager.start()?)
+    } else {
+        manager.status().ok()
+    };
+    if config.cloud_init {
+        let plan = ProvisionPlan::new(instance.harness, &instance.extra_packages).ok();
+        if let (Some(report), Some(plan)) = (&report, plan) {
+            wait_for_provision(report.serial_log.as_deref(), &plan);
+        }
+    }
+
+    let meta = project::read_meta(&instance.project);
+    let mut spec = launch::resolve(
+        &config,
+        instance.harness,
+        command.as_deref().or(meta.launch.as_deref()),
+        integration.or(meta.integration),
+    )?;
+    if no_bar {
+        spec.bar = false;
+    }
+    let hegn = std::env::current_exe().context("failed to locate the hegn executable")?;
+    match launch::action(&spec, &instance.name, &instance.workspace, &hegn)? {
+        LaunchAction::Embedded { command } => {
+            let console = manager.attach_console()?;
+            crate::console::run_interactive_with_command(console, spec.bar, Some(&command))?;
+        }
+        LaunchAction::External {
+            instance,
+            command,
+            bar,
+        } => {
+            let console = registry.manager_by_name(&instance)?.attach_console()?;
+            crate::console::run_interactive_with_command(console, bar, command.as_deref())?;
+        }
+        LaunchAction::Spawn { program, args } => {
+            let status = Command::new(&program)
+                .args(&args)
+                .status()
+                .with_context(|| format!("failed to run {program}"))?;
+            if !status.success() {
+                bail!("{program} launch integration failed");
+            }
+        }
+        LaunchAction::Herdr { pane_command, cwd } => {
+            launch::spawn_herdr(&pane_command, &cwd)?;
+        }
+    }
     Ok(0)
 }
 
@@ -2440,9 +2564,14 @@ mod tests {
     fn attach_alias_parses_and_accepts_an_optional_project() {
         let cli = Cli::try_parse_from(["hegn", "a", "demo"]).unwrap();
         match cli.command {
-            Some(Commands::Attach { project, no_bar }) => {
+            Some(Commands::Attach {
+                project,
+                no_bar,
+                command,
+            }) => {
                 assert_eq!(project.as_deref(), Some("demo"));
                 assert!(!no_bar);
+                assert!(command.is_none());
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -2454,9 +2583,37 @@ mod tests {
     }
 
     #[test]
+    fn launch_parses_a_named_command_and_integration() {
+        let cli = Cli::try_parse_from([
+            "hegn",
+            "launch",
+            "demo",
+            "--command",
+            "review",
+            "--integration",
+            "herdr",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Launch {
+                selector,
+                command,
+                integration,
+                no_bar,
+            }) => {
+                assert_eq!(selector.as_deref(), Some("demo"));
+                assert_eq!(command.as_deref(), Some("review"));
+                assert_eq!(integration, Some(Integration::Herdr));
+                assert!(!no_bar);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn attach_without_a_session_is_a_hard_error() {
         let (_dir, config) = config();
-        let err = attach(None, false, config).unwrap_err().to_string();
+        let err = attach(None, false, None, config).unwrap_err().to_string();
         assert!(err.contains("no running instance"), "{err}");
     }
 

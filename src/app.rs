@@ -16,6 +16,7 @@ pub use crate::config_form::{ConfigForm, ConfigKind};
 use crate::console::TerminalConsole;
 use crate::doctor::DoctorReport;
 use crate::instance::InstanceSummary;
+use crate::launch::{self, LaunchSpec};
 use crate::project::{self, GitSummary, Project, ProjectMeta};
 use crate::security::{Decision, Inspection, SecurityEngine};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
@@ -135,6 +136,12 @@ pub enum Effect {
     AttachInstance {
         instance: String,
     },
+    /// Launch a configured command through a terminal integration.
+    LaunchAgent {
+        spec: LaunchSpec,
+        instance: String,
+        project: PathBuf,
+    },
     /// Leave the TUI and attach the real serial console client.
     AttachConsole {
         instance: String,
@@ -187,6 +194,17 @@ impl Toast {
     pub fn expired(&self, now: Instant) -> bool {
         now.duration_since(self.created) > TOAST_TTL
     }
+}
+
+/// A launch request held back until the first-boot provisioner is done.
+#[derive(Debug, Clone)]
+pub struct PendingLaunch {
+    pub spec: LaunchSpec,
+    pub instance: String,
+    pub project: PathBuf,
+    pub since: Instant,
+    pub provision_seen: bool,
+    pub ready: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +348,7 @@ pub enum ActionId {
     InstanceConfig,
     GlobalConfig,
     MultiAgent,
+    Launch,
     KeepFiles,
     EditConfig,
     ReloadConfig,
@@ -710,6 +729,12 @@ pub struct App {
     pub download: Option<crate::images::DownloadProgress>,
     /// First-boot harness provisioning, rendered above the download/toast.
     pub provision: Option<crate::provision::ProvisionProgress>,
+    /// Command waiting for the VM (and its preset) to become ready.
+    pub pending_launch: Option<PendingLaunch>,
+    /// Provisioning progress arrived before the console was attached.
+    provision_running: bool,
+    /// The "preset ready" marker arrived before the console was attached.
+    provision_ready_seen: bool,
     pub footer_hits: Vec<FooterHit>,
     /// Settings rows and `‹ ›` steppers recorded by the renderer.
     pub config_rows: Vec<RowHit>,
@@ -784,6 +809,9 @@ impl App {
             toast: None,
             download: None,
             provision: None,
+            pending_launch: None,
+            provision_running: false,
+            provision_ready_seen: false,
             footer_hits: Vec::new(),
             config_rows: Vec::new(),
             config_steppers: Vec::new(),
@@ -1143,16 +1171,132 @@ impl App {
     /// The guest finished installing the harness preset.
     pub fn provision_ready(&mut self) {
         self.provision = None;
+        self.provision_running = false;
+        self.provision_ready_seen = true;
+        if let Some(pending) = self.pending_launch.as_mut() {
+            pending.ready = true;
+        }
         self.toast("harness preset ready", ToastLevel::Info);
     }
 
     /// Provisioning stopped before the marker was written.
     pub fn provision_failed(&mut self, message: String) {
         self.provision = None;
+        self.provision_running = false;
+        self.provision_ready_seen = false;
+        self.pending_launch = None;
         self.toast(
             format!("harness setup failed: {message}"),
             ToastLevel::Error,
         );
+    }
+
+    /// Note that first-boot provisioning is running.
+    pub fn provision_started(&mut self) {
+        self.provision_running = true;
+        if let Some(pending) = self.pending_launch.as_mut() {
+            pending.provision_seen = true;
+        }
+    }
+
+    /// Queue the configured command after the TUI started a VM with Enter.
+    pub fn queue_auto_launch(
+        &mut self,
+        instance: &str,
+        harness: Harness,
+        project: &Path,
+        started: bool,
+    ) {
+        if !started || !self.config.launch.auto_start {
+            return;
+        }
+        // Clones export their private workspace; project-level launch settings
+        // live next to the original project.
+        let meta_project = self
+            .instances
+            .iter()
+            .find(|candidate| candidate.name == instance)
+            .map(|candidate| candidate.project.as_path())
+            .unwrap_or(project);
+        let meta = project::read_meta(meta_project);
+        if meta.launch.is_none() && self.config.launch.default.is_none() {
+            return;
+        }
+        let spec = match launch::resolve(
+            &self.config,
+            harness,
+            meta.launch.as_deref(),
+            meta.integration,
+        ) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.toast(format!("launch skipped: {err}"), ToastLevel::Warn);
+                return;
+            }
+        };
+        // A shell project already lands in the embedded maintenance terminal;
+        // do not immediately hand it to an external integration.
+        if spec.is_shell() {
+            return;
+        }
+        self.pending_launch = Some(PendingLaunch {
+            spec,
+            instance: instance.to_string(),
+            project: project.to_path_buf(),
+            since: Instant::now(),
+            provision_seen: self.provision_running,
+            ready: self.provision_ready_seen,
+        });
+    }
+
+    /// Take a queued launch once provisioning is done (or clearly not running).
+    pub fn take_due_launch(&mut self) -> Option<(LaunchSpec, String, PathBuf)> {
+        let pending = self.pending_launch.as_ref()?;
+        // A cloud image may take a while to reach cloud-init. Wait for the
+        // explicit ready marker instead of racing the installer; images without
+        // cloud-init only need enough time for the shell prompt.
+        let grace = if self.config.cloud_init {
+            Duration::from_secs(5 * 60)
+        } else {
+            Duration::from_secs(5)
+        };
+        let due = pending.ready || (!pending.provision_seen && pending.since.elapsed() >= grace);
+        if !due {
+            return None;
+        }
+        let pending = self.pending_launch.take()?;
+        Some((pending.spec, pending.instance, pending.project))
+    }
+
+    /// Launch a command for the selected instance right now.
+    pub fn request_launch(&mut self, selector: Option<&str>) -> Vec<Effect> {
+        let Some(instance) = self.selected_instance().cloned() else {
+            self.toast("no instance selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        let meta = if self.open_project.as_deref() == Some(instance.project.as_path()) {
+            self.project_meta.clone()
+        } else {
+            project::read_meta(&instance.project)
+        };
+        let spec = match launch::resolve(
+            &self.config,
+            instance.harness,
+            selector.or(meta.launch.as_deref()),
+            meta.integration,
+        ) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.toast(format!("launch failed: {err}"), ToastLevel::Error);
+                return Vec::new();
+            }
+        };
+        self.pending_launch = None;
+        vec![Effect::LaunchAgent {
+            spec,
+            instance: instance.name,
+            project: instance.workspace,
+        }]
     }
 
     pub fn set_viewport(&mut self, cols: u16, rows: u16) {
@@ -1486,6 +1630,7 @@ impl App {
                 }
             }
             KeyCode::Char('i') | KeyCode::Char('a') | KeyCode::Char('t') => self.open_terminal(),
+            KeyCode::Char('L') => self.request_launch(None),
             KeyCode::Char('n') if self.focus == Focus::Snapshots => {
                 self.handle_action(ActionId::NewSnapshot)
             }
@@ -1538,6 +1683,7 @@ impl App {
                     self.toast("insert mode — Esc returns to normal", ToastLevel::Info);
                 }
                 KeyCode::Char('M') => return self.open_multi_agent(),
+                KeyCode::Char('L') => return self.request_launch(None),
                 KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.terminal.clear();
                     self.scroll = 0;
@@ -2128,6 +2274,7 @@ impl App {
                     harness: Some(form.harness),
                     packages: form.selected_packages(),
                     template: template.map(|path| path.display().to_string()),
+                    ..ProjectMeta::default()
                 };
                 if let Err(err) = project::write_meta(&path, &meta) {
                     self.toast(
@@ -2367,6 +2514,9 @@ impl App {
             return Vec::new();
         }
         self.session = None;
+        self.pending_launch = None;
+        self.provision_running = false;
+        self.provision_ready_seen = false;
         self.terminal.clear();
         self.scroll = 0;
         self.input.clear();
@@ -2697,6 +2847,9 @@ impl App {
         }
 
         self.session = None;
+        self.pending_launch = None;
+        self.provision_running = false;
+        self.provision_ready_seen = false;
         self.terminal.clear();
         self.scroll = 0;
         self.input.clear();
@@ -2770,6 +2923,9 @@ impl App {
     pub fn fail_start(&mut self, error: impl Into<String>) {
         let error = error.into();
         self.session = None;
+        self.pending_launch = None;
+        self.provision_running = false;
+        self.provision_ready_seen = false;
         self.instance.state = InstanceState::Failed;
         self.instance.started_at = None;
         self.instance.note = Some(error.clone());
@@ -2984,6 +3140,7 @@ impl App {
                 }
                 Vec::new()
             }
+            ActionId::Launch => self.request_launch(None),
             ActionId::ScrollUp => {
                 if self.screen == Screen::Project {
                     self.scroll = self.scroll.saturating_add(5).min(self.terminal.len());
@@ -4017,6 +4174,69 @@ mod tests {
         assert_eq!(app.terminal_mode, TerminalMode::Insert);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::Project);
+    }
+
+    #[test]
+    fn auto_launch_waits_for_provisioning_then_releases_the_command() {
+        let (_dir, mut app) = test_app();
+        app.config.launch.auto_start = true;
+        app.queue_auto_launch(
+            "demo",
+            Harness::Opencode,
+            Path::new("/missing/project"),
+            true,
+        );
+        let pending = app.pending_launch.as_ref().expect("queued");
+        assert_eq!(pending.spec.command, "opencode");
+        assert!(app.take_due_launch().is_none());
+        app.provision_started();
+        assert!(app.take_due_launch().is_none());
+        app.provision_ready();
+        let (spec, instance, _project) = app.take_due_launch().expect("ready");
+        assert_eq!(spec.command, "opencode");
+        assert_eq!(instance, "demo");
+        assert!(app.take_due_launch().is_none());
+    }
+
+    #[test]
+    fn a_ready_marker_that_arrives_before_started_still_launches() {
+        let (_dir, mut app) = test_app();
+        app.config.launch.auto_start = true;
+        // The provision watcher can win the race against the console attach.
+        app.provision_ready();
+        app.queue_auto_launch(
+            "demo",
+            Harness::Opencode,
+            Path::new("/missing/project"),
+            true,
+        );
+        assert!(
+            app.pending_launch
+                .as_ref()
+                .is_some_and(|pending| pending.ready)
+        );
+        assert!(app.take_due_launch().is_some());
+    }
+
+    #[test]
+    fn shell_projects_keep_the_embedded_maintenance_terminal() {
+        let (_dir, mut app) = test_app();
+        app.config.launch.auto_start = true;
+        app.queue_auto_launch("demo", Harness::Shell, Path::new("/missing/project"), true);
+        assert!(app.pending_launch.is_none());
+    }
+
+    #[test]
+    fn attaching_to_a_running_vm_does_not_auto_launch() {
+        let (_dir, mut app) = test_app();
+        app.config.launch.auto_start = true;
+        app.queue_auto_launch(
+            "demo",
+            Harness::Opencode,
+            Path::new("/missing/project"),
+            false,
+        );
+        assert!(app.pending_launch.is_none());
     }
 
     #[test]

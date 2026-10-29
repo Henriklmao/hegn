@@ -191,6 +191,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `cloud_init.rs` | NoCloud seed generation | FAT volume labelled `CIDATA`; serial root autologin; first-boot provisioner and guest network config; no secrets; `0600` and `O_NOFOLLOW` |
 | `provision.rs` | Harness preset install plans and first-boot script | Preset packages are always unioned; package names validated; only static install commands; waits for DNS, retries apt, emits serial progress stages and verifies the CLI before writing the marker |
 | `rootfs.rs` | Per-instance disk growth | Extends raw images sparsely and grows qcow2 virtual size in place; `qemu-img` fallback for unsupported layouts |
+| `launch.rs` | Configurable agent launch commands and terminal integrations | Commands are validated and typed into the guest; `auto` prefers herdr, then tmux, then the current terminal; tmux/herdr run `hegn attach`, never a host agent |
 | `profile.rs` | Per-harness profile templates, guest payload materialization, skill sync | Source/target/mode/env validation; config files refreshed every start; skills seeded once into a private per-instance copy; a second sandboxed virtiofsd exports only that copy; sync-back copies regular files and skips symlinks/special files |
 | `network.rs` | Guarded host network: TAP pool reservation, nftables rules, setup marker | Root-only marker; anti-spoof; private/IPv6/guest-to-host drop; HTTP(S)+public DNS allow-list; per-instance `/30` slice; stale reservations reclaimed only when the owning VM is not running; opt-in loopback endpoints are DNATed per TAP with `route_localnet` and cannot write; TAP pool exempted from ufw/firewalld/iptables routed policies because netfilter applies every `forward` base chain |
 | `relay.rs` | Detached serial relay | Sole VMM serial client; append-only log; replays the log tail on attach; bounded buffers; refuses to replace non-socket paths; stderr goes to `run/console-relay.log` because it has no terminal |
@@ -915,6 +916,7 @@ src/
   cloud_hypervisor.rs typed REST client
   cloud_init.rs   NoCloud seed generation
   provision.rs    harness preset installers, progress stages and first-boot script
+  launch.rs       named launch commands + embedded/external/tmux/herdr integrations
   rootfs.rs       sparse raw/ qcow2 growth for per-instance disks
   network.rs      guarded TAP pool, nftables rules and reservations
   relay.rs        detached serial relay

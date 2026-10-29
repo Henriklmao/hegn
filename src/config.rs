@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::launch::LaunchConfig;
+
 /// How the instance is selected when a project is opened.
 ///
 /// Both modes require a real Cloud Hypervisor VM. There is no local-shell
@@ -480,6 +482,8 @@ pub struct Config {
     pub backend: BackendKind,
     /// Harness launched when a project is opened.
     pub harness: Harness,
+    /// Commands and terminal integrations launched after a VM starts.
+    pub launch: LaunchConfig,
     /// Guest networking policy. `guarded` is an allow-listed TAP device;
     /// `off` removes the NIC entirely.
     pub network: NetworkMode,
@@ -530,6 +534,7 @@ impl Default for Config {
             virtiofs_sandbox: VirtiofsSandbox::Namespace,
             backend: BackendKind::Auto,
             harness: Harness::Shell,
+            launch: LaunchConfig::default(),
             network: NetworkMode::Guarded,
             local_endpoints: Vec::new(),
             extra_packages: Vec::new(),
@@ -711,6 +716,7 @@ impl Config {
                 bail!("invalid package name in extra_packages: {package:?}");
             }
         }
+        self.launch.validate()?;
         validate_local_endpoints(&self.local_endpoints)?;
         if !self.local_endpoints.is_empty() && self.network != NetworkMode::Guarded {
             bail!("local_endpoints need guarded networking; set network = \"guarded\"");

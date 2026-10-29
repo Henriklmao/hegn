@@ -20,6 +20,7 @@ use crate::app::{App, Effect, ToastLevel};
 use crate::config::{Config, Harness};
 use crate::console::TerminalConsole;
 use crate::doctor::DoctorReport;
+use crate::launch::{self, LaunchAction, LaunchSpec};
 use crate::project;
 use crate::provision::{ProvisionEvent, ProvisionPlan, ProvisionProgress, ProvisionWatcher};
 use crate::ui;
@@ -31,6 +32,9 @@ enum ScanMessage {
     Started {
         console: Box<dyn TerminalConsole>,
         branch: Option<Result<String, String>>,
+        harness: Harness,
+        /// True when this action booted the VM instead of only attaching.
+        started: bool,
     },
     StartFailed(String),
     InstancesChanged {
@@ -126,6 +130,19 @@ fn run_loop(
         }
 
         drain_scan(app, scan_rx);
+        if let Some((spec, instance, project)) = app.take_due_launch() {
+            handle_effects(
+                terminal,
+                app,
+                vec![Effect::LaunchAgent {
+                    spec,
+                    instance,
+                    project,
+                }],
+                scan_tx,
+                runtime,
+            )?;
+        }
 
         if app.should_quit {
             return Ok(());
@@ -137,8 +154,16 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
     loop {
         match scan_rx.try_recv() {
             Ok(ScanMessage::Projects(projects)) => app.set_projects(projects),
-            Ok(ScanMessage::Started { console, branch }) => {
+            Ok(ScanMessage::Started {
+                console,
+                branch,
+                harness,
+                started,
+            }) => {
+                let instance = console.instance_name().to_string();
+                let project = console.project().to_path_buf();
                 app.attach_console(console);
+                app.queue_auto_launch(&instance, harness, &project, started);
                 match branch {
                     Some(Ok(branch)) => {
                         app.toast(format!("session branch {branch}"), ToastLevel::Info)
@@ -163,7 +188,10 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 app.show_doctor(report, note);
             }
             Ok(ScanMessage::DownloadProgress(progress)) => app.set_download_progress(progress),
-            Ok(ScanMessage::Provision(progress)) => app.set_provision_progress(progress),
+            Ok(ScanMessage::Provision(progress)) => {
+                app.set_provision_progress(progress);
+                app.provision_started();
+            }
             Ok(ScanMessage::ProvisionReady) => app.provision_ready(),
             Ok(ScanMessage::ProvisionFailed(err)) => app.provision_failed(err),
             Ok(ScanMessage::Error(err)) => {
@@ -227,6 +255,11 @@ fn spawn_attach(config: Config, instance: String, tx: mpsc::Sender<ScanMessage>)
         .name("hegn-attach-vm".into())
         .spawn(move || {
             let registry = crate::instance::InstanceRegistry::new(config);
+            let harness = registry
+                .store()
+                .load(&instance)
+                .map(|config| config.harness)
+                .unwrap_or_default();
             let result = registry
                 .manager_by_name(&instance)
                 .and_then(|manager| manager.ensure_console());
@@ -235,6 +268,8 @@ fn spawn_attach(config: Config, instance: String, tx: mpsc::Sender<ScanMessage>)
                     let _ = thread_tx.send(ScanMessage::Started {
                         console: Box::new(console),
                         branch: None,
+                        harness,
+                        started: false,
                     });
                 }
                 Err(err) => {
@@ -348,9 +383,11 @@ fn spawn_start(
             };
             let workspace = instance.workspace.clone();
             let auto_branch = instance.auto_branch;
+            let harness = instance.harness;
             let plan = ProvisionPlan::new(instance.harness, &instance.extra_packages).ok();
             let manager = registry.manager(instance);
-            let started = if manager.is_running() {
+            let was_running = manager.is_running();
+            let started = if was_running {
                 manager.status().ok()
             } else {
                 match manager.start() {
@@ -379,6 +416,8 @@ fn spawn_start(
                     let _ = thread_tx.send(ScanMessage::Started {
                         console: Box::new(console),
                         branch,
+                        harness,
+                        started: !was_running,
                     });
                 }
                 Err(err) => {
@@ -454,8 +493,9 @@ fn spawn_provision_watch(
                     return;
                 }
                 // A pre-provisioned image (or `cloud_init = false`) never emits
-                // progress. Stop quietly instead of leaving a thread behind.
-                if !announced && started.elapsed() > Duration::from_secs(60) {
+                // progress. Keep the watcher long enough to cover a slow boot,
+                // then stop quietly instead of leaving a thread behind.
+                if !announced && started.elapsed() > Duration::from_secs(5 * 60) {
                     return;
                 }
                 if started.elapsed() > Duration::from_secs(60 * 60) {
@@ -598,6 +638,13 @@ fn handle_effects(
                 app.toast("starting VM…", ToastLevel::Info);
                 spawn_start(app.config.clone(), project, harness, scan_tx.clone());
             }
+            Effect::LaunchAgent {
+                spec,
+                instance,
+                project,
+            } => {
+                launch_agent(terminal, app, spec, instance, project)?;
+            }
             Effect::AttachInstance { instance } => {
                 app.toast(format!("attaching to {instance}…"), ToastLevel::Info);
                 spawn_attach(app.config.clone(), instance, scan_tx.clone());
@@ -607,6 +654,7 @@ fn handle_effects(
                 // Release the embedded client first. Otherwise the external
                 // attach replaces it in the relay and the TUI keeps a dead
                 // socket when the user comes back.
+                app.pending_launch = None;
                 app.detach_console();
                 let result = with_suspended_terminal(terminal, || {
                     let config = registry.resolve(&instance)?;
@@ -634,6 +682,7 @@ fn handle_effects(
             }
             Effect::StopInstance { instance } => {
                 let registry = crate::instance::InstanceRegistry::new(app.config.clone());
+                app.pending_launch = None;
                 match registry.stop(&instance) {
                     Ok(()) => {
                         app.toast(format!("instance {instance} stopped"), ToastLevel::Info);
@@ -773,6 +822,101 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     )
     .ok();
     terminal.show_cursor().ok();
+    Ok(())
+}
+
+fn launch_agent(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    spec: LaunchSpec,
+    instance: String,
+    project: std::path::PathBuf,
+) -> Result<()> {
+    let hegn = std::env::current_exe().context("failed to locate the hegn executable")?;
+    let action = match launch::action(&spec, &instance, &project, &hegn) {
+        Ok(action) => action,
+        Err(err) => {
+            app.toast(format!("launch failed: {err}"), ToastLevel::Error);
+            return Ok(());
+        }
+    };
+    match action {
+        LaunchAction::Embedded { command } => {
+            let result: Result<()> = (|| {
+                let session = app
+                    .session
+                    .as_mut()
+                    .context("open the terminal before launching an embedded command")?;
+                if !command.trim().is_empty() {
+                    session.send(command.as_bytes())?;
+                    session.send(b"\n")?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    app.project_view = crate::app::ProjectView::Split;
+                    app.terminal_focus = true;
+                    app.terminal_mode = crate::app::TerminalMode::Normal;
+                    app.toast(format!("launched {}", spec.name), ToastLevel::Info);
+                }
+                Err(err) => app.toast(format!("launch failed: {err}"), ToastLevel::Error),
+            }
+        }
+        LaunchAction::External {
+            instance,
+            command,
+            bar,
+        } => {
+            let registry = crate::instance::InstanceRegistry::new(app.config.clone());
+            app.detach_console();
+            let result = with_suspended_terminal(terminal, || {
+                let config = registry.resolve(&instance)?;
+                let console = registry.manager(config).attach_console()?;
+                crate::console::run_interactive_with_command(console, bar, command.as_deref())
+            });
+            // The external client closed on detach; restore the embedded view so
+            // the project screen is not left without a console.
+            let reattached = registry
+                .resolve(&instance)
+                .ok()
+                .and_then(|config| registry.manager(config).attach_console().ok());
+            if let Some(console) = reattached {
+                app.attach_console(Box::new(console));
+                app.project_view = crate::app::ProjectView::Split;
+                app.terminal_focus = true;
+            }
+            if let Err(err) = result {
+                app.toast(format!("launch failed: {err}"), ToastLevel::Error);
+            }
+        }
+        LaunchAction::Spawn { program, args } => {
+            app.detach_console();
+            match Command::new(&program).args(&args).output() {
+                Ok(output) if output.status.success() => {
+                    app.toast(
+                        format!("launched {} via {program}", spec.name),
+                        ToastLevel::Info,
+                    );
+                }
+                Ok(output) => app.toast(
+                    format!(
+                        "{program} launch failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                    ToastLevel::Error,
+                ),
+                Err(err) => app.toast(format!("{program} launch failed: {err}"), ToastLevel::Error),
+            }
+        }
+        LaunchAction::Herdr { pane_command, cwd } => {
+            app.detach_console();
+            match launch::spawn_herdr(&pane_command, &cwd) {
+                Ok(()) => app.toast(format!("launched {} in herdr", spec.name), ToastLevel::Info),
+                Err(err) => app.toast(format!("herdr launch failed: {err:#}"), ToastLevel::Error),
+            }
+        }
+    }
     Ok(())
 }
 
