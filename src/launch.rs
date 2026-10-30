@@ -46,6 +46,15 @@ pub enum Integration {
 }
 
 impl Integration {
+    /// Cyclable order for the project settings/launch pickers.
+    pub const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::Embedded,
+        Self::External,
+        Self::Tmux,
+        Self::Herdr,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -53,6 +62,26 @@ impl Integration {
             Self::External => "external",
             Self::Tmux => "tmux",
             Self::Herdr => "herdr",
+        }
+    }
+
+    /// One-line explanation for menus and the help screen.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Auto => "herdr → tmux → current terminal",
+            Self::Embedded => "TUI terminal pane (scrollback)",
+            Self::External => "suspend the TUI, attach this terminal",
+            Self::Tmux => "new tmux window running hegn attach",
+            Self::Herdr => "new herdr pane running hegn attach",
+        }
+    }
+
+    /// Whether the host can honour this integration right now.
+    pub fn available(self) -> bool {
+        match self.resolve() {
+            Self::Tmux => env::var_os("TMUX").is_some(),
+            Self::Herdr => env::var("HERDR_ENV").is_ok_and(|value| value == "1"),
+            _ => true,
         }
     }
 
@@ -389,6 +418,17 @@ mod tests {
 
     fn test_config() -> Config {
         Config::default()
+    }
+
+    #[test]
+    fn integration_menu_lists_every_choice() {
+        assert_eq!(
+            Integration::ALL.map(Integration::label),
+            ["auto", "embedded", "external", "tmux", "herdr"]
+        );
+        for integration in Integration::ALL {
+            assert!(!integration.description().is_empty());
+        }
     }
 
     #[test]

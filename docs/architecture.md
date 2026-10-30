@@ -606,7 +606,10 @@ insert mode returns to normal; `Esc` in normal mode returns focus to the section
 headers while keeping the pane open. `←` and the clickable `← all projects`
 breadcrumb return to the dashboard; `Ctrl-B`/`Ctrl-]` do so from every mode and
 the VM keeps running. `F2` releases the TUI and runs the real `hegn attach`
-client instead of a raw in-TUI mode.
+client instead of a raw in-TUI mode. `F6` opens the project settings editor for
+`hegn.toml` (harness, launch command, terminal integration and auto-launch);
+`Enter` saves and `r` saves and launches immediately, which is how the `tmux`
+and `herdr` integrations are selected without hand-editing TOML.
 
 The project instance list is scoped to the open project. Switching projects
 rebuilds the list from the already-loaded instances (no extra disk scan),
@@ -678,6 +681,9 @@ matters when hegn runs inside tmux and `Ctrl-B` is consumed as the tmux prefix.
 | Logs | — | `hegn logs list/path/show/prune` |
 | Security check | modal + insert-mode input | `hegn check` |
 | Multi-agent clones | `M` in the project terminal | `hegn instance clone` |
+| Launch agent/command | `L` (uses project settings) | `hegn launch`, `hegn open --command` |
+| Launch in tmux/herdr | `F6` integration → `r` | `hegn launch --integration tmux\|herdr` |
+| Project settings | `F6` (`hegn.toml`) | edit `hegn.toml` |
 | Doctor | `F3` + automatic on first launch/failure | `hegn doctor` |
 | Automatic setup | doctor modal `s` (confirmed) | `hegn doctor --fix` |
 | Image download | doctor modal `d` | `hegn images download` |

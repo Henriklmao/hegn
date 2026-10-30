@@ -1491,6 +1491,23 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 action: ActionId::Cancel,
             },
         ],
+        Some(Modal::ProjectConfig(_)) => vec![
+            FooterDef {
+                key: "Enter",
+                label: "Save",
+                action: ActionId::ProjectConfigSave,
+            },
+            FooterDef {
+                key: "r",
+                label: "Save + launch",
+                action: ActionId::ProjectConfigLaunch,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Cancel",
+                action: ActionId::Cancel,
+            },
+        ],
         Some(Modal::Help(help)) if help.searching => vec![FooterDef {
             key: "Esc",
             label: "Stop search",
@@ -1605,6 +1622,11 @@ fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 key: "F2",
                 label: "Attach",
                 action: ActionId::ToggleRaw,
+            });
+            buttons.push(FooterDef {
+                key: "F6",
+                label: "Project config",
+                action: ActionId::ProjectConfig,
             });
             buttons.push(FooterDef {
                 key: "Ctrl-B",
@@ -2099,6 +2121,14 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> Moda
                 ..ModalHits::default()
             }
         }
+        Modal::ProjectConfig(form) => {
+            let (footer, scroll) = render_project_config(frame, app, form, area);
+            ModalHits {
+                footer,
+                scroll,
+                ..ModalHits::default()
+            }
+        }
     }
 }
 
@@ -2502,6 +2532,127 @@ fn tail(text: &str, max: usize) -> String {
     out.chars().rev().collect()
 }
 
+fn render_project_config(
+    frame: &mut Frame,
+    app: &App,
+    form: &crate::app::ProjectConfigForm,
+    area: Rect,
+) -> (Vec<FooterHit>, Option<ScrollHit>) {
+    let marker = |row: usize| if form.row == row { "›" } else { " " };
+    let global_harness = app.config.harness;
+    let harness_value = match form.harness {
+        Some(harness) => harness.label().to_string(),
+        None => format!("global default ({})", global_harness.label()),
+    };
+    let launch_value = match &form.launch {
+        Some(name) if name == crate::launch::HARNESS => {
+            format!(
+                "harness ({})",
+                form.harness.unwrap_or(global_harness).label()
+            )
+        }
+        Some(name) => name.clone(),
+        None => match &app.config.launch.default {
+            Some(default) => format!("global default ({default})"),
+            None => "global default (none)".to_string(),
+        },
+    };
+    let integration_value = match form.integration {
+        None => format!("global default ({})", app.config.launch.integration.label()),
+        Some(integration) => match integration.resolve() {
+            resolved if resolved != integration => {
+                format!("{} → {}", integration.label(), resolved.label())
+            }
+            _ => integration.label().to_string(),
+        },
+    };
+    let auto_start_value = match form.auto_start {
+        Some(true) => "on".to_string(),
+        Some(false) => "off".to_string(),
+        None => format!(
+            "global default ({})",
+            if app.config.launch.auto_start {
+                "on"
+            } else {
+                "off"
+            }
+        ),
+    };
+    let availability: Vec<String> = [
+        crate::launch::Integration::Tmux,
+        crate::launch::Integration::Herdr,
+    ]
+    .into_iter()
+    .map(|integration| {
+        format!(
+            "{} {}",
+            integration.label(),
+            if integration.available() {
+                "available"
+            } else {
+                "unavailable"
+            }
+        )
+    })
+    .collect();
+    let mut body = format!(
+        "Project  {}\nFile     {}\n\n\
+         {} Launch command   {}\n\
+         {} Integration      {}\n\
+         {} Auto-launch      {}\n\
+         {} Harness          {}\n\n\
+         ↑/↓ row · ←/→ value · Enter save · r save + launch\n\
+         {}\n\
+         Inside tmux, Ctrl-B is the tmux prefix — Ctrl-] detaches hegn.",
+        form.project.display(),
+        form.project
+            .join(crate::project::PROJECT_META_FILE)
+            .display(),
+        marker(0),
+        launch_value,
+        marker(1),
+        integration_value,
+        marker(2),
+        auto_start_value,
+        marker(3),
+        harness_value,
+        availability.join(" · "),
+    );
+    if let Some(error) = &form.error {
+        body.push_str(&format!("\n\n{error}"));
+    }
+    let (footer, scroll) = render_message(
+        frame,
+        app,
+        area,
+        76,
+        66,
+        1,
+        "project settings",
+        &body,
+        CYAN,
+        0,
+        &[
+            FooterDef {
+                key: "Enter",
+                label: "Save",
+                action: ActionId::ProjectConfigSave,
+            },
+            FooterDef {
+                key: "r",
+                label: "Save + launch",
+                action: ActionId::ProjectConfigLaunch,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Cancel",
+                action: ActionId::Cancel,
+            },
+        ],
+    );
+    (footer, scroll)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_message(
     frame: &mut Frame,
@@ -2626,6 +2777,10 @@ fn render_help(
                 ("Esc", "sections → split; ×2 back to dashboard"),
                 ("←", "back to dashboard (VM keeps running)"),
                 ("L", "launch the configured agent/command"),
+                (
+                    "F6",
+                    "project settings: launch command, integration, auto-launch",
+                ),
                 ("F2", "real attach mode (Ctrl-B/^] detaches)"),
                 ("S", "stop selected instance"),
                 ("n", "start a new instance / new snapshot"),
@@ -4078,6 +4233,33 @@ mod tests {
             hits.footer
                 .iter()
                 .any(|hit| hit.action == ActionId::DeleteProjectFiles)
+        );
+    }
+
+    #[test]
+    fn project_settings_modal_lists_launch_integration_and_harness() {
+        let (_dir, mut app) = app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        app.screen = Screen::Project;
+        app.open_project = Some(project.clone());
+        app.modal = Some(Modal::ProjectConfig(crate::app::ProjectConfigForm::new(
+            project,
+            &crate::project::ProjectMeta {
+                launch: Some(crate::launch::HARNESS.into()),
+                integration: Some(crate::launch::Integration::Herdr),
+                ..crate::project::ProjectMeta::default()
+            },
+        )));
+        let (text, hits) = render(&app);
+        assert!(text.contains("project settings"), "{text}");
+        assert!(text.contains("Launch command"), "{text}");
+        assert!(text.contains("herdr"), "{text}");
+        assert!(text.contains("Save + launch"), "{text}");
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::ProjectConfigLaunch)
         );
     }
 

@@ -782,15 +782,27 @@ Per-project overrides live in the project's `hegn.toml`:
 ```toml
 launch = "review"
 integration = "herdr"
+auto_start = true
 ```
+
+`F6` in the project screen edits the same three values (`launch`, `integration`
+and `auto_start`, plus the harness used for new instances) instead of opening
+the file by hand. `←`/`→` cycles a value, `↑`/`↓` selects a row, `Enter` saves
+and `r` saves and launches the command immediately. Selecting `tmux` or `herdr`
+here is the supported way to open an agent in a multiplexer; `auto` keeps the
+host-dependent default.
 
 Project-level defaults live in `hegn.toml` inside each project (written by
 `hegn project create`) and record the harness, package list and template used.
+`auto_start = false` keeps the project's VM boots quiet even when the global
+`launch.auto_start` is on.
 
 ### Settings editor
 
-`F4` (global) and `F5` (selected instance) open a modal that edits the same
-schema interactively instead of printing the file. Rows are grouped by runtime,
+`F4` (global) and `F5` (selected instance) open a modal that edits the
+configuration schema interactively instead of printing the file; `F6` edits the
+project-level `hegn.toml` (harness, launch command, terminal integration and
+auto-launch). Rows are grouped by runtime,
 storage, sharing, network/security, tools, directories and packages; the
 instance editor also shows its project, workspace, rootfs and TAP slot as
 read-only rows. `landlock` and `seccomp` are deliberately not editable — hegn
@@ -923,6 +935,7 @@ open it.
 | `S` | Stop the selected instance |
 | `d` | Delete the selected instance or snapshot |
 | `F5` | Instance settings editor |
+| `F6` | Project settings (`hegn.toml`): launch command, integration, auto-launch |
 | `e` / `g` | Editor / lazygit for the project |
 | `F4` | Global settings editor |
 | `?` / `F1` | Help |

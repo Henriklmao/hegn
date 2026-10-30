@@ -16,7 +16,7 @@ pub use crate::config_form::{ConfigForm, ConfigKind};
 use crate::console::TerminalConsole;
 use crate::doctor::DoctorReport;
 use crate::instance::InstanceSummary;
-use crate::launch::{self, LaunchSpec};
+use crate::launch::{self, Integration, LaunchSpec};
 use crate::project::{self, GitSummary, Project, ProjectMeta};
 use crate::security::{Decision, Inspection, SecurityEngine};
 use crate::snapshot::{SnapshotMeta, SnapshotStore};
@@ -347,6 +347,9 @@ pub enum ActionId {
     DeleteProjectFiles,
     InstanceConfig,
     GlobalConfig,
+    ProjectConfig,
+    ProjectConfigSave,
+    ProjectConfigLaunch,
     MultiAgent,
     Launch,
     KeepFiles,
@@ -638,6 +641,42 @@ impl MultiAgentForm {
     }
 }
 
+/// Editable per-project settings stored in the project's `hegn.toml`.
+///
+/// `None` means "inherit the global setting", so the form distinguishes an
+/// explicit choice from the default instead of writing a snapshot of it.
+#[derive(Debug, Clone)]
+pub struct ProjectConfigForm {
+    pub project: PathBuf,
+    pub harness: Option<Harness>,
+    pub launch: Option<String>,
+    pub integration: Option<Integration>,
+    pub auto_start: Option<bool>,
+    pub row: usize,
+    pub error: Option<String>,
+}
+
+impl ProjectConfigForm {
+    pub const ROWS: usize = 4;
+
+    pub fn new(project: PathBuf, meta: &ProjectMeta) -> Self {
+        Self {
+            project,
+            harness: meta.harness,
+            launch: meta.launch.clone(),
+            integration: meta.integration,
+            auto_start: meta.auto_start,
+            row: 0,
+            error: None,
+        }
+    }
+
+    /// Move the row cursor with wrap-around.
+    pub fn select(&mut self, delta: isize) {
+        self.row = (self.row as isize + delta).rem_euclid(Self::ROWS as isize) as usize;
+    }
+}
+
 /// Search state for the help modal. `/` starts editing the query, so typed
 /// characters filter the keybinding list instead of triggering shortcuts.
 #[derive(Debug, Clone, Default)]
@@ -671,6 +710,7 @@ pub enum Modal {
     DeleteInstance(DeleteInstanceModal),
     DeleteProject(DeleteProjectModal),
     MultiAgent(MultiAgentForm),
+    ProjectConfig(ProjectConfigForm),
     Help(HelpState),
     Error {
         title: String,
@@ -1207,7 +1247,7 @@ impl App {
         project: &Path,
         started: bool,
     ) {
-        if !started || !self.config.launch.auto_start {
+        if !started {
             return;
         }
         // Clones export their private workspace; project-level launch settings
@@ -1219,6 +1259,11 @@ impl App {
             .map(|candidate| candidate.project.as_path())
             .unwrap_or(project);
         let meta = project::read_meta(meta_project);
+        // The project can override auto-start, so a chatty agent does not take
+        // over every VM the user boots just to run one command.
+        if !meta.auto_start.unwrap_or(self.config.launch.auto_start) {
+            return;
+        }
         if meta.launch.is_none() && self.config.launch.default.is_none() {
             return;
         }
@@ -1555,6 +1600,9 @@ impl App {
         }
         if key.code == KeyCode::F(2) {
             return self.attach_console_external();
+        }
+        if key.code == KeyCode::F(6) {
+            return self.open_project_config();
         }
         // Left leaves the project unless the guest is actively receiving text.
         if key.code == KeyCode::Left && self.terminal_mode == TerminalMode::Normal {
@@ -2103,6 +2151,35 @@ impl App {
                 }],
                 _ => {
                     self.modal = Some(Modal::MultiAgent(form));
+                    Vec::new()
+                }
+            },
+            Modal::ProjectConfig(mut form) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => Vec::new(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    form.select(-1);
+                    self.modal = Some(Modal::ProjectConfig(form));
+                    Vec::new()
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    form.select(1);
+                    self.modal = Some(Modal::ProjectConfig(form));
+                    Vec::new()
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.cycle_project_config(&mut form, -1);
+                    self.modal = Some(Modal::ProjectConfig(form));
+                    Vec::new()
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.cycle_project_config(&mut form, 1);
+                    self.modal = Some(Modal::ProjectConfig(form));
+                    Vec::new()
+                }
+                KeyCode::Enter => self.save_project_config(form),
+                KeyCode::Char('r') | KeyCode::Char('L') => self.launch_project_config(form),
+                _ => {
+                    self.modal = Some(Modal::ProjectConfig(form));
                     Vec::new()
                 }
             },
@@ -2765,6 +2842,151 @@ impl App {
         self.refresh_instances();
     }
 
+    /// Open the per-project settings editor for the project screen.
+    fn open_project_config(&mut self) -> Vec<Effect> {
+        let Some(project) = self.open_project.clone() else {
+            self.toast(
+                "open a project first — its settings live in hegn.toml",
+                ToastLevel::Warn,
+            );
+            return Vec::new();
+        };
+        let meta = match project::try_read_meta(&project) {
+            Ok(meta) => meta,
+            Err(err) => {
+                self.toast(
+                    format!("cannot edit project settings: {err:#}"),
+                    ToastLevel::Error,
+                );
+                return Vec::new();
+            }
+        };
+        self.project_meta = meta.clone();
+        self.modal = Some(Modal::ProjectConfig(ProjectConfigForm::new(project, &meta)));
+        Vec::new()
+    }
+
+    /// Change the value under the cursor in the project settings form.
+    fn cycle_project_config(&self, form: &mut ProjectConfigForm, delta: isize) {
+        match form.row {
+            0 => {
+                let mut values = vec![
+                    None,
+                    Some(launch::HARNESS.to_string()),
+                    Some(launch::SHELL.to_string()),
+                ];
+                values.extend(
+                    self.config
+                        .launch
+                        .commands
+                        .iter()
+                        .map(|command| Some(command.name.clone())),
+                );
+                form.launch = cycle_value(&values, &form.launch, delta);
+            }
+            1 => {
+                let values: Vec<Option<Integration>> = std::iter::once(None)
+                    .chain(Integration::ALL.map(Some))
+                    .collect();
+                form.integration = cycle_value(&values, &form.integration, delta);
+            }
+            2 => {
+                let values = [None, Some(true), Some(false)];
+                form.auto_start = cycle_value(&values, &form.auto_start, delta);
+            }
+            3 => {
+                let values: Vec<Option<Harness>> = std::iter::once(None)
+                    .chain(Harness::ALL.map(Some))
+                    .collect();
+                form.harness = cycle_value(&values, &form.harness, delta);
+            }
+            _ => {}
+        }
+    }
+
+    /// Write the form values to the project's `hegn.toml`.
+    fn persist_project_config(form: &ProjectConfigForm) -> anyhow::Result<ProjectMeta> {
+        // Refuse to rewrite a file that no longer parses: `read_meta` would
+        // silently return defaults and wipe the user's hand-written settings.
+        let mut meta = project::try_read_meta(&form.project)?;
+        meta.harness = form.harness;
+        meta.launch = form.launch.clone();
+        meta.integration = form.integration;
+        meta.auto_start = form.auto_start;
+        project::write_meta(&form.project, &meta)?;
+        Ok(meta)
+    }
+
+    fn apply_project_meta(&mut self, project: &Path, meta: ProjectMeta) {
+        if self.open_project.as_deref() == Some(project) {
+            self.project_meta = meta;
+        }
+    }
+
+    fn save_project_config(&mut self, form: ProjectConfigForm) -> Vec<Effect> {
+        match Self::persist_project_config(&form) {
+            Ok(meta) => {
+                self.apply_project_meta(&form.project, meta);
+                self.modal = None;
+                self.toast(
+                    format!(
+                        "project settings saved to {}",
+                        form.project.join(project::PROJECT_META_FILE).display()
+                    ),
+                    ToastLevel::Info,
+                );
+                Vec::new()
+            }
+            Err(err) => {
+                let mut form = form;
+                form.error = Some(format!("could not save hegn.toml: {err}"));
+                self.modal = Some(Modal::ProjectConfig(form));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Save the settings and launch the selected command in the chosen
+    /// integration (`embedded`, `external`, `tmux`, or `herdr`).
+    fn launch_project_config(&mut self, form: ProjectConfigForm) -> Vec<Effect> {
+        let meta = match Self::persist_project_config(&form) {
+            Ok(meta) => meta,
+            Err(err) => {
+                let mut form = form;
+                form.error = Some(format!("could not save hegn.toml: {err}"));
+                self.modal = Some(Modal::ProjectConfig(form));
+                return Vec::new();
+            }
+        };
+        self.apply_project_meta(&form.project, meta);
+        self.modal = None;
+
+        let Some(instance) = self.selected_instance().cloned() else {
+            self.toast(
+                "start the project first; the command runs inside its VM",
+                ToastLevel::Warn,
+            );
+            return Vec::new();
+        };
+        let spec = match launch::resolve(
+            &self.config,
+            instance.harness,
+            form.launch.as_deref(),
+            form.integration,
+        ) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.toast(format!("launch failed: {err}"), ToastLevel::Error);
+                return Vec::new();
+            }
+        };
+        vec![Effect::LaunchAgent {
+            spec,
+            instance: instance.name,
+            project: instance.workspace,
+        }]
+    }
+
     fn open_multi_agent(&mut self) -> Vec<Effect> {
         let Some(session) = self.session.as_ref() else {
             self.toast(
@@ -3033,6 +3255,7 @@ impl App {
                             | Modal::DeleteInstance(_)
                             | Modal::DeleteProject(_)
                             | Modal::MultiAgent(_)
+                            | Modal::ProjectConfig(_)
                     )
                 ) {
                     self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -3167,6 +3390,21 @@ impl App {
             }
             ActionId::InstanceConfig => self.open_instance_config(),
             ActionId::GlobalConfig => self.open_global_config(),
+            ActionId::ProjectConfig => self.open_project_config(),
+            ActionId::ProjectConfigSave => match self.modal.take() {
+                Some(Modal::ProjectConfig(form)) => self.save_project_config(form),
+                other => {
+                    self.modal = other;
+                    Vec::new()
+                }
+            },
+            ActionId::ProjectConfigLaunch => match self.modal.take() {
+                Some(Modal::ProjectConfig(form)) => self.launch_project_config(form),
+                other => {
+                    self.modal = other;
+                    Vec::new()
+                }
+            },
             ActionId::CloneInstance | ActionId::MultiAgent => self.open_multi_agent(),
             ActionId::KeepFiles => {
                 self.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
@@ -3583,6 +3821,21 @@ fn rect_contains(rect: Rect, pos: (u16, u16)) -> bool {
         && pos.0 < rect.x.saturating_add(rect.width)
         && pos.1 >= rect.y
         && pos.1 < rect.y.saturating_add(rect.height)
+}
+
+/// Cycle through `values`, wrapping at both ends. Falls back to the first
+/// value when `current` is not in the list (for example after the config
+/// changed under an open form).
+fn cycle_value<T: Clone + PartialEq>(values: &[T], current: &T, delta: isize) -> T {
+    if values.is_empty() {
+        return current.clone();
+    }
+    let index = values
+        .iter()
+        .position(|value| value == current)
+        .unwrap_or(0);
+    let next = (index as isize + delta).rem_euclid(values.len() as isize) as usize;
+    values[next].clone()
 }
 
 /// Encode a key for raw passthrough mode.
@@ -4224,6 +4477,132 @@ mod tests {
         app.config.launch.auto_start = true;
         app.queue_auto_launch("demo", Harness::Shell, Path::new("/missing/project"), true);
         assert!(app.pending_launch.is_none());
+    }
+
+    #[test]
+    fn project_settings_cycle_the_integration_and_save_hegn_toml() {
+        let (_dir, mut app) = test_app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let instance = fake_instance(&app, "demo", project.join("workspace"));
+        install_instances(&mut app, vec![instance]);
+        app.screen = Screen::Project;
+        app.open_project = Some(project.clone());
+
+        app.handle_key(key(KeyCode::F(6)));
+        assert!(matches!(app.modal, Some(Modal::ProjectConfig(_))));
+
+        // Row 0 is the launch command; row 1 is the integration.
+        app.handle_key(key(KeyCode::Down));
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Right));
+        }
+        match &app.modal {
+            Some(Modal::ProjectConfig(form)) => {
+                assert_eq!(form.row, 1);
+                assert_eq!(form.integration, Some(Integration::Tmux));
+            }
+            other => panic!("expected project config, got {other:?}"),
+        }
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.modal.is_none(), "saving closes the form");
+        let meta = project::read_meta(&project);
+        assert_eq!(meta.integration, Some(Integration::Tmux));
+        assert!(project.join(project::PROJECT_META_FILE).is_file());
+        assert_eq!(app.project_meta.integration, Some(Integration::Tmux));
+    }
+
+    #[test]
+    fn project_settings_open_from_the_focused_terminal() {
+        let (_dir, mut app) = test_app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        app.screen = Screen::Project;
+        app.open_project = Some(project);
+        app.terminal_focus = true;
+        app.terminal_mode = TerminalMode::Insert;
+
+        app.handle_key(key(KeyCode::F(6)));
+        assert!(matches!(app.modal, Some(Modal::ProjectConfig(_))));
+    }
+
+    #[test]
+    fn project_settings_refuse_to_overwrite_a_malformed_hegn_toml() {
+        let (_dir, mut app) = test_app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let file = project.join(project::PROJECT_META_FILE);
+        std::fs::write(&file, "harness = [\n").unwrap();
+        app.screen = Screen::Project;
+        app.open_project = Some(project);
+
+        app.handle_key(key(KeyCode::F(6)));
+        assert!(app.modal.is_none(), "the editor must not open");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "harness = [\n");
+    }
+
+    #[test]
+    fn project_settings_save_and_launch_returns_a_launch_effect() {
+        let (_dir, mut app) = test_app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let instance = fake_instance(&app, "demo", project.join("workspace"));
+        install_instances(&mut app, vec![instance]);
+        app.screen = Screen::Project;
+        app.open_project = Some(project.clone());
+        app.config.launch.default = Some(launch::HARNESS.to_string());
+
+        app.handle_key(key(KeyCode::F(6)));
+        app.handle_key(key(KeyCode::Down));
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Right));
+        }
+        let effects = app.handle_key(key(KeyCode::Char('r')));
+        let [Effect::LaunchAgent { spec, instance, .. }] = effects.as_slice() else {
+            panic!("expected one launch effect, got {effects:?}");
+        };
+        assert_eq!(instance, "demo");
+        assert_eq!(spec.integration, Integration::Tmux);
+        assert_eq!(
+            project::read_meta(&project).integration,
+            Some(Integration::Tmux)
+        );
+    }
+
+    #[test]
+    fn project_auto_start_override_wins_over_the_global_setting() {
+        let (_dir, mut app) = test_app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        project::write_meta(
+            &project,
+            &ProjectMeta {
+                auto_start: Some(false),
+                ..ProjectMeta::default()
+            },
+        )
+        .unwrap();
+        app.config.launch.auto_start = true;
+
+        app.queue_auto_launch("demo", Harness::Opencode, &project, true);
+        assert!(app.pending_launch.is_none());
+    }
+
+    #[test]
+    fn cycle_value_wraps_and_falls_back_to_the_first_entry() {
+        let values = [None, Some(Integration::Tmux)];
+        assert_eq!(
+            cycle_value(&values, &Some(Integration::Tmux), 1),
+            None,
+            "last value wraps to the first"
+        );
+        assert_eq!(cycle_value(&values, &None, -1), Some(Integration::Tmux));
+        assert_eq!(
+            cycle_value(&values, &Some(Integration::External), 1),
+            Some(Integration::Tmux),
+            "unknown values restart from the first entry"
+        );
     }
 
     #[test]
