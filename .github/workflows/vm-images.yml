@@ -39,7 +39,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if git diff --quiet -- src/images.rs; then
+          if git diff --quiet -- src/vm/images/assets.rs; then
             echo "VM image pins are current."
             exit 0
           fi
@@ -48,7 +48,7 @@ jobs:
           git config user.name "hegn-vm-images[bot]"
           git config user.email "hegn-vm-images@users.noreply.github.com"
           git checkout -B "$branch"
-          git add src/images.rs
+          git add src/vm/images/assets.rs
           git commit -m "chore(images): refresh pinned Cloud Hypervisor VM assets"
           git push --force origin "$branch"
 
@@ -57,7 +57,7 @@ jobs:
 
           The update script downloads the selected kernel and ext4 rootfs,
           computes SHA-256 from the actual bytes, and rewrites the architecture
-          blocks in `src/images.rs`. Review the URLs and checksums before
+          blocks in `src/vm/images/assets.rs`. Review the URLs and checksums before
           merging; the next Rust CI run verifies the code still builds.
           EOF
           )
