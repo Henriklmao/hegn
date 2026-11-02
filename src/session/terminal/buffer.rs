@@ -1,4 +1,4 @@
-//! ANSI-aware scrollback buffer for the VM serial console.
+//! Scrollback lines and their ANSI/control handling.
 
 use std::collections::VecDeque;
 
@@ -50,32 +50,7 @@ impl TerminalBuffer {
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) {
-        self.pending.extend_from_slice(bytes);
-        let decoded = {
-            match std::str::from_utf8(&self.pending) {
-                Ok(text) => Ok(text.to_string()),
-                Err(err) => Err((err.valid_up_to(), err.error_len().is_none())),
-            }
-        };
-        let text = match decoded {
-            Ok(text) => {
-                self.pending.clear();
-                text
-            }
-            Err((valid, true)) => {
-                // Incomplete sequence at the end: keep it for the next read.
-                let text = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
-                self.pending.drain(..valid);
-                text
-            }
-            Err((_, false)) => {
-                // Invalid bytes: render replacement characters rather than
-                // stalling forever on them.
-                let text = String::from_utf8_lossy(&self.pending).into_owned();
-                self.pending.clear();
-                text
-            }
-        };
+        let text = super::utf8::feed(&mut self.pending, bytes);
         for ch in text.chars() {
             self.push_char(ch);
         }

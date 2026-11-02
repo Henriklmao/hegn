@@ -1,87 +1,12 @@
-//! On-disk snapshot metadata.
-//!
-//! A snapshot is a directory written by Cloud Hypervisor:
-//!
-//! ```text
-//! ~/.local/share/hegn/snapshots/
-//!   .staging/<name>/   # the only path the VMM may write
-//!   <name>/
-//!     snapshot.json    # hegn metadata rendered by the TUI
-//!     config.json      # Cloud Hypervisor VM configuration
-//!     state.json       # device and CPU state
-//!     memory-ranges    # guest memory
-//! ```
-//!
-//! Finished snapshots are renamed out of `.staging` before metadata is saved,
-//! so the VMM's Landlock rule never covers completed checkpoints.
+//! Snapshot store: private directory creation, staging, finalize and listing.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::Utc;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotMeta {
-    pub name: String,
-    pub created_at: DateTime<Utc>,
-    pub vm_state: String,
-    /// Directory passed to Cloud Hypervisor as `file://<dir>`.
-    pub dir: PathBuf,
-    /// Instance that owns this snapshot. Optional for older metadata.
-    #[serde(default, alias = "sandbox")]
-    pub instance: Option<String>,
-    pub project: Option<PathBuf>,
-    #[serde(default)]
-    pub size_bytes: u64,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-impl SnapshotMeta {
-    pub fn size_label(&self) -> String {
-        human_size(self.size_bytes)
-    }
-
-    /// Cloud Hypervisor's required files. Snapshot directories from other VMM
-    /// formats are intentionally not accepted.
-    pub fn is_restorable(&self) -> bool {
-        self.dir.is_dir()
-            && self.dir.join("config.json").is_file()
-            && self.dir.join("state.json").is_file()
-            && self.dir.join("memory-ranges").is_file()
-    }
-
-    pub fn source_url(&self) -> String {
-        format!("file://{}", self.dir.display())
-    }
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-/// Paths reserved for a new snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotPaths {
-    /// Directory the VMM writes into (a staging directory in production).
-    pub dir: PathBuf,
-    /// Final private snapshot directory once `finalize` has moved it.
-    pub final_dir: PathBuf,
-    pub meta_path: PathBuf,
-}
+use super::model::{SnapshotMeta, SnapshotPaths, sanitize_name};
 
 #[derive(Debug, Clone)]
 pub struct SnapshotStore {
@@ -287,28 +212,6 @@ fn dir_size(dir: &Path) -> u64 {
         .sum()
 }
 
-/// Validate a snapshot name. Names become directory names, so traversal and
-/// hidden entries are rejected.
-pub fn sanitize_name(name: &str) -> Result<String> {
-    let name = name.trim();
-    if name.is_empty() {
-        bail!("snapshot name cannot be empty");
-    }
-    if name.len() > 100 {
-        bail!("snapshot name is too long");
-    }
-    if name.starts_with('.') || name.contains('/') || name.contains('\\') {
-        bail!("snapshot name must not contain path separators or start with '.'");
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
-        bail!("snapshot name may only contain ASCII letters, digits, '-', '_' and '.'");
-    }
-    Ok(name.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,43 +351,5 @@ mod tests {
         assert!(name.len() <= 100, "{}", name.len());
         sanitize_name(&name).unwrap();
         assert!(SnapshotStore::suggested_name("demo").starts_with("demo-"));
-    }
-
-    #[test]
-    fn source_url_is_a_file_url() {
-        let meta = SnapshotMeta {
-            name: "demo".into(),
-            created_at: Utc::now(),
-            vm_state: "Paused".into(),
-            dir: PathBuf::from("/snapshots/demo"),
-            instance: None,
-            project: None,
-            size_bytes: 0,
-            note: None,
-        };
-        assert_eq!(meta.source_url(), "file:///snapshots/demo");
-    }
-
-    #[test]
-    fn a_missing_snapshot_is_not_restorable() {
-        let dir = tempfile::tempdir().unwrap();
-        let meta = SnapshotMeta {
-            name: "missing".into(),
-            created_at: Utc::now(),
-            vm_state: "Paused".into(),
-            dir: dir.path().join("missing"),
-            instance: None,
-            project: None,
-            size_bytes: 0,
-            note: None,
-        };
-        assert!(!meta.is_restorable());
-    }
-
-    #[test]
-    fn human_sizes_are_readable() {
-        assert_eq!(human_size(12), "12 B");
-        assert_eq!(human_size(2048), "2.0 KiB");
-        assert_eq!(human_size(3 * 1024 * 1024), "3.0 MiB");
     }
 }
