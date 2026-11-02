@@ -62,17 +62,7 @@ pub(super) fn secure_snapshot_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn dir_size(dir: &Path) -> u64 {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| fs::symlink_metadata(entry.path()).ok())
-        .filter(|meta| meta.file_type().is_file())
-        .map(|meta| meta.len())
-        .sum()
-}
+pub(super) use crate::shared::fs::{dir_size, write_private};
 
 /// Guest URLs for the configured local endpoints on one TAP.
 pub(super) fn endpoint_urls(config: &Config, host: Ipv4Addr) -> Vec<String> {
@@ -99,25 +89,6 @@ pub(super) fn append_event_log(path: &Path, message: &str) {
     {
         let _ = writeln!(file, "{timestamp} hegn: {message}");
     }
-}
-
-/// Write a runtime metadata file with mode `0600`.
-///
-/// The run directory itself is `0700`, but keeping the files private too makes
-/// the invariant robust against a future path move or permission mistake.
-pub(super) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    file.write_all(contents.as_ref())?;
-    file.sync_all()?;
-    Ok(())
 }
 
 #[cfg(test)]

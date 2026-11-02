@@ -11,20 +11,7 @@ use anyhow::{Context, Result, bail};
 use super::discovery::absolute_or_canonical;
 use super::meta::validate_project_name;
 
-/// Expand a leading `~` in a path typed into the TUI or a config file.
-pub fn expand_tilde(path: &Path) -> PathBuf {
-    let Some(home) = dirs::home_dir() else {
-        return path.to_path_buf();
-    };
-    let raw = path.to_string_lossy();
-    if raw == "~" {
-        home
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        home.join(rest)
-    } else {
-        path.to_path_buf()
-    }
-}
+pub use crate::shared::paths::expand_tilde;
 
 /// Import an existing directory into the project picker without moving it.
 ///

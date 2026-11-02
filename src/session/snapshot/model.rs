@@ -42,20 +42,7 @@ impl SnapshotMeta {
     }
 }
 
-fn human_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
+use crate::shared::text::human_bytes as human_size;
 
 /// Paths reserved for a new snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]

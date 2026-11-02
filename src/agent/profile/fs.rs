@@ -16,10 +16,8 @@ pub(super) fn secure_dir(path: &Path) -> Result<()> {
     {
         bail!("refusing symlinked profile directory {}", path.display());
     }
-    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("failed to secure {}", path.display()))?;
-    Ok(())
+    crate::shared::fs::create_private_dir(path)
+        .with_context(|| format!("failed to secure profile directory {}", path.display()))
 }
 
 /// Ensure `path` is a real directory owned by hegn. A guest can replace a
@@ -54,20 +52,8 @@ pub(super) fn remove_path(path: &Path) -> Result<()> {
 }
 
 pub(super) fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    file.write_all(contents)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    file.sync_all()?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to secure {}", path.display()))?;
-    Ok(())
+    crate::shared::fs::write_private(path, contents)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 pub(super) fn copy_file_private(source: &Path, dest: &Path) -> Result<()> {

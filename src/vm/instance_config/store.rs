@@ -13,8 +13,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
 
-use super::clone::create_private_dir;
 use super::model::{CONFIG_FILE, InstanceConfig, validate_name};
+use crate::shared::fs::create_private_dir;
 
 /// Filesystem-only store for instance configuration and cloned workspaces.
 #[derive(Debug, Clone)]

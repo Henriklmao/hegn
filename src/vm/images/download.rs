@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
+use crate::shared::fs::create_private_dir;
 
 use super::MAX_ASSET_BYTES;
 use super::assets::{AssetStatus, status};
@@ -297,23 +298,6 @@ fn temp_path(dest: &Path) -> PathBuf {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "asset".into());
     dest.with_file_name(format!(".{name}.part-{}-{unique}", std::process::id()))
-}
-
-#[cfg(unix)]
-fn create_private_dir(path: &Path) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder
-        .create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn create_private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
-    Ok(())
 }
 
 #[cfg(test)]

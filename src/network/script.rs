@@ -9,6 +9,7 @@ use super::TAP_POOL;
 use super::addressing::{host_ip, mac, tap_name};
 use super::firewall::{host_firewall_cleanup, host_firewall_coexistence, nft_rules};
 use super::privilege::safe_user;
+use crate::shared::text::shell_quote_os;
 
 /// Shell script that creates the TAP pool and installs the nftables table.
 /// `user` must pass [`safe_user`]; it is embedded in the script deliberately.
@@ -92,26 +93,9 @@ pub(super) fn run_script(script: &str) -> Result<()> {
 pub(super) fn render_command(program: &str, args: &[OsString]) -> String {
     std::iter::once(OsStr::new(program))
         .chain(args.iter().map(OsString::as_os_str))
-        .map(shell_quote)
+        .map(shell_quote_os)
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn shell_quote(value: &OsStr) -> String {
-    let raw = value.to_string_lossy();
-    if !raw.is_empty()
-        && raw.chars().all(|ch| {
-            ch.is_ascii_alphanumeric()
-                || matches!(
-                    ch,
-                    '_' | '@' | '%' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
-                )
-        })
-    {
-        raw.into_owned()
-    } else {
-        format!("'{}'", raw.replace('\'', r#"'\''"#))
-    }
 }
 
 #[cfg(test)]
@@ -263,7 +247,7 @@ mod tests {
             ("safe-._@%+=:,/", "safe-._@%+=:,/"),
         ] {
             assert_eq!(
-                shell_quote(OsStr::new(raw)),
+                shell_quote_os(OsStr::new(raw)),
                 quoted,
                 "unexpected quoting for {raw:?}"
             );
@@ -277,7 +261,7 @@ mod tests {
             "a b", "it's", "$(id)", "`id`", "a;b", "a&&b", "a|b", "a>b", "a*b", "a\nb", "--force",
             "", "100%", "$HOME", "~root", "a\\b",
         ] {
-            let script = format!("printf %s {}", shell_quote(OsStr::new(raw)));
+            let script = format!("printf %s {}", shell_quote_os(OsStr::new(raw)));
             let output = Command::new("sh")
                 .args(["-c", &script])
                 .output()

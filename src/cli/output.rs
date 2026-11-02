@@ -3,23 +3,10 @@
 
 use anyhow::Result;
 
+pub(crate) use crate::shared::text::human_bytes as human_size;
+
 use crate::session::snapshot::SnapshotMeta;
 use crate::vm::instance::{InstanceReport, InstanceSummary, process_alive};
-
-pub(crate) fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
 
 pub(crate) fn print_instances(instances: &[InstanceSummary], json: bool) -> Result<()> {
     if json {
@@ -198,8 +185,8 @@ mod tests {
     }
 
     #[test]
-    fn human_size_stops_at_gibibytes_for_larger_values() {
-        assert_eq!(human_size(1024_u64.pow(4)), "1024.0 GiB");
-        assert_eq!(human_size(u64::MAX), "17179869184.0 GiB");
+    fn human_size_uses_tebibytes_for_larger_values() {
+        assert_eq!(human_size(1024_u64.pow(4)), "1.0 TiB");
+        assert_eq!(human_size(u64::MAX), "16777216.0 TiB");
     }
 }

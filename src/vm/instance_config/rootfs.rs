@@ -42,7 +42,7 @@ impl InstanceConfig {
         if !crate::vm::images::is_regular_file(&config.rootfs_image) {
             bail!("base rootfs {} is missing", config.rootfs_image.display());
         }
-        super::clone::create_private_dir(dest.parent().unwrap_or(&dest))?;
+        crate::shared::fs::create_private_dir(dest.parent().unwrap_or(&dest))?;
         let tmp = dest.with_file_name(format!(".rootfs.part-{}", std::process::id()));
         let _ = fs::remove_file(&tmp);
         let result = (|| -> Result<()> {

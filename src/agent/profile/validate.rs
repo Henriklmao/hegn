@@ -4,21 +4,13 @@
 //! targets are restricted to user and configuration locations, and sources may
 //! not point at the filesystem root or the user's whole home directory.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use anyhow::{Result, bail};
 
 use super::{MAX_ENV_VALUE, MAX_TARGET_LEN};
 
-/// Expand a leading `~` without touching the rest of the path.
-pub fn expand_home(path: &Path) -> PathBuf {
-    if let Ok(rest) = path.strip_prefix("~") {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
-        home.join(rest)
-    } else {
-        path.to_path_buf()
-    }
-}
+pub use crate::shared::paths::expand_home;
 
 pub(super) fn validate_source(source: &Path) -> Result<()> {
     let expanded = expand_home(source);
@@ -128,7 +120,8 @@ pub(super) fn validate_env(name: &str, value: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::agent::profile::model::{Profile, ProfileFile};
-    use crate::agent::profile::store::shell_quote;
+    use crate::shared::text::shell_quote_always as shell_quote;
+    use std::path::PathBuf;
 
     #[test]
     fn rejects_unsafe_targets_and_packages() {

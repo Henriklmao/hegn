@@ -112,9 +112,7 @@ fn parse_kib(value: &str) -> Option<u64> {
     Some(kib * 1024)
 }
 
-pub(super) fn process_alive(pid: u32) -> bool {
-    pid != 0 && Path::new("/proc").join(pid.to_string()).exists()
-}
+pub(super) use crate::shared::process::process_alive;
 
 /// Whether the process command line contains `needle`.
 ///

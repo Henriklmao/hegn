@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 use super::model::{SnapshotMeta, SnapshotPaths, sanitize_name};
+use crate::shared::fs::{create_private_dir, dir_size};
 
 #[derive(Debug, Clone)]
 pub struct SnapshotStore {
@@ -184,32 +185,6 @@ impl SnapshotStore {
             .with_context(|| format!("failed to delete snapshot {}", dir.display()))?;
         Ok(())
     }
-}
-
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        builder.create(dir)
-    }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(dir)
-    }
-}
-
-fn dir_size(dir: &Path) -> u64 {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| fs::symlink_metadata(entry.path()).ok())
-        .filter(|meta| meta.file_type().is_file())
-        .map(|meta| meta.len())
-        .sum()
 }
 
 #[cfg(test)]

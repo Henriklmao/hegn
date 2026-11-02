@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 use crate::config::Harness;
+use crate::shared::fs::create_private_dir;
 
 use super::model::{CONFIG_FILE, CONFIG_VERSION, InstanceConfig, WORKSPACE_DIR, validate_name};
 use super::store::InstanceStore;
@@ -428,29 +429,6 @@ fn path_is_inside(path: &Path, parent: &Path) -> bool {
         .canonicalize()
         .unwrap_or_else(|_| parent.to_path_buf());
     path != parent && path.starts_with(&parent)
-}
-
-pub(super) fn create_private_dir(path: &Path) -> Result<()> {
-    if let Ok(metadata) = fs::symlink_metadata(path)
-        && metadata.file_type().is_symlink()
-    {
-        bail!("refusing symlinked directory {}", path.display());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        use std::os::unix::fs::PermissionsExt;
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        builder
-            .create(path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to secure {}", path.display()))?;
-    }
-    #[cfg(not(unix))]
-    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
-    Ok(())
 }
 
 #[cfg(test)]

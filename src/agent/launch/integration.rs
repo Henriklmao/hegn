@@ -13,6 +13,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use super::command::LaunchSpec;
+use crate::shared::text::shell_quote;
 
 /// Where the serial console (and therefore the launched command) is displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Default)]
@@ -176,17 +177,6 @@ pub fn attach_shell_command(
         .join(" ")
 }
 
-fn shell_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || "-_./:=@%+".contains(ch))
-    {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
 /// Create a herdr pane and run the attach command in it.
 pub fn spawn_herdr(pane_command: &str, cwd: &Path) -> Result<()> {
     let output = Command::new("herdr")
@@ -279,7 +269,7 @@ mod tests {
         assert!(command.contains("'/usr/bin/hegn'") || command.contains("/usr/bin/hegn"));
         assert!(command.contains("--no-bar"));
         assert!(command.contains("opencode --model"));
-        assert!(command.contains("'\"'\"'"));
+        assert!(command.contains(r#"'\''"#));
     }
 
     #[test]
@@ -290,7 +280,7 @@ mod tests {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("$(id)"), "'$(id)'");
         assert_eq!(shell_quote("a;reboot"), "'a;reboot'");
-        assert_eq!(shell_quote("it's"), r#"'it'"'"'s'"#);
+        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
         for value in ["a b", "$(id)", "a;b", "a\nb", "x\"y", "`id`"] {
             let quoted = shell_quote(value);
             assert!(

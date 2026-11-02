@@ -18,20 +18,7 @@ pub(super) fn rect_contains(rect: Rect, pos: (u16, u16)) -> bool {
         && pos.1 < rect.y.saturating_add(rect.height)
 }
 
-/// Cycle through `values`, wrapping at both ends. Falls back to the first
-/// value when `current` is not in the list (for example after the config
-/// changed under an open form).
-pub(super) fn cycle_value<T: Clone + PartialEq>(values: &[T], current: &T, delta: isize) -> T {
-    if values.is_empty() {
-        return current.clone();
-    }
-    let index = values
-        .iter()
-        .position(|value| value == current)
-        .unwrap_or(0);
-    let next = (index as isize + delta).rem_euclid(values.len() as isize) as usize;
-    values[next].clone()
-}
+pub(super) use crate::shared::math::cycle_value;
 
 /// Encode a key for raw passthrough mode.
 pub fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{BackendKind, Config, Harness, NetworkMode, RootfsFormat, SecurityMode};
+use crate::shared::math::cycle_value;
 use crate::vm::instance_config::{CONFIG_FILE, InstanceConfig};
 
 use super::rows::{
@@ -497,29 +498,30 @@ impl ConfigForm {
         match &mut self.draft {
             Draft::Global(config) => match field {
                 ConfigField::Harness => {
-                    config.harness = cycle_value(&Harness::ALL, config.harness, dir)
+                    config.harness = cycle_value(&Harness::ALL, &config.harness, dir.into())
                 }
                 ConfigField::RootfsFormat => {
                     config.rootfs_format =
-                        cycle_value(&RootfsFormat::ALL, config.rootfs_format, dir)
+                        cycle_value(&RootfsFormat::ALL, &config.rootfs_format, dir.into())
                 }
                 ConfigField::Network => {
-                    config.network = cycle_value(&NetworkMode::ALL, config.network, dir)
+                    config.network = cycle_value(&NetworkMode::ALL, &config.network, dir.into())
                 }
                 ConfigField::Security => {
-                    config.security = cycle_value(&SecurityMode::ALL, config.security, dir)
+                    config.security = cycle_value(&SecurityMode::ALL, &config.security, dir.into())
                 }
                 ConfigField::Backend => {
-                    config.backend = cycle_value(&BackendKind::ALL, config.backend, dir)
+                    config.backend = cycle_value(&BackendKind::ALL, &config.backend, dir.into())
                 }
                 _ => {}
             },
             Draft::Instance(instance) => match field {
                 ConfigField::Harness => {
-                    instance.harness = cycle_value(&Harness::ALL, instance.harness, dir)
+                    instance.harness = cycle_value(&Harness::ALL, &instance.harness, dir.into())
                 }
                 ConfigField::Security => {
-                    instance.security = cycle_value(&SecurityMode::ALL, instance.security, dir)
+                    instance.security =
+                        cycle_value(&SecurityMode::ALL, &instance.security, dir.into())
                 }
                 _ => {}
             },
@@ -571,20 +573,6 @@ impl ConfigForm {
         }
         Ok(())
     }
-}
-
-fn cycle_value<T: Copy + PartialEq>(items: &[T], current: T, dir: i8) -> T {
-    let index = items.iter().position(|item| *item == current).unwrap_or(0);
-    let len = items.len();
-    if len == 0 {
-        return current;
-    }
-    let next = if dir < 0 {
-        (index + len - 1) % len
-    } else {
-        (index + 1) % len
-    };
-    items[next]
 }
 
 #[cfg(test)]

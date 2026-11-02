@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Harness};
+use crate::shared::text::shell_quote_always as shell_quote;
 use crate::vm::instance_config::InstanceConfig;
 
 use super::fs::{ensure_real_dir, remove_path, secure_dir, write_private};
@@ -187,10 +188,6 @@ impl ProfileLayout {
         }
         env
     }
-}
-
-pub(super) fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r#"'\''"#))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

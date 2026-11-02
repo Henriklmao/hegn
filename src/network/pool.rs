@@ -1,7 +1,6 @@
 //! TAP pool reservations: owner files, per-slice locking and status rows.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
@@ -14,6 +13,7 @@ use super::addressing::{guest_ip, host_ip, mac, tap_name};
 use super::privilege::ensure_ready;
 use super::{DNS, NETWORK_DIR, TAP_POOL};
 use crate::config::Config;
+use crate::shared::fs::write_private;
 use crate::vm::instance::InstanceManager;
 use crate::vm::instance_config::{InstanceConfig, InstanceStore};
 
@@ -170,7 +170,7 @@ fn try_claim(config: &Config, index: u8, instance: &str) -> Result<Option<Lease>
         host_ip: host_ip(index),
         guest_ip: guest_ip(index),
     };
-    write_private(&path, &format!("{instance}\n{}\n", std::process::id()))?;
+    write_private(&path, format!("{instance}\n{}\n", std::process::id()))?;
     Ok(Some(lease))
 }
 
@@ -219,20 +219,6 @@ fn tap_exists(index: u8) -> bool {
 
 fn lock_path(config: &Config, index: u8) -> PathBuf {
     network_dir(config).join(format!("{}.lock", tap_name(index)))
-}
-
-fn write_private(path: &Path, contents: &str) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
 }
 
 struct FileLock {
@@ -469,7 +455,7 @@ mod tests {
         for index in 0..TAP_POOL {
             write_private(
                 &owner_path(&config, index),
-                &format!("other\n{}\n", std::process::id()),
+                format!("other\n{}\n", std::process::id()),
             )
             .unwrap();
         }
