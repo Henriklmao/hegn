@@ -137,7 +137,7 @@ impl InstanceConfig {
     /// Concurrent instances therefore never open the same writable disk.
     pub fn prepare_rootfs(&self, config: &Config) -> Result<PathBuf> {
         let dest = self.rootfs_path(config);
-        if crate::images::is_regular_file(&dest) {
+        if crate::vm::images::is_regular_file(&dest) {
             // An instance that was prepared by an older hegn version may still
             // be at the cloud image's 2.2 GiB. Grow it before the next boot so
             // the provisioner has room for Node.js and the harness.
@@ -147,7 +147,7 @@ impl InstanceConfig {
         if self.rootfs_image.is_some() {
             bail!("instance rootfs_image {} does not exist", dest.display());
         }
-        if !crate::images::is_regular_file(&config.rootfs_image) {
+        if !crate::vm::images::is_regular_file(&config.rootfs_image) {
             bail!("base rootfs {} is missing", config.rootfs_image.display());
         }
         create_private_dir(dest.parent().unwrap_or(&dest))?;
@@ -194,7 +194,7 @@ impl InstanceConfig {
         if !config.cloud_init {
             return Ok(());
         }
-        crate::rootfs::grow_to_minimum(path, config.rootfs_format).with_context(|| {
+        crate::vm::rootfs::grow_to_minimum(path, config.rootfs_format).with_context(|| {
             format!(
                 "failed to grow the instance rootfs {} (the first boot needs room for the \
                  harness preset)",
@@ -233,19 +233,19 @@ impl InstanceConfig {
         if self.memory_mib < 128 {
             bail!("instance memory_mib must be at least 128");
         }
-        crate::cloud_init::safe_token(&self.shared_tag)
+        crate::vm::cloud_init::safe_token(&self.shared_tag)
             .then_some(())
             .context("instance shared_tag contains unsafe characters")?;
-        if self.shared_tag == crate::profile::PROFILE_SHARE_TAG {
+        if self.shared_tag == crate::agent::profile::PROFILE_SHARE_TAG {
             bail!(
                 "instance shared_tag '{}' is reserved for the harness profile share",
-                crate::profile::PROFILE_SHARE_TAG
+                crate::agent::profile::PROFILE_SHARE_TAG
             );
         }
         if self.shared_tag.len() > 36 {
             bail!("instance shared_tag must be at most 36 bytes");
         }
-        crate::cloud_init::safe_mount(&self.guest_mount)
+        crate::vm::cloud_init::safe_mount(&self.guest_mount)
             .then_some(())
             .context("instance guest_mount must be an absolute, simple path")?;
         if let Some(source) = &self.source_instance {

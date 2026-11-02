@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::logs::sanitize_label;
+use crate::session::logs::sanitize_label;
 
 /// Hint on the right side of the bar.
 ///

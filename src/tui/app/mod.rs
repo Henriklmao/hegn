@@ -1,6 +1,6 @@
 //! TUI application state and event handling.
 //!
-//! All state transitions live here and are covered by unit tests; [`crate::ui`]
+//! All state transitions live here and are covered by unit tests; [`crate::tui::ui`]
 //! is a pure renderer and [`crate::tui`] owns the terminal loop. This separation
 //! makes the dashboard testable with ratatui's `TestBackend`.
 
@@ -10,18 +10,18 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
+use crate::agent::launch::{self, Integration, LaunchSpec};
+use crate::config::form::{Applied, ConfigField, ConfigPage, FormOutcome};
+pub use crate::config::form::{ConfigForm, ConfigKind};
 use crate::config::{Config, Harness, SecurityMode};
-use crate::config_form::{Applied, ConfigField, ConfigPage, FormOutcome};
-pub use crate::config_form::{ConfigForm, ConfigKind};
-use crate::console::TerminalConsole;
-use crate::doctor::DoctorReport;
-use crate::instance::InstanceSummary;
-use crate::launch::{self, Integration, LaunchSpec};
+use crate::diagnostics::doctor::DoctorReport;
 use crate::project::{self, GitSummary, Project, ProjectMeta};
 use crate::security::{Decision, Inspection, SecurityEngine};
-use crate::snapshot::{SnapshotMeta, SnapshotStore};
-use crate::state::StateStore;
-use crate::terminal::TerminalBuffer;
+use crate::session::console::TerminalConsole;
+use crate::session::snapshot::{SnapshotMeta, SnapshotStore};
+use crate::session::state::StateStore;
+use crate::session::terminal::TerminalBuffer;
+use crate::vm::instance::InstanceSummary;
 
 const TOAST_TTL: Duration = Duration::from_secs(6);
 const DOUBLE_CLICK: Duration = Duration::from_millis(450);
@@ -766,9 +766,9 @@ pub struct App {
     pub scroll: usize,
     pub toast: Option<Toast>,
     /// In-flight VM image download, rendered as a progress notification.
-    pub download: Option<crate::images::DownloadProgress>,
+    pub download: Option<crate::vm::images::DownloadProgress>,
     /// First-boot harness provisioning, rendered above the download/toast.
-    pub provision: Option<crate::provision::ProvisionProgress>,
+    pub provision: Option<crate::agent::provision::ProvisionProgress>,
     /// Command waiting for the VM (and its preset) to become ready.
     pub pending_launch: Option<PendingLaunch>,
     /// Provisioning progress arrived before the console was attached.
@@ -805,7 +805,7 @@ impl App {
         let snapshots = SnapshotStore::new(&config.snapshots_dir)
             .list()
             .unwrap_or_default();
-        let instances = crate::instance::InstanceRegistry::new(config.clone())
+        let instances = crate::vm::instance::InstanceRegistry::new(config.clone())
             .summaries()
             .unwrap_or_default();
         let instance = InstanceStatus::from_config(&config);
@@ -934,7 +934,7 @@ impl App {
             self.health = None;
             return;
         };
-        let bytes = crate::logs::tail_bytes(path, 200).unwrap_or_default();
+        let bytes = crate::session::logs::tail_bytes(path, 200).unwrap_or_default();
         let text = String::from_utf8_lossy(&bytes);
         self.health = InstanceHealth::parse(&text);
     }
@@ -961,7 +961,9 @@ impl App {
             .map(|project| {
                 self.instances
                     .iter()
-                    .filter(|instance| crate::instance::same_project(&instance.project, project))
+                    .filter(|instance| {
+                        crate::vm::instance::same_project(&instance.project, project)
+                    })
                     .map(|instance| instance.name.as_str())
                     .collect()
             })
@@ -1026,8 +1028,8 @@ impl App {
                     .instances
                     .iter()
                     .find(|instance| {
-                        crate::instance::same_project(&instance.workspace, path)
-                            || crate::instance::same_project(&instance.project, path)
+                        crate::vm::instance::same_project(&instance.workspace, path)
+                            || crate::vm::instance::same_project(&instance.project, path)
                     })
                     .map(|instance| instance.project.clone())?;
                 self.projects
@@ -1073,7 +1075,9 @@ impl App {
                 .instances
                 .iter()
                 .enumerate()
-                .filter(|(_, instance)| crate::instance::same_project(&instance.project, &project))
+                .filter(|(_, instance)| {
+                    crate::vm::instance::same_project(&instance.project, &project)
+                })
                 .map(|(index, _)| index)
                 .collect(),
             None => Vec::new(),
@@ -1108,7 +1112,7 @@ impl App {
         let selected = self
             .selected_instance()
             .map(|instance| instance.name.clone());
-        let registry = crate::instance::InstanceRegistry::new(self.config.clone());
+        let registry = crate::vm::instance::InstanceRegistry::new(self.config.clone());
         if let Ok(instances) = registry.summaries() {
             self.instances = instances;
         }
@@ -1194,7 +1198,7 @@ impl App {
     }
 
     /// Record the latest image download progress shown in the notification.
-    pub fn set_download_progress(&mut self, progress: crate::images::DownloadProgress) {
+    pub fn set_download_progress(&mut self, progress: crate::vm::images::DownloadProgress) {
         self.download = Some(progress);
     }
 
@@ -1204,7 +1208,7 @@ impl App {
     }
 
     /// Record the latest first-boot provisioning stage.
-    pub fn set_provision_progress(&mut self, progress: crate::provision::ProvisionProgress) {
+    pub fn set_provision_progress(&mut self, progress: crate::agent::provision::ProvisionProgress) {
         self.provision = Some(progress);
     }
 
@@ -1455,9 +1459,9 @@ impl App {
                 Vec::new()
             }
             KeyCode::F(3) => {
-                self.modal = Some(Modal::Doctor(DoctorModal::new(crate::doctor::run(
-                    &self.config,
-                ))));
+                self.modal = Some(Modal::Doctor(DoctorModal::new(
+                    crate::diagnostics::doctor::run(&self.config),
+                )));
                 Vec::new()
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1594,7 +1598,7 @@ impl App {
     }
 
     fn handle_project_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        if crate::attach_bar::detach_requested(key) {
+        if crate::session::attach_bar::detach_requested(key) {
             self.leave_project();
             return Vec::new();
         }
@@ -2186,7 +2190,7 @@ impl App {
             Modal::Doctor(mut modal) => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => Vec::new(),
                 KeyCode::Char('r') => {
-                    modal.report = crate::doctor::run(&self.config);
+                    modal.report = crate::diagnostics::doctor::run(&self.config);
                     modal.downloading = false;
                     modal.scroll = 0;
                     self.modal = Some(Modal::Doctor(modal));
@@ -2649,8 +2653,8 @@ impl App {
             .instances
             .iter()
             .filter(|instance| {
-                crate::instance::same_project(&instance.project, &project.path)
-                    || crate::instance::same_project(&instance.workspace, &project.path)
+                crate::vm::instance::same_project(&instance.project, &project.path)
+                    || crate::vm::instance::same_project(&instance.workspace, &project.path)
             })
             .map(|instance| instance.name.clone())
             .collect();
@@ -2738,7 +2742,7 @@ impl App {
     }
 
     fn show_instance_config_form(&mut self, name: &str, status: Option<String>) {
-        let store = crate::instance_config::InstanceStore::new(self.config.clone());
+        let store = crate::vm::instance_config::InstanceStore::new(self.config.clone());
         match store.load(name) {
             Ok(instance) => {
                 let mut form = ConfigForm::instance(instance, self.config.clone());
@@ -3047,10 +3051,9 @@ impl App {
             return Vec::new();
         };
 
-        let attached_to_project = self
-            .session
-            .as_ref()
-            .is_some_and(|session| crate::instance::same_project(session.project(), &project.path));
+        let attached_to_project = self.session.as_ref().is_some_and(|session| {
+            crate::vm::instance::same_project(session.project(), &project.path)
+        });
         if attached_to_project && self.session_active() {
             self.enter_project(project.path);
             self.project_view = ProjectView::Split;
@@ -3153,7 +3156,7 @@ impl App {
         self.instance.note = Some(error.clone());
         self.toast(format!("VM start failed: {error}"), ToastLevel::Error);
         self.modal = Some(Modal::Doctor(DoctorModal::with_error(
-            crate::doctor::run(&self.config),
+            crate::diagnostics::doctor::run(&self.config),
             error,
         )));
     }
@@ -3163,7 +3166,7 @@ impl App {
     /// The setup itself may ask for sudo/pkexec; this confirmation is the
     /// in-TUI "yes" before anything privileged is attempted.
     pub fn open_setup_confirmation(&mut self) -> Vec<Effect> {
-        let actions = crate::doctor::setup_actions(&self.config);
+        let actions = crate::diagnostics::doctor::setup_actions(&self.config);
         if !actions.any() {
             self.toast("nothing to set up", ToastLevel::Info);
             return Vec::new();
@@ -3293,9 +3296,9 @@ impl App {
             ActionId::Lazygit => self.effect_for_selected(Effect::OpenLazygit),
             ActionId::Refresh => vec![Effect::RefreshProjects, Effect::RefreshInstances],
             ActionId::Doctor => {
-                self.modal = Some(Modal::Doctor(DoctorModal::new(crate::doctor::run(
-                    &self.config,
-                ))));
+                self.modal = Some(Modal::Doctor(DoctorModal::new(
+                    crate::diagnostics::doctor::run(&self.config),
+                )));
                 Vec::new()
             }
             ActionId::DoctorSetup => {
@@ -4085,10 +4088,12 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             app.modal,
-            Some(Modal::DeleteInstance(crate::app::DeleteInstanceModal {
-                stage: crate::app::DeleteInstanceStage::Confirm,
-                ..
-            }))
+            Some(Modal::DeleteInstance(
+                crate::tui::app::DeleteInstanceModal {
+                    stage: crate::tui::app::DeleteInstanceStage::Confirm,
+                    ..
+                }
+            ))
         ));
 
         app.handle_key(key(KeyCode::Char('y')));
@@ -4096,10 +4101,12 @@ mod tests {
         assert!(effects.is_empty(), "Enter must not delete files");
         assert!(matches!(
             app.modal,
-            Some(Modal::DeleteInstance(crate::app::DeleteInstanceModal {
-                stage: crate::app::DeleteInstanceStage::Files,
-                ..
-            }))
+            Some(Modal::DeleteInstance(
+                crate::tui::app::DeleteInstanceModal {
+                    stage: crate::tui::app::DeleteInstanceStage::Files,
+                    ..
+                }
+            ))
         ));
     }
 
@@ -4871,19 +4878,23 @@ mod tests {
         app.handle_key(key(KeyCode::Char('d')));
         assert!(matches!(
             app.modal,
-            Some(Modal::DeleteInstance(crate::app::DeleteInstanceModal {
-                stage: crate::app::DeleteInstanceStage::Confirm,
-                ..
-            }))
+            Some(Modal::DeleteInstance(
+                crate::tui::app::DeleteInstanceModal {
+                    stage: crate::tui::app::DeleteInstanceStage::Confirm,
+                    ..
+                }
+            ))
         ));
         // First confirmation moves to the file question.
         app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(
             app.modal,
-            Some(Modal::DeleteInstance(crate::app::DeleteInstanceModal {
-                stage: crate::app::DeleteInstanceStage::Files,
-                ..
-            }))
+            Some(Modal::DeleteInstance(
+                crate::tui::app::DeleteInstanceModal {
+                    stage: crate::tui::app::DeleteInstanceStage::Files,
+                    ..
+                }
+            ))
         ));
         let effects = app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(
@@ -5069,14 +5080,14 @@ mod tests {
         let inside = app.config.instances_dir.join("demo").join("workspace");
         app.focus = Focus::Instances;
         let instance = fake_instance(&app, "demo", inside.clone());
-        let stored = crate::instance_config::InstanceConfig {
+        let stored = crate::vm::instance_config::InstanceConfig {
             name: "demo".into(),
             project: instance.project.clone(),
             workspace: inside,
             harness: Harness::Shell,
-            ..crate::instance_config::InstanceConfig::default()
+            ..crate::vm::instance_config::InstanceConfig::default()
         };
-        crate::instance_config::InstanceStore::new(app.config.clone())
+        crate::vm::instance_config::InstanceStore::new(app.config.clone())
             .save(&stored)
             .unwrap();
         install_instances(&mut app, vec![instance]);

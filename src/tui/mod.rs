@@ -1,4 +1,11 @@
 //! Terminal lifecycle and the blocking TUI event loop.
+//!
+//! [`app`] owns the pure state machine and [`ui`] is the ratatui renderer.
+
+pub mod app;
+pub mod ui;
+
+pub use app::App;
 
 use std::io::{Stdout, stdout};
 use std::path::Path;
@@ -16,14 +23,13 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::{App, Effect, ToastLevel};
+use crate::agent::launch::{self, LaunchAction, LaunchSpec};
+use crate::agent::provision::{ProvisionEvent, ProvisionPlan, ProvisionProgress, ProvisionWatcher};
 use crate::config::{Config, Harness};
-use crate::console::TerminalConsole;
-use crate::doctor::DoctorReport;
-use crate::launch::{self, LaunchAction, LaunchSpec};
+use crate::diagnostics::doctor::DoctorReport;
 use crate::project;
-use crate::provision::{ProvisionEvent, ProvisionPlan, ProvisionProgress, ProvisionWatcher};
-use crate::ui;
+use crate::session::console::TerminalConsole;
+use crate::tui::app::{Effect, ToastLevel};
 
 const TICK: Duration = Duration::from_millis(50);
 
@@ -47,7 +53,7 @@ enum ScanMessage {
         note: Option<String>,
     },
     /// Byte progress for an in-flight image download.
-    DownloadProgress(crate::images::DownloadProgress),
+    DownloadProgress(crate::vm::images::DownloadProgress),
     /// Live first-boot harness provisioning progress.
     Provision(ProvisionProgress),
     ProvisionReady,
@@ -61,7 +67,7 @@ pub fn run(config: Config) -> Result<()> {
     // First launch / a broken host: surface the doctor immediately instead of
     // waiting for a VM start to fail. The "Set up everything" action is an
     // explicit confirmation inside the modal.
-    let report = crate::doctor::run(&app.config);
+    let report = crate::diagnostics::doctor::run(&app.config);
     if should_show_doctor(&report) {
         app.show_doctor(report, None);
     }
@@ -231,11 +237,14 @@ fn spawn_image_download(config: Config, tx: mpsc::Sender<ScanMessage>) {
         .name("hegn-images".into())
         .spawn(move || {
             let progress_tx = thread_tx.clone();
-            let result =
-                crate::images::download_missing_with_progress(&config, false, &mut |progress| {
+            let result = crate::vm::images::download_missing_with_progress(
+                &config,
+                false,
+                &mut |progress| {
                     let _ = progress_tx.send(ScanMessage::DownloadProgress(progress));
-                });
-            let report = crate::doctor::run(&config);
+                },
+            );
+            let report = crate::diagnostics::doctor::run(&config);
             let note = Some(match result {
                 Ok(_) => "VM images downloaded and verified".to_string(),
                 Err(err) => format!("image download failed: {err:#}"),
@@ -254,7 +263,7 @@ fn spawn_attach(config: Config, instance: String, tx: mpsc::Sender<ScanMessage>)
     let spawned = std::thread::Builder::new()
         .name("hegn-attach-vm".into())
         .spawn(move || {
-            let registry = crate::instance::InstanceRegistry::new(config);
+            let registry = crate::vm::instance::InstanceRegistry::new(config);
             let harness = registry
                 .store()
                 .load(&instance)
@@ -296,7 +305,7 @@ fn spawn_clones(
     let spawned = std::thread::Builder::new()
         .name("hegn-clone-agents".into())
         .spawn(move || {
-            let registry = crate::instance::InstanceRegistry::new(config.clone());
+            let registry = crate::vm::instance::InstanceRegistry::new(config.clone());
             let source = match registry.resolve(&source) {
                 Ok(source) => source,
                 Err(err) => {
@@ -373,7 +382,7 @@ fn spawn_start(
     let spawned = std::thread::Builder::new()
         .name("hegn-start-vm".into())
         .spawn(move || {
-            let registry = crate::instance::InstanceRegistry::new(config.clone());
+            let registry = crate::vm::instance::InstanceRegistry::new(config.clone());
             let instance = match registry.ensure_for_project(&project, harness) {
                 Ok(instance) => instance,
                 Err(err) => {
@@ -532,12 +541,13 @@ fn handle_effects(
                 spawn_image_download(app.config.clone(), scan_tx.clone());
             }
             Effect::SetupEnvironment => {
-                let actions = crate::doctor::setup_actions(&app.config);
+                let actions = crate::diagnostics::doctor::setup_actions(&app.config);
                 let mut notes = Vec::new();
                 let mut failed = false;
-                let mut modal = crate::app::DoctorModal::new(crate::doctor::run(&app.config));
+                let mut modal =
+                    crate::tui::app::DoctorModal::new(crate::diagnostics::doctor::run(&app.config));
                 modal.setting_up = true;
-                app.modal = Some(crate::app::Modal::Doctor(modal));
+                app.modal = Some(crate::tui::app::Modal::Doctor(modal));
                 app.toast("setting up hegn…", ToastLevel::Info);
 
                 if actions.create_dirs {
@@ -560,7 +570,7 @@ fn handle_effects(
                     }
                 }
                 if actions.init_profiles {
-                    match crate::profile::ProfileStore::new(&app.config).write_templates() {
+                    match crate::agent::profile::ProfileStore::new(&app.config).write_templates() {
                         Ok(paths) if !paths.is_empty() => {
                             notes.push(format!("{} profile template(s) written", paths.len()))
                         }
@@ -591,7 +601,7 @@ fn handle_effects(
                     } else {
                         notes.join("; ")
                     };
-                    app.show_doctor(crate::doctor::run(&app.config), Some(note));
+                    app.show_doctor(crate::diagnostics::doctor::run(&app.config), Some(note));
                 }
                 if failed && actions.download_images {
                     app.toast("some setup steps failed; see the doctor", ToastLevel::Error);
@@ -607,7 +617,7 @@ fn handle_effects(
                 }
             }
             Effect::OpenProfileEditor(harness) => {
-                let store = crate::profile::ProfileStore::new(&app.config);
+                let store = crate::agent::profile::ProfileStore::new(&app.config);
                 let path = store.path(harness);
                 if !path.is_file()
                     && let Err(err) = store.write_templates()
@@ -622,7 +632,7 @@ fn handle_effects(
                     Ok(()) => {
                         app.reload_after_edit();
                         app.reopen_global_config(
-                            crate::config_form::ConfigPage::Profiles,
+                            crate::config::form::ConfigPage::Profiles,
                             Some(format!("{} profile edited", harness.label())),
                         );
                     }
@@ -650,7 +660,7 @@ fn handle_effects(
                 spawn_attach(app.config.clone(), instance, scan_tx.clone());
             }
             Effect::AttachConsole { instance } => {
-                let registry = crate::instance::InstanceRegistry::new(app.config.clone());
+                let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
                 // Release the embedded client first. Otherwise the external
                 // attach replaces it in the relay and the TUI keeps a dead
                 // socket when the user comes back.
@@ -659,7 +669,7 @@ fn handle_effects(
                 let result = with_suspended_terminal(terminal, || {
                     let config = registry.resolve(&instance)?;
                     let console = registry.manager(config).ensure_console()?;
-                    crate::console::run_interactive(console, true)
+                    crate::session::console::run_interactive(console, true)
                 });
                 let reattached = registry
                     .resolve(&instance)
@@ -667,12 +677,12 @@ fn handle_effects(
                     .and_then(|config| registry.manager(config).attach_console().ok());
                 if let Some(console) = reattached {
                     app.attach_console(Box::new(console));
-                    app.project_view = crate::app::ProjectView::Split;
+                    app.project_view = crate::tui::app::ProjectView::Split;
                     app.terminal_focus = true;
                 } else {
                     match result {
                         Ok(()) => {
-                            app.project_view = crate::app::ProjectView::Split;
+                            app.project_view = crate::tui::app::ProjectView::Split;
                             app.terminal_focus = true;
                             app.toast("detached from console", ToastLevel::Info);
                         }
@@ -681,7 +691,7 @@ fn handle_effects(
                 }
             }
             Effect::StopInstance { instance } => {
-                let registry = crate::instance::InstanceRegistry::new(app.config.clone());
+                let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
                 app.pending_launch = None;
                 match registry.stop(&instance) {
                     Ok(()) => {
@@ -695,7 +705,7 @@ fn handle_effects(
                 instance,
                 delete_files,
             } => {
-                let registry = crate::instance::InstanceRegistry::new(app.config.clone());
+                let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
                 match registry.delete(&instance, delete_files) {
                     Ok(outcome) => {
                         let message = match outcome.kept_workspace {
@@ -757,7 +767,7 @@ fn handle_effects(
             }
             Effect::RefreshInstances => app.refresh_instances(),
             Effect::RestoreSnapshot(snapshot) => {
-                let registry = crate::instance::InstanceRegistry::new(app.config.clone());
+                let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
                 let instance = snapshot
                     .instance
                     .as_deref()
@@ -855,9 +865,9 @@ fn launch_agent(
             })();
             match result {
                 Ok(()) => {
-                    app.project_view = crate::app::ProjectView::Split;
+                    app.project_view = crate::tui::app::ProjectView::Split;
                     app.terminal_focus = true;
-                    app.terminal_mode = crate::app::TerminalMode::Normal;
+                    app.terminal_mode = crate::tui::app::TerminalMode::Normal;
                     app.toast(format!("launched {}", spec.name), ToastLevel::Info);
                 }
                 Err(err) => app.toast(format!("launch failed: {err}"), ToastLevel::Error),
@@ -868,12 +878,16 @@ fn launch_agent(
             command,
             bar,
         } => {
-            let registry = crate::instance::InstanceRegistry::new(app.config.clone());
+            let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
             app.detach_console();
             let result = with_suspended_terminal(terminal, || {
                 let config = registry.resolve(&instance)?;
                 let console = registry.manager(config).attach_console()?;
-                crate::console::run_interactive_with_command(console, bar, command.as_deref())
+                crate::session::console::run_interactive_with_command(
+                    console,
+                    bar,
+                    command.as_deref(),
+                )
             });
             // The external client closed on detach; restore the embedded view so
             // the project screen is not left without a console.
@@ -883,7 +897,7 @@ fn launch_agent(
                 .and_then(|config| registry.manager(config).attach_console().ok());
             if let Some(console) = reattached {
                 app.attach_console(Box::new(console));
-                app.project_view = crate::app::ProjectView::Split;
+                app.project_view = crate::tui::app::ProjectView::Split;
                 app.terminal_focus = true;
             }
             if let Err(err) = result {
@@ -987,14 +1001,14 @@ mod tests {
             ok: true,
             checks: Vec::new(),
             assets: Vec::new(),
-            setup: crate::doctor::SetupActions::default(),
+            setup: crate::diagnostics::doctor::SetupActions::default(),
         };
         assert!(!should_show_doctor(&clean));
 
         let setup = DoctorReport {
-            setup: crate::doctor::SetupActions {
+            setup: crate::diagnostics::doctor::SetupActions {
                 init_config: true,
-                ..crate::doctor::SetupActions::default()
+                ..crate::diagnostics::doctor::SetupActions::default()
             },
             ..clean.clone()
         };

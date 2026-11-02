@@ -8,13 +8,13 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{
+use crate::config::form::{ConfigField, ConfigForm, ConfigRow, FieldKind};
+use crate::tui::app::{
     ActionId, App, ConfigStepHit, ConfigTabHit, CreateFocus, DeleteInstanceStage, Focus, FooterHit,
     HelpState, InstanceState, Modal, ProjectSection, ProjectView, RowHit, Screen, ScrollHit,
     SectionHit, TerminalMode, ToastLevel,
 };
-use crate::config_form::{ConfigField, ConfigForm, ConfigRow, FieldKind};
-use crate::images::DownloadProgress;
+use crate::vm::images::DownloadProgress;
 
 // Use the terminal's own palette and default background. Only ANSI colors
 // are selected here; the user's terminal theme decides how they look.
@@ -275,7 +275,7 @@ fn render_dashboard_preview(frame: &mut Frame, app: &App, area: Rect) {
     let instances: Vec<_> = app
         .instances
         .iter()
-        .filter(|instance| crate::instance::same_project(&instance.project, &project.path))
+        .filter(|instance| crate::vm::instance::same_project(&instance.project, &project.path))
         .collect();
     let running = instances
         .iter()
@@ -2535,7 +2535,7 @@ fn tail(text: &str, max: usize) -> String {
 fn render_project_config(
     frame: &mut Frame,
     app: &App,
-    form: &crate::app::ProjectConfigForm,
+    form: &crate::tui::app::ProjectConfigForm,
     area: Rect,
 ) -> (Vec<FooterHit>, Option<ScrollHit>) {
     let marker = |row: usize| if form.row == row { "›" } else { " " };
@@ -2545,7 +2545,7 @@ fn render_project_config(
         None => format!("global default ({})", global_harness.label()),
     };
     let launch_value = match &form.launch {
-        Some(name) if name == crate::launch::HARNESS => {
+        Some(name) if name == crate::agent::launch::HARNESS => {
             format!(
                 "harness ({})",
                 form.harness.unwrap_or(global_harness).label()
@@ -2579,8 +2579,8 @@ fn render_project_config(
         ),
     };
     let availability: Vec<String> = [
-        crate::launch::Integration::Tmux,
-        crate::launch::Integration::Herdr,
+        crate::agent::launch::Integration::Tmux,
+        crate::agent::launch::Integration::Herdr,
     ]
     .into_iter()
     .map(|integration| {
@@ -2927,7 +2927,7 @@ fn render_help(
 fn render_create_form(
     frame: &mut Frame,
     app: &App,
-    form: &crate::app::CreateProjectForm,
+    form: &crate::tui::app::CreateProjectForm,
     area: Rect,
 ) -> (Vec<FooterHit>, Option<ScrollHit>) {
     let rect = centered(area, 74, 84);
@@ -3115,7 +3115,7 @@ fn render_create_form(
 fn render_import_form(
     frame: &mut Frame,
     app: &App,
-    form: &crate::app::ImportProjectForm,
+    form: &crate::tui::app::ImportProjectForm,
     area: Rect,
 ) -> Vec<FooterHit> {
     let rect = centered(area, 78, 56);
@@ -3153,17 +3153,19 @@ fn render_import_form(
 
     let path_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(field_style(form.focus == crate::app::ImportFocus::Path))
+        .border_style(field_style(
+            form.focus == crate::tui::app::ImportFocus::Path,
+        ))
         .title(Span::styled(
             " existing directory (~ allowed) ",
-            field_style(form.focus == crate::app::ImportFocus::Path),
+            field_style(form.focus == crate::tui::app::ImportFocus::Path),
         ))
         .style(Style::default());
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(form.path.clone(), Style::default().fg(TEXT)),
             Span::styled(
-                if form.focus == crate::app::ImportFocus::Path {
+                if form.focus == crate::tui::app::ImportFocus::Path {
                     "▌"
                 } else {
                     ""
@@ -3177,17 +3179,19 @@ fn render_import_form(
 
     let name_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(field_style(form.focus == crate::app::ImportFocus::Name))
+        .border_style(field_style(
+            form.focus == crate::tui::app::ImportFocus::Name,
+        ))
         .title(Span::styled(
             " picker name (optional) ",
-            field_style(form.focus == crate::app::ImportFocus::Name),
+            field_style(form.focus == crate::tui::app::ImportFocus::Name),
         ))
         .style(Style::default());
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(form.name.clone(), Style::default().fg(TEXT)),
             Span::styled(
-                if form.focus == crate::app::ImportFocus::Name {
+                if form.focus == crate::tui::app::ImportFocus::Name {
                     "▌"
                 } else {
                     ""
@@ -3263,7 +3267,7 @@ fn render_import_form(
 fn render_doctor(
     frame: &mut Frame,
     app: &App,
-    modal: &crate::app::DoctorModal,
+    modal: &crate::tui::app::DoctorModal,
     area: Rect,
 ) -> (Vec<FooterHit>, Option<ScrollHit>) {
     let rect = centered(area, 92, 82);
@@ -3415,7 +3419,7 @@ fn render_doctor(
 fn render_security(
     frame: &mut Frame,
     app: &App,
-    prompt: &crate::app::SecurityPrompt,
+    prompt: &crate::tui::app::SecurityPrompt,
     area: Rect,
 ) -> (Vec<FooterHit>, Option<ScrollHit>) {
     let rect = centered(area, 82, 80);
@@ -3554,7 +3558,7 @@ fn render_toast(frame: &mut Frame, app: &App, area: Rect) {
 /// Progress notification for the first boot's package installation.
 fn render_provision_progress(
     frame: &mut Frame,
-    progress: &crate::provision::ProvisionProgress,
+    progress: &crate::agent::provision::ProvisionProgress,
     tick: u64,
     area: Rect,
     bottom: u16,
@@ -3995,10 +3999,10 @@ fn truncate(text: &str, max: usize) -> String {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
-    use crate::app::SecurityPrompt;
     use crate::config::Config;
     use crate::project::{GitSummary, Project};
     use crate::security::SecurityEngine;
+    use crate::tui::app::SecurityPrompt;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -4104,9 +4108,10 @@ mod tests {
     fn provisioning_progress_names_the_harness_and_stage() {
         let (_dir, mut app) = app();
         let plan =
-            crate::provision::ProvisionPlan::new(crate::config::Harness::Opencode, &[]).unwrap();
-        let mut progress = crate::provision::ProvisionProgress::new(&plan);
-        progress.advance(crate::provision::Stage::Packages);
+            crate::agent::provision::ProvisionPlan::new(crate::config::Harness::Opencode, &[])
+                .unwrap();
+        let mut progress = crate::agent::provision::ProvisionProgress::new(&plan);
+        progress.advance(crate::agent::provision::Stage::Packages);
         app.set_provision_progress(progress);
         let (text, _) = render(&app);
         assert!(text.contains("setting up OpenCode"), "{text}");
@@ -4206,7 +4211,7 @@ mod tests {
     fn delete_project_modal_shows_git_status_and_file_choices() {
         let (_dir, mut app) = app();
         let project = app.selected_project().cloned().unwrap();
-        app.modal = Some(Modal::DeleteProject(crate::app::DeleteProjectModal {
+        app.modal = Some(Modal::DeleteProject(crate::tui::app::DeleteProjectModal {
             project,
             git: GitSummary {
                 is_repo: true,
@@ -4243,14 +4248,16 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         app.screen = Screen::Project;
         app.open_project = Some(project.clone());
-        app.modal = Some(Modal::ProjectConfig(crate::app::ProjectConfigForm::new(
-            project,
-            &crate::project::ProjectMeta {
-                launch: Some(crate::launch::HARNESS.into()),
-                integration: Some(crate::launch::Integration::Herdr),
-                ..crate::project::ProjectMeta::default()
-            },
-        )));
+        app.modal = Some(Modal::ProjectConfig(
+            crate::tui::app::ProjectConfigForm::new(
+                project,
+                &crate::project::ProjectMeta {
+                    launch: Some(crate::agent::launch::HARNESS.into()),
+                    integration: Some(crate::agent::launch::Integration::Herdr),
+                    ..crate::project::ProjectMeta::default()
+                },
+            ),
+        ));
         let (text, hits) = render(&app);
         assert!(text.contains("project settings"), "{text}");
         assert!(text.contains("Launch command"), "{text}");
@@ -4266,11 +4273,11 @@ mod tests {
     #[test]
     fn modal_keybinding_hints_are_clickable() {
         let (_dir, mut app) = app();
-        app.modal = Some(Modal::Confirm(crate::app::ConfirmPrompt {
+        app.modal = Some(Modal::Confirm(crate::tui::app::ConfirmPrompt {
             title: "Delete snapshot".into(),
             message: "Delete 'demo'?".into(),
             confirm_label: "Delete".into(),
-            action: crate::app::ConfirmAction::DeleteSnapshot("demo".into()),
+            action: crate::tui::app::ConfirmAction::DeleteSnapshot("demo".into()),
             scroll: 0,
         }));
         let (text, hits) = render(&app);
@@ -4301,7 +4308,9 @@ mod tests {
     #[test]
     fn import_modal_renders_the_symlink_explanation() {
         let (_dir, mut app) = app();
-        app.modal = Some(Modal::ImportProject(crate::app::ImportProjectForm::new()));
+        app.modal = Some(Modal::ImportProject(
+            crate::tui::app::ImportProjectForm::new(),
+        ));
         let (text, hits) = render(&app);
         assert!(text.contains("import project"), "{text}");
         assert!(text.contains("Creates a symlink"), "{text}");
@@ -4315,17 +4324,17 @@ mod tests {
     #[test]
     fn doctor_modal_wraps_the_full_failure_message() {
         let (_dir, mut app) = app();
-        let report = crate::doctor::DoctorReport {
+        let report = crate::diagnostics::doctor::DoctorReport {
             ok: false,
             checks: Vec::new(),
             assets: Vec::new(),
-            setup: crate::doctor::SetupActions::default(),
+            setup: crate::diagnostics::doctor::SetupActions::default(),
         };
         let error = format!(
             "failed to grow the instance rootfs /home/henrik/.local/share/hegn/instances/oc-test/rootfs.qcow2 ({}): END-OF-ERROR",
             "very-long-segment-".repeat(12)
         );
-        app.modal = Some(Modal::Doctor(crate::app::DoctorModal::with_error(
+        app.modal = Some(Modal::Doctor(crate::tui::app::DoctorModal::with_error(
             report, error,
         )));
         let (text, _) = render(&app);
@@ -4339,13 +4348,13 @@ mod tests {
     #[test]
     fn doctor_modal_renders_failures_and_missing_images() {
         let (_dir, mut app) = app();
-        let report = crate::doctor::DoctorReport {
+        let report = crate::diagnostics::doctor::DoctorReport {
             ok: false,
             checks: vec![
-                crate::doctor::Check::new("kernel image", false, true, "missing"),
-                crate::doctor::Check::new("lazygit", false, false, "optional"),
+                crate::diagnostics::doctor::Check::new("kernel image", false, true, "missing"),
+                crate::diagnostics::doctor::Check::new("lazygit", false, false, "optional"),
             ],
-            assets: vec![crate::images::AssetStatus {
+            assets: vec![crate::vm::images::AssetStatus {
                 name: "kernel",
                 path: PathBuf::from("/images/vmlinux-x86_64"),
                 url: "https://example.com/vmlinux-x86_64".into(),
@@ -4353,12 +4362,12 @@ mod tests {
                 exists: false,
                 size_bytes: None,
             }],
-            setup: crate::doctor::SetupActions {
+            setup: crate::diagnostics::doctor::SetupActions {
                 download_images: true,
-                ..crate::doctor::SetupActions::default()
+                ..crate::diagnostics::doctor::SetupActions::default()
             },
         };
-        app.modal = Some(Modal::Doctor(crate::app::DoctorModal::new(report)));
+        app.modal = Some(Modal::Doctor(crate::tui::app::DoctorModal::new(report)));
         let (text, hits) = render(&app);
         assert!(text.contains("doctor"), "{text}");
         assert!(text.contains("kernel image"), "{text}");
@@ -4527,11 +4536,11 @@ mod tests {
         for (width, height) in [(40, 10), (24, 8), (16, 6)] {
             app.modal = Some(Modal::Help(HelpState::default()));
             let _ = render_sized(&app, width, height);
-            app.modal = Some(Modal::CreateProject(crate::app::CreateProjectForm::new(
-                crate::config::Harness::Shell,
-            )));
+            app.modal = Some(Modal::CreateProject(
+                crate::tui::app::CreateProjectForm::new(crate::config::Harness::Shell),
+            ));
             let _ = render_sized(&app, width, height);
-            app.modal = Some(Modal::Config(crate::config_form::ConfigForm::global(
+            app.modal = Some(Modal::Config(crate::config::form::ConfigForm::global(
                 app.config.clone(),
                 path.clone(),
             )));
@@ -4543,7 +4552,7 @@ mod tests {
     fn config_modal_renders_clickable_tabs() {
         let (_dir, mut app) = app();
         let path = app.config.state_dir.join("config.toml");
-        app.modal = Some(Modal::Config(crate::config_form::ConfigForm::global(
+        app.modal = Some(Modal::Config(crate::config::form::ConfigForm::global(
             app.config.clone(),
             path,
         )));
@@ -4555,12 +4564,12 @@ mod tests {
         assert!(
             hits.config_tabs
                 .iter()
-                .any(|hit| hit.page == crate::config_form::ConfigPage::Profiles)
+                .any(|hit| hit.page == crate::config::form::ConfigPage::Profiles)
         );
         assert!(
             hits.config_tabs
                 .iter()
-                .any(|hit| hit.page == crate::config_form::ConfigPage::LocalLlm)
+                .any(|hit| hit.page == crate::config::form::ConfigPage::LocalLlm)
         );
     }
 
@@ -4568,8 +4577,8 @@ mod tests {
     fn config_modal_profiles_tab_renders_templates() {
         let (_dir, mut app) = app();
         let path = app.config.state_dir.join("config.toml");
-        let mut form = crate::config_form::ConfigForm::global(app.config.clone(), path);
-        assert!(form.set_page(crate::config_form::ConfigPage::Profiles));
+        let mut form = crate::config::form::ConfigForm::global(app.config.clone(), path);
+        assert!(form.set_page(crate::config::form::ConfigPage::Profiles));
         app.modal = Some(Modal::Config(form));
         let (text, hits) = render_sized(&app, 110, 40);
         assert!(text.contains("Harness profiles"), "{text}");
@@ -4582,7 +4591,7 @@ mod tests {
     fn config_modal_stacks_label_and_value_when_narrow() {
         let (_dir, mut app) = app();
         let path = app.config.state_dir.join("config.toml");
-        app.modal = Some(Modal::Config(crate::config_form::ConfigForm::global(
+        app.modal = Some(Modal::Config(crate::config::form::ConfigForm::global(
             app.config.clone(),
             path,
         )));
@@ -4609,7 +4618,7 @@ mod tests {
     fn config_modal_renders_editable_rows_and_hit_boxes() {
         let (_dir, mut app) = app();
         let path = app.config.state_dir.join("config.toml");
-        app.modal = Some(Modal::Config(crate::config_form::ConfigForm::global(
+        app.modal = Some(Modal::Config(crate::config::form::ConfigForm::global(
             app.config.clone(),
             path,
         )));
@@ -4646,13 +4655,13 @@ mod tests {
     #[test]
     fn instance_config_modal_marks_read_only_context() {
         let (_dir, mut app) = app();
-        let instance = crate::instance_config::InstanceConfig {
+        let instance = crate::vm::instance_config::InstanceConfig {
             name: "demo".into(),
             project: PathBuf::from("/projects/demo"),
             workspace: PathBuf::from("/projects/demo"),
-            ..crate::instance_config::InstanceConfig::default()
+            ..crate::vm::instance_config::InstanceConfig::default()
         };
-        app.modal = Some(Modal::Config(crate::config_form::ConfigForm::instance(
+        app.modal = Some(Modal::Config(crate::config::form::ConfigForm::instance(
             instance,
             app.config.clone(),
         )));
@@ -4669,9 +4678,9 @@ mod tests {
     #[test]
     fn create_modal_renders_fields_and_packages() {
         let (_dir, mut app) = app();
-        app.modal = Some(Modal::CreateProject(crate::app::CreateProjectForm::new(
-            crate::config::Harness::Opencode,
-        )));
+        app.modal = Some(Modal::CreateProject(
+            crate::tui::app::CreateProjectForm::new(crate::config::Harness::Opencode),
+        ));
         let (text, hits) = render(&app);
         assert!(text.contains("new project"));
         assert!(text.contains("OpenCode"));
@@ -4770,7 +4779,7 @@ mod tests {
         let (_dir, mut app) = app();
         app.screen = Screen::Project;
         app.open_project = Some(PathBuf::from("/projects/demo"));
-        app.snapshots = vec![crate::snapshot::SnapshotMeta {
+        app.snapshots = vec![crate::session::snapshot::SnapshotMeta {
             name: "before-refactor".into(),
             created_at: chrono::Utc::now(),
             vm_state: "Paused".into(),

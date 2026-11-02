@@ -15,10 +15,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use fatfs::{FileSystem, FormatVolumeOptions, FsOptions};
 
+use crate::agent::profile::{PROFILE_GUEST_MOUNT, PROFILE_SHARE_TAG, ProfileShare, apply_script};
+use crate::agent::provision::ProvisionPlan;
 use crate::config::LocalEndpoint;
 use crate::network::Lease;
-use crate::profile::{PROFILE_GUEST_MOUNT, PROFILE_SHARE_TAG, ProfileShare, apply_script};
-use crate::provision::ProvisionPlan;
 
 /// 4 MiB is enough for the seed and keeps it cheap.
 const SEED_BYTES: u64 = 4 * 1024 * 1024;

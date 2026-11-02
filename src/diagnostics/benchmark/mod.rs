@@ -27,8 +27,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Harness};
-use crate::instance::{InstanceRegistry, same_project};
 use crate::project;
+use crate::vm::instance::{InstanceRegistry, same_project};
 
 const MIB: u64 = 1024 * 1024;
 /// Prefix for throwaway projects created by `benchmark --clean`.
@@ -636,7 +636,7 @@ fn instance_limits(session: &Path, config: &Config) -> (u8, u32) {
     let config_file = session
         .parent()
         .and_then(Path::parent)
-        .map(|dir| dir.join(crate::instance_config::CONFIG_FILE));
+        .map(|dir| dir.join(crate::vm::instance_config::CONFIG_FILE));
     let limits = config_file
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|raw| toml::from_str::<Limits>(&raw).ok())

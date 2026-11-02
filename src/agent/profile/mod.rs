@@ -31,7 +31,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Harness, safe_package_name};
-use crate::instance_config::InstanceConfig;
+use crate::vm::instance_config::InstanceConfig;
 
 /// virtio-fs tag of the profile share. Reserved in `config.shared_tag`.
 pub const PROFILE_SHARE_TAG: &str = "hegn-profile";

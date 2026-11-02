@@ -34,8 +34,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::instance::InstanceManager;
-use crate::instance_config::InstanceStore;
+use crate::vm::instance::InstanceManager;
+use crate::vm::instance_config::InstanceStore;
 
 /// TAP devices created by `hegn network setup`.
 pub const TAP_POOL: u8 = 16;
@@ -395,7 +395,7 @@ pub fn ensure_ready(config: &Config) -> Result<()> {
 /// the pool is exhausted, the start fails instead of silently sharing a TAP.
 pub fn acquire(
     config: &Config,
-    instance: &crate::instance_config::InstanceConfig,
+    instance: &crate::vm::instance_config::InstanceConfig,
 ) -> Result<Lease> {
     ensure_ready(config)?;
     fs::create_dir_all(network_dir(config))
@@ -454,7 +454,7 @@ fn try_claim(config: &Config, index: u8, instance: &str) -> Result<Option<Lease>
     {
         // A live hegn process may still be booting the owner VM, before its
         // session record exists. A live VM is equally authoritative.
-        if crate::instance::process_alive(pid) || instance_is_running(config, &owner) {
+        if crate::vm::instance::process_alive(pid) || instance_is_running(config, &owner) {
             return Ok(None);
         }
         // A crashed hegn process and a stopped VM left the reservation behind.

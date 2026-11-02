@@ -1,3 +1,10 @@
+//! User configuration: schema, defaults, environment overrides, validation and
+//! XDG paths.
+//!
+//! [`form`] contains the interactive settings editor used by the TUI.
+
+pub mod form;
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -6,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::launch::LaunchConfig;
+use crate::agent::launch::LaunchConfig;
 
 /// How the instance is selected when a project is opened.
 ///
@@ -289,7 +296,7 @@ impl LocalEndpoint {
 pub fn validate_local_endpoints(endpoints: &[LocalEndpoint]) -> Result<()> {
     let mut seen = Vec::new();
     for endpoint in endpoints {
-        if !crate::cloud_init::safe_token(&endpoint.name) || endpoint.name.len() > 32 {
+        if !crate::vm::cloud_init::safe_token(&endpoint.name) || endpoint.name.len() > 32 {
             bail!(
                 "invalid local endpoint name {:?}: use up to 32 ASCII letters, digits, '-', '_' or '.'",
                 endpoint.name
@@ -514,19 +521,19 @@ impl Default for Config {
             virtiofsd_bin: PathBuf::from("virtiofsd"),
             kernel_image: data_dir
                 .join("hegn/images")
-                .join(crate::images::KERNEL_ARTIFACT),
+                .join(crate::vm::images::KERNEL_ARTIFACT),
             rootfs_image: data_dir
                 .join("hegn/images")
-                .join(crate::images::ROOTFS_ARTIFACT),
-            rootfs_format: crate::images::ROOTFS_FORMAT,
+                .join(crate::vm::images::ROOTFS_ARTIFACT),
+            rootfs_format: crate::vm::images::ROOTFS_FORMAT,
             root_device: "/dev/vda1".to_string(),
             landlock: true,
             seccomp: true,
             cloud_init: true,
-            kernel_url: crate::images::KERNEL_URL.to_string(),
-            kernel_sha256: crate::images::KERNEL_SHA256.to_string(),
-            rootfs_url: crate::images::ROOTFS_URL.to_string(),
-            rootfs_sha256: crate::images::ROOTFS_SHA256.to_string(),
+            kernel_url: crate::vm::images::KERNEL_URL.to_string(),
+            kernel_sha256: crate::vm::images::KERNEL_SHA256.to_string(),
+            rootfs_url: crate::vm::images::ROOTFS_URL.to_string(),
+            rootfs_sha256: crate::vm::images::ROOTFS_SHA256.to_string(),
             vcpus: 2,
             memory_mib: 2048,
             shared_tag: "workspace".to_string(),
@@ -657,13 +664,13 @@ impl Config {
         if self.memory_mib < 128 {
             bail!("memory_mib must be at least 128 (got {})", self.memory_mib);
         }
-        if !crate::cloud_init::safe_token(&self.shared_tag) {
+        if !crate::vm::cloud_init::safe_token(&self.shared_tag) {
             bail!("shared_tag may only contain ASCII letters, digits, '-', '_' and '.'");
         }
-        if self.shared_tag == crate::profile::PROFILE_SHARE_TAG {
+        if self.shared_tag == crate::agent::profile::PROFILE_SHARE_TAG {
             bail!(
                 "shared_tag '{}' is reserved for the harness profile share",
-                crate::profile::PROFILE_SHARE_TAG
+                crate::agent::profile::PROFILE_SHARE_TAG
             );
         }
         // virtio-fs tags are limited to 36 bytes including the terminator.
@@ -673,7 +680,7 @@ impl Config {
                 self.shared_tag.len()
             );
         }
-        if !crate::cloud_init::safe_mount(&self.guest_mount) {
+        if !crate::vm::cloud_init::safe_mount(&self.guest_mount) {
             bail!(
                 "guest_mount must be an absolute path with simple components                  (letters, digits, '/', '-', '_' and '.')"
             );
@@ -699,7 +706,7 @@ impl Config {
             ("kernel_sha256", &self.kernel_sha256),
             ("rootfs_sha256", &self.rootfs_sha256),
         ] {
-            if !sha.trim().is_empty() && !crate::images::is_sha256(sha.trim()) {
+            if !sha.trim().is_empty() && !crate::vm::images::is_sha256(sha.trim()) {
                 bail!("{name} must be a 64 character SHA-256 hex digest");
             }
         }
@@ -764,7 +771,7 @@ impl Config {
         }
         // Logs may contain secrets printed by an agent; never rely on the
         // process umask for this directory.
-        crate::logs::LogStore::new(self.logs_dir()).ensure()?;
+        crate::session::logs::LogStore::new(self.logs_dir()).ensure()?;
         Ok(())
     }
 
@@ -913,8 +920,8 @@ impl Config {
     /// Symlinks are rejected: a swapped link could make hegn boot an arbitrary
     /// host file as the guest kernel or root filesystem.
     pub fn vm_assets_ready(&self) -> bool {
-        crate::images::is_regular_file(&self.kernel_image)
-            && crate::images::is_regular_file(&self.rootfs_image)
+        crate::vm::images::is_regular_file(&self.kernel_image)
+            && crate::vm::images::is_regular_file(&self.rootfs_image)
     }
 
     /// The backend actually used for work. hegn never falls back to a host
@@ -981,8 +988,8 @@ mod tests {
             "new projects belong in Projects/hegn: {}",
             config.projects_root.display()
         );
-        assert!(crate::images::is_sha256(&config.kernel_sha256));
-        assert!(crate::images::is_sha256(&config.rootfs_sha256));
+        assert!(crate::vm::images::is_sha256(&config.kernel_sha256));
+        assert!(crate::vm::images::is_sha256(&config.rootfs_sha256));
         assert!(config.kernel_url.starts_with("https://"));
         assert!(config.rootfs_url.starts_with("https://"));
         assert_eq!(config.root_device, "/dev/vda1");
@@ -996,7 +1003,7 @@ mod tests {
         let mut config = Config::default();
         config.kernel_sha256 = "not-a-digest".into();
         assert!(config.validate().is_err());
-        config.kernel_sha256 = crate::images::KERNEL_SHA256.into();
+        config.kernel_sha256 = crate::vm::images::KERNEL_SHA256.into();
         config.rootfs_url = "http://example.com/rootfs".into();
         assert!(config.validate().is_err());
     }
@@ -1057,7 +1064,7 @@ root_device = "/dev/vda"
         config.kernel_image = PathBuf::from("/images/vmlinux,broken");
         assert!(config.validate().is_err());
         config.kernel_image = PathBuf::from("/images/vmlinux");
-        config.shared_tag = crate::profile::PROFILE_SHARE_TAG.into();
+        config.shared_tag = crate::agent::profile::PROFILE_SHARE_TAG.into();
         assert!(
             config.validate().is_err(),
             "the profile share tag is reserved"

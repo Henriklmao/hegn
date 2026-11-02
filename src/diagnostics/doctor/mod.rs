@@ -6,7 +6,7 @@ use std::process::Command;
 use serde::Serialize;
 
 use crate::config::{Config, VIRTIOFSD_FALLBACKS};
-use crate::images::{self, AssetStatus};
+use crate::vm::images::{self, AssetStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Check {
@@ -69,7 +69,7 @@ pub fn setup_actions(config: &Config) -> SetupActions {
             || !config.profiles_dir.is_dir()
             || !config.logs_dir().is_dir(),
         init_config: !Config::config_path().exists(),
-        init_profiles: crate::profile::ProfileStore::new(config).needs_templates(),
+        init_profiles: crate::agent::profile::ProfileStore::new(config).needs_templates(),
         download_images: images::status(config).iter().any(AssetStatus::missing),
         configure_network: config.network == crate::config::NetworkMode::Guarded
             && !crate::network::guard_ready(config),

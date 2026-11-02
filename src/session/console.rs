@@ -16,12 +16,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::attach_bar::{OutputGate, StatusBar, detach_requested};
 use crate::config::Config;
-use crate::instance::{InstanceManager, InstancePaths, process_matches};
-use crate::instance_config::InstanceConfig;
-use crate::logs::sanitize_label;
-use crate::relay;
+use crate::session::attach_bar::{OutputGate, StatusBar, detach_requested};
+use crate::session::logs::sanitize_label;
+use crate::session::relay;
+use crate::vm::instance::{InstanceManager, InstancePaths, process_matches};
+use crate::vm::instance_config::InstanceConfig;
 
 /// Transport used by the terminal view. Implementations must never pretend to
 /// be an instance when no VM is running.
@@ -393,7 +393,7 @@ pub fn run_interactive_with_command(
                         if detach_requested(key) {
                             break;
                         }
-                        if let Some(bytes) = crate::app::encode_key(key) {
+                        if let Some(bytes) = crate::tui::app::encode_key(key) {
                             console.send(&bytes)?;
                         }
                     }
@@ -460,7 +460,7 @@ pub fn run_interactive_with_command(
 mod tests {
     use super::*;
     use crate::config::BackendKind;
-    use crate::instance::{InstancePaths, SessionRecord};
+    use crate::vm::instance::{InstancePaths, SessionRecord};
     use chrono::Utc;
     use std::os::unix::net::UnixListener;
 

@@ -10,19 +10,19 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use crate::app::PACKAGE_CHOICES;
-use crate::benchmark;
+use crate::agent::launch::{self, Integration, LaunchAction};
+use crate::agent::provision::{ProvisionPlan, ProvisionProgress, ProvisionWatcher};
 use crate::config::{Config, Harness};
-use crate::doctor;
-use crate::images::{self, AssetStatus};
-use crate::instance::{InstanceRegistry, InstanceReport, InstanceSummary, process_alive};
-use crate::launch::{self, Integration, LaunchAction};
-use crate::logs::{self, DEFAULT_KEEP, LogStore};
+use crate::diagnostics::benchmark;
+use crate::diagnostics::doctor;
 use crate::project::{self, ProjectMeta};
-use crate::provision::{ProvisionPlan, ProvisionProgress, ProvisionWatcher};
 use crate::security::{Decision, SecurityEngine};
-use crate::snapshot::{SnapshotMeta, SnapshotStore};
-use crate::terminal::TerminalBuffer;
+use crate::session::logs::{self, DEFAULT_KEEP, LogStore};
+use crate::session::snapshot::{SnapshotMeta, SnapshotStore};
+use crate::session::terminal::TerminalBuffer;
+use crate::tui::app::PACKAGE_CHOICES;
+use crate::vm::images::{self, AssetStatus};
+use crate::vm::instance::{InstanceRegistry, InstanceReport, InstanceSummary, process_alive};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -489,7 +489,8 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
             Ok(0)
         }
         Commands::Projects { query } => {
-            let store = crate::state::StateStore::load(config.state_dir.join("state.json"));
+            let store =
+                crate::session::state::StateStore::load(config.state_dir.join("state.json"));
             let projects =
                 project::discover_protected(&config.projects_root, &config.protected_paths())?
                     .into_iter()
@@ -752,7 +753,8 @@ fn project_command(command: ProjectCommands, config: Config, json: bool) -> Resu
         }
         ProjectCommands::Restore { project: selector } => {
             let entry = resolve_project_entry(&config, &selector)?;
-            let mut store = crate::state::StateStore::load(config.state_dir.join("state.json"));
+            let mut store =
+                crate::session::state::StateStore::load(config.state_dir.join("state.json"));
             store.set_project_hidden(&entry, false)?;
             if json {
                 println!(
@@ -1016,7 +1018,7 @@ fn instance_command(command: InstanceCommands, config: Config, json: bool) -> Re
 
 fn only_running_instance(
     registry: &InstanceRegistry,
-) -> Result<crate::instance_config::InstanceConfig> {
+) -> Result<crate::vm::instance_config::InstanceConfig> {
     let mut running: Vec<_> = registry
         .summaries()?
         .into_iter()
@@ -1054,7 +1056,7 @@ fn prompt_yes(question: &str) -> Result<bool> {
 fn snapshot_instance(
     registry: &InstanceRegistry,
     requested: Option<String>,
-) -> Result<crate::instance_config::InstanceConfig> {
+) -> Result<crate::vm::instance_config::InstanceConfig> {
     match requested {
         Some(selector) => registry.resolve(&selector),
         None => only_running_instance(registry),
@@ -1209,7 +1211,8 @@ fn config_command(command: ConfigCommands, config: Config, json: bool) -> Result
         }
         ConfigCommands::Init => {
             let config_written = config.write_default_if_missing()?;
-            let profiles_written = crate::profile::ProfileStore::new(&config).write_templates()?;
+            let profiles_written =
+                crate::agent::profile::ProfileStore::new(&config).write_templates()?;
             config.ensure_dirs()?;
             if json {
                 println!(
@@ -1245,7 +1248,7 @@ fn config_command(command: ConfigCommands, config: Config, json: bool) -> Result
 }
 
 fn profile_command(command: ProfileCommands, config: Config, json: bool) -> Result<i32> {
-    let store = crate::profile::ProfileStore::new(&config);
+    let store = crate::agent::profile::ProfileStore::new(&config);
     match command {
         ProfileCommands::List => {
             let mut entries = Vec::new();
@@ -1324,7 +1327,7 @@ fn profile_command(command: ProfileCommands, config: Config, json: bool) -> Resu
         ProfileCommands::Sync { instance } => {
             let registry = InstanceRegistry::new(config);
             let instance = registry.resolve(&instance)?;
-            let plan = crate::profile::prepare_for_start(registry.config(), &instance)?;
+            let plan = crate::agent::profile::prepare_for_start(registry.config(), &instance)?;
             if json {
                 println!(
                     "{}",
@@ -1362,7 +1365,7 @@ fn skill_command(command: SkillCommands, config: Config, json: bool) -> Result<i
     match command {
         SkillCommands::Sync { instance } => {
             let instance = registry.resolve(&instance)?;
-            let report = crate::profile::sync_skills(registry.config(), &instance)?;
+            let report = crate::agent::profile::sync_skills(registry.config(), &instance)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1389,7 +1392,8 @@ fn skill_command(command: SkillCommands, config: Config, json: bool) -> Result<i
                     instance.name
                 );
             }
-            let report = crate::profile::sync_skills_back(registry.config(), &instance, dry_run)?;
+            let report =
+                crate::agent::profile::sync_skills_back(registry.config(), &instance, dry_run)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1603,7 +1607,8 @@ fn doctor(config: Config, json: bool, fix: bool) -> Result<i32> {
                 eprintln!("hegn: wrote {}", Config::config_path().display());
             }
             if actions.init_profiles {
-                let written = crate::profile::ProfileStore::new(&config).write_templates()?;
+                let written =
+                    crate::agent::profile::ProfileStore::new(&config).write_templates()?;
                 if !json {
                     for path in &written {
                         eprintln!("hegn: wrote {}", path.display());
@@ -1694,7 +1699,7 @@ fn open(
         }
     }
 
-    crate::console::run_interactive_with_command(console, !no_bar, command.as_deref())?;
+    crate::session::console::run_interactive_with_command(console, !no_bar, command.as_deref())?;
     Ok(0)
 }
 
@@ -1782,7 +1787,7 @@ fn attach(
     };
     // VmConsole::attach re-verifies the recorded pid, VM binary and relay.
     let console = registry.manager(instance).attach_console()?;
-    crate::console::run_interactive_with_command(console, !no_bar, command.as_deref())?;
+    crate::session::console::run_interactive_with_command(console, !no_bar, command.as_deref())?;
     Ok(0)
 }
 
@@ -1835,7 +1840,11 @@ fn launch_command(
     match launch::action(&spec, &instance.name, &instance.workspace, &hegn)? {
         LaunchAction::Embedded { command } => {
             let console = manager.attach_console()?;
-            crate::console::run_interactive_with_command(console, spec.bar, Some(&command))?;
+            crate::session::console::run_interactive_with_command(
+                console,
+                spec.bar,
+                Some(&command),
+            )?;
         }
         LaunchAction::External {
             instance,
@@ -1843,7 +1852,11 @@ fn launch_command(
             bar,
         } => {
             let console = registry.manager_by_name(&instance)?.attach_console()?;
-            crate::console::run_interactive_with_command(console, bar, command.as_deref())?;
+            crate::session::console::run_interactive_with_command(
+                console,
+                bar,
+                command.as_deref(),
+            )?;
         }
         LaunchAction::Spawn { program, args } => {
             let status = Command::new(&program)
@@ -2357,7 +2370,7 @@ mod tests {
         .unwrap();
         assert_eq!(code, 0);
         assert!(project.join("README.md").is_file(), "files must be kept");
-        let store = crate::state::StateStore::load(config.state_dir.join("state.json"));
+        let store = crate::session::state::StateStore::load(config.state_dir.join("state.json"));
         assert!(store.is_hidden(&project));
 
         let code = project_command(
@@ -2369,7 +2382,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(code, 0);
-        let store = crate::state::StateStore::load(config.state_dir.join("state.json"));
+        let store = crate::session::state::StateStore::load(config.state_dir.join("state.json"));
         assert!(!store.is_hidden(&project));
 
         let code = project_command(

@@ -39,7 +39,7 @@ pub fn grow_to_minimum(path: &Path, format: RootfsFormat) -> Result<bool> {
 
 /// Extend `path` to `target` bytes. A larger file is left untouched.
 pub fn grow(path: &Path, format: RootfsFormat, target: u64) -> Result<bool> {
-    if !crate::images::is_regular_file(path) {
+    if !crate::vm::images::is_regular_file(path) {
         bail!("{} is not a regular file", path.display());
     }
     match format {

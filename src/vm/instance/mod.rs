@@ -43,17 +43,17 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::cloud_hypervisor::{CloudHypervisorClient, SnapshotConfig, VmInfo, VmState};
-use crate::cloud_init;
+use crate::agent::profile::{self, PROFILE_SHARE_TAG};
+use crate::agent::provision::ProvisionPlan;
 use crate::config::{Config, Harness, VIRTIOFSD_FALLBACKS};
-use crate::instance_config::{CloneOutcome, DeleteOutcome, InstanceConfig, InstanceStore};
-use crate::logs::{DEFAULT_KEEP, LogStore};
 use crate::network;
-use crate::profile::{self, PROFILE_SHARE_TAG};
-use crate::provision::ProvisionPlan;
-use crate::relay::{self, RelayArgs};
-use crate::snapshot::{SnapshotMeta, SnapshotStore};
-use crate::virtiofs::{VirtiofsConfig, VirtiofsProcess};
+use crate::session::logs::{DEFAULT_KEEP, LogStore};
+use crate::session::relay::{self, RelayArgs};
+use crate::session::snapshot::{SnapshotMeta, SnapshotStore};
+use crate::vm::cloud_init;
+use crate::vm::hypervisor::{CloudHypervisorClient, SnapshotConfig, VmInfo, VmState};
+use crate::vm::instance_config::{CloneOutcome, DeleteOutcome, InstanceConfig, InstanceStore};
+use crate::vm::virtiofs::{VirtiofsConfig, VirtiofsProcess};
 
 const API_START_TIMEOUT: Duration = Duration::from_secs(15);
 const RELAY_START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -696,12 +696,12 @@ impl InstanceManager {
     }
 
     /// Attach the TUI/CLI terminal to the running guest serial console.
-    pub fn attach_console(&self) -> Result<crate::console::VmConsole> {
-        crate::console::VmConsole::attach(&self.config, &self.instance)
+    pub fn attach_console(&self) -> Result<crate::session::console::VmConsole> {
+        crate::session::console::VmConsole::attach(&self.config, &self.instance)
     }
 
     /// Boot a VM if needed, then attach its console.
-    pub fn ensure_console(&self) -> Result<crate::console::VmConsole> {
+    pub fn ensure_console(&self) -> Result<crate::session::console::VmConsole> {
         if !self.is_running() {
             self.start()?;
         }
@@ -898,7 +898,7 @@ impl InstanceManager {
         // Serialize with start/stop/restore so the VM cannot be torn down
         // between pause and resume.
         let _lock = self.lock(&paths)?;
-        let name = crate::snapshot::sanitize_name(name)?;
+        let name = crate::session::snapshot::sanitize_name(name)?;
         let store = SnapshotStore::new(&self.config.snapshots_dir);
         let prepared = store.prepare_staged(&name)?;
         let client = CloudHypervisorClient::new(&paths.api_socket);
@@ -1537,7 +1537,7 @@ impl InstanceRegistry {
 
     /// Find a free instance name starting at `base`.
     pub fn unique_name(&self, base: &str) -> Result<String> {
-        let base = crate::logs::sanitize_segment(base, 48);
+        let base = crate::session::logs::sanitize_segment(base, 48);
         let mut candidate = base.clone();
         for suffix in 1..1000 {
             if !self.store.dir(&candidate)?.exists() {
@@ -1831,7 +1831,7 @@ fn start_relay(paths: &InstancePaths, serial_log: &Path, vm: &mut Child) -> Resu
 
 /// Last few lines of a startup log, flattened into one diagnostic line.
 fn log_tail(path: &Path) -> String {
-    let Ok(bytes) = crate::logs::tail_bytes(path, 8) else {
+    let Ok(bytes) = crate::session::logs::tail_bytes(path, 8) else {
         return "no log output".into();
     };
     let text = String::from_utf8_lossy(&bytes);
@@ -1843,7 +1843,7 @@ fn log_tail(path: &Path) -> String {
     if lines.is_empty() {
         return "no log output".into();
     }
-    crate::logs::sanitize_label(&lines.join(" | "))
+    crate::session::logs::sanitize_label(&lines.join(" | "))
 }
 
 async fn wait_for_vm(socket: &Path, child: &mut Child, timeout: Duration) -> Result<()> {

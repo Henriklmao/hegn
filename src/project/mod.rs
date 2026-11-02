@@ -334,7 +334,7 @@ pub struct ProjectMeta {
     /// command name from the global `[launch]` table).
     pub launch: Option<String>,
     /// Terminal integration override for this project.
-    pub integration: Option<crate::launch::Integration>,
+    pub integration: Option<crate::agent::launch::Integration>,
     /// Whether starting this project's VM also launches the configured
     /// command. Overrides the global `launch.auto_start`.
     pub auto_start: Option<bool>,
@@ -617,13 +617,13 @@ pub fn delete_project(
     entry: &Path,
     delete_files: bool,
 ) -> Result<ProjectDeleteOutcome> {
-    let registry = crate::instance::InstanceRegistry::new(config.clone());
+    let registry = crate::vm::instance::InstanceRegistry::new(config.clone());
     let instances: Vec<String> = registry
         .summaries()?
         .into_iter()
         .filter(|instance| {
-            crate::instance::same_project(&instance.project, entry)
-                || crate::instance::same_project(&instance.workspace, entry)
+            crate::vm::instance::same_project(&instance.project, entry)
+                || crate::vm::instance::same_project(&instance.workspace, entry)
         })
         .map(|instance| instance.name)
         .collect();
@@ -634,7 +634,7 @@ pub fn delete_project(
     let removal = remove_entry(&config.projects_root, entry, delete_files)?;
     let kept = matches!(removal, EntryRemoval::Kept);
     let files_deleted = matches!(removal, EntryRemoval::Deleted);
-    let mut store = crate::state::StateStore::load(config.state_dir.join("state.json"));
+    let mut store = crate::session::state::StateStore::load(config.state_dir.join("state.json"));
     store.forget_project(entry)?;
     store.set_project_hidden(entry, kept)?;
     Ok(ProjectDeleteOutcome {
@@ -1059,7 +1059,7 @@ mod tests {
             packages: vec!["nodejs".into(), "git".into()],
             template: Some("rust".into()),
             launch: Some("review".into()),
-            integration: Some(crate::launch::Integration::Tmux),
+            integration: Some(crate::agent::launch::Integration::Tmux),
             auto_start: Some(false),
         };
         write_meta(dir.path(), &meta).unwrap();
@@ -1068,7 +1068,10 @@ mod tests {
         assert_eq!(loaded.harness, Some(crate::config::Harness::Codex));
         assert_eq!(loaded.packages.len(), 2);
         assert_eq!(loaded.launch.as_deref(), Some("review"));
-        assert_eq!(loaded.integration, Some(crate::launch::Integration::Tmux));
+        assert_eq!(
+            loaded.integration,
+            Some(crate::agent::launch::Integration::Tmux)
+        );
         assert_eq!(loaded.auto_start, Some(false));
         assert_eq!(read_meta(Path::new("/missing")).packages.len(), 0);
     }

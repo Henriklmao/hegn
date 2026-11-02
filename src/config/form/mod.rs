@@ -4,7 +4,7 @@
 //! `hegn.toml`. Nothing touches disk until the user saves, and every change is
 //! validated against the same schema the CLI uses. Keyboard handling lives here
 //! so navigation, editing and persistence are unit-testable without a terminal;
-//! [`crate::ui`] only draws the rows and records their hit rectangles.
+//! [`crate::tui::ui`] only draws the rows and records their hit rectangles.
 
 use std::path::PathBuf;
 
@@ -15,7 +15,7 @@ use crate::config::{
     BackendKind, Config, Harness, LocalEndpoint, NetworkMode, RootfsFormat, SecurityMode,
     safe_package_name, validate_local_endpoints,
 };
-use crate::instance_config::{CONFIG_FILE, InstanceConfig, InstanceStore};
+use crate::vm::instance_config::{CONFIG_FILE, InstanceConfig, InstanceStore};
 
 /// Which configuration file the modal edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,7 +523,7 @@ impl ConfigForm {
             Draft::Global(config) => config.as_ref(),
             Draft::Instance(_) => self.base.as_ref(),
         };
-        let path = crate::profile::ProfileStore::new(config).path(harness);
+        let path = crate::agent::profile::ProfileStore::new(config).path(harness);
         if path.is_file() {
             path.display().to_string()
         } else {
@@ -1109,7 +1109,7 @@ fn parse_number(text: &str, min: i64, max: i64) -> Result<i64> {
 }
 
 fn validate_shared_tag(text: &str) -> Result<()> {
-    if !crate::cloud_init::safe_token(text) {
+    if !crate::vm::cloud_init::safe_token(text) {
         bail!("shared tag may only contain letters, digits, '-', '_' and '.'");
     }
     if text.len() > 36 {
@@ -1119,7 +1119,7 @@ fn validate_shared_tag(text: &str) -> Result<()> {
 }
 
 fn validate_guest_mount(text: &str) -> Result<()> {
-    if !crate::cloud_init::safe_mount(text) {
+    if !crate::vm::cloud_init::safe_mount(text) {
         bail!("guest mount must be an absolute path with simple components");
     }
     Ok(())
