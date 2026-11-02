@@ -205,7 +205,7 @@ hegn images verify       # re-hashes installed files
 ```
 
 Images are the upstream Cloud Hypervisor kernel and cloud image pinned by URL
-and SHA-256 in `src/images.rs`. Existing files are never replaced without
+and SHA-256 in `src/vm/images/assets.rs`. Existing files are never replaced without
 `--force`. Do not pass `--allow-unverified` unless the user explicitly asks for
 custom, unhashed images.
 

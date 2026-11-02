@@ -182,34 +182,34 @@ All state paths can be overridden in `config.toml` or by environment variables
 
 | Module | Responsibility | Notable invariants |
 | --- | --- | --- |
-| `cli.rs` | Clap command surface, JSON/text output, exit codes | Every TUI operation has a CLI counterpart; no fallback paths |
-| `config.rs` | Schema, defaults, env overrides, validation, XDG paths, tool lookup | Unknown keys rejected; SHA-256 and HTTPS URL validation; log dir `0700`; `virtiofsd` resolved via `PATH` then distribution dirs; writes are validated and installed with an atomic tmp+rename |
-| `config_form.rs` | Interactive settings editor for the `F4`/`F5` modal | Edits a validated working copy; schema validation before saving; locked Landlock/seccomp; global Profiles tab opens harness templates in `$EDITOR`; inline text edits never touch disk until `Ctrl-S` |
-| `project.rs` | Discovery, removal, fuzzy filter, git summaries, create, import, checkpoints | Import only creates a symlink; dangerous targets rejected; discovery skips links to `/`, `$HOME` and root ancestors; deletion is limited to direct children of `projects_root` and never follows import links |
-| `security.rs` | `tirith-core` integration and hegn workspace rules | Empty commands allowed; off mode still keeps destructive-operation guard |
-| `cloud_hypervisor.rs` | Typed REST client over `/api/v1` | Frames responses by `Content-Length`/chunked encoding, accepts bodyless `204`, bounded response sizes, pause/resume/info/snapshot only |
-| `cloud_init.rs` | NoCloud seed generation | FAT volume labelled `CIDATA`; serial root autologin; first-boot provisioner and guest network config; no secrets; `0600` and `O_NOFOLLOW` |
-| `provision.rs` | Harness preset install plans and first-boot script | Preset packages are always unioned; package names validated; only static install commands; waits for DNS, retries apt, emits serial progress stages and verifies the CLI before writing the marker |
-| `rootfs.rs` | Per-instance disk growth | Extends raw images sparsely and grows qcow2 virtual size in place; `qemu-img` fallback for unsupported layouts |
-| `launch.rs` | Configurable agent launch commands and terminal integrations | Commands are validated and typed into the guest; `auto` prefers herdr, then tmux, then the current terminal; tmux/herdr run `hegn attach`, never a host agent |
-| `profile.rs` | Per-harness profile templates, guest payload materialization, skill sync | Source/target/mode/env validation; config files refreshed every start; skills seeded once into a private per-instance copy; a second sandboxed virtiofsd exports only that copy; sync-back copies regular files and skips symlinks/special files |
-| `network.rs` | Guarded host network: TAP pool reservation, nftables rules, setup marker | Root-only marker; anti-spoof; private/IPv6/guest-to-host drop; HTTP(S)+public DNS allow-list; per-instance `/30` slice; stale reservations reclaimed only when the owning VM is not running; opt-in loopback endpoints are DNATed per TAP with `route_localnet` and cannot write; TAP pool exempted from ufw/firewalld/iptables routed policies because netfilter applies every `forward` base chain |
-| `relay.rs` | Detached serial relay | Sole VMM serial client; append-only log; replays the log tail on attach; bounded buffers; refuses to replace non-socket paths; stderr goes to `run/console-relay.log` because it has no terminal |
-| `virtiofs.rs` | virtiofsd argv/process construction | Shared dir canonicalized; always sandboxed; `--cache=never` by default; sockets scoped to run dir |
-| `instance_config.rs` | Per-instance `hegn.toml`, clone/copy workspaces, rootfs copies | Names validated; source project never deleted; git identity copied; clone child output is captured (warnings go to the UI, never the terminal); reflink rootfs with copy fallback |
-| `instance.rs` | VM lifecycle, registry, lock, session record, status, snapshots | One lifecycle lock per instance; preflight before spawn; hardened VMM argv; cleanup on every error path; registry lists/starts/deletes independent instances |
-| `snapshot.rs` | Snapshot metadata store | Sanitized names; private dirs/files; atomic-ish metadata writes |
-| `images.rs` | Upstream asset pins, streaming download, SHA-256 install/verify | HTTPS only by config validation; checksum before rename; no overwrite without `--force` |
-| `doctor.rs` | Shared host checks and automatic setup planning for CLI and TUI | Required vs optional checks; `SetupActions` covers directories, default config, profile templates, pinned images and the guarded network; `hegn doctor --fix` and the TUI `s` action are idempotent |
-| `benchmark.rs` | Measured host cost: process RSS, disk usage, snapshot estimate; boots a VM only when asked | Refuses to delete anything outside its own `hegn-benchmark-*` projects; sparse-aware accounting; JSON output |
-| `console.rs` | Serial transport over the relay socket, tmux-style attach, status bar | Never pretends a VM exists; verifies VMM and relay; bar content sanitized; `--no-bar` for full-screen guests |
-| `attach_bar.rs` | Bottom status bar overlay and sequence-safe output gate | Clamps DECSTBM so the bar stays pinned; repaints after every output burst; never injects into a split escape sequence or UTF-8 character |
-| `logs.rs` | Log naming, listing, resolve, tail, prune | `O_NOFOLLOW`, regular files only, no foreign files deleted, active log protected |
-| `terminal.rs` | ANSI-aware scrollback | Strips CSI/OSC; handles CRLF without losing lines; caps line bytes and scrollback |
-| `state.rs` | Recent and hidden-project persistence | Atomic tmp+rename |
-| `app.rs` | TUI state machine, modals, key/mouse handling, effects | Pure state transitions; side effects returned as `Effect` |
-| `ui.rs` | Ratatui rendering | Pure renderer; footer, row and settings-stepper hit rectangles; all modals testable with `TestBackend` |
-| `tui.rs` | Terminal lifecycle, event loop, background jobs | Restores terminal on every exit path; project scan and image download off the UI thread |
+| `cli/` | Clap command surface, per-command modules, JSON/text output, exit codes | Every TUI operation has a CLI counterpart; no fallback paths |
+| `config/` | Schema, defaults, env overrides, validation, XDG paths, tool lookup; `form/` is the interactive settings editor | Unknown keys rejected; SHA-256 and HTTPS URL validation; log dir `0700`; `virtiofsd` resolved via `PATH` then distribution dirs; writes are validated and installed with an atomic tmp+rename; form edits a validated working copy and never touches disk before `Ctrl-S` |
+| `project/` | Discovery, removal, fuzzy filter, git summaries, create, import, checkpoints | Import only creates a symlink; dangerous targets rejected; discovery skips links to `/`, `$HOME` and root ancestors; deletion is limited to direct children of `projects_root` and never follows import links |
+| `security/` | `tirith-core` integration and hegn workspace rules | Empty commands allowed; off mode still keeps destructive-operation guard |
+| `network/` | Guarded host network: TAP pool reservation, nftables rules, setup marker, privileged setup scripts | Root-only marker; anti-spoof; private/IPv6/guest-to-host drop; HTTP(S)+public DNS allow-list; per-instance `/30` slice; stale reservations reclaimed only when the owning VM is not running; opt-in loopback endpoints are DNATed per TAP with `route_localnet` and cannot write; TAP pool exempted from ufw/firewalld/iptables routed policies because netfilter applies every `forward` base chain |
+| `vm/hypervisor/` | Typed REST client over `/api/v1` and HTTP framing | Frames responses by `Content-Length`/chunked encoding, accepts bodyless `204`, bounded response sizes, pause/resume/info/snapshot only |
+| `vm/cloud_init/` | NoCloud seed generation, user-data rendering and endpoint env | FAT volume labelled `CIDATA`; serial root autologin; first-boot provisioner and guest network config; no secrets; `0600` and `O_NOFOLLOW` |
+| `vm/rootfs/` | Per-instance disk growth | Extends raw images sparsely and grows qcow2 virtual size in place; `qemu-img` fallback for unsupported layouts |
+| `vm/images/` | Upstream asset pins, streaming download, SHA-256 install/verify | HTTPS only by config validation; checksum before rename; no overwrite without `--force` |
+| `agent/launch/` | Configurable agent launch commands and terminal integrations | Commands are validated and typed into the guest; `auto` prefers herdr, then tmux, then the current terminal; tmux/herdr run `hegn attach`, never a host agent |
+| `agent/profile/` | Per-harness profile templates, guest payload materialization, skill sync | Source/target/mode/env validation; config files refreshed every start; skills seeded once into a private per-instance copy; a second sandboxed virtiofsd exports only that copy; sync-back copies regular files and skips symlinks/special files |
+| `agent/provision/` | Harness preset install plans and first-boot script | Preset packages are always unioned; package names validated; only static install commands; waits for DNS, retries apt, emits serial progress stages and verifies the CLI before writing the marker |
+| `vm/virtiofs/` | virtiofsd argv/process construction | Shared dir canonicalized; always sandboxed; `--cache=never` by default; sockets scoped to run dir |
+| `vm/instance_config/` | Per-instance `hegn.toml`, clone/copy workspaces, rootfs copies | Names validated; source project never deleted; git identity copied; clone child output is captured (warnings go to the UI, never the terminal); reflink rootfs with copy fallback |
+| `vm/instance/` | VM lifecycle, registry, lock, session record, status, snapshots | One lifecycle lock per instance; preflight before spawn; hardened VMM argv; cleanup on every error path; registry lists/starts/deletes independent instances |
+| `session/snapshot/` | Snapshot metadata store | Sanitized names; private dirs/files; atomic-ish metadata writes |
+| `diagnostics/doctor/` | Shared host checks and automatic setup planning for CLI and TUI | Required vs optional checks; `SetupActions` covers directories, default config, profile templates, pinned images and the guarded network; `hegn doctor --fix` and the TUI `s` action are idempotent |
+| `diagnostics/benchmark/` | Measured host cost: process RSS, disk usage, snapshot estimate; boots a VM only when asked | Refuses to delete anything outside its own `hegn-benchmark-*` projects; sparse-aware accounting; JSON output |
+| `session/console/` | Serial transport over the relay socket, tmux-style attach, status bar | Never pretends a VM exists; verifies VMM and relay; bar content sanitized; `--no-bar` for full-screen guests |
+| `session/attach_bar/` | Bottom status bar overlay and sequence-safe output gate | Clamps DECSTBM so the bar stays pinned; repaints after every output burst; never injects into a split escape sequence or UTF-8 character |
+| `session/logs/` | Log naming, listing, resolve, tail, prune | `O_NOFOLLOW`, regular files only, no foreign files deleted, active log protected |
+| `session/relay/` | Detached serial relay | Sole VMM serial client; append-only log; replays the log tail on attach; bounded buffers; refuses to replace non-socket paths; stderr goes to `run/console-relay.log` because it has no terminal |
+| `session/terminal/` | ANSI-aware scrollback | Strips CSI/OSC; handles CRLF without losing lines; caps line bytes and scrollback |
+| `session/state/` | Recent and hidden-project persistence | Atomic tmp+rename |
+| `tui/app/` | TUI state machine, modals, key/mouse handling, effects | Pure state transitions; side effects returned as `Effect` |
+| `tui/ui/` | Ratatui rendering | Pure renderer; footer, row and settings-stepper hit rectangles; all modals testable with `TestBackend` |
+| `tui/` | Terminal lifecycle, event loop, background jobs | Restores terminal on every exit path; project scan and image download off the UI thread |
+| `shared/` | Dependency-free fs, process, path, text and numeric helpers | No domain imports, so it can be used by every domain without cycles |
 
 ---
 
@@ -501,7 +501,7 @@ hegn intentionally does **not** build, sign or publish its own guest image.
 That would add a second supply chain, a package-rebuild cadence and a large
 release artifact. Instead:
 
-- `src/images.rs` contains per-architecture constants:
+- `src/vm/images/assets.rs` contains per-architecture constants:
   `KERNEL_VERSION`, `KERNEL_ARTIFACT`, `KERNEL_URL`, `KERNEL_SHA256`,
   `ROOTFS_VERSION`, `ROOTFS_ARTIFACT`, `ROOTFS_URL`, `ROOTFS_SHA256`.
 - Defaults use the official Cloud Hypervisor Linux kernel release and the
@@ -514,7 +514,7 @@ release artifact. Instead:
 - `scripts/update_vm_images.py --arch <arch>` queries the Cloud Hypervisor
   Linux release and the upstream `test_assets.yaml`, selects the kernel and
   cloud image, downloads both, computes SHA-256 from the actual bytes, and
-  rewrites only the matching architecture block in `src/images.rs`.
+  rewrites only the matching architecture block in `src/vm/images/assets.rs`.
 - If the file changed, the workflow force-pushes a `chore/vm-images` branch and
   creates or updates a pull request. A human reviews the new artifacts before
   merging; the normal Rust CI then re-runs tests and clippy.
@@ -721,7 +721,7 @@ needs to recover or audit has a CLI form.
 
 ## 11. Testing strategy
 
-- All modules are unit-tested from the library crate (`src/*.rs` `#[cfg(test)]`).
+- All modules are unit-tested from the library crate (`src/**/*.rs` `#[cfg(test)]`).
 - Cloud Hypervisor API tests use a local Unix socket server; no `/dev/kvm`
   needed.
 - Console and relay tests use Unix socket pairs with a fake session record whose
@@ -821,10 +821,10 @@ can build their own rootfs and point `rootfs_image`/`rootfs_*` at it.
 
 **Consequence:** the upstream rootfs stays signed upstream; hegn never rebuilds
 it. Harness binaries are installed *inside* the guest on first boot by the
-NoCloud provisioner (`src/provision.rs`): apt packages plus a static per-preset
+NoCloud provisioner (`src/agent/provision/`): apt packages plus a static per-preset
 installer, retried by a oneshot until `/var/lib/hegn/provisioned` exists. The
 same oneshot re-applies the user's `profiles/<harness>.toml` payload on every
-boot; profile skills live in a per-instance copy (`src/profile.rs`), never in a
+boot; profile skills live in a per-instance copy (`src/agent/profile/`), never in a
 host mount. The host image is never mutated, and a pre-baked custom rootfs
 remains an explicit opt-in.
 
@@ -911,35 +911,35 @@ normal mode.
 ```text
 src/
   main.rs        thin binary / exit codes
-  lib.rs         module exports and crate documentation
-  cli.rs         clap commands and text/JSON output
-  benchmark.rs   measured host cost and disk usage
-  config.rs      schema, defaults, env overrides, validation
-  config_form.rs interactive settings editor model (F4/F5 modal)
-  project.rs     discovery, removal, import, templates, git helpers
-  profile.rs     per-harness profiles, copied skill bundles, sync-back
-  security.rs    tirith-core + hegn workspace guardrails
-  cloud_hypervisor.rs typed REST client
-  cloud_init.rs   NoCloud seed generation
-  provision.rs    harness preset installers, progress stages and first-boot script
-  launch.rs       named launch commands + embedded/external/tmux/herdr integrations
-  rootfs.rs       sparse raw/ qcow2 growth for per-instance disks
-  network.rs      guarded TAP pool, nftables rules and reservations
-  relay.rs        detached serial relay
-  virtiofs.rs    hardened virtiofsd process construction
-  instance_config.rs per-instance config, clones, rootfs copies
-  instance.rs     instance registry, lifecycle, lock, session, report
-  snapshot.rs    snapshot metadata store
-  images.rs      upstream image pins, downloads, SHA-256
-  doctor.rs      shared host checks
-  console.rs     serial transport over the relay, attach bar
-  attach_bar.rs  status bar overlay + sequence-safe output gate
-  logs.rs        persistent logs, tail, prune
-  terminal.rs    ANSI-aware scrollback
-  state.rs       recent and hidden project state
-  app.rs         TUI state machine
-  ui.rs          ratatui renderer
-  tui.rs         terminal loop and effects
+  lib.rs         module tree and crate documentation
+  shared/        dependency-free fs/process/path/text helpers
+  cli/           clap commands, per-command modules, output and resolution
+  config/        schema, defaults, env overrides, validation; form/ editor model
+  project/       discovery, removal, import, templates, git helpers
+  security/      tirith-core + hegn workspace guardrails
+  network/       guarded TAP pool, nftables rules and reservations
+  vm/            hypervisor/ REST client
+                 cloud_init/ NoCloud seed generation
+                 images/ upstream pins, downloads, SHA-256
+                 rootfs/ sparse raw/qcow2 growth
+                 virtiofs/ hardened virtiofsd process construction
+                 instance_config/ per-instance config, clones, rootfs copies
+                 instance/ registry, lifecycle, lock, session, report
+  agent/         launch/ named commands + integrations
+                 profile/ per-harness profiles and skill sync
+                 provision/ harness preset installers and first-boot script
+  session/       relay/ detached serial relay
+                 console/ serial transport and attach
+                 attach_bar/ status bar overlay + output gate
+                 logs/ persistent logs, tail, prune
+                 terminal/ ANSI-aware scrollback
+                 snapshot/ snapshot metadata store
+                 state/ recent and hidden project state
+  diagnostics/   doctor/ shared host checks
+                 benchmark/ measured host cost and disk usage
+  tui/           terminal loop and effects
+                 app/ TUI state machine
+                 ui/ ratatui renderer
 scripts/
   update_vm_images.py  refresh upstream pins (CI)
 .github/workflows/
@@ -947,8 +947,6 @@ scripts/
   vm-images.yml     weekly upstream pin refresh PR
   release.yml       tagged AppImage release
   aur-publish.yml   tagged AUR publish
-vendor/
-  tirith-core/      patched newest upstream release (RustSec fixes)
 vendor/
   tirith-core/      patched newest upstream release (RustSec fixes)
 docs/

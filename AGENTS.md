@@ -47,25 +47,36 @@ is the minimum bar.
 
 ## Project layout
 
-- `src/lib.rs` — module exports; the crate is a library with a thin `main.rs`.
-- `src/cli.rs` — every TUI action needs a non-interactive CLI counterpart.
-- `src/benchmark.rs` — `hegn benchmark`: measured host cost and disk usage.
-- `src/config.rs` — config schema; unknown keys are rejected, so update the
-  struct *and* the README example when adding options.
-- `src/security.rs` — `tirith-core` integration plus hegn-specific guardrails.
-- `src/cloud_hypervisor.rs` / `src/instance.rs` / `src/virtiofs.rs` — VM lifecycle.
-- `src/relay.rs` / `src/console.rs` — detached serial relay and attach transport.
-- `src/cloud_init.rs` — NoCloud seed for the official cloud images.
-- `src/instance_config.rs` — per-instance `hegn.toml`, cloning and rootfs copies.
-- `src/snapshot.rs` / `src/state.rs` — persisted metadata under XDG dirs.
-- `src/images.rs` / `src/doctor.rs` — pinned upstream VM assets and shared
-  prerequisite checks.
-- `src/launch.rs` — named agent commands and embedded/external/tmux/herdr
+- `src/lib.rs` — module tree and domain re-exports; the crate is a library with
+  a thin `main.rs`.
+- `src/shared/` — dependency-free fs, process, path, text and numeric helpers.
+- `src/cli/` — every TUI action needs a non-interactive CLI counterpart.
+- `src/config/` — config schema; unknown keys are rejected, so update the
+  struct *and* the README example when adding options. `form/` is the TUI
+  settings editor.
+- `src/security/` — `tirith-core` integration plus hegn-specific guardrails.
+- `src/network/` — guarded TAP pool, nftables rules and privileged setup.
+- `src/vm/hypervisor/` / `src/vm/instance/` / `src/vm/virtiofs/` — VM lifecycle.
+- `src/session/relay/` / `src/session/console/` — detached serial relay and
+  attach transport.
+- `src/vm/cloud_init/` — NoCloud seed for the official cloud images.
+- `src/vm/instance_config/` — per-instance `hegn.toml`, cloning and rootfs copies.
+- `src/session/snapshot/` / `src/session/state/` — persisted metadata under XDG
+  dirs.
+- `src/vm/images/` / `src/diagnostics/doctor/` — pinned upstream VM assets and
+  shared prerequisite checks.
+- `src/agent/launch/` — named agent commands and embedded/external/tmux/herdr
   launch integrations.
-- `src/rootfs.rs` — sparse per-instance disk growth (raw and qcow2).
+- `src/agent/profile/` — per-harness profiles, skill sync and guest payloads.
+- `src/agent/provision/` — first-boot harness preset installers.
+- `src/vm/rootfs/` — sparse per-instance disk growth (raw and qcow2).
+- `src/diagnostics/benchmark/` — `hegn benchmark`: measured host cost and disk
+  usage.
+- `src/session/logs/` / `src/session/terminal/` / `src/session/attach_bar/` —
+  persistent serial logs, scrollback and the attach status bar.
+- `src/tui/app/` / `src/tui/ui/` / `src/tui/` — state machine, rendering,
+  terminal event loop and background jobs.
 - `docs/architecture.md` — detailed module, lifecycle, safety and CI documentation.
-- `src/app.rs` / `src/ui.rs` / `src/tui.rs` — state machine, rendering, terminal
-  event loop.
 
 `README.md` is the user-facing documentation. Keep it in sync when behavior
 changes.
