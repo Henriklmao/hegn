@@ -823,6 +823,47 @@ mod tests {
     }
 
     #[test]
+    fn create_form_focus_cycles_and_only_selected_packages_are_returned() {
+        let mut form = CreateProjectForm::new(Harness::Shell);
+        assert_eq!(form.focus, CreateFocus::Name);
+        form.cycle_focus(false);
+        assert_eq!(form.focus, CreateFocus::Harness);
+        form.cycle_focus(false);
+        assert_eq!(form.focus, CreateFocus::Packages);
+        form.cycle_focus(false);
+        assert_eq!(form.focus, CreateFocus::Create);
+        form.cycle_focus(false);
+        assert_eq!(form.focus, CreateFocus::Name, "forward cycles wrap");
+        form.cycle_focus(true);
+        assert_eq!(form.focus, CreateFocus::Create, "backward cycles wrap");
+
+        assert!(form.selected_packages().is_empty());
+        form.packages[2].selected = true;
+        form.packages[5].selected = true;
+        assert_eq!(form.selected_packages(), vec!["python3", "fd-find"]);
+    }
+
+    #[test]
+    fn import_and_project_config_forms_cycle_their_focus() {
+        let mut import = ImportProjectForm::new();
+        assert_eq!(import.focus, ImportFocus::Path);
+        import.cycle_focus();
+        assert_eq!(import.focus, ImportFocus::Name);
+        import.cycle_focus();
+        assert_eq!(import.focus, ImportFocus::Path);
+
+        let mut config =
+            ProjectConfigForm::new(PathBuf::from("/projects/demo"), &ProjectMeta::default());
+        assert_eq!(config.row, 0);
+        config.select(-1);
+        assert_eq!(config.row, ProjectConfigForm::ROWS - 1);
+        config.select(1);
+        assert_eq!(config.row, 0);
+        config.select(1);
+        assert_eq!(config.row, 1);
+    }
+
+    #[test]
     fn health_parser_takes_the_last_guest_line() {
         let parsed = InstanceHealth::parse(
             "boot\nhegn-health v1 apt=2 checked=1700000000 reason=ok\n\

@@ -147,4 +147,69 @@ mod tests {
         let err = paths.ensure().unwrap_err().to_string();
         assert!(err.contains("symlinked run directory"), "{err}");
     }
+
+    #[test]
+    fn ensure_creates_a_fresh_run_directory_with_private_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(config_with_assets(dir.path()), dir.path());
+        let paths = manager.paths();
+        assert!(!paths.run_dir.exists());
+
+        paths.ensure().unwrap();
+        assert!(paths.run_dir.is_dir());
+        assert_eq!(
+            std::fs::metadata(&paths.run_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        // Repeated ensure calls keep the invariant.
+        paths.ensure().unwrap();
+        assert_eq!(
+            std::fs::metadata(&paths.run_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn every_runtime_path_stays_inside_the_instance_run_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let instance = instance_for(&dir.path().join("project"));
+        let paths = InstancePaths::from_instance(&config, &instance);
+        let runtime = [
+            &paths.api_socket,
+            &paths.serial_socket,
+            &paths.console_socket,
+            &paths.virtiofs_socket,
+            &paths.profile_socket,
+            &paths.vm_pid,
+            &paths.relay_pid,
+            &paths.virtiofs_pid,
+            &paths.profile_virtiofs_pid,
+            &paths.session,
+            &paths.log,
+            &paths.relay_log,
+            &paths.event_log,
+            &paths.lock,
+            &paths.cloud_init,
+        ];
+        for path in runtime {
+            assert_eq!(
+                path.parent(),
+                Some(paths.run_dir.as_path()),
+                "{} escapes the run directory",
+                path.display()
+            );
+        }
+        assert!(paths.run_dir.starts_with(config.instances_dir.join("demo")));
+    }
 }

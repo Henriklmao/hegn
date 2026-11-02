@@ -661,4 +661,122 @@ mod tests {
         assert!(clone.workspace.join("README.md").is_file());
         assert!(clone.workspace.join("link").is_symlink());
     }
+
+    #[test]
+    fn deleting_a_clone_never_removes_the_source_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        let base = store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+        store.clone_from(&base, "demo-agent-1", None).unwrap();
+
+        let outcome = store.delete("demo-agent-1", true).unwrap();
+        assert!(outcome.removed);
+        assert!(outcome.kept_workspace.is_none());
+        assert!(!store.dir("demo-agent-1").unwrap().exists());
+        assert_eq!(
+            fs::read(project.join("README.md")).unwrap(),
+            b"hello\n",
+            "the source project must survive clone deletion"
+        );
+        assert!(store.dir("demo").unwrap().exists());
+    }
+
+    #[test]
+    fn path_is_inside_accepts_only_strict_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let child = root.join("workspace");
+        let sibling = dir.path().join("sibling");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+
+        assert!(path_is_inside(&child, &root));
+        assert!(!path_is_inside(&root, &root));
+        assert!(!path_is_inside(&root, &child));
+        assert!(!path_is_inside(&sibling, &root));
+        assert!(!path_is_inside(&root, &sibling));
+    }
+
+    #[test]
+    fn clone_workspace_refuses_nested_source_and_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let source = dir.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file"), b"x").unwrap();
+
+        let err = store
+            .clone_workspace(&source, &source.join("nested"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("into itself"), "{err}");
+        let err = store
+            .clone_workspace(&source, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("into itself"), "{err}");
+        assert!(!source.join("nested").exists());
+    }
+
+    #[test]
+    fn creation_assigns_distinct_network_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        let mut indices = Vec::new();
+        for name in ["one", "two", "three"] {
+            let instance = store
+                .create_from_project(&project, Some(name), None, false)
+                .unwrap();
+            indices.push(instance.network_index.unwrap());
+        }
+        indices.sort_unstable();
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn creation_rejects_a_non_directory_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let file = dir.path().join("not-a-project");
+        fs::write(&file, b"x").unwrap();
+        let err = store
+            .create_from_project(&file, Some("demo"), None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn private_directories_are_tightened_and_symlinks_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing");
+        fs::create_dir_all(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir(&existing).unwrap();
+        assert_eq!(
+            fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let target = dir.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = create_private_dir(&link).unwrap_err().to_string();
+        assert!(err.contains("symlinked directory"), "{err}");
+    }
+
+    #[test]
+    fn deleting_a_missing_instance_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let err = store.delete("missing", true).unwrap_err().to_string();
+        assert!(err.contains("has no config"), "{err}");
+    }
 }

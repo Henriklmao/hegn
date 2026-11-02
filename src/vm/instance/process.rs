@@ -12,37 +12,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::session::relay;
-
-pub fn process_alive(pid: u32) -> bool {
-    // `kill(0, ...)` and `kill(-pgrp, ...)` target hegn's own process group or
-    // an arbitrary group, so only real positive PIDs are considered.
-    if pid == 0 || pid > i32::MAX as u32 {
-        return false;
-    }
-    // Safety: kill(2) with signal 0 only probes for existence.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
+use crate::shared::process::executable_matches;
+pub use crate::shared::process::process_alive;
 
 /// Whether `pid` is alive *and* still runs the expected executable.
 ///
 /// PID files and `session.json` outlive crashes and reboots. Without this check
 /// a recycled PID could make hegn report a stale VM as running, or worse, send
-/// SIGKILL to an unrelated process.
+/// SIGKILL to an unrelated process. Absolute paths are compared against
+/// `/proc/<pid>/exe`; argv[0] is only a fallback.
 pub fn process_matches(pid: u32, binary: &Path) -> bool {
-    if !process_alive(pid) {
-        return false;
-    }
-    let Some(expected) = binary.file_name() else {
-        return false;
-    };
-    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
-        return false;
-    };
-    let argv0 = cmdline.split(|byte| *byte == 0).next().unwrap_or(&[]);
-    let argv0 = String::from_utf8_lossy(argv0);
-    Path::new(argv0.as_ref())
-        .file_name()
-        .is_some_and(|actual| actual == expected)
+    executable_matches(pid, binary)
 }
 
 pub(super) fn terminate(pid: u32, binary: &Path) {
@@ -156,5 +136,80 @@ mod tests {
         let err = remove_socket(&path).unwrap_err().to_string();
         assert!(err.contains("not a socket"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
+    }
+
+    #[test]
+    fn read_pid_handles_missing_garbage_and_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_pid(&dir.path().join("missing.pid")), None);
+
+        let garbage = dir.path().join("garbage.pid");
+        std::fs::write(&garbage, b"not-a-pid\n").unwrap();
+        assert_eq!(read_pid(&garbage), None);
+
+        let signed = dir.path().join("signed.pid");
+        std::fs::write(&signed, b"-1\n").unwrap();
+        assert_eq!(read_pid(&signed), None);
+
+        let valid = dir.path().join("valid.pid");
+        std::fs::write(&valid, b"  4321\n").unwrap();
+        assert_eq!(read_pid(&valid), Some(4321));
+    }
+
+    #[test]
+    fn remove_socket_removes_a_real_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(is_socket(&path));
+        remove_socket(&path).unwrap();
+        assert!(!path.exists());
+        drop(listener);
+    }
+
+    #[test]
+    fn remove_socket_refuses_symlinks_and_leaves_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"do not delete").unwrap();
+        let link = dir.path().join("api.sock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = remove_socket(&link).unwrap_err().to_string();
+        assert!(err.contains("not a socket"), "{err}");
+        assert!(link.is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not delete");
+    }
+
+    #[test]
+    fn is_socket_distinguishes_sockets_from_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("regular");
+        std::fs::write(&regular, b"x").unwrap();
+        assert!(!is_socket(&regular));
+        assert!(!is_socket(&dir.path().join("missing")));
+
+        let socket = dir.path().join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(is_socket(&socket));
+    }
+
+    #[test]
+    fn process_matches_rejects_paths_without_a_binary_name() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(!process_matches(std::process::id(), Path::new("/")));
+        assert!(!process_matches(std::process::id(), Path::new("")));
+        assert!(process_matches(std::process::id(), &exe));
+    }
+
+    #[test]
+    fn ensure_socket_reports_a_missing_api_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud-hypervisor.sock");
+        let err = ensure_socket(&path).unwrap_err().to_string();
+        assert!(err.contains("no Cloud Hypervisor API socket"), "{err}");
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        std::fs::write(&path, b"x").unwrap();
+        assert!(ensure_socket(&path).is_ok());
     }
 }

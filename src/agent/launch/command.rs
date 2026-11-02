@@ -156,4 +156,59 @@ mod tests {
             "{err:#}"
         );
     }
+
+    #[test]
+    fn selectors_reject_newlines_shell_metacharacters_and_overlong_names() {
+        for bad in [
+            "",
+            "bad name",
+            "bad\nname",
+            "bad\rname",
+            "bad;reboot",
+            "bad$(id)",
+            "bad`id`",
+            "bad|pipe",
+            "bad&background",
+            "bad/path",
+            "bad.name",
+            "bad:name",
+        ] {
+            assert!(safe_selector(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(safe_selector(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn selectors_accept_letters_digits_dashes_and_underscores() {
+        for good in ["a", "A1", "review-2", "my_command", &"a".repeat(64)] {
+            assert!(safe_selector(good).is_ok(), "{good:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn named_commands_are_trimmed_but_inner_spacing_is_preserved() {
+        let mut config = test_config();
+        config.launch.commands.push(LaunchCommand {
+            name: "review".into(),
+            command: "  opencode   --model test  ".into(),
+            ..LaunchCommand::default()
+        });
+        let spec = resolve(&config, Harness::Opencode, Some("review"), None).unwrap();
+        assert_eq!(spec.command, "opencode   --model test");
+        assert!(!spec.is_shell());
+        assert!(!spec.bar);
+    }
+
+    #[test]
+    fn a_whitespace_only_named_command_is_a_maintenance_shell() {
+        let mut config = test_config();
+        config.launch.commands.push(LaunchCommand {
+            name: "blank".into(),
+            command: "   ".into(),
+            ..LaunchCommand::default()
+        });
+        let spec = resolve(&config, Harness::Opencode, Some("blank"), None).unwrap();
+        assert!(spec.is_shell());
+        assert!(spec.bar);
+    }
 }

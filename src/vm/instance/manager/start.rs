@@ -473,4 +473,69 @@ mod tests {
             0o600
         );
     }
+
+    #[test]
+    fn start_refuses_a_second_boot_while_the_recorded_vm_is_alive() {
+        use chrono::Utc;
+
+        use crate::config::Harness;
+        use crate::vm::instance::test_support::instance_for;
+        use crate::vm::instance::{InstanceManager, SessionRecord};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
+        config.virtiofsd_bin = std::env::current_exe().unwrap();
+        let instance = instance_for(&dir.path().join("project"));
+        let manager = InstanceManager::new(config, instance);
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        let record = SessionRecord {
+            project: manager.instance().project.clone(),
+            workspace: manager.instance().workspace.clone(),
+            instance: "demo".into(),
+            harness: Harness::Shell,
+            started_at: Utc::now(),
+            vm_pid: std::process::id(),
+            vm_binary: Some(std::env::current_exe().unwrap()),
+            relay_pid: 0,
+            virtiofs_pid: 0,
+            profile_virtiofs_pid: 0,
+            boot_args: String::new(),
+            serial_log: None,
+        };
+        let raw = serde_json::to_string(&record).unwrap();
+        fs::write(&paths.session, &raw).unwrap();
+
+        let err = manager.start().unwrap_err().to_string();
+        assert!(err.contains("already running"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&paths.session).unwrap(),
+            raw,
+            "a refused boot must not touch the live session"
+        );
+        assert!(!paths.virtiofs_pid.exists());
+    }
+
+    #[test]
+    fn start_refuses_a_harness_install_without_the_guarded_network() {
+        use crate::config::Harness;
+        use crate::vm::instance::InstanceManager;
+        use crate::vm::instance::test_support::instance_for;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
+        config.virtiofsd_bin = std::env::current_exe().unwrap();
+        config.network = crate::config::NetworkMode::Off;
+        config.cloud_init = true;
+        let mut instance = instance_for(&dir.path().join("project"));
+        instance.harness = Harness::Codex;
+        let manager = InstanceManager::new(config, instance);
+
+        let err = manager.start().unwrap_err().to_string();
+        assert!(err.contains("needs the guarded network"), "{err}");
+        assert!(!manager.paths().virtiofs_pid.exists());
+        assert!(!manager.paths().api_socket.exists());
+    }
 }

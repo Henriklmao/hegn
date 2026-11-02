@@ -575,4 +575,246 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
     }
+
+    #[test]
+    fn visible_aliases_map_to_their_commands() {
+        let cli = Cli::try_parse_from(["hegn", "ls"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Projects { query: None })
+        ));
+
+        let cli = Cli::try_parse_from(["hegn", "log"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Logs { command: None })
+        ));
+
+        let cli = Cli::try_parse_from(["hegn", "instance", "ls"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Instance {
+                command: InstanceCommands::List
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["hegn", "snapshot", "ls"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Snapshot {
+                command: SnapshotCommands::List
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["hegn", "logs", "ls"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Logs {
+                command: Some(LogCommands::List)
+            })
+        ));
+    }
+
+    #[test]
+    fn missing_required_arguments_are_parse_errors() {
+        assert!(Cli::try_parse_from(["hegn", "open"]).is_err());
+        assert!(Cli::try_parse_from(["hegn", "project"]).is_err());
+        assert!(Cli::try_parse_from(["hegn", "project", "import"]).is_err());
+        assert!(Cli::try_parse_from(["hegn", "check"]).is_err());
+        assert!(Cli::try_parse_from(["hegn", "instance"]).is_err());
+        assert!(Cli::try_parse_from(["hegn", "logs", "show", "--lines"]).is_err());
+    }
+
+    #[test]
+    fn conflicting_flags_are_parse_errors() {
+        assert!(Cli::try_parse_from(["hegn", "open", "demo", "--editor", "--lazygit"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "hegn",
+                "project",
+                "delete",
+                "demo",
+                "--delete-files",
+                "--keep-files",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["hegn", "benchmark", "demo", "--clean"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "hegn",
+                "instance",
+                "delete",
+                "demo",
+                "--delete-files",
+                "--keep-files",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["hegn", "project", "create", "demo", "--harness", "unknown"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn global_flags_are_accepted_before_and_after_a_subcommand() {
+        let cli = Cli::try_parse_from([
+            "hegn",
+            "--config",
+            "/tmp/hegn.toml",
+            "--json",
+            "config",
+            "show",
+        ])
+        .unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/hegn.toml")));
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Config {
+                command: ConfigCommands::Show
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["hegn", "config", "show", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(cli.config.is_none());
+    }
+
+    #[test]
+    fn optional_arguments_default_to_safe_values() {
+        let cli = Cli::try_parse_from(["hegn", "instance", "clone", "demo"]).unwrap();
+        match cli.command {
+            Some(Commands::Instance {
+                command:
+                    InstanceCommands::Clone {
+                        source,
+                        name,
+                        count,
+                        harness,
+                        no_start,
+                    },
+            }) => {
+                assert_eq!(source, "demo");
+                assert!(name.is_none());
+                assert_eq!(count, 1);
+                assert!(harness.is_none());
+                assert!(!no_start);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hegn", "logs", "show"]).unwrap();
+        match cli.command {
+            Some(Commands::Logs {
+                command: Some(LogCommands::Show { lines, raw, .. }),
+            }) => {
+                assert_eq!(lines, 80);
+                assert!(!raw);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hegn", "logs", "prune"]).unwrap();
+        match cli.command {
+            Some(Commands::Logs {
+                command: Some(LogCommands::Prune { keep }),
+            }) => assert_eq!(keep, DEFAULT_KEEP),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hegn", "snapshot", "create"]).unwrap();
+        match cli.command {
+            Some(Commands::Snapshot {
+                command: SnapshotCommands::Create { name, instance },
+            }) => {
+                assert!(name.is_none());
+                assert!(instance.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_command_specific_options() {
+        let cli = Cli::try_parse_from(["hegn", "check", "--cwd", "/tmp", "echo", "hi"]).unwrap();
+        match cli.command {
+            Some(Commands::Check { command, cwd }) => {
+                assert_eq!(command.join(" "), "echo hi");
+                assert_eq!(cwd, Some(PathBuf::from("/tmp")));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "hegn",
+            "project",
+            "create",
+            "demo",
+            "--package",
+            "ripgrep,fd-find",
+            "--template",
+            "/tmp/AGENTS.md",
+            "--harness",
+            "codex",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Project {
+                command:
+                    ProjectCommands::Create {
+                        name,
+                        harness,
+                        template,
+                        packages,
+                    },
+            }) => {
+                assert_eq!(name, "demo");
+                assert_eq!(harness, Some(Harness::Codex));
+                assert_eq!(template, Some(PathBuf::from("/tmp/AGENTS.md")));
+                assert_eq!(packages, vec!["ripgrep".to_string(), "fd-find".to_string()]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "hegn",
+            "images",
+            "download",
+            "--force",
+            "--allow-unverified",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Images {
+                command: ImageCommands::Download {
+                    force: true,
+                    allow_unverified: true
+                }
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["hegn", "network", "setup", "--user", "alice", "--dry-run"])
+            .unwrap();
+        match cli.command {
+            Some(Commands::Network {
+                command: NetworkCommands::Setup { user, dry_run },
+            }) => {
+                assert_eq!(user.as_deref(), Some("alice"));
+                assert!(dry_run);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hegn", "benchmark", "--clean"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Benchmark {
+                project: None,
+                clean: true
+            })
+        ));
+    }
 }

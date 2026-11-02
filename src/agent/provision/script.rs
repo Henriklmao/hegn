@@ -252,4 +252,67 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn user_packages_appear_only_as_validated_apt_arguments() {
+        use crate::config::safe_package_name;
+
+        let plan = ProvisionPlan::new(Harness::Shell, &["tmux".into()]).unwrap();
+        let script = plan.script();
+        let install_lines: Vec<_> = script
+            .lines()
+            .filter(|line| line.starts_with("apt_install "))
+            .collect();
+        assert_eq!(install_lines.len(), 1, "{script}");
+        let arguments = install_lines[0]
+            .strip_prefix("apt_install ")
+            .unwrap()
+            .split(" || {")
+            .next()
+            .unwrap();
+        assert_eq!(arguments.split(' ').next_back(), Some("tmux"));
+        assert!(
+            arguments.split(' ').all(safe_package_name),
+            "every argument must be a validated package name: {arguments}"
+        );
+        assert_eq!(
+            script.matches("tmux").count(),
+            1,
+            "the user package must not be interpolated anywhere else"
+        );
+    }
+
+    #[test]
+    fn the_script_is_deterministic_for_identical_plans() {
+        let plan = ProvisionPlan::new(Harness::Opencode, &["tmux".into()]).unwrap();
+        let first = plan.script();
+        assert_eq!(first, plan.script());
+        assert_eq!(
+            first,
+            ProvisionPlan::new(Harness::Opencode, &["tmux".into()])
+                .unwrap()
+                .script()
+        );
+        assert!(first.contains(&plan.package_hash()));
+        assert_eq!(first.matches(&plan.package_hash()).count(), 1);
+    }
+
+    #[test]
+    fn the_package_install_line_never_spans_multiple_lines() {
+        for harness in Harness::ALL {
+            let script = ProvisionPlan::new(harness, &["tmux".into()])
+                .unwrap()
+                .script();
+            for line in script.lines().filter(|line| line.contains("apt_install ")) {
+                assert!(
+                    line.trim_start().starts_with("apt_install "),
+                    "unexpected apt line: {line:?}"
+                );
+                assert!(
+                    !line.trim_end().ends_with('\\'),
+                    "the package list must not continue on another line: {line:?}"
+                );
+            }
+        }
+    }
 }

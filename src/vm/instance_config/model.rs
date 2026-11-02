@@ -177,6 +177,9 @@ impl InstanceConfig {
 /// Validate an instance name. It becomes a directory name, so traversal and
 /// hidden entries are rejected.
 pub fn validate_name(name: &str) -> Result<()> {
+    if name != name.trim() {
+        bail!("instance name must not start or end with whitespace");
+    }
     let name = name.trim();
     if name.is_empty() {
         bail!("instance name cannot be empty");
@@ -194,4 +197,221 @@ pub fn validate_name(name: &str) -> Result<()> {
         bail!("instance name may only contain ASCII letters, digits, '-', '_' and '.'");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid() -> InstanceConfig {
+        InstanceConfig {
+            name: "demo".into(),
+            project: PathBuf::from("/projects/demo"),
+            workspace: PathBuf::from("/projects/demo"),
+            ..InstanceConfig::default()
+        }
+    }
+
+    #[test]
+    fn names_reject_traversal_separators_and_hidden_entries() {
+        for name in [
+            "",
+            " ",
+            "..",
+            "../escape",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            ".ssh",
+            "a b",
+            " demo ",
+            "demo ",
+            " demo",
+            "\tdemo",
+            "a\0b",
+            "café",
+            "~root",
+        ] {
+            assert!(validate_name(name).is_err(), "{name:?} must be rejected");
+        }
+        assert!(validate_name(&"a".repeat(MAX_NAME_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn names_accept_ascii_letters_digits_and_safe_punctuation() {
+        let longest = "a".repeat(MAX_NAME_BYTES);
+        for name in [
+            "demo",
+            "demo-1",
+            "demo_agent",
+            "release.2026",
+            "A1",
+            &longest,
+        ] {
+            validate_name(name).unwrap_or_else(|err| panic!("{name:?}: {err}"));
+        }
+    }
+
+    #[test]
+    fn validation_requires_absolute_project_and_workspace_paths() {
+        let mut instance = valid();
+        instance.project = PathBuf::from("relative/project");
+        assert!(
+            instance
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("absolute")
+        );
+
+        let mut instance = valid();
+        instance.workspace = PathBuf::from("");
+        assert!(
+            instance
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("absolute")
+        );
+
+        let mut instance = valid();
+        instance.rootfs_image = Some(PathBuf::from("relative.qcow2"));
+        assert!(
+            instance
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("absolute")
+        );
+
+        assert!(valid().validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_a_comma_in_the_rootfs_path() {
+        let mut instance = valid();
+        instance.rootfs_image = Some(PathBuf::from("/disks/demo,backup.qcow2"));
+        let err = instance.validate().unwrap_err().to_string();
+        assert!(err.contains("comma"), "{err}");
+    }
+
+    #[test]
+    fn validation_bounds_vcpus_and_memory() {
+        for vcpus in [0, 33, u8::MAX] {
+            let mut instance = valid();
+            instance.vcpus = vcpus;
+            assert!(instance.validate().is_err(), "vcpus={vcpus}");
+        }
+        for vcpus in [1, 32] {
+            let mut instance = valid();
+            instance.vcpus = vcpus;
+            assert!(instance.validate().is_ok(), "vcpus={vcpus}");
+        }
+        for memory in [0, 127] {
+            let mut instance = valid();
+            instance.memory_mib = memory;
+            assert!(instance.validate().is_err(), "memory={memory}");
+        }
+        let mut instance = valid();
+        instance.memory_mib = 128;
+        assert!(instance.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_reserved_unsafe_and_oversized_share_tags() {
+        let oversized = "t".repeat(37);
+        for tag in [
+            crate::agent::profile::PROFILE_SHARE_TAG,
+            "",
+            "with space",
+            "trailing/slash",
+            "quote\"tag",
+            &oversized,
+        ] {
+            let mut instance = valid();
+            instance.shared_tag = tag.into();
+            assert!(instance.validate().is_err(), "tag={tag:?}");
+        }
+        let mut instance = valid();
+        instance.shared_tag = "workspace-1".into();
+        assert!(instance.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_bounds_the_network_index_to_the_tap_pool() {
+        let mut instance = valid();
+        instance.network_index = Some(crate::network::TAP_POOL);
+        let err = instance.validate().unwrap_err().to_string();
+        assert!(err.contains("TAP pool"), "{err}");
+
+        let mut instance = valid();
+        instance.network_index = Some(crate::network::TAP_POOL - 1);
+        assert!(instance.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_unsafe_guest_mounts_and_packages() {
+        for mount in ["", "relative", "/", "/workspace path", "/work;rm"] {
+            let mut instance = valid();
+            instance.guest_mount = mount.into();
+            assert!(instance.validate().is_err(), "mount={mount:?}");
+        }
+        let mut instance = valid();
+        instance.guest_mount = "/work/space".into();
+        assert!(instance.validate().is_ok());
+
+        for package in ["", "-bad", "bad package", "pkg;rm -rf /"] {
+            let mut instance = valid();
+            instance.extra_packages = vec![package.into()];
+            assert!(instance.validate().is_err(), "package={package:?}");
+        }
+        let mut instance = valid();
+        instance.extra_packages = vec!["build-essential".into(), "python3.12".into()];
+        assert!(instance.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_unknown_versions_and_bad_source_names() {
+        let mut instance = valid();
+        instance.version = CONFIG_VERSION + 1;
+        assert!(
+            instance
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("version")
+        );
+
+        let mut instance = valid();
+        instance.source_instance = Some("../escape".into());
+        assert!(instance.validate().is_err());
+
+        let mut instance = valid();
+        instance.source_instance = Some("demo-1".into());
+        assert!(instance.validate().is_ok());
+    }
+
+    #[test]
+    fn suggested_name_sanitizes_the_project_directory() {
+        assert_eq!(
+            InstanceConfig::suggested_name(Path::new("/projects/My Project!")),
+            "My-Project"
+        );
+        assert_eq!(
+            InstanceConfig::suggested_name(Path::new("/projects/---")),
+            "instance"
+        );
+        assert_eq!(InstanceConfig::suggested_name(Path::new("/")), "instance");
+        let long = "a".repeat(MAX_NAME_BYTES + 20);
+        let name = InstanceConfig::suggested_name(&PathBuf::from(format!("/projects/{long}")));
+        assert_eq!(name.len(), MAX_NAME_BYTES);
+    }
+
+    #[test]
+    fn instance_paths_are_rooted_at_instances_dir() {
+        let instance = valid();
+        let root = Path::new("/state/instances");
+        assert_eq!(instance.dir(root), root.join("demo"));
+        assert_eq!(instance.config_path(root), root.join("demo/hegn.toml"));
+    }
 }

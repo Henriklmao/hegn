@@ -272,6 +272,156 @@ mod tests {
         assert_eq!(app.hovered, None, "keyboard input clears the hover state");
     }
 
+    fn click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn double_clicking_a_project_row_opens_it() {
+        let (_dir, mut app) = test_app();
+        let path = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&path).unwrap();
+        app.set_projects(vec![Project {
+            name: "demo".into(),
+            path: path.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        }]);
+        app.project_rows = vec![RowHit {
+            rect: Rect::new(0, 2, 20, 1),
+            index: 0,
+        }];
+
+        app.handle_mouse(click(1, 2));
+        assert_eq!(app.screen, Screen::Dashboard, "one click only selects");
+        assert_eq!(app.selected_project().unwrap().name, "demo");
+
+        app.handle_mouse(click(1, 2));
+        assert_eq!(app.screen, Screen::Project);
+        assert_eq!(app.open_project.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn double_clicking_an_instance_asks_to_attach() {
+        let (_dir, mut app) = test_app();
+        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let instance = fake_instance(&app, "demo", inside);
+        install_instances(&mut app, vec![instance]);
+        app.screen = Screen::Project;
+        app.instance_rows = vec![RowHit {
+            rect: Rect::new(0, 4, 20, 1),
+            index: 0,
+        }];
+
+        assert!(app.handle_mouse(click(1, 4)).is_empty());
+        let effects = app.handle_mouse(click(1, 4));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::AttachInstance { instance }] if instance == "demo"
+        ));
+        assert_eq!(app.instance.state, InstanceState::Starting);
+    }
+
+    #[test]
+    fn section_clicks_focus_the_section_and_expand_only_when_split() {
+        let (_dir, mut app) = test_app();
+        app.screen = Screen::Project;
+        app.section_hits = vec![SectionHit {
+            rect: Rect::new(0, 1, 12, 1),
+            section: ProjectSection::Snapshots,
+        }];
+        app.project_view = ProjectView::Split;
+
+        app.handle_mouse(click(1, 1));
+
+        assert_eq!(app.focus, Focus::Snapshots);
+        assert_eq!(app.project_view, ProjectView::Section);
+        assert!(!app.terminal_focus);
+
+        app.project_view = ProjectView::Compact;
+        app.focus = Focus::Instances;
+        app.handle_mouse(click(1, 1));
+        assert_eq!(app.focus, Focus::Snapshots);
+        assert_eq!(app.project_view, ProjectView::Compact);
+    }
+
+    #[test]
+    fn clicking_the_terminal_pane_returns_to_normal_mode() {
+        let (_dir, mut app) = test_app();
+        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
+        app.project_view = ProjectView::Compact;
+        app.terminal_focus = false;
+        app.terminal_mode = TerminalMode::Insert;
+        app.terminal_hit = Some(Rect::new(40, 0, 30, 20));
+
+        app.handle_mouse(click(45, 5));
+
+        assert_eq!(app.project_view, ProjectView::Split);
+        assert!(app.terminal_focus);
+        assert_eq!(
+            app.terminal_mode,
+            TerminalMode::Normal,
+            "a mouse focus change must not leave the guest in insert passthrough"
+        );
+    }
+
+    #[test]
+    fn clicking_delete_project_opens_a_confirmation_not_a_deletion() {
+        let (_dir, mut app) = test_app();
+        let path = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&path).unwrap();
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path,
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+        app.footer_hits = vec![FooterHit {
+            rect: Rect::new(0, 30, 10, 1),
+            action: ActionId::DeleteProject,
+        }];
+
+        let effects = app.handle_mouse(click(1, 30));
+
+        assert!(effects.is_empty());
+        assert!(matches!(app.modal, Some(Modal::DeleteProject(_))));
+    }
+
+    #[test]
+    fn scrolling_the_split_view_moves_the_terminal_not_the_selection() {
+        let (_dir, mut app) = test_app();
+        app.set_projects(vec![fake_project("a"), fake_project("b")]);
+        app.screen = Screen::Project;
+        app.project_view = ProjectView::Split;
+        app.terminal.push_bytes(b"one\ntwo\nthree\n");
+        app.scroll = 0;
+        app.selected = 0;
+
+        let scroll = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(scroll(MouseEventKind::ScrollUp));
+        assert!(app.scroll > 0);
+        assert_eq!(
+            app.selected, 0,
+            "terminal scrolling must not move the picker"
+        );
+        app.handle_mouse(scroll(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.selected, 0);
+    }
+
     #[test]
     fn mouse_scroll_moves_selection() {
         let (_dir, mut app) = test_app();

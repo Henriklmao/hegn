@@ -312,4 +312,111 @@ mod tests {
         assert!(!is_log_name("session-.log"));
         assert!(!is_log_name("other.log"));
     }
+
+    fn timestamp() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn create_session_never_writes_through_a_precreated_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store.ensure().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"secret").unwrap();
+        // Predict the exact first name and squat on it with a symlink.
+        let squatted = store.root().join("session-20260102T030405Z-demo-7.log");
+        std::os::unix::fs::symlink(&victim, &squatted).unwrap();
+
+        let path = store
+            .create_session(Path::new("/p/demo"), timestamp(), 7)
+            .unwrap();
+
+        assert_ne!(path, squatted);
+        assert_eq!(fs::read(&victim).unwrap(), b"secret");
+        assert!(
+            fs::symlink_metadata(&squatted)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the squatted name must not be replaced"
+        );
+    }
+
+    #[test]
+    fn ensure_refuses_a_regular_file_as_log_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("logs");
+        fs::write(&root, b"not a directory").unwrap();
+        let err = LogStore::new(&root).ensure().unwrap_err().to_string();
+        assert!(err.contains("is not a directory"), "{err}");
+    }
+
+    #[test]
+    fn list_ignores_directories_and_symlinks_with_log_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let log = store
+            .create_session(Path::new("/p/demo"), timestamp(), 1)
+            .unwrap();
+        fs::create_dir(store.root().join("session-dir-2.log")).unwrap();
+        std::os::unix::fs::symlink(&log, store.root().join("session-link-3.log")).unwrap();
+        fs::write(store.root().join("session-.log"), b"too short").unwrap();
+
+        let logs = store.list().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].path, log);
+    }
+
+    #[test]
+    fn resolve_rejects_empty_and_separator_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store.ensure().unwrap();
+        for bad in ["", ".", "..", "a/b", "a\\b", "../session-x.log"] {
+            let err = store.resolve(Some(bad)).unwrap_err();
+            assert!(err.to_string().contains("invalid log name"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_a_directory_that_looks_like_a_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store.ensure().unwrap();
+        fs::create_dir(store.root().join("session-dir.log")).unwrap();
+        let err = store
+            .resolve(Some("session-dir.log"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular log file"), "{err}");
+    }
+
+    #[test]
+    fn resolve_project_name_picks_the_newest_matching_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let older = store
+            .create_session(Path::new("/p/demo"), timestamp(), 1)
+            .unwrap();
+        let newer = store
+            .create_session(Path::new("/p/demo"), timestamp(), 2)
+            .unwrap();
+        assert_ne!(older, newer);
+
+        assert_eq!(store.resolve(Some("demo")).unwrap(), newer);
+        assert_eq!(store.resolve(None).unwrap(), newer);
+    }
+
+    #[test]
+    fn create_session_falls_back_to_a_safe_project_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let path = store.create_session(Path::new(""), timestamp(), 9).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.contains("-project-"), "{name}");
+        assert!(is_log_name(&name), "{name}");
+    }
 }

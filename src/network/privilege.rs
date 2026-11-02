@@ -17,11 +17,10 @@ use crate::config::{Config, NetworkMode};
 /// User that should own the TAP devices. `SUDO_USER` wins when hegn itself was
 /// re-executed through sudo.
 pub fn invoking_user() -> Option<String> {
-    std::env::var("SUDO_USER")
-        .ok()
-        .or_else(|| std::env::var("USER").ok())
-        .or_else(|| std::env::var("LOGNAME").ok())
-        .filter(|user| safe_user(user))
+    ["SUDO_USER", "USER", "LOGNAME"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|user| safe_user(user))
 }
 
 /// Apply the guard, re-executing hegn through sudo/pkexec when the current
@@ -151,4 +150,200 @@ pub fn teardown() -> Result<()> {
         bail!("`hegn network teardown` must run as root");
     }
     run_script(&teardown_script()).context("failed to tear down the guarded network")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{LocalEndpoint, NetworkMode};
+
+    #[test]
+    fn safe_user_accepts_normal_unix_account_names() {
+        for user in [
+            "alice",
+            "Alice",
+            "a",
+            "_alice",
+            "_",
+            "alice-1",
+            "alice.b",
+            "systemd-network",
+            "user_name",
+            "a1._-",
+        ] {
+            assert!(safe_user(user), "{user:?} must be accepted");
+        }
+        let longest = "a".repeat(32);
+        assert!(safe_user(&longest), "32 bytes is the documented maximum");
+    }
+
+    #[test]
+    fn safe_user_rejects_empty_overlong_and_leading_characters() {
+        for user in [
+            "", "1alice", "-alice", "--force", ".alice", "..", " alice", "alice ", "\talice",
+        ] {
+            assert!(!safe_user(user), "{user:?} must be rejected");
+        }
+        let overlong = "a".repeat(33);
+        assert!(!safe_user(&overlong), "33 bytes exceeds the limit");
+    }
+
+    #[test]
+    fn safe_user_rejects_every_shell_metacharacter() {
+        // `safe_user` is the only gate before a name is embedded verbatim in a
+        // root shell script, so this list is deliberately hostile.
+        for user in [
+            "root; reboot",
+            "root;reboot",
+            "$(id)",
+            "`id`",
+            "${HOME}",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "a&&b",
+            "a|b",
+            "a||b",
+            "a>b",
+            "a<b",
+            "a'b",
+            "a\"b",
+            "a\\b",
+            "a/b",
+            "a*b",
+            "a?b",
+            "a[b]",
+            "a{b}",
+            "a(b)",
+            "a~b",
+            "a#b",
+            "a!b",
+            "a%b",
+            "a@b",
+            "a=b",
+            "a:b",
+            "a,b",
+            "a+b",
+            "a^b",
+            "a$b",
+            "a&b",
+            "a;b",
+            "üser",
+            "aliceé",
+        ] {
+            assert!(!safe_user(user), "{user:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn is_privileged_matches_the_effective_uid() {
+        // Safety: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() == 0 };
+        assert_eq!(is_privileged(), root);
+    }
+
+    #[test]
+    fn invoking_user_never_returns_an_unsafe_name() {
+        // Whatever SUDO_USER/USER/LOGNAME contains, the result must always pass
+        // the same filter that guards the setup script.
+        if let Some(user) = invoking_user() {
+            assert!(!user.is_empty());
+            assert!(safe_user(&user), "invoking_user returned {user:?}");
+        }
+    }
+
+    #[test]
+    fn ensure_ready_allows_air_gapped_networks_without_a_marker() {
+        let config = Config {
+            network: NetworkMode::Off,
+            ..Config::default()
+        };
+        assert!(ensure_ready(&config).is_ok());
+    }
+
+    #[test]
+    fn ensure_ready_fails_closed_for_guarded_networking() {
+        let config = Config::default();
+        assert_eq!(config.network, NetworkMode::Guarded);
+        match ready_marker() {
+            None => {
+                let err = ensure_ready(&config).unwrap_err();
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains("host firewall is not active")
+                        && message.contains("network setup"),
+                    "unexpected error: {message}"
+                );
+            }
+            Some(marker) => {
+                // A marker exists on this host. A changed endpoint list must
+                // still make readiness fail closed.
+                let Some(port) = [65535u16, 65000, 64512]
+                    .into_iter()
+                    .find(|port| !marker.endpoints.contains(port))
+                else {
+                    return;
+                };
+                let mut config = config;
+                config.local_endpoints = vec![LocalEndpoint {
+                    name: "probe".to_string(),
+                    port,
+                }];
+                let err = ensure_ready(&config).unwrap_err();
+                assert!(
+                    format!("{err:#}").contains("endpoints changed"),
+                    "unexpected error: {err:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_ready_accepts_the_endpoints_the_marker_vouched_for() {
+        let Some(marker) = ready_marker() else {
+            return;
+        };
+        if marker.endpoints.iter().any(|port| *port < 1024) {
+            return;
+        }
+        let config = Config {
+            local_endpoints: marker
+                .endpoints
+                .iter()
+                .map(|port| LocalEndpoint {
+                    name: format!("probe{port}"),
+                    port: *port,
+                })
+                .collect(),
+            ..Config::default()
+        };
+        assert!(ensure_ready(&config).is_ok());
+    }
+
+    #[test]
+    fn setup_and_teardown_refuse_to_run_unprivileged() {
+        if is_privileged() {
+            // Never execute the apply/remove scripts from a test.
+            return;
+        }
+        let setup_err = setup("alice", &[]).unwrap_err();
+        assert!(
+            format!("{setup_err:#}").contains("must run as root"),
+            "{setup_err:#}"
+        );
+        let teardown_err = teardown().unwrap_err();
+        assert!(
+            format!("{teardown_err:#}").contains("must run as root"),
+            "{teardown_err:#}"
+        );
+    }
+
+    #[test]
+    fn setup_with_privilege_rejects_unsafe_users_before_escalating() {
+        for user in ["root; reboot", "$(id)", "", "-rf"] {
+            let err = setup_with_privilege(user, &[]).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains("invalid user name"), "{user:?}: {message}");
+        }
+    }
 }

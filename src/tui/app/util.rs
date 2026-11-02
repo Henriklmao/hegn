@@ -115,6 +115,25 @@ mod tests {
     }
 
     #[test]
+    fn clamp_index_saturates_on_both_ends() {
+        assert_eq!(clamp_index(0, -5, 10), 0);
+        assert_eq!(clamp_index(3, -2, 10), 1);
+        assert_eq!(clamp_index(9, 4, 10), 10);
+        assert_eq!(clamp_index(10, 1, 10), 10);
+        assert_eq!(clamp_index(5, 0, 10), 5);
+    }
+
+    #[test]
+    fn rect_contains_excludes_the_far_edges() {
+        let rect = Rect::new(2, 3, 4, 2);
+        assert!(rect_contains(rect, (2, 3)));
+        assert!(rect_contains(rect, (5, 4)));
+        assert!(!rect_contains(rect, (1, 3)));
+        assert!(!rect_contains(rect, (6, 3)));
+        assert!(!rect_contains(rect, (2, 5)), "height is exclusive");
+    }
+
+    #[test]
     fn encode_key_supports_ctrl_and_arrows() {
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(encode_key(ctrl_c), Some(vec![0x03]));

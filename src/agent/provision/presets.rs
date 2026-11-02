@@ -200,4 +200,66 @@ mod tests {
             "{script}"
         );
     }
+
+    #[test]
+    fn package_hash_is_deterministic_and_order_sensitive() {
+        let a = ProvisionPlan::new(Harness::Shell, &["tmux".into(), "htop".into()]).unwrap();
+        let b = ProvisionPlan::new(Harness::Shell, &["tmux".into(), "htop".into()]).unwrap();
+        assert_eq!(a.package_hash(), b.package_hash());
+        assert_eq!(a.package_hash().len(), 16);
+        assert!(a.package_hash().chars().all(|ch| ch.is_ascii_hexdigit()));
+
+        let reordered =
+            ProvisionPlan::new(Harness::Shell, &["htop".into(), "tmux".into()]).unwrap();
+        assert_ne!(a.package_hash(), reordered.package_hash());
+    }
+
+    #[test]
+    fn package_names_are_length_bounded_and_may_not_lead_with_a_dash() {
+        let longest = "a".repeat(64);
+        assert!(ProvisionPlan::new(Harness::Shell, &[longest]).is_ok());
+        assert!(ProvisionPlan::new(Harness::Shell, &["a".repeat(65)]).is_err());
+        assert!(ProvisionPlan::new(Harness::Shell, &["-oops".into()]).is_err());
+
+        for good in ["git", "python3-dev", "libssl3.0", "g++", "foo_bar"] {
+            assert!(
+                ProvisionPlan::new(Harness::Shell, &[good.into()]).is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_estimates_follow_the_plan() {
+        let shell = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
+        let shell_stages: Vec<_> = stage_estimate(&shell)
+            .into_iter()
+            .map(|(stage, _)| stage)
+            .collect();
+        assert_eq!(
+            shell_stages,
+            vec![
+                Stage::Prepare,
+                Stage::Grow,
+                Stage::Network,
+                Stage::AptUpdate,
+                Stage::Packages
+            ]
+        );
+
+        let opencode = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
+        let opencode_stages: Vec<_> = stage_estimate(&opencode)
+            .into_iter()
+            .map(|(stage, _)| stage)
+            .collect();
+        assert!(opencode_stages.contains(&Stage::Node));
+        assert_eq!(opencode_stages.last(), Some(&Stage::Harness));
+        let total = |plan: &ProvisionPlan| {
+            stage_estimate(plan)
+                .iter()
+                .map(|(_, duration)| duration.as_secs())
+                .sum::<u64>()
+        };
+        assert!(total(&opencode) > total(&shell));
+    }
 }

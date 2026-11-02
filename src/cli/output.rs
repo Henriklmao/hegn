@@ -175,3 +175,31 @@ pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
         .enable_all()
         .build()?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_size_keeps_bytes_below_the_first_boundary() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1), "1 B");
+        assert_eq!(human_size(1023), "1023 B");
+    }
+
+    #[test]
+    fn human_size_switches_units_at_each_binary_boundary() {
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(1536), "1.5 KiB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn human_size_stops_at_gibibytes_for_larger_values() {
+        assert_eq!(human_size(1024_u64.pow(4)), "1024.0 GiB");
+        assert_eq!(human_size(u64::MAX), "17179869184.0 GiB");
+    }
+}

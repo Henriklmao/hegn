@@ -1430,6 +1430,249 @@ mod tests {
     }
 
     #[test]
+    fn delete_instance_cancel_keys_emit_nothing() {
+        let (_dir, mut app) = test_app();
+        let inside = app.config.instances_dir.join("demo").join("workspace");
+        app.focus = Focus::Instances;
+        let instance = fake_instance(&app, "demo", inside);
+        install_instances(&mut app, vec![instance]);
+
+        app.handle_key(key(KeyCode::Char('d')));
+        let effects = app.handle_key(key(KeyCode::Esc));
+        assert!(effects.is_empty());
+        assert!(app.modal.is_none());
+
+        app.handle_key(key(KeyCode::Char('d')));
+        let effects = app.handle_key(key(KeyCode::Char('n')));
+        assert!(effects.is_empty());
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn delete_instance_escape_at_the_files_question_keeps_the_instance() {
+        let (_dir, mut app) = test_app();
+        let inside = app.config.instances_dir.join("demo").join("workspace");
+        app.focus = Focus::Instances;
+        let instance = fake_instance(&app, "demo", inside);
+        install_instances(&mut app, vec![instance]);
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('y')));
+
+        let effects = app.handle_key(key(KeyCode::Esc));
+
+        assert!(
+            effects.is_empty(),
+            "the last chance must not delete: {effects:?}"
+        );
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn deleting_an_instance_outside_the_instance_dir_skips_the_file_question() {
+        let (dir, mut app) = test_app();
+        let outside = dir.path().join("host-workspace");
+        std::fs::create_dir_all(&outside).unwrap();
+        app.focus = Focus::Instances;
+        let instance = fake_instance(&app, "demo", outside);
+        install_instances(&mut app, vec![instance]);
+
+        app.handle_key(key(KeyCode::Char('d')));
+        let effects = app.handle_key(key(KeyCode::Char('y')));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::DeleteInstance {
+                instance,
+                delete_files: false
+            }] if instance == "demo"
+        ));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn delete_instance_files_stage_k_and_n_keep_the_files() {
+        for cancel in ['k', 'n'] {
+            let (_dir, mut app) = test_app();
+            let inside = app.config.instances_dir.join("demo").join("workspace");
+            app.focus = Focus::Instances;
+            let instance = fake_instance(&app, "demo", inside);
+            install_instances(&mut app, vec![instance]);
+            app.handle_key(key(KeyCode::Char('d')));
+            app.handle_key(key(KeyCode::Char('y')));
+
+            let effects = app.handle_key(key(KeyCode::Char(cancel)));
+
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::DeleteInstance {
+                    instance,
+                    delete_files: false
+                }] if instance == "demo"
+            ));
+        }
+    }
+
+    #[test]
+    fn project_delete_cancel_keys_emit_nothing() {
+        let (_dir, mut app) = test_app();
+        let path = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&path).unwrap();
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path,
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+
+        for cancel in [KeyCode::Char('n'), KeyCode::Char('q'), KeyCode::Esc] {
+            app.handle_key(key(KeyCode::Char('d')));
+            assert!(matches!(app.modal, Some(Modal::DeleteProject(_))));
+            let effects = app.handle_key(key(cancel));
+            assert!(
+                effects.is_empty(),
+                "{cancel:?} must not delete: {effects:?}"
+            );
+            assert!(app.modal.is_none());
+        }
+    }
+
+    #[test]
+    fn create_form_cycles_focus_both_ways_and_toggles_packages() {
+        let (_dir, mut app) = test_app();
+        app.handle_key(key(KeyCode::Char('c')));
+
+        app.handle_key(key(KeyCode::Tab)); // Name -> Harness
+        app.handle_key(key(KeyCode::Right));
+        app.handle_key(key(KeyCode::Tab)); // Harness -> Packages
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Tab)); // Packages -> Create
+
+        let Some(Modal::CreateProject(form)) = &app.modal else {
+            panic!("expected the create form");
+        };
+        assert_eq!(form.focus, CreateFocus::Create);
+        assert_ne!(form.harness, Harness::Shell, "Right picks the next harness");
+        assert_eq!(form.package_cursor, 1);
+        assert_eq!(form.selected_packages(), vec!["git", "nodejs"]);
+
+        app.handle_key(key(KeyCode::BackTab)); // Create -> Packages
+        app.handle_key(key(KeyCode::BackTab)); // Packages -> Harness
+        app.handle_key(key(KeyCode::BackTab)); // Harness -> Name
+        app.handle_key(key(KeyCode::BackTab)); // Name wraps to Create
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::CreateProject(form)) if form.focus == CreateFocus::Create
+        ));
+    }
+
+    #[test]
+    fn enter_in_the_create_form_advances_focus_and_empty_names_do_not_submit() {
+        let (_dir, mut app) = test_app();
+        app.handle_key(key(KeyCode::Char('c')));
+
+        app.handle_key(key(KeyCode::Enter)); // Name -> Harness
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::CreateProject(form)) if form.focus == CreateFocus::Harness
+        ));
+        app.handle_key(key(KeyCode::Enter)); // Harness -> Packages
+        app.handle_key(key(KeyCode::Enter)); // Packages -> Create
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::CreateProject(form)) if form.focus == CreateFocus::Create
+        ));
+
+        app.handle_key(key(KeyCode::Enter));
+        match &app.modal {
+            Some(Modal::CreateProject(form)) => {
+                let error = form.error.as_deref().unwrap_or_default();
+                assert!(error.contains("empty"), "{error}");
+            }
+            other => panic!("empty names must keep the form open, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_dir(&app.config.projects_root)
+                .unwrap()
+                .count(),
+            0,
+            "an invalid submit must not create a directory"
+        );
+    }
+
+    #[test]
+    fn import_form_edits_the_path_and_optional_name_separately() {
+        let (dir, mut app) = test_app();
+        let source = dir.path().join("external/repo");
+        std::fs::create_dir_all(&source).unwrap();
+
+        app.handle_key(key(KeyCode::Char('h')));
+        for c in source.to_string_lossy().chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Tab));
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::ImportProject(form)) if form.focus == ImportFocus::Name
+        ));
+        for c in "linked".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.modal.is_none(), "{:?}", app.modal);
+        let link = app.config.projects_root.join("linked");
+        assert_eq!(
+            std::fs::canonicalize(&link).unwrap(),
+            std::fs::canonicalize(&source).unwrap()
+        );
+        assert!(app.projects.iter().any(|project| project.name == "linked"));
+    }
+
+    #[test]
+    fn import_form_rejects_empty_and_missing_paths_in_place() {
+        let (_dir, mut app) = test_app();
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Enter));
+        match &app.modal {
+            Some(Modal::ImportProject(form)) => {
+                assert!(
+                    form.error
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("enter the path")
+                );
+            }
+            other => panic!("expected import form, got {other:?}"),
+        }
+        assert!(app.projects.is_empty());
+
+        app.modal = None;
+        app.handle_key(key(KeyCode::Char('h')));
+        for c in "/definitely/missing/hegn-import".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        match &app.modal {
+            Some(Modal::ImportProject(form)) => {
+                assert!(
+                    form.error
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("does not exist"),
+                    "{:?}",
+                    form.error
+                );
+            }
+            other => panic!("expected import form, got {other:?}"),
+        }
+        assert!(app.projects.is_empty());
+    }
+
+    #[test]
     fn importing_hegn_state_is_rejected_in_the_form() {
         let (_dir, mut app) = test_app();
         std::fs::create_dir_all(&app.config.state_dir).unwrap();

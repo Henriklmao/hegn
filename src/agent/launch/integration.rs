@@ -281,4 +281,93 @@ mod tests {
         assert!(command.contains("opencode --model"));
         assert!(command.contains("'\"'\"'"));
     }
+
+    #[test]
+    fn shell_quoting_wraps_empty_and_metacharacter_values() {
+        assert_eq!(shell_quote("/usr/bin/hegn"), "/usr/bin/hegn");
+        assert_eq!(shell_quote("demo-1_2"), "demo-1_2");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("$(id)"), "'$(id)'");
+        assert_eq!(shell_quote("a;reboot"), "'a;reboot'");
+        assert_eq!(shell_quote("it's"), r#"'it'"'"'s'"#);
+        for value in ["a b", "$(id)", "a;b", "a\nb", "x\"y", "`id`"] {
+            let quoted = shell_quote(value);
+            assert!(
+                quoted.starts_with('\'') && quoted.ends_with('\''),
+                "{value:?} must be single-quoted: {quoted}"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_commands_quote_instance_and_command_arguments() {
+        let command = attach_shell_command(
+            Path::new("/usr/bin/hegn"),
+            "demo;reboot",
+            Some("$(rm -rf /)"),
+            true,
+        );
+        assert!(command.contains("'demo;reboot'"), "{command}");
+        assert!(command.contains("'$(rm -rf /)'"), "{command}");
+        assert!(!command.contains("--no-bar"));
+    }
+
+    #[test]
+    fn a_shell_launch_has_no_command_in_external_actions() {
+        let spec = LaunchSpec {
+            name: "shell".into(),
+            command: String::new(),
+            integration: Integration::External,
+            bar: true,
+        };
+        let action = action(
+            &spec,
+            "demo",
+            Path::new("/tmp/demo"),
+            Path::new("/bin/hegn"),
+        )
+        .unwrap();
+        assert_eq!(
+            action,
+            LaunchAction::External {
+                instance: "demo".into(),
+                command: None,
+                bar: true
+            }
+        );
+    }
+
+    #[test]
+    fn embedded_actions_keep_the_full_command() {
+        let spec = LaunchSpec {
+            name: "review".into(),
+            command: "opencode --model test".into(),
+            integration: Integration::Embedded,
+            bar: false,
+        };
+        let action = action(
+            &spec,
+            "demo",
+            Path::new("/tmp/demo"),
+            Path::new("/bin/hegn"),
+        )
+        .unwrap();
+        assert_eq!(
+            action,
+            LaunchAction::Embedded {
+                command: "opencode --model test".into()
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_integrations_do_not_resolve_to_auto() {
+        for integration in Integration::ALL {
+            if integration != Integration::Auto {
+                assert_eq!(integration.resolve(), integration);
+                assert_eq!(integration.resolve().label(), integration.label());
+            }
+        }
+    }
 }

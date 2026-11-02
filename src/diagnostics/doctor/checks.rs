@@ -259,3 +259,76 @@ fn check_tool(name: &str, binary: &Path, args: &[&str], required: bool) -> Check
         Err(err) => Check::new(name, false, required, err.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn check_tool_accepts_a_working_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = script(dir.path(), "fake-tool", "echo 'fake-tool 1.2.3'");
+
+        let check = check_tool("fake-tool", &tool, &["--version"], true);
+        assert!(check.ok, "{check:?}");
+        assert!(check.required);
+        assert!(check.detail.contains("fake-tool 1.2.3"), "{check:?}");
+        // An explicit path is included so the user knows which binary ran.
+        assert!(
+            check.detail.contains(&tool.display().to_string()),
+            "{check:?}"
+        );
+    }
+
+    #[test]
+    fn check_tool_reports_a_missing_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+
+        let check = check_tool("missing", &missing, &["--version"], true);
+        assert!(!check.ok);
+        assert!(check.required);
+        assert!(!check.detail.is_empty());
+    }
+
+    #[test]
+    fn check_tool_reports_a_non_executable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-executable");
+        std::fs::write(&path, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let check = check_tool("noexec", &path, &["--version"], true);
+        assert!(!check.ok);
+        assert!(!check.detail.is_empty());
+    }
+
+    #[test]
+    fn check_tool_reports_a_failing_executable_and_its_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = script(dir.path(), "failing", "echo 'boom' >&2\nexit 3");
+
+        let check = check_tool("failing", &tool, &["--version"], false);
+        assert!(!check.ok);
+        assert!(!check.required);
+        assert_eq!(check.detail, "boom");
+    }
+
+    #[test]
+    fn check_tool_reports_success_without_a_version_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = script(dir.path(), "silent", "exit 0");
+
+        let check = check_tool("silent", &tool, &[], true);
+        assert!(check.ok);
+        assert!(check.detail.contains("exit status"), "{check:?}");
+    }
+}

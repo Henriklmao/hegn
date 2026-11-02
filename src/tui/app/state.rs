@@ -519,6 +519,219 @@ mod tests {
     }
 
     #[test]
+    fn filtering_clamps_the_selection_to_the_visible_rows() {
+        let (_dir, mut app) = test_app();
+        let projects = ["alpha", "beta", "gamma"]
+            .into_iter()
+            .map(|name| {
+                let mut project = fake_project(name);
+                project.path = app.config.projects_root.join(name);
+                project
+            })
+            .collect();
+        app.set_projects(projects);
+        app.selected = 2;
+
+        app.query = "alpha".into();
+        app.refresh_filter();
+        assert_eq!(app.visible.len(), 1);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_project().unwrap().name, "alpha");
+
+        app.query.clear();
+        app.refresh_filter();
+        assert_eq!(app.visible.len(), 3);
+        app.select_next(10);
+        assert_eq!(app.selected, 2, "selection never exceeds the list");
+        app.select_next(-10);
+        assert_eq!(app.selected, 0, "selection never goes below zero");
+    }
+
+    #[test]
+    fn switching_projects_selects_the_running_instance() {
+        let (_dir, mut app) = test_app();
+        let demo = app.config.projects_root.join("demo");
+        let other = app.config.projects_root.join("other");
+        let mut base = fake_instance(&app, "demo", demo.join("workspace"));
+        base.project = demo.clone();
+        base.state = "stopped".into();
+        let mut running = fake_instance(&app, "other", other.join("workspace"));
+        running.project = other.clone();
+        running.state = "running".into();
+
+        let demo_project = Project {
+            name: "demo".into(),
+            path: demo.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        };
+        let other_project = Project {
+            name: "other".into(),
+            path: other.clone(),
+            ..demo_project.clone()
+        };
+        app.set_projects(vec![demo_project, other_project]);
+        app.instances = vec![base, running];
+
+        app.selected = app
+            .visible
+            .iter()
+            .position(|&index| app.projects[index].path == demo)
+            .unwrap();
+        app.refresh_instance_filter();
+        assert_eq!(app.selected_instance().unwrap().name, "demo");
+
+        app.selected = app
+            .visible
+            .iter()
+            .position(|&index| app.projects[index].path == other)
+            .unwrap();
+        app.refresh_instance_filter();
+        assert_eq!(app.instance_selected, 0);
+        assert_eq!(
+            app.selected_instance().unwrap().name,
+            "other",
+            "a running instance is preferred after switching projects"
+        );
+    }
+
+    #[test]
+    fn refreshing_instances_keeps_the_selection_by_name() {
+        let (_dir, mut app) = test_app();
+        let demo = app.config.projects_root.join("demo");
+        let mut base = fake_instance(&app, "demo", demo.join("workspace"));
+        base.project = demo.clone();
+        let mut clone = fake_instance(&app, "demo-1", demo.join("clone-1"));
+        clone.project = demo.clone();
+        clone.ephemeral = true;
+        clone.source_instance = Some("demo".into());
+
+        app.set_projects(vec![Project {
+            name: "demo".into(),
+            path: demo,
+            git: GitSummary::default(),
+            last_opened: None,
+        }]);
+        app.instances = vec![base, clone];
+        app.refresh_instance_filter();
+        assert_eq!(app.selected_instance().unwrap().name, "demo");
+        app.instance_selected = 1;
+        assert_eq!(app.selected_instance().unwrap().name, "demo-1");
+
+        // A background refresh can reorder the registry; the selection follows
+        // the instance name, not the vector index.
+        app.instances.reverse();
+        app.refresh_instance_filter_named(Some("demo-1".into()));
+        assert_eq!(app.selected_instance().unwrap().name, "demo-1");
+    }
+
+    #[test]
+    fn readding_a_hidden_project_makes_it_visible_again() {
+        let (_dir, mut app) = test_app();
+        let mut project = fake_project("hidden");
+        project.path = app.config.projects_root.join("hidden");
+        app.store.set_project_hidden(&project.path, true).unwrap();
+        app.set_projects(vec![project.clone()]);
+        assert!(app.visible.is_empty());
+        assert!(app.store.is_hidden(&project.path));
+
+        app.add_project(project.clone());
+
+        assert!(!app.store.is_hidden(&project.path));
+        assert_eq!(app.visible.len(), 1);
+        assert_eq!(app.selected_project().unwrap().name, "hidden");
+    }
+
+    fn pending_launch(since: Instant, provision_seen: bool, ready: bool) -> PendingLaunch {
+        PendingLaunch {
+            spec: crate::agent::launch::LaunchSpec {
+                name: "opencode".into(),
+                command: "opencode".into(),
+                integration: crate::agent::launch::Integration::External,
+                bar: true,
+            },
+            instance: "demo".into(),
+            project: PathBuf::from("/projects/demo"),
+            since,
+            provision_seen,
+            ready,
+        }
+    }
+
+    #[test]
+    fn due_launch_waits_for_the_ready_marker_or_the_grace_period() {
+        let (_dir, mut app) = test_app();
+        // Without cloud-init, a prompt should appear within seconds.
+        app.config.cloud_init = false;
+        app.pending_launch = Some(pending_launch(
+            Instant::now() - std::time::Duration::from_secs(10),
+            false,
+            false,
+        ));
+        let (spec, instance, _project) = app.take_due_launch().expect("grace elapsed");
+        assert_eq!(spec.command, "opencode");
+        assert_eq!(instance, "demo");
+        assert!(app.pending_launch.is_none(), "a release is consumed once");
+
+        // A cloud image must not race cloud-init/provisioning.
+        app.config.cloud_init = true;
+        app.pending_launch = Some(pending_launch(
+            Instant::now() - std::time::Duration::from_secs(10),
+            false,
+            false,
+        ));
+        assert!(app.take_due_launch().is_none());
+        assert!(app.pending_launch.is_some());
+
+        // An explicit ready marker releases immediately.
+        if let Some(pending) = app.pending_launch.as_mut() {
+            pending.ready = true;
+        }
+        assert!(app.take_due_launch().is_some());
+    }
+
+    #[test]
+    fn provisioning_in_progress_never_releases_on_a_timeout() {
+        let (_dir, mut app) = test_app();
+        app.config.cloud_init = false;
+        app.pending_launch = Some(pending_launch(
+            Instant::now() - std::time::Duration::from_secs(3600),
+            true,
+            false,
+        ));
+        assert!(
+            app.take_due_launch().is_none(),
+            "the installer must finish before an agent starts"
+        );
+        assert!(app.pending_launch.is_some());
+    }
+
+    #[test]
+    fn poll_reports_a_closed_session_once() {
+        let (_dir, mut app) = test_app();
+        let log = ConsoleLog::default();
+        app.attach_console(log.console("/projects/demo"));
+        log.push_output(b"hello\nworld\n");
+        log.set_exited(true);
+
+        app.poll();
+        assert_eq!(app.instance.state, InstanceState::Stopped);
+        assert!(app.terminal.len() >= 2);
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("session exited"))
+        );
+
+        app.toast = None;
+        app.poll();
+        assert!(
+            app.toast.is_none(),
+            "a closed session is reported only once"
+        );
+    }
+
+    #[test]
     fn refresh_does_not_clear_the_starting_state() {
         let (_dir, mut app) = test_app();
         app.instance.state = InstanceState::Starting;

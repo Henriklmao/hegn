@@ -114,4 +114,73 @@ mod tests {
         });
         assert!(config.launch.validate().is_err());
     }
+
+    #[test]
+    fn reserved_and_duplicate_selectors_are_rejected() {
+        for reserved in [HARNESS, SHELL] {
+            let mut config = Config::default();
+            config.launch.commands.push(LaunchCommand {
+                name: reserved.into(),
+                command: "true".into(),
+                ..LaunchCommand::default()
+            });
+            let err = config.launch.validate().unwrap_err().to_string();
+            assert!(err.contains("reserved"), "{err}");
+        }
+
+        let mut config = Config::default();
+        for _ in 0..2 {
+            config.launch.commands.push(LaunchCommand {
+                name: "review".into(),
+                command: "true".into(),
+                ..LaunchCommand::default()
+            });
+        }
+        let err = config.launch.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn every_control_character_and_overlong_commands_are_rejected() {
+        for bad in ["echo\tid", "echo\rid", "echo\u{7}id", "echo\u{1b}[2J"] {
+            let mut config = Config::default();
+            config.launch.commands.push(LaunchCommand {
+                name: "review".into(),
+                command: bad.into(),
+                ..LaunchCommand::default()
+            });
+            assert!(config.launch.validate().is_err(), "{bad:?}");
+        }
+
+        let mut config = Config::default();
+        config.launch.commands.push(LaunchCommand {
+            name: "long".into(),
+            command: "x".repeat(4097),
+            ..LaunchCommand::default()
+        });
+        assert!(config.launch.validate().is_err());
+
+        let mut config = Config::default();
+        config.launch.commands.push(LaunchCommand {
+            name: "ok".into(),
+            command: "x".repeat(4096),
+            ..LaunchCommand::default()
+        });
+        assert!(config.launch.validate().is_ok());
+    }
+
+    #[test]
+    fn a_default_can_name_a_defined_command() {
+        let mut config = Config::default();
+        config.launch.default = Some("review".into());
+        config.launch.commands.push(LaunchCommand {
+            name: "review".into(),
+            command: "opencode --model test".into(),
+            ..LaunchCommand::default()
+        });
+        config.launch.validate().unwrap();
+
+        config.launch.default = Some("missing".into());
+        assert!(config.launch.validate().is_err());
+    }
 }

@@ -257,6 +257,9 @@ impl App {
         self.project_view = ProjectView::Split;
         self.terminal_focus = true;
         self.terminal_mode = TerminalMode::Normal;
+        self.input.clear();
+        self.scroll = 0;
+        self.terminal.clear();
         self.session_closed_reported = false;
         self.toast(
             "attached — normal mode, press i or a to type",
@@ -387,6 +390,81 @@ mod tests {
         assert_eq!(app.screen, Screen::Project);
         assert_eq!(app.instance.state, InstanceState::Running);
         assert!(app.session_active());
+    }
+
+    #[test]
+    fn attaching_a_console_clears_stale_input_and_scrollback() {
+        let (_dir, mut app) = test_app();
+        app.input = "stale command".into();
+        app.scroll = 7;
+        app.terminal.push_bytes(b"old output\r\n");
+        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
+        assert!(app.input.is_empty());
+        assert_eq!(app.scroll, 0);
+        assert!(app.terminal.is_empty());
+    }
+
+    #[test]
+    fn attaching_selects_the_matching_instance_and_starts_in_normal_mode() {
+        let (_dir, mut app) = test_app();
+        let demo = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&demo).unwrap();
+        // Persist both instances so the registry refresh in `enter_project`
+        // keeps the selection instead of emptying the list.
+        let store = crate::vm::instance_config::InstanceStore::new(app.config.clone());
+        for (name, workspace) in [
+            ("demo", demo.join("workspace")),
+            ("demo-1", demo.join("clone-1")),
+        ] {
+            store
+                .save(&crate::vm::instance_config::InstanceConfig {
+                    name: name.into(),
+                    project: demo.clone(),
+                    workspace,
+                    harness: Harness::Shell,
+                    ..crate::vm::instance_config::InstanceConfig::default()
+                })
+                .unwrap();
+        }
+        let mut first = fake_instance(&app, "demo", demo.join("workspace"));
+        first.project = demo.clone();
+        let mut clone = fake_instance(&app, "demo-1", demo.join("clone-1"));
+        clone.project = demo.clone();
+        install_instances(&mut app, vec![first, clone]);
+        app.terminal_mode = TerminalMode::Insert;
+
+        let log = ConsoleLog::default();
+        app.attach_console(log.console_named(demo, "demo-1"));
+
+        assert_ne!(
+            app.instance.state,
+            InstanceState::Starting,
+            "a successful attach is no longer booting"
+        );
+        assert_eq!(app.instance.backend, "cloud-hypervisor");
+        assert!(app.instance.started_at.is_some());
+        assert_eq!(app.selected_instance().unwrap().name, "demo-1");
+        assert_eq!(app.terminal_mode, TerminalMode::Normal);
+        assert!(app.terminal_focus);
+    }
+
+    #[test]
+    fn attaching_is_rejected_while_another_vm_is_booting() {
+        let (_dir, mut app) = test_app();
+        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let instance = fake_instance(&app, "demo", inside);
+        install_instances(&mut app, vec![instance]);
+        app.instance.state = InstanceState::Starting;
+
+        let effects = app.attach_selected_instance();
+
+        assert!(effects.is_empty());
+        assert!(app.session.is_none());
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("already starting"))
+        );
     }
 
     #[test]

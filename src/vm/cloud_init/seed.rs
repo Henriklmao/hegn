@@ -7,7 +7,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -39,9 +39,15 @@ pub(crate) fn safe_token(value: &str) -> bool {
 pub(crate) fn safe_mount(value: &str) -> bool {
     value.starts_with('/')
         && value.len() > 1
+        && !value.ends_with('/')
+        && !value.contains("//")
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+        && value
+            .split('/')
+            .skip(1)
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
 /// Write (or replace) the NoCloud seed at `path`.
@@ -88,6 +94,10 @@ pub fn write_seed(
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .with_context(|| format!("failed to create cloud-init seed {}", path.display()))?;
+    // An existing seed may predate the private-file invariant. Tighten it on
+    // the open descriptor, so a concurrently replaced path cannot redirect it.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to secure cloud-init seed {}", path.display()))?;
     file.set_len(SEED_BYTES)
         .with_context(|| format!("failed to size cloud-init seed {}", path.display()))?;
     file.seek(SeekFrom::Start(0))?;
@@ -164,6 +174,7 @@ mod tests {
     use crate::config::Harness;
     use crate::network::{Lease, guest_ip, host_ip, mac, tap_name};
     use std::io::Read;
+    use std::path::PathBuf;
 
     fn lease() -> Lease {
         Lease {
@@ -444,6 +455,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cloud-init.img");
         std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
         write_seed(
             &path,
@@ -457,5 +469,138 @@ mod tests {
         )
         .unwrap();
         assert!(std::fs::metadata(&path).unwrap().len() >= SEED_BYTES);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "an existing seed must be tightened to 0600"
+        );
+    }
+
+    #[test]
+    fn safe_tokens_reject_shell_and_yaml_metacharacters() {
+        for bad in [
+            "",
+            "line\nbreak",
+            "carriage\rreturn",
+            "tab\there",
+            "single'quote",
+            "double\"quote",
+            "comma,separated",
+            "space separated",
+            "semi;colon",
+            "pipe|operator",
+            "amp&background",
+            "redirect>file",
+            "redirect<file",
+            "dollar$(id)",
+            "back`tick`",
+            "back\\slash",
+            "paren(thesis)",
+            "colon:name",
+        ] {
+            assert!(!safe_token(bad), "{bad:?} must not be a safe token");
+        }
+        for good in ["workspace", "hegn-demo_1.2", "A1", "hegn-profile"] {
+            assert!(safe_token(good), "{good:?} must be a safe token");
+        }
+    }
+
+    #[test]
+    fn safe_mounts_reject_metacharacters_and_relative_paths() {
+        for good in ["/workspace", "/home/user/.config", "/a", "/opt/x-y_z"] {
+            assert!(safe_mount(good), "{good:?} must be a safe mount");
+        }
+        for bad in [
+            "",
+            "/",
+            "/..",
+            "/.",
+            "/workspace/",
+            "/workspace//etc",
+            "/workspace/..",
+            "/workspace/../etc",
+            "/workspace/.",
+            "relative/path",
+            "~/.config",
+            "/work space",
+            "/work\nspace",
+            "/work'space",
+            "/work\"space",
+            "/work,space",
+            "/work;space",
+            "/work$(id)",
+            "/work`id`",
+            "/work|space",
+            "/work&space",
+        ] {
+            assert!(!safe_mount(bad), "{bad:?} must not be a safe mount");
+        }
+    }
+
+    #[test]
+    fn write_seed_rejects_unsafe_instance_ids_before_creating_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud-init.img");
+        let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
+        for bad in [
+            "hegn demo",
+            "hegn;reboot",
+            "hegn\nid",
+            "hegn'id",
+            "hegn$(id)",
+        ] {
+            assert!(
+                write_seed(
+                    &path,
+                    "workspace",
+                    "/workspace",
+                    bad,
+                    &plan,
+                    None,
+                    None,
+                    &[],
+                )
+                .is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(!path.exists(), "no seed may be written for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn instance_id_is_stable_and_tracks_profile_and_endpoints() {
+        let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
+        let plain = instance_id("demo", &plan, None, None, &[]);
+        assert_eq!(plain, instance_id("demo", &plan, None, None, &[]));
+        assert_eq!(
+            plain,
+            format!("hegn-demo-v{SEED_VERSION}-{}", &plain[plain.len() - 12..])
+        );
+
+        let profile = ProfileShare {
+            bundle_dir: PathBuf::from("/tmp/bundle"),
+            manifest_id: "b".repeat(64),
+        };
+        let with_profile = instance_id("demo", &plan, Some(&profile), None, &[]);
+        assert_ne!(plain, with_profile);
+
+        let lease = lease();
+        let no_endpoints = instance_id("demo", &plan, None, Some(&lease), &[]);
+        let endpoint = LocalEndpoint {
+            name: "ollama".into(),
+            port: 11434,
+        };
+        let with_endpoint = instance_id("demo", &plan, None, Some(&lease), &[endpoint]);
+        assert_ne!(no_endpoints, with_endpoint);
+    }
+
+    #[test]
+    fn disk_arg_is_a_raw_cloud_hypervisor_path() {
+        let path = Path::new("/var/lib/hegn/demo/cloud-init.img");
+        assert_eq!(
+            disk_arg(path),
+            "path=/var/lib/hegn/demo/cloud-init.img,image_type=raw"
+        );
+        assert!(!disk_arg(path).contains(' '));
     }
 }

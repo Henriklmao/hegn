@@ -178,4 +178,170 @@ mod tests {
         assert_eq!(loaded.harness, Some(crate::config::Harness::Codex));
         assert_eq!(loaded.packages, vec!["git"]);
     }
+
+    #[test]
+    fn validate_project_name_accepts_only_safe_components() {
+        assert_eq!(validate_project_name("  demo  ").unwrap(), "demo");
+        assert_eq!(
+            validate_project_name("UPPER_case.v2").unwrap(),
+            "UPPER_case.v2"
+        );
+        assert_eq!(validate_project_name("with space").unwrap(), "with space");
+        assert!(validate_project_name("a..b").is_ok());
+        assert!(validate_project_name(&"a".repeat(80)).is_ok());
+
+        let mut bad = vec![
+            "".to_string(),
+            "   ".to_string(),
+            ".".to_string(),
+            "..".to_string(),
+            "../escape".to_string(),
+            "a/b".to_string(),
+            "a\\b".to_string(),
+            ".hidden".to_string(),
+            "bad;name".to_string(),
+            "nul\0byte".to_string(),
+        ];
+        bad.push("a".repeat(81));
+        for name in &bad {
+            assert!(validate_project_name(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn try_read_meta_uses_current_file_and_falls_back_to_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let fresh = dir.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(
+            fresh.join(LEGACY_PROJECT_META_FILE),
+            "packages = [\"legacy\"]\n",
+        )
+        .unwrap();
+        assert_eq!(try_read_meta(&fresh).unwrap().packages, vec!["legacy"]);
+
+        let both = dir.path().join("both");
+        std::fs::create_dir_all(&both).unwrap();
+        std::fs::write(both.join(PROJECT_META_FILE), "packages = [\"current\"]\n").unwrap();
+        std::fs::write(
+            both.join(LEGACY_PROJECT_META_FILE),
+            "packages = [\"legacy\"]\n",
+        )
+        .unwrap();
+        assert_eq!(read_meta(&both).packages, vec!["current"]);
+        assert_eq!(try_read_meta(&both).unwrap().packages, vec!["current"]);
+
+        let none = dir.path().join("none");
+        std::fs::create_dir_all(&none).unwrap();
+        let meta = try_read_meta(&none).unwrap();
+        assert!(meta.harness.is_none());
+        assert!(meta.packages.is_empty());
+    }
+
+    #[test]
+    fn try_read_meta_rejects_unknown_keys_and_malformed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(PROJECT_META_FILE), "surprise = true\n").unwrap();
+        let err = try_read_meta(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("failed to parse"), "{err}");
+        // Lenient readers keep the rest of the TUI usable.
+        assert!(read_meta(dir.path()).packages.is_empty());
+
+        let legacy = tempfile::tempdir().unwrap();
+        std::fs::write(
+            legacy.path().join(LEGACY_PROJECT_META_FILE),
+            "packages = [\n",
+        )
+        .unwrap();
+        let err = try_read_meta(legacy.path()).unwrap_err().to_string();
+        assert!(err.contains("failed to parse"), "{err}");
+    }
+
+    #[test]
+    fn read_meta_falls_back_to_legacy_when_the_current_file_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(PROJECT_META_FILE), "harness = [\n").unwrap();
+        std::fs::write(
+            dir.path().join(LEGACY_PROJECT_META_FILE),
+            "harness = \"codex\"\npackages = [\"git\"]\n",
+        )
+        .unwrap();
+
+        let loaded = read_meta(dir.path());
+        assert_eq!(loaded.harness, Some(crate::config::Harness::Codex));
+        assert_eq!(loaded.packages, vec!["git"]);
+        // Rewriting must not silently pick the legacy file over a broken current one.
+        assert!(try_read_meta(dir.path()).is_err());
+    }
+
+    #[test]
+    fn write_meta_is_private_atomic_and_leaves_no_temporary_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = ProjectMeta {
+            packages: vec!["git".into()],
+            ..ProjectMeta::default()
+        };
+        write_meta(dir.path(), &meta).unwrap();
+
+        let target = dir.path().join(PROJECT_META_FILE);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![PROJECT_META_FILE.to_string()],
+            "no temp file may remain"
+        );
+
+        // Replacing a permissive existing file keeps the private mode.
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        meta.packages.push("curl".into());
+        write_meta(dir.path(), &meta).unwrap();
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            try_read_meta(dir.path()).unwrap().packages,
+            vec!["git".to_string(), "curl".to_string()]
+        );
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![PROJECT_META_FILE.to_string()],
+            "no temp file may remain"
+        );
+
+        // A missing parent directory is an error; nothing is created.
+        let missing = dir.path().join("missing");
+        assert!(write_meta(&missing, &meta).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn write_meta_cleans_up_after_a_failed_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join(PROJECT_META_FILE)).unwrap();
+
+        assert!(write_meta(&project, &ProjectMeta::default()).is_err());
+        assert!(project.join(PROJECT_META_FILE).is_dir());
+        let leftovers: Vec<String> = std::fs::read_dir(&project)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("hegn.tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
 }

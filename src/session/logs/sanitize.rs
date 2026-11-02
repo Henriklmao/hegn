@@ -58,4 +58,46 @@ mod tests {
         assert_eq!(sanitize_segment("///", 64), "project");
         assert_eq!(sanitize_segment("abcdef", 3), "abc");
     }
+
+    #[test]
+    fn sanitize_label_replaces_every_bidi_control() {
+        for ch in [
+            '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+            '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
+            assert_eq!(sanitize_label(&ch.to_string()), "?", "{ch:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_label_keeps_printable_unicode_and_drops_c1_controls() {
+        assert_eq!(sanitize_label("héllo 日本"), "héllo 日本");
+        // U+009B is the 8-bit CSI introducer; it must not reach a terminal.
+        assert_eq!(sanitize_label("\u{9b}31mred"), "?31mred");
+        assert_eq!(sanitize_label("a\nb\tc\r"), "a?b?c?");
+        assert_eq!(sanitize_label(""), "");
+    }
+
+    #[test]
+    fn sanitize_segment_removes_path_separators_and_traversal() {
+        assert_eq!(sanitize_segment("../../etc/passwd", 64), "etc-passwd");
+        assert_eq!(sanitize_segment("/abs/path", 64), "abs-path");
+        assert_eq!(sanitize_segment("a\\b", 64), "a-b");
+        assert_eq!(sanitize_segment("a b\tc", 64), "a-b-c");
+        assert_eq!(sanitize_segment(".../...", 64), "project");
+        assert_eq!(sanitize_segment("\0\0", 64), "project");
+    }
+
+    #[test]
+    fn sanitize_segment_is_ascii_and_bounded() {
+        for input in ["Ünïcode", "日本語", "a\u{202e}b", "  ", "---"] {
+            let out = sanitize_segment(input, 64);
+            assert!(out.is_ascii(), "{input:?} -> {out:?}");
+            assert!(!out.is_empty(), "{input:?}");
+            assert!(!out.starts_with('.'), "{input:?} -> {out:?}");
+            assert!(!out.contains('/') && !out.contains('\\'), "{out:?}");
+        }
+        assert_eq!(sanitize_segment("abcdef", 1), "a");
+        assert_eq!(sanitize_segment("abcdef", 0), "a");
+    }
 }

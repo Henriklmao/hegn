@@ -145,4 +145,40 @@ mod tests {
         assert!(assets[0].exists);
         assert!(assets[1].missing());
     }
+
+    #[test]
+    fn is_regular_file_never_accepts_symlinks_or_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("kernel");
+        fs::write(&file, b"kernel").unwrap();
+        assert!(is_regular_file(&file));
+
+        let directory = dir.path().join("images");
+        fs::create_dir(&directory).unwrap();
+        assert!(!is_regular_file(&directory));
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(!is_regular_file(&link));
+
+        assert!(!is_regular_file(&dir.path().join("absent")));
+    }
+
+    #[test]
+    fn status_does_not_report_symlinked_assets_as_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.kernel_image = dir.path().join("kernel");
+        config.rootfs_image = dir.path().join("rootfs");
+        let real = dir.path().join("real-kernel");
+        fs::write(&real, b"kernel").unwrap();
+        std::os::unix::fs::symlink(&real, &config.kernel_image).unwrap();
+
+        let assets = status(&config);
+        assert!(
+            assets[0].missing(),
+            "a symlinked kernel must not look installed"
+        );
+        assert_eq!(assets[0].size_bytes, None);
+    }
 }

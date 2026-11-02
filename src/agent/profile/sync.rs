@@ -690,4 +690,174 @@ OPENAI_API_KEY = "sk-test"
         assert!(plan.warnings.iter().any(|w| w.contains("missing")));
         assert!(plan.share.is_none());
     }
+
+    fn make_fifo(path: &Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+        let raw = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::mkfifo(raw.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "failed to create fifo at {}", path.display());
+        assert!(fs::symlink_metadata(path).unwrap().file_type().is_fifo());
+    }
+
+    fn skill_profile(host_skills: &Path) -> String {
+        format!(
+            "version = 1\n[[skills]]\nsource = {source:?}\ntarget = \"/root/.config/opencode/skills\"\nsync_back = true\n",
+            source = host_skills.to_string_lossy(),
+        )
+    }
+
+    #[test]
+    fn copying_skips_symlinks_and_special_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let instance = instance(&config, Harness::Opencode);
+        let store = ProfileStore::new(&config);
+        let host_skills = dir.path().join("host-skills");
+        fs::create_dir_all(host_skills.join("demo")).unwrap();
+        fs::write(host_skills.join("demo/SKILL.md"), b"# demo").unwrap();
+        fs::write(dir.path().join("secret"), b"host").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secret"), host_skills.join("link")).unwrap();
+        make_fifo(&host_skills.join("pipe"));
+        fs::write(store.path(Harness::Opencode), skill_profile(&host_skills)).unwrap();
+
+        let plan = prepare_for_start(&config, &instance).unwrap();
+        let share = plan.share.expect("profile share");
+        let skills = first_skill_dir(&share);
+        assert!(skills.join("demo/SKILL.md").is_file());
+        assert!(!skills.join("link").exists());
+        assert!(!skills.join("pipe").exists());
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("symlink")),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("special file")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn sync_back_skips_special_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let instance = instance(&config, Harness::Opencode);
+        let store = ProfileStore::new(&config);
+        let host_skills = dir.path().join("host-skills");
+        fs::create_dir_all(host_skills.join("demo")).unwrap();
+        fs::write(host_skills.join("demo/SKILL.md"), b"# host").unwrap();
+        fs::write(store.path(Harness::Opencode), skill_profile(&host_skills)).unwrap();
+        let plan = prepare_for_start(&config, &instance).unwrap();
+        let skills = first_skill_dir(&plan.share.unwrap());
+        make_fifo(&skills.join("pipe"));
+
+        let report = sync_skills_back(&config, &instance, false).unwrap();
+        assert_eq!(report.copied_files, 0);
+        assert!(report.skipped_files >= 1);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("special file")),
+            "{:?}",
+            report.warnings
+        );
+        assert!(!host_skills.join("pipe").exists());
+    }
+
+    #[test]
+    fn sync_back_dry_run_reports_changes_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let instance = instance(&config, Harness::Opencode);
+        let store = ProfileStore::new(&config);
+        let host_skills = dir.path().join("host-skills");
+        fs::create_dir_all(host_skills.join("demo")).unwrap();
+        fs::write(host_skills.join("demo/SKILL.md"), b"# host").unwrap();
+        fs::write(store.path(Harness::Opencode), skill_profile(&host_skills)).unwrap();
+        let plan = prepare_for_start(&config, &instance).unwrap();
+        let skills = first_skill_dir(&plan.share.unwrap());
+        fs::write(skills.join("demo/SKILL.md"), b"# guest").unwrap();
+
+        let dry = sync_skills_back(&config, &instance, true).unwrap();
+        assert!(dry.dry_run);
+        assert_eq!(dry.copied_files, 1);
+        assert_eq!(
+            fs::read(host_skills.join("demo/SKILL.md")).unwrap(),
+            b"# host"
+        );
+
+        let real = sync_skills_back(&config, &instance, false).unwrap();
+        assert!(!real.dry_run);
+        assert_eq!(
+            fs::read(host_skills.join("demo/SKILL.md")).unwrap(),
+            b"# guest"
+        );
+    }
+
+    #[test]
+    fn sync_back_refuses_symlinked_destination_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let instance = instance(&config, Harness::Opencode);
+        let store = ProfileStore::new(&config);
+        let host_skills = dir.path().join("host-skills");
+        fs::create_dir_all(host_skills.join("seed")).unwrap();
+        fs::write(host_skills.join("seed/SKILL.md"), b"# host").unwrap();
+        fs::write(store.path(Harness::Opencode), skill_profile(&host_skills)).unwrap();
+        let plan = prepare_for_start(&config, &instance).unwrap();
+        let skills = first_skill_dir(&plan.share.unwrap());
+        fs::create_dir_all(skills.join("sub")).unwrap();
+        fs::write(skills.join("sub/SKILL.md"), b"# guest").unwrap();
+
+        let trap = dir.path().join("trap");
+        fs::create_dir_all(&trap).unwrap();
+        fs::write(trap.join("do-not-touch"), b"host").unwrap();
+        std::os::unix::fs::symlink(&trap, host_skills.join("sub")).unwrap();
+
+        let err = sync_skills_back(&config, &instance, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("refusing symlinked profile directory"),
+            "{err:#}"
+        );
+        assert_eq!(fs::read(trap.join("do-not-touch")).unwrap(), b"host");
+        assert!(!trap.join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn the_profile_bundle_and_state_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let instance = instance(&config, Harness::Opencode);
+        let store = ProfileStore::new(&config);
+        let source = dir.path().join("opencode.json");
+        fs::write(&source, b"{}").unwrap();
+        let profile = format!(
+            "version = 1\n[[files]]\nsource = {source:?}\ntarget = \"/root/.config/opencode/opencode.json\"\n[environment]\nTOKEN = \"secret\"\n",
+            source = source.to_string_lossy(),
+        );
+        fs::write(store.path(Harness::Opencode), profile).unwrap();
+
+        let plan = prepare_for_start(&config, &instance).unwrap();
+        let share = plan.share.expect("profile share");
+        let root = share.bundle_dir.parent().unwrap();
+        for path in [
+            share.bundle_dir.clone(),
+            share.bundle_dir.join("files"),
+            share.bundle_dir.join("skills"),
+        ] {
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} must be private", path.display());
+        }
+        for path in [
+            root.join("local.json"),
+            share.bundle_dir.join("manifest"),
+            share.bundle_dir.join("env.sh"),
+        ] {
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} must be private", path.display());
+        }
+    }
 }

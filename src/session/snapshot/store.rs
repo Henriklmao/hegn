@@ -352,4 +352,85 @@ mod tests {
         sanitize_name(&name).unwrap();
         assert!(SnapshotStore::suggested_name("demo").starts_with("demo-"));
     }
+
+    #[test]
+    fn staged_names_cannot_be_reserved_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let first = store.prepare_staged("demo").unwrap();
+        let err = store.prepare_staged("demo").unwrap_err().to_string();
+        assert!(err.contains("already being created"), "{err}");
+        assert!(first.dir.is_dir());
+    }
+
+    #[test]
+    fn load_reports_corrupt_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        fs::create_dir(store.root().join("broken")).unwrap();
+        fs::write(store.root().join("broken/snapshot.json"), "{not json").unwrap();
+        let err = store.load("broken").unwrap_err().to_string();
+        assert!(err.contains("failed to parse snapshot"), "{err}");
+    }
+
+    #[test]
+    fn save_meta_creates_a_private_snapshot_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let paths = SnapshotPaths {
+            dir: store.root().join("direct"),
+            final_dir: store.root().join("direct"),
+            meta_path: store.root().join("direct/snapshot.json"),
+        };
+        store.save_meta(&meta("direct", &paths)).unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&paths.dir), 0o700);
+        assert_eq!(mode(&paths.meta_path), 0o600);
+    }
+
+    #[test]
+    fn list_skips_files_and_the_staging_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        fs::create_dir_all(store.staging_dir()).unwrap();
+        fs::write(store.root().join("notes.txt"), b"x").unwrap();
+        fs::create_dir(dir.path().join("not-a-snapshot")).unwrap();
+
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_refuses_traversal_and_missing_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+
+        assert!(store.delete("../outside").is_err());
+        assert!(store.delete("/absolute").is_err());
+        assert!(store.delete("missing").is_err());
+        assert!(outside.is_dir());
+    }
+
+    #[test]
+    fn suggested_names_fall_back_for_unsafe_prefixes() {
+        for prefix in ["日本語", "..", "a/b", ""] {
+            let name = SnapshotStore::suggested_name(prefix);
+            assert!(name.starts_with("snapshot-"), "{prefix:?} -> {name}");
+            sanitize_name(&name).unwrap();
+        }
+    }
+
+    #[test]
+    fn dir_size_counts_only_files_directly_in_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), b"12345").unwrap();
+        fs::create_dir(dir.path().join("nested")).unwrap();
+        fs::write(dir.path().join("nested/state.json"), b"0123456789").unwrap();
+
+        assert_eq!(dir_size(dir.path()), 5);
+    }
 }

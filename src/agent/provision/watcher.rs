@@ -345,4 +345,133 @@ mod tests {
         assert_eq!(events, vec![ProvisionEvent::Ready]);
         assert!(watcher.finished());
     }
+
+    #[test]
+    fn malformed_and_unknown_progress_lines_are_ignored() {
+        for line in [
+            "no prefix at all",
+            "hegn-progress:",
+            "hegn-progress: {",
+            "hegn-progress: } not json {",
+            "hegn-progress: {\"stage\":\"bogus\"}",
+            "hegn-progress: {\"stage\":123}",
+            "hegn-progress: {\"other\":\"ready\"}",
+            "hegn-progress: {}{}",
+        ] {
+            assert_eq!(parse_progress(line), None, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn failed_messages_are_sanitized_and_truncated() {
+        let message = format!("\u{1b}[2J{}", "x".repeat(400));
+        let line = format!(
+            "hegn-progress: {}",
+            serde_json::json!({ "stage": "failed", "message": message })
+        );
+        let parsed = parse_progress(&line).expect("failed event");
+        let ProvisionEvent::Failed {
+            code,
+            message: Some(message),
+        } = parsed
+        else {
+            panic!("expected a failed event");
+        };
+        assert_eq!(code, None);
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+        assert_eq!(message.chars().count(), 160);
+        assert!(!message.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn watcher_keeps_partial_lines_between_polls() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.log");
+        std::fs::write(&path, b"").unwrap();
+        let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
+        let mut watcher = ProvisionWatcher::open(&path, &plan).unwrap();
+
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(log, "hegn-progress: {{\"stage\":\"pack").unwrap();
+        assert!(watcher.poll().unwrap().is_empty());
+
+        writeln!(log, "ages\"}}").unwrap();
+        assert_eq!(
+            watcher.poll().unwrap(),
+            vec![ProvisionEvent::Stage(Stage::Packages)]
+        );
+    }
+
+    #[test]
+    fn watcher_resets_when_the_log_is_truncated() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.log");
+        std::fs::write(&path, vec![b'a'; 200]).unwrap();
+        let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
+        let mut watcher = ProvisionWatcher::open(&path, &plan).unwrap();
+        assert!(watcher.poll().unwrap().is_empty());
+
+        let mut log = std::fs::File::create(&path).unwrap();
+        writeln!(log, "hegn-progress: {{\"stage\":\"network\"}}").unwrap();
+        assert_eq!(
+            watcher.poll().unwrap(),
+            vec![ProvisionEvent::Stage(Stage::Network)]
+        );
+    }
+
+    #[test]
+    fn a_failed_event_stops_the_watcher() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.log");
+        std::fs::write(&path, b"").unwrap();
+        let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
+        let mut watcher = ProvisionWatcher::open(&path, &plan).unwrap();
+
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            log,
+            "hegn-progress: {{\"stage\":\"failed\",\"code\":2,\"message\":\"apt failed\"}}"
+        )
+        .unwrap();
+        let events = watcher.poll().unwrap();
+        assert_eq!(
+            events,
+            vec![ProvisionEvent::Failed {
+                code: Some(2),
+                message: Some("apt failed".into())
+            }]
+        );
+        assert!(watcher.finished());
+        assert!(watcher.saw_progress());
+    }
+
+    #[test]
+    fn progress_only_advances_forward_to_known_stages() {
+        let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
+        let mut progress = ProvisionProgress::new(&plan);
+        progress.advance(Stage::Harness);
+        assert_eq!(progress.stage_label(), Stage::Harness.label());
+        progress.advance(Stage::Prepare);
+        assert_eq!(progress.stage_label(), Stage::Harness.label());
+
+        let shell = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
+        let mut progress = ProvisionProgress::new(&shell);
+        progress.advance(Stage::Node);
+        assert_eq!(progress.stage_label(), Stage::Prepare.label());
+        progress.finish();
+        assert_eq!(progress.remaining(), Duration::ZERO);
+        assert_eq!(progress.eta_label(), "done");
+    }
 }

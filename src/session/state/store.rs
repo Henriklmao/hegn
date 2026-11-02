@@ -148,4 +148,76 @@ mod tests {
             .unwrap();
         assert!(store.state().hidden_projects.is_empty());
     }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut store = StateStore::load(&path);
+        store.touch(Path::new("/projects/a")).unwrap();
+
+        let tmp = path.with_extension("json.tmp");
+        assert!(!tmp.exists(), "the temporary file must be renamed away");
+        let raw = fs::read_to_string(&path).unwrap();
+        serde_json::from_str::<crate::session::state::PersistedState>(&raw).unwrap();
+    }
+
+    #[test]
+    fn save_creates_missing_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/deeper/state.json");
+        let mut store = StateStore::load(&path);
+        store.touch(Path::new("/projects/a")).unwrap();
+        assert!(path.is_file());
+        assert_eq!(
+            StateStore::load(&path).state().recent[0].path,
+            PathBuf::from("/projects/a")
+        );
+    }
+
+    #[test]
+    fn partially_valid_json_falls_back_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, br#"{"last_project":"/projects/a"}"#).unwrap();
+        let store = StateStore::load(&path);
+        assert!(store.state().recent.is_empty());
+        assert_eq!(
+            store.state().last_project.as_deref(),
+            Some(Path::new("/projects/a"))
+        );
+        assert_eq!(store.state().version, 1);
+    }
+
+    #[test]
+    fn wrong_types_are_ignored_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, br#"{"recent":"not a list"}"#).unwrap();
+        let store = StateStore::load(&path);
+        assert!(store.state().recent.is_empty());
+        assert_eq!(store.state().version, 1);
+    }
+
+    #[test]
+    fn forget_only_removes_the_named_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut store = StateStore::load(&path);
+        store.touch(Path::new("/projects/a")).unwrap();
+        store.touch(Path::new("/projects/b")).unwrap();
+        store
+            .set_project_hidden(Path::new("/projects/b"), true)
+            .unwrap();
+
+        store.forget_project(Path::new("/projects/b")).unwrap();
+
+        assert_eq!(store.state().recent.len(), 1);
+        assert_eq!(store.state().recent[0].path, PathBuf::from("/projects/a"));
+        // Forgetting the most recent project clears the selection instead of
+        // silently selecting an older project.
+        assert_eq!(store.state().last_project, None);
+        assert!(!store.is_hidden(Path::new("/projects/b")));
+        assert_eq!(StateStore::load(&path).state().recent.len(), 1);
+    }
 }

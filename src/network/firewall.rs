@@ -355,4 +355,291 @@ mod tests {
             assert_eq!(parsed, firewall);
         }
     }
+
+    #[test]
+    fn every_non_public_ipv4_range_is_dropped() {
+        let rules = nft_rules(&[]);
+        for range in [
+            "0.0.0.0/8",
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+            "172.16.0.0/12",
+            "192.0.0.0/24",
+            "192.0.2.0/24",
+            "192.168.0.0/16",
+            "198.18.0.0/15",
+            "198.51.100.0/24",
+            "203.0.113.0/24",
+            "224.0.0.0/4",
+            "240.0.0.0/4",
+        ] {
+            assert!(
+                rules.contains(range),
+                "missing private range {range}:\n{rules}"
+            );
+        }
+        assert!(rules.contains("set private_v4 {"), "{rules}");
+    }
+
+    #[test]
+    fn guest_egress_can_only_reach_public_web_and_public_dns() {
+        let rules = nft_rules(&[]);
+        let accepts = rules
+            .lines()
+            .filter(|line| line.contains("iifname") && line.contains(" accept"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            accepts.len(),
+            4,
+            "the forward path may only accept conntrack, 80/443 and public DNS:\n{}",
+            accepts.join("\n")
+        );
+
+        assert!(
+            rules.contains("ct state established,related accept"),
+            "{rules}"
+        );
+        assert!(rules.contains("tcp dport { 80, 443 } accept"), "{rules}");
+        assert!(
+            rules.contains("tcp dport 53 ip daddr @web_dns accept"),
+            "{rules}"
+        );
+        assert!(
+            rules.contains("udp dport 53 ip daddr @web_dns accept"),
+            "{rules}"
+        );
+
+        // The DNS allow-list is the two public resolvers, not arbitrary DNS.
+        assert!(rules.contains("elements = { 1.1.1.1, 9.9.9.9 }"), "{rules}");
+        for forbidden in ["8.8.8.8", "tcp dport 22", "udp dport 123", "dport 25"] {
+            assert!(
+                !rules.contains(forbidden),
+                "must not allow {forbidden}:\n{rules}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_and_private_destinations_are_dropped_before_any_accept() {
+        let rules = nft_rules(&[]);
+        let ipv6 = rules.find("meta nfproto ipv6 counter drop").unwrap();
+        let private = rules.find("ip daddr @private_v4 counter drop").unwrap();
+        let established = rules.find("ct state established,related accept").unwrap();
+        let web = rules.find("tcp dport { 80, 443 } accept").unwrap();
+        assert!(ipv6 < established, "{rules}");
+        assert!(private < established, "{rules}");
+        assert!(private < web, "{rules}");
+    }
+
+    #[test]
+    fn guests_cannot_initiate_connections_to_the_host_or_lan() {
+        let rules = nft_rules(&[]);
+        // Anything entering the host from a TAP that is not a DNATed endpoint
+        // flow hits the input chain's catch-all drop.
+        assert!(
+            rules.contains("iifname @hegn_ifaces counter drop"),
+            "{rules}"
+        );
+        // The TAP host addresses themselves are inside RFC1918 and therefore
+        // unreachable from the guest's forward path.
+        assert!(rules.contains("iifname @hegn_ifaces ip daddr @private_v4 counter drop"));
+        for index in 0..TAP_POOL {
+            assert!(rules.contains(&host_ip(index).to_string()), "{rules}");
+        }
+        // Unsolicited LAN/internet traffic to the guest subnet is dropped, while
+        // replies to guest-initiated flows stay allowed.
+        let inbound_accept = rules
+            .find("ip daddr 10.213.0.0/24 ct state established,related accept")
+            .unwrap();
+        let inbound_drop = rules.find("ip daddr 10.213.0.0/24 counter drop").unwrap();
+        assert!(inbound_accept < inbound_drop, "{rules}");
+    }
+
+    #[test]
+    fn no_endpoints_means_no_dnat_or_host_input_accept() {
+        let rules = nft_rules(&[]);
+        assert!(!rules.contains("endpoint_ports"), "{rules}");
+        assert!(!rules.contains("dnat"), "{rules}");
+        assert!(!rules.contains("prerouting"), "{rules}");
+        assert!(!rules.contains("ct status dnat"), "{rules}");
+    }
+
+    /// Rules wrap with `\` line continuations, so multi-token assertions have
+    /// to look at the logical line rather than a physical one.
+    fn one_line(rules: &str) -> String {
+        rules
+            .replace("\\\n", " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn dnat_is_scoped_to_pool_host_addresses_and_endpoint_ports() {
+        let rules = nft_rules(&[11434, 4321, 11434]);
+        let flat = one_line(&rules);
+        assert_eq!(
+            flat.matches("dnat ip to 127.0.0.1").count(),
+            1,
+            "one DNAT rule:\n{rules}"
+        );
+        let (before, _) = flat.split_once("dnat ip to").unwrap();
+        let dnat_rule = before.rsplit("iifname").next().unwrap();
+        assert!(dnat_rule.contains("ip daddr @hegn_hosts"), "{dnat_rule}");
+        assert!(dnat_rule.contains("ip protocol tcp"), "{dnat_rule}");
+        assert!(
+            dnat_rule.contains("tcp dport @endpoint_ports"),
+            "{dnat_rule}"
+        );
+        // It must not rewrite arbitrary destinations to the loopback.
+        assert!(!dnat_rule.contains("0.0.0.0"), "{dnat_rule}");
+        assert!(!dnat_rule.contains("10.0.0.0"), "{dnat_rule}");
+
+        let prerouting = rules.find("chain prerouting").unwrap();
+        let dnat = rules.find("dnat ip to").unwrap();
+        let input = rules.find("chain input").unwrap();
+        assert!(prerouting < dnat && dnat < input, "{rules}");
+        assert!(rules.contains("elements = { 4321, 11434 }"), "{rules}");
+    }
+
+    #[test]
+    fn endpoint_input_accept_requires_translated_flows_and_precedes_the_drop() {
+        let rules = nft_rules(&[11434]);
+        let flat = one_line(&rules);
+        let expected = "iifname @hegn_ifaces ct status dnat ip protocol tcp tcp dport \
+                        @endpoint_ports counter accept";
+        assert!(
+            flat.contains(expected),
+            "missing conntrack-gated endpoint accept:\n{rules}"
+        );
+
+        let accept_pos = rules.find("ct status dnat").unwrap();
+        let drop_pos = rules.find("iifname @hegn_ifaces counter drop").unwrap();
+        assert!(accept_pos < drop_pos, "{rules}");
+    }
+
+    #[test]
+    fn pool_sets_cover_every_tap_and_host_address() {
+        let rules = nft_rules(&[]);
+        for index in 0..TAP_POOL {
+            assert!(
+                rules.contains(&format!("\"{}\"", tap_name(index))),
+                "missing {}:\n{rules}",
+                tap_name(index)
+            );
+            assert!(
+                rules.contains(host_ip(index).to_string().as_str()),
+                "missing host address for {}:\n{rules}",
+                tap_name(index)
+            );
+        }
+    }
+
+    #[test]
+    fn masquerade_is_scoped_to_the_guest_subnet() {
+        let rules = nft_rules(&[]);
+        assert!(
+            rules.contains("ip saddr 10.213.0.0/24 masquerade"),
+            "{rules}"
+        );
+        assert_eq!(rules.matches("masquerade").count(), 1, "{rules}");
+        assert!(!rules.contains("oifname"), "{rules}");
+    }
+
+    #[test]
+    fn egress_drops_are_rate_limited_and_logged() {
+        let rules = nft_rules(&[]);
+        let log = rules
+            .find("log prefix \"hegn-egress-drop \" level warn drop")
+            .unwrap();
+        let web = rules.find("tcp dport { 80, 443 } accept").unwrap();
+        assert!(
+            web < log,
+            "the drop must come after the allow-list:\n{rules}"
+        );
+        assert!(
+            rules.contains("counter limit rate 10/minute burst 20 packets"),
+            "{rules}"
+        );
+    }
+
+    #[test]
+    fn host_firewall_carve_out_only_runs_for_active_firewalls() {
+        let script = host_firewall_coexistence();
+        assert!(script.contains("ufw status 2>/dev/null | grep -qx 'Status: active'"));
+        assert!(script.contains("firewall-cmd --state >/dev/null 2>&1"));
+        assert!(script.contains("grep -qx -- '-P FORWARD DROP'"));
+        // The plain-iptables branch must not run when ufw/firewalld was handled.
+        assert!(script.contains("hegn_firewall_handled=0"));
+        assert!(script.contains("[ \"$hegn_firewall_handled\" -eq 0 ]"));
+
+        assert_eq!(
+            script.matches("ufw route allow in on hegn").count(),
+            TAP_POOL as usize
+        );
+        assert_eq!(
+            script
+                .matches("--quiet --direct --add-rule ipv4 filter FORWARD")
+                .count(),
+            TAP_POOL as usize
+        );
+        assert_eq!(
+            script
+                .matches("--quiet --permanent --direct --add-rule ipv4 filter FORWARD")
+                .count(),
+            TAP_POOL as usize
+        );
+        assert_eq!(
+            script.matches("iptables -w -I FORWARD 1 -i hegn").count(),
+            TAP_POOL as usize
+        );
+        // Never insert an iptables rule without checking for it first.
+        for line in script.lines().filter(|line| line.contains("-I FORWARD 1")) {
+            let check = line.trim().replace("-I FORWARD 1", "-C FORWARD");
+            assert!(
+                script.contains(check.as_str()),
+                "missing idempotence check for {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_firewall_cleanup_is_symmetric_and_cannot_abort_teardown() {
+        let script = host_firewall_cleanup();
+        assert_eq!(
+            script.matches("ufw route delete allow in on hegn").count(),
+            TAP_POOL as usize
+        );
+        assert_eq!(
+            script
+                .matches("--direct --remove-rule ipv4 filter FORWARD")
+                .count(),
+            TAP_POOL as usize * 2
+        );
+        assert_eq!(
+            script.matches("iptables -w -D FORWARD -i hegn").count(),
+            TAP_POOL as usize
+        );
+        assert!(!script.contains("--add-rule"), "{script}");
+        for line in script.lines().filter(|line| !line.trim().is_empty()) {
+            assert!(
+                line.ends_with("|| true"),
+                "cleanup could abort teardown: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_and_unknown_host_firewalls_are_none() {
+        assert_eq!(HostFirewall::default(), HostFirewall::None);
+        assert!(serde_json::from_str::<HostFirewall>("\"nftables\"").is_err());
+        assert!(serde_json::from_str::<HostFirewall>("\"firewalld \"").is_err());
+    }
+
+    #[test]
+    fn nft_rules_are_deterministic() {
+        assert_eq!(nft_rules(&[11434]), nft_rules(&[11434]));
+    }
 }

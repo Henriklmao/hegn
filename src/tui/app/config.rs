@@ -429,6 +429,142 @@ mod tests {
     }
 
     #[test]
+    fn invalid_inline_edit_keeps_the_settings_page() {
+        let (dir, mut app) = test_app();
+        app.handle_key(key(KeyCode::F(4)));
+        let row = crate::config::form::row_of(ConfigKind::Global, ConfigField::SharedTag).unwrap();
+        if let Some(Modal::Config(form)) = app.modal.as_mut() {
+            form.path = dir.path().join("config.toml");
+            assert!(form.select_row(row));
+            form.activate();
+        }
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Config(form)) if form.is_editing()
+        ));
+
+        // Replace the valid tag with an invalid one, then try to switch tabs.
+        for _ in 0.."workspace".len() {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        for c in "bad tag".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.config_tabs = vec![ConfigTabHit {
+            rect: Rect::new(0, 0, 4, 1),
+            page: ConfigPage::Profiles,
+        }];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        match &app.modal {
+            Some(Modal::Config(form)) => {
+                assert_eq!(form.page(), ConfigPage::General, "the page must not change");
+                assert!(form.is_editing(), "the invalid text stays editable");
+                assert!(form.error.is_some());
+                assert_eq!(form.value(ConfigField::SharedTag), "workspace");
+            }
+            other => panic!("expected settings modal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn saving_global_settings_applies_and_persists_them() {
+        let (dir, mut app) = test_app();
+        let path = dir.path().join("config.toml");
+        app.handle_key(key(KeyCode::F(4)));
+        if let Some(Modal::Config(form)) = app.modal.as_mut() {
+            // Never write the real user config from a unit test.
+            form.path = path.clone();
+        }
+        // The first row is the harness choice.
+        app.handle_key(key(KeyCode::Right));
+        let effects = app.handle_key(key(KeyCode::Char('s')));
+
+        assert!(effects.is_empty(), "only a moved projects root rescans");
+        assert_eq!(app.config.harness, Harness::Opencode);
+        assert_eq!(Config::load_from(&path).unwrap().harness, Harness::Opencode);
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Config(form))
+                if form.status.as_deref() == Some("saved") && !form.dirty()
+        ));
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("settings saved"))
+        );
+    }
+
+    #[test]
+    fn reloading_instance_settings_discards_the_edit() {
+        let (_dir, mut app) = test_app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let inside = app.config.instances_dir.join("demo").join("workspace");
+        crate::vm::instance_config::InstanceStore::new(app.config.clone())
+            .save(&crate::vm::instance_config::InstanceConfig {
+                name: "demo".into(),
+                project: project.clone(),
+                workspace: inside.clone(),
+                harness: Harness::Shell,
+                vcpus: 2,
+                memory_mib: 2048,
+                ..crate::vm::instance_config::InstanceConfig::default()
+            })
+            .unwrap();
+        let instance = fake_instance(&app, "demo", inside);
+        install_instances(&mut app, vec![instance]);
+        app.focus = Focus::Instances;
+
+        app.handle_key(key(KeyCode::F(5)));
+        app.handle_key(key(KeyCode::Down)); // Harness -> vCPUs
+        app.handle_key(key(KeyCode::Right));
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Config(form)) if form.value(ConfigField::Vcpus) == "3"
+        ));
+
+        app.handle_action(ActionId::ReloadConfig);
+
+        match &app.modal {
+            Some(Modal::Config(form)) => {
+                assert_eq!(form.kind, ConfigKind::Instance);
+                assert_eq!(form.value(ConfigField::Vcpus), "2");
+                assert!(!form.dirty());
+                assert_eq!(form.status.as_deref(), Some("reverted to the file on disk"));
+            }
+            other => panic!("expected instance settings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancelling_project_settings_never_writes_hegn_toml() {
+        let (_dir, mut app) = test_app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let instance = fake_instance(&app, "demo", project.join("workspace"));
+        install_instances(&mut app, vec![instance]);
+        app.screen = Screen::Project;
+        app.open_project = Some(project.clone());
+
+        app.handle_key(key(KeyCode::F(6)));
+        app.handle_key(key(KeyCode::Down)); // launch -> integration
+        app.handle_key(key(KeyCode::Right));
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.modal.is_none());
+        assert!(
+            !project.join(project::PROJECT_META_FILE).exists(),
+            "an unsaved project setting must not reach disk"
+        );
+    }
+
+    #[test]
     fn config_profiles_tab_opens_the_profile_editor() {
         let (_dir, mut app) = test_app();
         app.handle_key(key(KeyCode::F(4)));

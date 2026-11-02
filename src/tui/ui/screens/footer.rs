@@ -570,3 +570,274 @@ pub(crate) fn hint_buttons(
     }
     hits
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Harness;
+    use crate::tui::app::{
+        App, ConfirmPrompt, DeleteInstanceModal, DeleteInstanceStage::Confirm,
+        DeleteInstanceStage::Files, DeleteProjectModal, MultiAgentForm,
+    };
+    use crate::tui::ui::test_support::*;
+    use crate::vm::instance::InstanceSummary;
+    use std::path::PathBuf;
+
+    fn actions(app: &App) -> Vec<ActionId> {
+        footer_buttons(app)
+            .into_iter()
+            .map(|button| button.action)
+            .collect()
+    }
+
+    fn labels(app: &App) -> Vec<&'static str> {
+        footer_buttons(app)
+            .into_iter()
+            .map(|button| button.label)
+            .collect()
+    }
+
+    fn instance(app: &App, name: &str, state: &str) -> InstanceSummary {
+        InstanceSummary {
+            name: name.into(),
+            project: PathBuf::from("/projects/demo"),
+            workspace: PathBuf::from(format!("/workspaces/{name}")),
+            harness: Harness::Shell,
+            ephemeral: false,
+            source_instance: None,
+            created_at: chrono::Utc::now(),
+            state: state.into(),
+            vm_pid: None,
+            serial_log: None,
+            config_path: app.config.instances_dir.join(name).join("hegn.toml"),
+            vcpus: 2,
+            memory_mib: 2048,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn dashboard_footer_tracks_the_focused_panel() {
+        let (_dir, mut app) = app();
+        let buttons = actions(&app);
+        for action in [
+            ActionId::Open,
+            ActionId::Create,
+            ActionId::Import,
+            ActionId::DeleteProject,
+            ActionId::Edit,
+            ActionId::GlobalConfig,
+            ActionId::Doctor,
+            ActionId::Refresh,
+            ActionId::Help,
+            ActionId::Quit,
+        ] {
+            assert!(buttons.contains(&action), "missing {action:?}");
+        }
+        assert!(!buttons.contains(&ActionId::StartInstance));
+
+        app.focus = Focus::Instances;
+        let buttons = actions(&app);
+        for action in [
+            ActionId::StartInstance,
+            ActionId::StopInstance,
+            ActionId::DeleteInstance,
+            ActionId::InstanceConfig,
+        ] {
+            assert!(buttons.contains(&action), "missing {action:?}");
+        }
+        assert!(labels(&app).contains(&"Attach"));
+
+        app.focus = Focus::Snapshots;
+        let buttons = actions(&app);
+        assert!(buttons.contains(&ActionId::NewSnapshot));
+        assert!(buttons.contains(&ActionId::DeleteSnapshot));
+        assert!(!buttons.contains(&ActionId::Open));
+
+        app.focus = Focus::Health;
+        let buttons = actions(&app);
+        assert!(!buttons.contains(&ActionId::NewSnapshot));
+        assert!(buttons.contains(&ActionId::GlobalConfig));
+    }
+
+    #[test]
+    fn project_footer_switches_with_view_focus_and_terminal_mode() {
+        let (_dir, mut app) = app();
+        app.screen = Screen::Project;
+        app.open_project = Some(PathBuf::from("/projects/demo"));
+        app.project_view = ProjectView::Compact;
+        app.focus = Focus::Instances;
+
+        assert!(labels(&app).contains(&"Start"));
+
+        app.instances = vec![instance(&app, "build", "running")];
+        app.refresh_instance_filter();
+        assert!(
+            labels(&app).contains(&"Open"),
+            "an existing instance is opened instead of started"
+        );
+
+        app.focus = Focus::Snapshots;
+        let buttons = actions(&app);
+        for action in [
+            ActionId::Restore,
+            ActionId::NewSnapshot,
+            ActionId::DeleteSnapshot,
+            ActionId::InsertMode,
+        ] {
+            assert!(buttons.contains(&action), "missing {action:?}");
+        }
+
+        app.project_view = ProjectView::Split;
+        app.terminal_mode = TerminalMode::Normal;
+        let buttons = footer_buttons(&app);
+        assert!(
+            buttons
+                .iter()
+                .any(|button| button.action == ActionId::InsertMode && button.label == "Type")
+        );
+
+        app.terminal_mode = TerminalMode::Insert;
+        let buttons = footer_buttons(&app);
+        assert!(
+            buttons
+                .iter()
+                .any(|button| button.action == ActionId::NormalMode && button.label == "Normal")
+        );
+
+        app.project_view = ProjectView::Section;
+        let buttons = footer_buttons(&app);
+        assert!(
+            buttons
+                .iter()
+                .any(|button| button.action == ActionId::InsertMode && button.label == "Terminal")
+        );
+        for action in [
+            ActionId::Launch,
+            ActionId::ToggleRaw,
+            ActionId::ProjectConfig,
+            ActionId::Back,
+            ActionId::Help,
+        ] {
+            assert!(
+                buttons.iter().any(|button| button.action == action),
+                "missing {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modal_footer_offers_stage_specific_destructive_choices() {
+        let (_dir, mut app) = app();
+        let build = instance(&app, "build", "running");
+
+        app.modal = Some(Modal::DeleteInstance(DeleteInstanceModal {
+            instance: build.clone(),
+            stage: Confirm,
+            error: None,
+            scroll: 0,
+        }));
+        let mut buttons = actions(&app);
+        assert_eq!(buttons, vec![ActionId::Confirm, ActionId::Cancel]);
+        assert!(labels(&app).contains(&"Continue"));
+
+        app.modal = Some(Modal::DeleteInstance(DeleteInstanceModal {
+            instance: build,
+            stage: Files,
+            error: None,
+            scroll: 0,
+        }));
+        buttons = actions(&app);
+        assert_eq!(
+            buttons,
+            vec![ActionId::Confirm, ActionId::KeepFiles, ActionId::Cancel]
+        );
+        let labels = labels(&app);
+        assert!(labels.contains(&"Delete files"));
+        assert!(labels.contains(&"Keep files"));
+
+        let project = app.selected_project().cloned().unwrap();
+        app.modal = Some(Modal::DeleteProject(DeleteProjectModal {
+            project,
+            git: crate::project::GitSummary::default(),
+            instances: vec!["build".into()],
+            scroll: 0,
+        }));
+        assert_eq!(
+            actions(&app),
+            vec![
+                ActionId::Confirm,
+                ActionId::DeleteProjectFiles,
+                ActionId::Cancel
+            ]
+        );
+
+        app.modal = Some(Modal::MultiAgent(MultiAgentForm::new(
+            "build".into(),
+            Harness::Shell,
+        )));
+        assert_eq!(actions(&app), vec![ActionId::Confirm, ActionId::Cancel]);
+
+        app.modal = Some(Modal::Confirm(ConfirmPrompt {
+            title: "Delete snapshot".into(),
+            message: "Delete 'demo'?".into(),
+            confirm_label: "Delete".into(),
+            action: crate::tui::app::ConfirmAction::DeleteSnapshot("demo".into()),
+            scroll: 0,
+        }));
+        assert_eq!(actions(&app), vec![ActionId::Confirm, ActionId::Cancel]);
+    }
+
+    #[test]
+    fn footer_buttons_stay_inside_a_narrow_terminal() {
+        let (_dir, mut app) = app();
+        app.focus = Focus::Instances;
+        let (text, hits) = render_sized(&app, 40, 15);
+        assert!(!hits.footer.is_empty(), "{text}");
+        for hit in &hits.footer {
+            assert!(hit.rect.x < 40, "{hit:?}");
+            assert!(
+                hit.rect.x + hit.rect.width <= 40,
+                "footer button overflows: {hit:?}"
+            );
+            assert!(hit.rect.y < 15, "{hit:?}");
+        }
+    }
+
+    fn footer_text(app: &App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_footer(frame, app, Rect::new(0, 0, width, height));
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn footer_hint_row_reflects_search_and_screen() {
+        let (_dir, mut app) = app();
+
+        let text = footer_text(&app, 120, 4);
+        assert!(text.contains("Tab cycle"), "{text}");
+        assert!(text.contains("<Enter> Open"), "{text}");
+
+        app.searching = true;
+        let text = footer_text(&app, 120, 4);
+        assert!(text.contains("typing filter"), "{text}");
+
+        app.searching = false;
+        app.screen = Screen::Project;
+        let text = footer_text(&app, 120, 4);
+        assert!(text.contains("Esc/← dashboard"), "{text}");
+    }
+}

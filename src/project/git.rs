@@ -394,4 +394,102 @@ mod tests {
             git_stdout(repo.path(), &["show", &format!("{branch}:first.txt")], None).unwrap();
         assert_eq!(content.trim(), "hello");
     }
+
+    #[test]
+    fn parses_staged_modified_renamed_and_ignored_entries() {
+        let output = concat!(
+            "## main\n",
+            "AM staged-and-modified\n",
+            "MM both\n",
+            "A  added\n",
+            " D deleted-in-worktree\n",
+            "R  old -> new\n",
+            "!! ignored\n",
+            "?? untracked\n",
+        );
+        let summary = parse_git_status(output);
+        assert!(summary.is_repo);
+        assert_eq!(summary.branch.as_deref(), Some("main"));
+        assert_eq!(summary.staged, 4, "{summary:?}");
+        assert_eq!(summary.modified, 3, "{summary:?}");
+        assert_eq!(summary.untracked, 1, "{summary:?}");
+        assert!(summary.is_dirty());
+    }
+
+    #[test]
+    fn parses_malformed_branch_tracking_and_short_lines_without_panicking() {
+        let summary = parse_git_status("## feature...origin/feature [ahead nope, behind 4]\n");
+        assert_eq!(summary.branch.as_deref(), Some("feature"));
+        assert_eq!(summary.ahead, 0);
+        assert_eq!(summary.behind, 4);
+
+        let summary = parse_git_status("## main...origin/main [ahead 3]\n");
+        assert_eq!(summary.branch.as_deref(), Some("main"));
+        assert_eq!(summary.ahead, 3);
+        assert_eq!(summary.behind, 0);
+
+        // Short/garbage lines use space padding instead of panicking.
+        let summary = parse_git_status("## main\nx\n\n??\n");
+        assert_eq!(summary.branch.as_deref(), Some("main"));
+        assert_eq!(summary.staged, 1);
+        assert_eq!(summary.modified, 0);
+        assert_eq!(summary.untracked, 1);
+    }
+
+    #[test]
+    fn badge_combines_dirt_ahead_and_behind() {
+        let mut summary = parse_git_status("## main...origin/main [ahead 2, behind 1]\n");
+        assert_eq!(summary.badge(), "main ↑2 ↓1");
+        summary.untracked = 1;
+        assert_eq!(summary.badge(), "main* ↑2 ↓1");
+
+        let empty = parse_git_status("");
+        assert!(empty.is_repo);
+        assert_eq!(empty.badge(), "detached");
+        assert_eq!(GitSummary::default().badge(), "not a repo");
+    }
+
+    #[test]
+    fn read_git_summary_reports_non_directories_and_non_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain.txt");
+        std::fs::write(&file, "x").unwrap();
+        let summary = read_git_summary(&file);
+        assert_eq!(summary.error.as_deref(), Some("not a directory"));
+        assert!(!summary.is_repo);
+        assert_eq!(summary.badge(), "not a repo");
+
+        let plain = tempfile::tempdir().unwrap();
+        let summary = read_git_summary(plain.path());
+        assert!(!summary.is_repo);
+        assert!(summary.error.is_some(), "{summary:?}");
+    }
+
+    #[test]
+    fn checkpoint_and_session_branch_refuse_non_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = create_checkpoint(dir.path(), "manual")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a git working tree"), "{err}");
+        let err = create_session_branch(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("not a git working tree"), "{err}");
+    }
+
+    #[test]
+    fn checkpoint_sanitizes_labels_and_falls_back_to_manual() {
+        let repo = git_repo();
+        std::fs::write(repo.path().join("a.txt"), "hello").unwrap();
+
+        let branch = create_checkpoint(repo.path(), "  !!!  ").unwrap();
+        assert!(branch.starts_with("hegn/checkpoint-"), "{branch}");
+        assert!(branch.ends_with("-manual"), "{branch}");
+
+        let repo = git_repo();
+        std::fs::write(repo.path().join("a.txt"), "hello").unwrap();
+        let branch = create_checkpoint(repo.path(), "before rm -rf && echo").unwrap();
+        assert!(!branch.contains(' '), "{branch}");
+        assert!(!branch.contains('&'), "{branch}");
+        assert!(branch.ends_with("-before-rm--rf----echo"), "{branch}");
+    }
 }

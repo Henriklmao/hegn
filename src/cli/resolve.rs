@@ -72,4 +72,74 @@ mod tests {
         );
         assert!(resolve_project(&config, "missing").is_err());
     }
+
+    #[test]
+    fn resolves_an_external_directory_but_rejects_files() {
+        let (dir, config) = config();
+        let external = dir.path().join("external-project");
+        std::fs::create_dir_all(&external).unwrap();
+        assert_eq!(
+            resolve_project(&config, external.to_str().unwrap()).unwrap(),
+            external.canonicalize().unwrap()
+        );
+
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, b"x").unwrap();
+        let err = resolve_project(&config, file.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn missing_project_reports_both_looked_up_locations() {
+        let (_dir, config) = config();
+        let err = resolve_project(&config, "nope").unwrap_err().to_string();
+        assert!(err.contains("nope"), "{err}");
+        assert!(
+            err.contains(&config.projects_root.display().to_string()),
+            "{err}"
+        );
+        assert!(err.contains("looked at"), "{err}");
+    }
+
+    #[test]
+    fn entry_resolution_stays_inside_the_projects_root() {
+        let (dir, config) = config();
+        std::fs::create_dir_all(config.projects_root.join("demo")).unwrap();
+        std::fs::create_dir_all(config.projects_root.join("nested/deep")).unwrap();
+
+        let resolved = resolve_project_entry(&config, "demo").unwrap();
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            config.projects_root.join("demo").canonicalize().unwrap()
+        );
+
+        let absolute = config.projects_root.join("demo");
+        assert_eq!(
+            resolve_project_entry(&config, absolute.to_str().unwrap())
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            absolute.canonicalize().unwrap()
+        );
+
+        assert!(
+            resolve_project_entry(&config, "nested/deep").is_err(),
+            "nested selectors are not root entries"
+        );
+        assert!(resolve_project_entry(&config, "missing").is_err());
+
+        let external = dir.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        let imported = config.projects_root.join("imported");
+        std::os::unix::fs::symlink(&external, &imported).unwrap();
+        assert_eq!(
+            resolve_project_entry(&config, "imported")
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            external.canonicalize().unwrap()
+        );
+    }
 }

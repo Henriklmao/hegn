@@ -152,4 +152,16 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn harmless_commands_exit_zero() {
+        let (_dir, config) = config();
+        for command in ["true", "false", "echo hello"] {
+            assert_eq!(
+                check_command_for_test(&config, command).unwrap(),
+                0,
+                "{command:?} must be allowed"
+            );
+        }
+    }
 }

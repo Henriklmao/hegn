@@ -93,3 +93,59 @@ pub(crate) fn render_multi_agent(
         ..ModalHits::default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::config::Harness;
+    use crate::tui::app::{ActionId, Modal, MultiAgentForm};
+    use crate::tui::ui::test_support::*;
+
+    #[test]
+    fn multi_agent_modal_shows_clone_count_harness_and_controls() {
+        let (_dir, mut app) = app();
+        let mut form = MultiAgentForm::new("build".into(), Harness::Opencode);
+        form.count = 3;
+        app.modal = Some(Modal::MultiAgent(form));
+        let (text, hits) = render(&app);
+
+        assert!(text.contains("multi-agent clones"), "{text}");
+        assert!(text.contains("Instance: build"), "{text}");
+        assert!(text.contains("Clones:  3"), "{text}");
+        assert!(text.contains("Harness: OpenCode"), "{text}");
+        assert!(text.contains("Start:   yes"), "{text}");
+        assert!(text.contains("commits cannot collide"), "{text}");
+        for action in [
+            ActionId::MultiAgentMore,
+            ActionId::MultiAgentFewer,
+            ActionId::HarnessPrev,
+            ActionId::HarnessNext,
+            ActionId::ToggleCloneStart,
+            ActionId::Confirm,
+            ActionId::Cancel,
+        ] {
+            assert!(
+                hits.footer.iter().any(|hit| hit.action == action),
+                "missing footer action {action:?} in:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_agent_modal_renders_the_no_start_choice_and_errors() {
+        let (_dir, mut app) = app();
+        let mut form = MultiAgentForm::new("build".into(), Harness::Shell);
+        form.count = 1;
+        form.start = false;
+        form.error = Some("refusing to create more than 8 clones".into());
+        app.modal = Some(Modal::MultiAgent(form));
+        let (text, _) = render(&app);
+
+        assert!(text.contains("Clones:  1"), "{text}");
+        assert!(text.contains("Start:   no"), "{text}");
+        assert!(text.contains("Harness: shell"), "{text}");
+        assert!(
+            text.contains("refusing to create more than 8 clones"),
+            "{text}"
+        );
+    }
+}

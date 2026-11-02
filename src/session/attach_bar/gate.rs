@@ -50,8 +50,8 @@ impl OutputGate {
         out: &mut impl Write,
     ) -> io::Result<()> {
         for &byte in bytes {
-            self.advance_utf8(byte);
-            self.feed_byte(byte, bar_row, out)?;
+            let utf8 = self.advance_utf8(byte);
+            self.feed_byte(byte, utf8, bar_row, out)?;
         }
         Ok(())
     }
@@ -82,9 +82,20 @@ impl OutputGate {
     fn feed_byte(
         &mut self,
         byte: u8,
+        utf8: bool,
         bar_row: Option<u16>,
         out: &mut impl Write,
     ) -> io::Result<()> {
+        // A continuation byte only looks like a C1 control (0x90/0x98/0x9B/
+        // 0x9D/0x9E/0x9F/0x9C). Never reinterpret bytes that belong to a
+        // multi-byte UTF-8 character as escape-sequence introducers or
+        // terminators.
+        if utf8 {
+            return match self.state {
+                State::Ground => out.write_all(&[byte]),
+                _ => self.push(byte, out),
+            };
+        }
         match self.state {
             State::Ground => self.ground(byte, out),
             State::Esc => self.escape(byte, bar_row, out),
@@ -310,11 +321,14 @@ impl OutputGate {
     }
 
     /// Track whether the stream ends inside a multi-byte UTF-8 character.
-    fn advance_utf8(&mut self, byte: u8) {
+    ///
+    /// Returns true when `byte` is a lead or continuation byte, so the caller
+    /// can pass it through without interpreting it as a control.
+    fn advance_utf8(&mut self, byte: u8) -> bool {
         if self.utf8_left > 0 {
             if (0x80..=0xbf).contains(&byte) {
                 self.utf8_left -= 1;
-                return;
+                return true;
             }
             self.utf8_left = 0;
         }
@@ -324,6 +338,7 @@ impl OutputGate {
             0xf0..=0xf4 => 3,
             _ => 0,
         };
+        self.utf8_left > 0
     }
 }
 
@@ -487,5 +502,166 @@ mod tests {
         gate.feed(b"\x1b]0;title", None, &mut out).unwrap();
         gate.finish(&mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "\x1b]0;title\x07");
+    }
+
+    #[test]
+    fn gate_is_never_safe_inside_a_split_csi() {
+        let bytes = b"\x1b[1;2H";
+        for split in 1..bytes.len() {
+            let mut gate = OutputGate::new();
+            let mut out = Vec::new();
+            gate.feed(&bytes[..split], None, &mut out).unwrap();
+            assert!(!gate.safe_to_inject(), "split at {split}");
+            gate.feed(&bytes[split..], None, &mut out).unwrap();
+            assert!(gate.safe_to_inject(), "split at {split}");
+            assert_eq!(out.as_slice(), bytes.as_slice(), "split at {split}");
+        }
+    }
+
+    #[test]
+    fn gate_is_never_safe_inside_a_split_osc() {
+        let bytes = b"\x1b]0;title\x1b\\visible";
+        // Byte 8 is inside the payload, 10 is the ESC of the ST terminator.
+        for split in [1, 5, 8, 10] {
+            let mut gate = OutputGate::new();
+            let mut out = Vec::new();
+            gate.feed(&bytes[..split], None, &mut out).unwrap();
+            assert!(!gate.safe_to_inject(), "split at {split}");
+            gate.feed(&bytes[split..], None, &mut out).unwrap();
+            assert!(gate.safe_to_inject(), "split at {split}");
+            assert_eq!(out.as_slice(), bytes.as_slice(), "split at {split}");
+        }
+    }
+
+    #[test]
+    fn gate_accepts_an_eight_bit_string_terminator() {
+        let mut gate = OutputGate::new();
+        let out = gate_feed_raw(&mut gate, b"\x9d0;title\x9crest", None);
+        assert_eq!(out.as_slice(), b"\x1b]0;title\x9crest");
+        assert!(gate.safe_to_inject());
+    }
+
+    #[test]
+    fn gate_is_never_safe_inside_a_split_four_byte_character() {
+        // U+100000 is F4 80 80 80: no continuation byte is a C1 control, so
+        // this test isolates the split-character state machine.
+        let bytes = "\u{100000}".as_bytes();
+        for split in 1..bytes.len() {
+            let mut gate = OutputGate::new();
+            let mut out = Vec::new();
+            gate.feed(&bytes[..split], None, &mut out).unwrap();
+            assert!(!gate.safe_to_inject(), "split at {split}");
+            gate.feed(&bytes[split..], None, &mut out).unwrap();
+            assert!(gate.safe_to_inject(), "split at {split}");
+            assert_eq!(out.as_slice(), bytes, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn gate_treats_a_broken_utf8_sequence_as_ground_again() {
+        let mut gate = OutputGate::new();
+        let raw = gate_feed_raw(&mut gate, &[0xe2, b'(', 0xa1], None);
+        assert_eq!(raw.as_slice(), [0xe2, b'(', 0xa1]);
+        assert!(gate.safe_to_inject());
+    }
+
+    #[test]
+    fn gate_clamps_degenerate_margin_parameters() {
+        let mut gate = OutputGate::new();
+        assert_eq!(
+            gate_feed(&mut gate, b"\x1b[50;60r", Some(30)),
+            "\x1b[29;29r"
+        );
+        assert_eq!(gate_feed(&mut gate, b"\x1b[1;0r", Some(30)), "\x1b[1;29r");
+        // Unknown, extra or non-numeric parameters are passed through.
+        assert_eq!(gate_feed(&mut gate, b"\x1b[;10r", Some(30)), "\x1b[;10r");
+        assert_eq!(
+            gate_feed(&mut gate, b"\x1b[1;2;3r", Some(30)),
+            "\x1b[1;2;3r"
+        );
+        assert_eq!(gate_feed(&mut gate, b"\x1b[1;?r", Some(30)), "\x1b[1;?r");
+    }
+
+    #[test]
+    fn gate_clamps_correctly_on_a_one_row_bar() {
+        let mut gate = OutputGate::new();
+        // Nothing to clamp: the guest may only use row 1 anyway.
+        assert_eq!(gate_feed(&mut gate, b"\x1b[r", Some(1)), "\x1b[r");
+        assert_eq!(gate_feed(&mut gate, b"\x1b[1;2r", Some(1)), "\x1b[1;1r");
+    }
+
+    #[test]
+    fn gate_normalises_eight_bit_control_introducers() {
+        let mut gate = OutputGate::new();
+        assert_eq!(
+            gate_feed_raw(&mut gate, b"\x9b31m", None).as_slice(),
+            b"\x1b[31m"
+        );
+        assert_eq!(
+            gate_feed_raw(&mut gate, b"\x90abc\x9c", None).as_slice(),
+            b"\x1bPabc\x9c"
+        );
+        assert!(gate.safe_to_inject());
+    }
+
+    #[test]
+    fn gate_esc_esc_aborts_the_previous_sequence() {
+        let mut gate = OutputGate::new();
+        let out = gate_feed(&mut gate, b"\x1b[12\x1b[31m", None);
+        assert_eq!(out, "\x1b[12\x1b[31m");
+        assert!(gate.safe_to_inject());
+    }
+
+    #[test]
+    fn gate_replays_an_overlong_sequence_without_injecting() {
+        let mut input = vec![0x1b, b'P'];
+        input.extend(vec![b'a'; MAX_SEQ + 200]);
+        input.extend_from_slice(b"\x1b\\");
+        let mut gate = OutputGate::new();
+        let mut out = Vec::new();
+        gate.feed(&input, None, &mut out).unwrap();
+        assert_eq!(out.as_slice(), input.as_slice());
+        assert!(gate.safe_to_inject());
+    }
+
+    #[test]
+    fn gate_is_safe_after_a_burst_of_complete_sequences() {
+        let mut gate = OutputGate::new();
+        let burst = b"a\x1b[31mred\x1b[0m\x1b]0;title\x07\r\n";
+        let out = gate_feed_raw(&mut gate, burst, Some(30));
+        assert_eq!(out.as_slice(), burst, "complete sequences pass unchanged");
+        // The attach loop repaints the bar only when this is true.
+        assert!(gate.safe_to_inject());
+    }
+
+    #[test]
+    fn gate_finish_terminates_an_open_dcs_with_st() {
+        let mut gate = OutputGate::new();
+        let mut out = Vec::new();
+        gate.feed(b"\x1bPdata", None, &mut out).unwrap();
+        gate.finish(&mut out).unwrap();
+        assert_eq!(out.as_slice(), b"\x1bPdata\x1b\\");
+        assert!(gate.safe_to_inject());
+    }
+
+    #[test]
+    fn gate_does_not_reserve_a_region_without_a_bar() {
+        let mut gate = OutputGate::new();
+        assert_eq!(gate_feed(&mut gate, b"\x1bc", None), "\x1bc");
+        assert_eq!(gate_feed(&mut gate, b"\x1b[!p", None), "\x1b[!p");
+    }
+
+    #[test]
+    fn gate_passes_utf8_whose_continuation_looks_like_a_control() {
+        // U+061B is D8 9B (0x9B is the 8-bit CSI) and U+1F600 is
+        // F0 9F 98 80 (0x9F is the 8-bit DCS introducer). Both must pass
+        // through untouched instead of being held or rewritten.
+        for text in ["\u{061b}x", "😀"] {
+            let mut gate = OutputGate::new();
+            let bytes = text.as_bytes();
+            let out = gate_feed_raw(&mut gate, bytes, None);
+            assert_eq!(out.as_slice(), bytes, "{text:?}");
+            assert!(gate.safe_to_inject(), "{text:?}");
+        }
     }
 }

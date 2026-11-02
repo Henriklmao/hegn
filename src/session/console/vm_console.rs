@@ -254,6 +254,18 @@ mod tests {
         relay_pid: u32,
         log: Option<PathBuf>,
     ) {
+        write_session_with_binary(config, instance, dir, vm_pid, relay_pid, log, None);
+    }
+
+    fn write_session_with_binary(
+        config: &Config,
+        instance: &InstanceConfig,
+        dir: &Path,
+        vm_pid: u32,
+        relay_pid: u32,
+        log: Option<PathBuf>,
+        vm_binary: Option<PathBuf>,
+    ) {
         let paths = InstancePaths::from_instance(config, instance);
         paths.ensure().unwrap();
         let record = SessionRecord {
@@ -263,7 +275,7 @@ mod tests {
             harness: crate::config::Harness::Opencode,
             started_at: Utc::now(),
             vm_pid,
-            vm_binary: None,
+            vm_binary,
             relay_pid,
             virtiofs_pid: std::process::id(),
             profile_virtiofs_pid: 0,
@@ -357,5 +369,129 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not running"), "{err}");
+    }
+
+    #[test]
+    fn attach_refuses_unreadable_session_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let instance = instance(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
+        paths.ensure().unwrap();
+        std::fs::write(&paths.session, b"{not json").unwrap();
+
+        let err = VmConsole::attach(&config, &instance)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unreadable"), "{err}");
+        assert!(err.contains("stop the old VM"), "{err}");
+    }
+
+    #[test]
+    fn attach_rejects_a_vm_recorded_with_another_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let instance = instance(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
+        paths.ensure().unwrap();
+        let _listener = UnixListener::bind(&paths.console_socket).unwrap();
+        // The pid is alive, but it is not the recorded binary.
+        write_session_with_binary(
+            &config,
+            &instance,
+            dir.path(),
+            std::process::id(),
+            0,
+            None,
+            Some(PathBuf::from("/opt/not-cloud-hypervisor")),
+        );
+
+        let err = VmConsole::attach(&config, &instance)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not running"), "{err}");
+        assert!(err.contains("start a VM before attaching"), "{err}");
+    }
+
+    #[test]
+    fn attach_rejects_a_recycled_relay_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let instance = instance(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
+        paths.ensure().unwrap();
+        let _listener = UnixListener::bind(&paths.console_socket).unwrap();
+        // The VM pid is this test process (the configured binary); the relay
+        // pid is also alive but is not the internal relay.
+        write_session(
+            &config,
+            &instance,
+            dir.path(),
+            std::process::id(),
+            std::process::id(),
+            None,
+        );
+
+        let err = VmConsole::attach(&config, &instance)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("console relay is not running"), "{err}");
+    }
+
+    #[test]
+    fn attach_rejects_a_console_path_that_is_not_a_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let instance = instance(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
+        paths.ensure().unwrap();
+        std::fs::write(&paths.console_socket, b"not a socket").unwrap();
+        write_session(&config, &instance, dir.path(), std::process::id(), 0, None);
+
+        let err = VmConsole::attach(&config, &instance)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("socket is missing"), "{err}");
+    }
+
+    #[test]
+    fn attach_ignores_a_symlinked_serial_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let instance = instance(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
+        paths.ensure().unwrap();
+        let _listener = UnixListener::bind(&paths.console_socket).unwrap();
+        let real = dir.path().join("real.log");
+        std::fs::write(&real, b"secret").unwrap();
+        let link = dir.path().join("session-link.log");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_session(
+            &config,
+            &instance,
+            dir.path(),
+            std::process::id(),
+            0,
+            Some(link),
+        );
+
+        let console = VmConsole::attach(&config, &instance).unwrap();
+        assert_eq!(console.serial_log(), None);
+    }
+
+    #[test]
+    fn console_reports_exit_when_the_vm_process_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let instance = instance(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
+        paths.ensure().unwrap();
+        let _listener = UnixListener::bind(&paths.console_socket).unwrap();
+        write_session(&config, &instance, dir.path(), std::process::id(), 0, None);
+
+        let mut console = VmConsole::attach(&config, &instance).unwrap();
+        assert!(!console.is_exited());
+        console.vm_pid = 4_000_000_000;
+        assert!(console.is_exited());
     }
 }

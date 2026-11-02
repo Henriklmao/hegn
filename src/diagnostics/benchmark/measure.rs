@@ -697,6 +697,149 @@ mod tests {
     }
 
     #[test]
+    fn instance_limits_default_without_or_with_a_broken_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            vcpus: 2,
+            memory_mib: 2048,
+            ..Config::default()
+        };
+        let run = dir.path().join("instance/run");
+        fs::create_dir_all(&run).unwrap();
+        let session = run.join("session.json");
+
+        assert_eq!(instance_limits(&session, &config), (2, 2048));
+
+        fs::write(dir.path().join("instance/hegn.toml"), b"not = [valid").unwrap();
+        assert_eq!(instance_limits(&session, &config), (2, 2048));
+
+        fs::write(dir.path().join("instance/hegn.toml"), b"vcpus = 4\n").unwrap();
+        assert_eq!(instance_limits(&session, &config), (4, 2048));
+    }
+
+    #[test]
+    fn session_candidates_include_the_legacy_layout_in_sorted_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            state_dir: dir.path().join("state"),
+            instances_dir: dir.path().join("instances"),
+            ..Config::default()
+        };
+        for instance in ["b", "a"] {
+            fs::create_dir_all(config.instances_dir.join(instance).join("run")).unwrap();
+            fs::write(
+                config.instances_dir.join(instance).join("run/session.json"),
+                b"{}",
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(config.state_dir.join("run")).unwrap();
+        fs::write(config.state_dir.join("run/session.json"), b"{}").unwrap();
+
+        let candidates = session_candidates(&config);
+        assert_eq!(candidates.len(), 3);
+        let mut sorted = candidates.clone();
+        sorted.sort();
+        assert_eq!(candidates, sorted);
+        assert!(
+            candidates
+                .iter()
+                .any(|path| path.ends_with("instances/a/run/session.json"))
+        );
+    }
+
+    #[test]
+    fn session_costs_skips_corrupt_metadata_with_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            state_dir: dir.path().join("state"),
+            instances_dir: dir.path().join("instances"),
+            ..Config::default()
+        };
+        fs::create_dir_all(config.instances_dir.join("a/run")).unwrap();
+        fs::write(
+            config.instances_dir.join("a/run/session.json"),
+            b"{not json",
+        )
+        .unwrap();
+
+        let mut notes = Vec::new();
+        let costs = session_costs(&config, &mut notes, |_, _| true);
+        assert!(costs.is_empty());
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("ignoring unreadable session metadata")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_estimate_ignores_files_and_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            snapshots_dir: dir.path().join("snapshots"),
+            ..Config::default()
+        };
+        fs::create_dir_all(config.snapshots_dir.join("one")).unwrap();
+        fs::create_dir_all(config.snapshots_dir.join(".staging/two")).unwrap();
+        fs::write(config.snapshots_dir.join("notes.txt"), b"x").unwrap();
+
+        assert_eq!(snapshot_estimate(&config, 512), (1, 512 * MIB));
+    }
+
+    #[test]
+    fn disk_costs_does_not_count_logs_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            state_dir: dir.path().join("state"),
+            instances_dir: dir.path().join("instances"),
+            snapshots_dir: dir.path().join("snapshots"),
+            kernel_image: dir.path().join("images/kernel"),
+            ..Config::default()
+        };
+        fs::create_dir_all(config.logs_dir()).unwrap();
+        fs::write(config.logs_dir().join("session-1.log"), vec![0u8; 100]).unwrap();
+        fs::write(config.state_dir.join("state.json"), vec![0u8; 10]).unwrap();
+
+        let disk = disk_costs(&config);
+        let logs = disk.iter().find(|cost| cost.name == "logs").unwrap();
+        let state = disk.iter().find(|cost| cost.name == "state").unwrap();
+        assert_eq!(logs.files, 1);
+        assert_eq!(logs.apparent_bytes, 100);
+        assert_eq!(state.files, 1, "the log inside state/ must be excluded");
+        assert_eq!(state.apparent_bytes, 10);
+    }
+
+    #[test]
+    fn build_session_falls_back_to_the_project_name_and_clamps_uptime() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            vcpus: 2,
+            memory_mib: 2048,
+            ..Config::default()
+        };
+        let session = SessionFile {
+            project: Some(dir.path().join("demo")),
+            workspace: None,
+            instance: None,
+            harness: None,
+            started_at: Some(Utc::now() + chrono::Duration::seconds(60)),
+            vm_pid: 0,
+            relay_pid: 0,
+            virtiofs_pid: 0,
+        };
+
+        let mut notes = Vec::new();
+        let cost = build_session(&session, &config, 4, 512, &mut notes);
+        assert_eq!(cost.instance, "demo");
+        assert_eq!(cost.uptime_secs, Some(0), "future timestamps clamp to zero");
+        assert_eq!(cost.guest_memory_bytes, 512 * MIB);
+        assert_eq!(cost.vcpus, 4);
+        assert!(cost.processes.is_empty());
+    }
+
+    #[test]
     fn running_sessions_ignores_a_recycled_pid() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {

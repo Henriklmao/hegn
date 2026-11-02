@@ -134,6 +134,134 @@ mod tests {
         assert!(!app.config.snapshots_dir.join("old").exists());
     }
 
+    fn save_snapshot(app: &App, name: &str, project: Option<PathBuf>, instance: Option<&str>) {
+        let paths = SnapshotStore::new(&app.config.snapshots_dir)
+            .prepare(name)
+            .unwrap();
+        SnapshotStore::new(&app.config.snapshots_dir)
+            .save_meta(&SnapshotMeta {
+                name: name.into(),
+                created_at: chrono::Utc::now(),
+                vm_state: "Paused".into(),
+                dir: paths.dir,
+                instance: instance.map(str::to_string),
+                project,
+                size_bytes: 0,
+                note: None,
+            })
+            .unwrap();
+    }
+
+    fn confirm_prompt(app: &App) -> &ConfirmPrompt {
+        match &app.modal {
+            Some(Modal::Confirm(prompt)) => prompt,
+            other => panic!("expected a confirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_never_deletes_a_snapshot() {
+        let (_dir, mut app) = test_app();
+        save_snapshot(&app, "old", None, None);
+        app.refresh_snapshots();
+        app.focus = Focus::Snapshots;
+
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(confirm_prompt(&app).title, "Delete snapshot");
+        let effects = app.handle_key(key(KeyCode::Enter));
+
+        assert!(effects.is_empty());
+        assert_eq!(confirm_prompt(&app).title, "Delete snapshot");
+        assert!(app.config.snapshots_dir.join("old").exists());
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert!(app.config.snapshots_dir.join("old").exists());
+    }
+
+    #[test]
+    fn restoring_a_project_snapshot_needs_explicit_consent() {
+        let (_dir, mut app) = test_app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        save_snapshot(&app, "before-upgrade", Some(project.clone()), None);
+        app.open_project = Some(project);
+        app.screen = Screen::Project;
+        app.refresh_snapshots();
+        app.focus = Focus::Snapshots;
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(confirm_prompt(&app).title, "Restore snapshot");
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
+        assert_eq!(confirm_prompt(&app).title, "Restore snapshot");
+
+        let effects = app.handle_key(key(KeyCode::Char('y')));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::RestoreSnapshot(snapshot)] if snapshot.name == "before-upgrade"
+        ));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn project_snapshots_include_snapshots_of_scoped_instances() {
+        let (_dir, mut app) = test_app();
+        let demo = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&demo).unwrap();
+        app.open_project = Some(demo.clone());
+        app.screen = Screen::Project;
+        let mut clone = fake_instance(&app, "demo-1", demo.join("clone-1"));
+        clone.project = demo.clone();
+        app.instances = vec![clone];
+        app.snapshots = vec![
+            SnapshotMeta {
+                name: "by-project".into(),
+                created_at: chrono::Utc::now(),
+                vm_state: "Paused".into(),
+                dir: PathBuf::from("/snap/by-project"),
+                instance: None,
+                project: Some(demo.clone()),
+                size_bytes: 0,
+                note: None,
+            },
+            SnapshotMeta {
+                name: "by-instance".into(),
+                created_at: chrono::Utc::now(),
+                vm_state: "Paused".into(),
+                dir: PathBuf::from("/snap/by-instance"),
+                instance: Some("demo-1".into()),
+                project: None,
+                size_bytes: 0,
+                note: None,
+            },
+            SnapshotMeta {
+                name: "unrelated".into(),
+                created_at: chrono::Utc::now(),
+                vm_state: "Paused".into(),
+                dir: PathBuf::from("/snap/unrelated"),
+                instance: Some("other".into()),
+                project: Some(app.config.projects_root.join("other")),
+                size_bytes: 0,
+                note: None,
+            },
+        ];
+        app.project_snapshot_selected = 9;
+        app.refresh_project_snapshots();
+
+        assert_eq!(app.project_snapshots, vec![0, 1]);
+        assert_eq!(
+            app.project_snapshot_selected, 1,
+            "a zoomed-out selection clamps to the scoped list"
+        );
+        let names: Vec<&str> = app
+            .project_snapshots
+            .iter()
+            .map(|&index| app.snapshots[index].name.as_str())
+            .collect();
+        assert_eq!(names, ["by-project", "by-instance"]);
+        assert_eq!(app.selected_snapshot().unwrap().name, "by-instance");
+    }
+
     #[test]
     fn project_snapshots_are_filtered_by_project() {
         let (_dir, mut app) = test_app();

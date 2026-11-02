@@ -571,4 +571,211 @@ mod tests {
             "{args:?}"
         );
     }
+
+    #[test]
+    fn boot_command_pins_the_kernel_rootfs_and_seed_disks() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
+        let args = strings(&cloud_hypervisor_args(
+            &config,
+            &instance,
+            &paths,
+            &instance.rootfs_path(&config),
+            None,
+            None,
+        ));
+        let index = |flag: &str| {
+            args.iter()
+                .position(|arg| arg == flag)
+                .unwrap_or_else(|| panic!("missing {flag} in {args:?}"))
+        };
+
+        let kernel = index("--kernel");
+        assert_eq!(args[kernel + 1], config.kernel_image.display().to_string());
+        assert!(args[kernel + 3].contains("root=/dev/vda1 rw"), "{args:?}");
+        assert!(args[kernel + 3].contains("reboot=k panic=1"), "{args:?}");
+
+        let disk = index("--disk");
+        assert_eq!(
+            args[disk + 1],
+            format!(
+                "path={},image_type=qcow2",
+                instance.rootfs_path(&config).display()
+            )
+        );
+        assert_eq!(args[disk + 2], cloud_init::disk_arg(&paths.cloud_init));
+
+        assert_eq!(args[index("--cpus") + 1], "boot=1,max=1");
+        assert_eq!(args[index("--memory") + 1], "size=128M,shared=on");
+        assert_eq!(
+            args[index("--fs") + 1],
+            format!(
+                "tag=workspace,socket={},num_queues=1,queue_size=1024",
+                paths.virtiofs_socket.display()
+            )
+        );
+        assert_eq!(
+            args[index("--serial") + 1],
+            format!("socket={}", paths.serial_socket.display())
+        );
+        assert_eq!(args[index("--console") + 1], "off");
+    }
+
+    #[test]
+    fn restore_args_keep_seccomp_and_drop_boot_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
+        let snapshot = SnapshotMeta {
+            name: "demo".into(),
+            created_at: chrono::Utc::now(),
+            vm_state: "Paused".into(),
+            dir: dir.path().join("snap"),
+            instance: Some("demo".into()),
+            project: None,
+            size_bytes: 0,
+            note: None,
+        };
+        let args = restore_args(&config, &paths, &snapshot);
+        let joined = strings(&args).join(" ");
+        assert!(joined.contains("--seccomp true"), "{joined}");
+        assert!(
+            joined.contains(&format!("--api-socket {}", paths.api_socket.display())),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(&format!("--log-file {}", paths.log.display())),
+            "{joined}"
+        );
+        assert!(joined.contains("--restore"), "{joined}");
+        assert!(joined.contains("resume=true"), "{joined}");
+        // The saved VM config owns these devices; passing them again would
+        // override the snapshot.
+        for forbidden in [
+            "--kernel",
+            "--disk",
+            "--fs",
+            "--net",
+            "--serial",
+            "--cpus",
+            "--memory",
+            "--landlock",
+        ] {
+            assert!(!joined.contains(forbidden), "{forbidden} in {joined}");
+        }
+    }
+
+    #[test]
+    fn restore_common_args_never_add_landlock_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
+
+        let restore = strings(&common_args(&config, &paths, false)).join(" ");
+        assert!(restore.contains("--seccomp true"), "{restore}");
+        assert!(!restore.contains("--landlock"), "{restore}");
+
+        let boot = strings(&common_args(&config, &paths, true)).join(" ");
+        assert!(boot.contains("--seccomp true"), "{boot}");
+        assert!(boot.contains("--landlock"), "{boot}");
+        assert!(
+            boot.contains(&format!(
+                "path={},access=rw",
+                SnapshotStore::new(&config.snapshots_dir)
+                    .staging_dir()
+                    .display()
+            )),
+            "{boot}"
+        );
+    }
+
+    #[test]
+    fn missing_virtiofsd_is_reported_before_anything_is_spawned() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
+
+        let err = virtiofs_config(&config, &paths, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("virtiofsd"), "{err}");
+        assert!(err.contains("install virtiofsd"), "{err}");
+        assert!(
+            !paths.virtiofs_socket.exists(),
+            "a failed preflight must not create a socket"
+        );
+        assert!(!paths.virtiofs_pid.exists());
+    }
+
+    #[test]
+    fn tap_pool_boundary_maps_to_the_last_slice_without_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
+        let last = crate::network::TAP_POOL - 1;
+        let lease = crate::network::Lease {
+            index: last,
+            instance: instance.name.clone(),
+            tap: crate::network::tap_name(last),
+            mac: crate::network::mac(last),
+            host_ip: crate::network::host_ip(last),
+            guest_ip: crate::network::guest_ip(last),
+        };
+        let joined = strings(&cloud_hypervisor_args(
+            &config,
+            &instance,
+            &paths,
+            &instance.rootfs_path(&config),
+            Some(&lease),
+            None,
+        ))
+        .join(" ");
+        assert!(
+            joined.contains("--net tap=hegn15,mac=52:54:00:00:00:10"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--landlock-rules path=/sys/devices/virtual/net/hegn15,access=r"),
+            "{joined}"
+        );
+        // The host TAP configuration belongs to `hegn network setup`, never the
+        // VMM command line.
+        for forbidden in ["ip=", "mask=", "gateway=", "dns="] {
+            assert!(!joined.contains(forbidden), "{forbidden} in {joined}");
+        }
+    }
+
+    #[test]
+    fn hardened_args_never_name_a_host_process_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
+        let joined = strings(&cloud_hypervisor_args(
+            &config,
+            &instance,
+            &paths,
+            &instance.rootfs_path(&config),
+            None,
+            None,
+        ))
+        .join(" ");
+        // hegn has no host-process fallback: boot always goes through the VMM.
+        for forbidden in [
+            "--backend",
+            "host-process",
+            "chroot=",
+            "init=/bin/sh",
+            "/bin/bash",
+        ] {
+            assert!(!joined.contains(forbidden), "{forbidden} in {joined}");
+        }
+        assert!(joined.contains("--kernel"), "{joined}");
+    }
 }

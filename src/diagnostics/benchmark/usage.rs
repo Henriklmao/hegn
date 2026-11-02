@@ -224,4 +224,52 @@ mod tests {
         assert_eq!(without_logs.files, 1);
         assert_eq!(without_logs.apparent, 2);
     }
+
+    #[test]
+    fn usage_can_exclude_a_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("state.json"), b"{}\n").unwrap();
+        fs::write(dir.path().join("other.json"), b"[]\n").unwrap();
+
+        let without_state = usage_excluding(dir.path(), Some(&dir.path().join("state.json")));
+        assert_eq!(without_state.files, 1);
+        assert_eq!(without_state.apparent, 3);
+    }
+
+    #[test]
+    fn usage_of_a_missing_or_empty_directory_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            usage_excluding(&dir.path().join("missing"), None),
+            Usage::default()
+        );
+        assert_eq!(usage_excluding(dir.path(), None), Usage::default());
+    }
+
+    #[test]
+    fn usage_does_not_follow_a_symlinked_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret"), vec![0u8; 1024]).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+
+        let usage = usage_excluding(dir.path(), None);
+        assert_eq!(usage, Usage::default());
+    }
+
+    #[test]
+    fn parse_kib_reads_the_leading_number() {
+        assert_eq!(parse_kib("1234 kB"), Some(1234 * 1024));
+        assert_eq!(parse_kib("  42"), Some(42 * 1024));
+        assert_eq!(parse_kib("0 kB"), Some(0));
+        assert_eq!(parse_kib("not a number"), None);
+        assert_eq!(parse_kib(""), None);
+    }
+
+    #[test]
+    fn process_alive_rejects_pid_zero_and_missing_processes() {
+        assert!(!process_alive(0));
+        assert!(!process_alive(u32::MAX - 1));
+        assert!(process_alive(std::process::id()));
+    }
 }

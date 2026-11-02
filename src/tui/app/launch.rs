@@ -225,6 +225,85 @@ mod tests {
     }
 
     #[test]
+    fn auto_launch_without_a_configured_command_is_a_no_op() {
+        let (_dir, mut app) = test_app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        app.config.launch.auto_start = true;
+        app.config.launch.default = None;
+
+        app.queue_auto_launch("demo", Harness::Opencode, &project, true);
+
+        assert!(app.pending_launch.is_none());
+        assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn an_unknown_project_launch_command_warns_instead_of_queueing() {
+        let (_dir, mut app) = test_app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        project::write_meta(
+            &project,
+            &ProjectMeta {
+                launch: Some("missing-command".into()),
+                ..ProjectMeta::default()
+            },
+        )
+        .unwrap();
+        app.config.launch.auto_start = true;
+
+        app.queue_auto_launch("demo", Harness::Opencode, &project, true);
+
+        assert!(app.pending_launch.is_none());
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("launch skipped"))
+        );
+    }
+
+    #[test]
+    fn request_launch_requires_a_selected_instance_and_resolves_its_harness() {
+        let (_dir, mut app) = test_app();
+        let effects = app.request_launch(None);
+        assert!(effects.is_empty());
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("no instance selected"))
+        );
+
+        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let mut instance = fake_instance(&app, "demo", inside.clone());
+        instance.harness = Harness::Opencode;
+        install_instances(&mut app, vec![instance]);
+        app.config.launch.default = Some(crate::agent::launch::HARNESS.to_string());
+        app.pending_launch = None;
+
+        let effects = app.request_launch(None);
+
+        let [
+            Effect::LaunchAgent {
+                spec,
+                instance,
+                project,
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("expected one launch effect, got {effects:?}");
+        };
+        assert_eq!(instance, "demo");
+        assert_eq!(project, &inside);
+        assert_eq!(spec.name, Harness::Opencode.label());
+        assert_eq!(spec.command, Harness::Opencode.command());
+        assert!(
+            app.pending_launch.is_none(),
+            "a manual launch clears the queue"
+        );
+    }
+
+    #[test]
     fn multi_agent_form_submits_clone_effect() {
         let (_dir, mut app) = test_app();
         app.attach_console(Box::new(FakeConsole::new("/projects/demo")));

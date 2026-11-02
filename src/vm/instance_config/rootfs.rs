@@ -124,4 +124,95 @@ mod tests {
         // A second call reuses the same private copy.
         assert_eq!(instance.prepare_rootfs(&cfg).unwrap(), rootfs);
     }
+
+    #[test]
+    fn rootfs_path_uses_the_instance_directory_and_configured_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.rootfs_format = crate::config::RootfsFormat::Raw;
+        let instance = crate::vm::instance_config::InstanceConfig {
+            name: "demo".into(),
+            project: dir.path().join("project"),
+            workspace: dir.path().join("project"),
+            ..Default::default()
+        };
+        assert_eq!(
+            instance.rootfs_path(&cfg),
+            cfg.instances_dir.join("demo/rootfs.raw")
+        );
+        cfg.rootfs_format = crate::config::RootfsFormat::Qcow2;
+        assert_eq!(
+            instance.rootfs_path(&cfg),
+            cfg.instances_dir.join("demo/rootfs.qcow2")
+        );
+        // An explicit per-instance image always wins.
+        let mut instance = instance;
+        instance.rootfs_image = Some(dir.path().join("explicit.img"));
+        assert_eq!(instance.rootfs_path(&cfg), dir.path().join("explicit.img"));
+    }
+
+    #[test]
+    fn prepare_rootfs_reports_a_missing_base_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.rootfs_image = dir.path().join("missing-base.qcow2");
+        cfg.cloud_init = false;
+        let store = crate::vm::instance_config::InstanceStore::new(cfg.clone());
+        let project = project(dir.path(), "demo");
+        let instance = store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+
+        let err = instance.prepare_rootfs(&cfg).unwrap_err().to_string();
+        assert!(err.contains("base rootfs"), "{err}");
+        assert!(!instance.rootfs_path(&cfg).exists());
+    }
+
+    #[test]
+    fn prepare_rootfs_reports_a_missing_explicit_instance_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.rootfs_image = dir.path().join("base.qcow2");
+        cfg.cloud_init = false;
+        fs::write(&cfg.rootfs_image, b"base").unwrap();
+        let store = crate::vm::instance_config::InstanceStore::new(cfg.clone());
+        let project = project(dir.path(), "demo");
+        let mut instance = store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+        instance.rootfs_image = Some(dir.path().join("gone.qcow2"));
+
+        let err = instance.prepare_rootfs(&cfg).unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        assert_eq!(fs::read(&cfg.rootfs_image).unwrap(), b"base");
+    }
+
+    #[test]
+    fn prepared_rootfs_is_private_and_leaves_no_partial_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.rootfs_image = dir.path().join("base.img");
+        cfg.cloud_init = false;
+        fs::write(&cfg.rootfs_image, b"base").unwrap();
+        let store = crate::vm::instance_config::InstanceStore::new(cfg.clone());
+        let project = project(dir.path(), "demo");
+        let instance = store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+        let rootfs = instance.prepare_rootfs(&cfg).unwrap();
+
+        assert_eq!(
+            fs::metadata(&rootfs).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let leftovers: Vec<_> = fs::read_dir(rootfs.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".rootfs.part-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
 }

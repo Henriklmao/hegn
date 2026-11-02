@@ -169,4 +169,100 @@ mod tests {
         assert!(profile.validate().is_ok());
         assert!(shell_quote("sk-'quoted'").contains(r#"'\''"#));
     }
+
+    #[test]
+    fn guest_targets_reject_traversal_relative_and_disallowed_roots() {
+        for bad in [
+            "",
+            "/",
+            "root/x",
+            "~/.config/x",
+            "/root",
+            "/root/",
+            "/root//x",
+            "/root/../etc/passwd",
+            "/tmp/x",
+            "/usr/bin/x",
+            "/etc",
+            "/root/x y",
+            "/root/x;reboot",
+            "/root/x\nYAML",
+        ] {
+            assert!(
+                validate_guest_path(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+
+        let too_long = format!("/root/{}", "a".repeat(MAX_TARGET_LEN));
+        assert!(validate_guest_path(&too_long).is_err());
+    }
+
+    #[test]
+    fn guest_targets_accept_the_documented_roots() {
+        for good in [
+            "/root/.config/opencode/opencode.json",
+            "/home/user/.config/x",
+            "/etc/profile.d/hegn.sh",
+            "/usr/local/bin/tool",
+            "/opt/vendor/tool",
+            "/workspace/project",
+        ] {
+            assert!(
+                validate_guest_path(good).is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn modes_must_be_three_or_four_octal_digits() {
+        for good in ["000", "600", "0600", "755", "0755", "7777"] {
+            assert!(validate_mode(good).is_ok(), "{good:?} must be accepted");
+        }
+        for bad in ["", "77", "06000", "0899", "abcd", "-600", "0o600"] {
+            assert!(validate_mode(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn environment_names_and_values_are_strict() {
+        for good in ["_", "_A", "A1", "OPENAI_API_KEY", "a_b_c"] {
+            assert!(validate_env(good, "value").is_ok(), "{good:?}");
+        }
+        for bad in ["", "1A", "A-B", "A B", "A.B", "A\nB", "A\u{0}B"] {
+            assert!(validate_env(bad, "value").is_err(), "{bad:?}");
+        }
+        for bad in ["line\nbreak", "carriage\rreturn", "nul\u{0}byte"] {
+            assert!(validate_env("OK", bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_env("OK", &"x".repeat(MAX_ENV_VALUE)).is_ok());
+        assert!(validate_env("OK", &"x".repeat(MAX_ENV_VALUE + 1)).is_err());
+    }
+
+    #[test]
+    fn sources_must_be_absolute_and_free_of_nul_bytes() {
+        assert!(validate_source(Path::new("relative")).is_err());
+        assert!(validate_source(Path::new("/")).is_err());
+        let nul = PathBuf::from("/tmp/profile\u{0}name");
+        assert!(validate_source(&nul).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("config.toml");
+        std::fs::write(&real, b"x").unwrap();
+        assert!(validate_source(&real).is_ok());
+        assert!(validate_source(&dir.path().join("missing")).is_ok());
+    }
+
+    #[test]
+    fn expand_home_only_touches_a_leading_tilde() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            expand_home(Path::new("~/.config/x")),
+            home.join(".config/x")
+        );
+        assert_eq!(expand_home(Path::new("/tmp/x")), PathBuf::from("/tmp/x"));
+        assert_eq!(expand_home(Path::new("a/~/b")), PathBuf::from("a/~/b"));
+        assert_eq!(expand_home(Path::new("~user/x")), PathBuf::from("~user/x"));
+    }
 }

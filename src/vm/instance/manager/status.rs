@@ -153,7 +153,33 @@ impl InstanceManager {
 
 #[cfg(test)]
 mod tests {
-    use crate::vm::instance::test_support::{config_with_assets, manager};
+    use chrono::Utc;
+
+    use super::*;
+    use crate::config::Harness;
+    use crate::vm::instance::SessionRecord;
+    use crate::vm::instance::test_support::{config_with_assets, instance_for, manager};
+
+    fn write_session(manager: &InstanceManager, vm_pid: u32) {
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        let project = manager.instance().project.clone();
+        let record = SessionRecord {
+            project: project.clone(),
+            workspace: project,
+            instance: manager.instance().name.clone(),
+            harness: Harness::Shell,
+            started_at: Utc::now(),
+            vm_pid,
+            vm_binary: None,
+            relay_pid: 0,
+            virtiofs_pid: 0,
+            profile_virtiofs_pid: 0,
+            boot_args: String::new(),
+            serial_log: None,
+        };
+        std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
+    }
 
     #[test]
     fn status_without_session_is_stopped() {
@@ -175,5 +201,115 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["state"], "stopped");
         assert_eq!(json["backend"], "cloud-hypervisor");
+    }
+
+    #[test]
+    fn status_reports_an_unreadable_session_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(config_with_assets(dir.path()), dir.path());
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        std::fs::write(&paths.session, b"{not json").unwrap();
+
+        let report = manager.status().unwrap();
+        assert_eq!(report.state, "failed");
+        assert!(
+            report
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("unreadable")),
+            "{:?}",
+            report.note
+        );
+        assert!(paths.session.exists(), "diagnostic state must be preserved");
+    }
+
+    #[test]
+    fn status_notes_a_session_whose_api_socket_disappeared() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(config_with_assets(dir.path()), dir.path());
+        write_session(&manager, 0);
+
+        let report = manager.status().unwrap();
+        assert_eq!(report.state, "stopped");
+        assert!(
+            report
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("API socket is gone")),
+            "{:?}",
+            report.note
+        );
+        assert_eq!(report.vm_pid, Some(0));
+    }
+
+    #[test]
+    fn api_operations_require_a_socket_and_never_boot_a_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(config_with_assets(dir.path()), dir.path());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for err in [
+            runtime.block_on(manager.pause()).unwrap_err(),
+            runtime.block_on(manager.resume()).unwrap_err(),
+            runtime.block_on(manager.instance_info()).unwrap_err(),
+        ] {
+            let err = err.to_string();
+            assert!(err.contains("no Cloud Hypervisor API socket"), "{err}");
+        }
+        assert!(!manager.paths().api_socket.exists());
+        assert!(!manager.is_running());
+    }
+
+    #[test]
+    fn running_is_false_without_an_api_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(config_with_assets(dir.path()), dir.path());
+        assert!(!manager.paths().api_socket.exists());
+        assert!(!manager.running());
+    }
+
+    #[test]
+    fn status_exposes_the_profile_bundle_only_when_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(config_with_assets(dir.path()), dir.path());
+        let bundle = manager
+            .paths()
+            .run_dir
+            .parent()
+            .unwrap()
+            .join("profile/bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        assert_eq!(manager.status().unwrap().profile_share, None);
+
+        std::fs::write(bundle.join("manifest"), b"{}").unwrap();
+        assert_eq!(manager.status().unwrap().profile_share, Some(bundle));
+    }
+
+    #[test]
+    fn status_exposes_local_endpoints_only_with_a_network_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.local_endpoints = vec![crate::config::LocalEndpoint {
+            name: "ollama".into(),
+            port: 11434,
+        }];
+        let mut instance = instance_for(&dir.path().join("project"));
+        instance.network_index = Some(2);
+        let manager = InstanceManager::new(config, instance);
+
+        let report = manager.status().unwrap();
+        assert_eq!(report.local_endpoints, vec!["http://10.213.0.9:11434"]);
+
+        let mut instance = manager.instance().clone();
+        instance.network_index = None;
+        let manager = InstanceManager::new(manager_config(&dir), instance);
+        assert!(manager.status().unwrap().local_endpoints.is_empty());
+    }
+
+    fn manager_config(dir: &tempfile::TempDir) -> crate::config::Config {
+        config_with_assets(dir.path())
     }
 }

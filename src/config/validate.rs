@@ -226,4 +226,140 @@ mod tests {
         config.network = NetworkMode::Off;
         assert!(config.validate().is_err(), "endpoints need a network");
     }
+
+    fn endpoint(name: &str, port: u16) -> LocalEndpoint {
+        LocalEndpoint {
+            name: name.into(),
+            port,
+        }
+    }
+
+    #[test]
+    fn endpoint_ports_must_be_unprivileged() {
+        assert!(validate_local_endpoints(&[endpoint("lowest", 1024)]).is_ok());
+        assert!(validate_local_endpoints(&[endpoint("highest", 65535)]).is_ok());
+        assert!(validate_local_endpoints(&[endpoint("zero", 0)]).is_err());
+        assert!(validate_local_endpoints(&[endpoint("reserved", 1023)]).is_err());
+    }
+
+    #[test]
+    fn endpoint_names_are_bounded_and_case_insensitively_unique() {
+        let longest = "a".repeat(32);
+        assert!(validate_local_endpoints(&[endpoint(&longest, 11434)]).is_ok());
+        assert!(validate_local_endpoints(&[endpoint(&"a".repeat(33), 11434)]).is_err());
+        assert!(validate_local_endpoints(&[endpoint("", 11434)]).is_err());
+        assert!(validate_local_endpoints(&[endpoint("bad name", 11434)]).is_err());
+        assert!(
+            validate_local_endpoints(&[endpoint("ollama", 11434), endpoint("OLLAMA", 8080)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn endpoint_ports_are_sorted_and_deduplicated() {
+        let mut config = Config::default();
+        config.local_endpoints = vec![
+            endpoint("beta", 11434),
+            endpoint("alpha", 8080),
+            endpoint("gamma", 11434),
+        ];
+        assert!(config.validate().is_ok(), "distinct names may share a port");
+        assert_eq!(config.endpoint_ports(), vec![8080, 11434]);
+    }
+
+    #[test]
+    fn package_names_reject_shell_and_empty_values() {
+        let longest = "x".repeat(64);
+        for name in [
+            "ripgrep",
+            "fd-find",
+            "g++",
+            "python3.12",
+            "libfoo_bar",
+            longest.as_str(),
+        ] {
+            assert!(safe_package_name(name), "{name:?} must be valid");
+        }
+        let too_long = "x".repeat(65);
+        for name in ["", "-rm", "a b", "pkg\nname", "ümlaut", too_long.as_str()] {
+            assert!(!safe_package_name(name), "{name:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn resource_and_guest_path_boundaries_are_enforced() {
+        let mut config = Config::default();
+        config.vcpus = 32;
+        config.memory_mib = 128;
+        config.shared_tag = "a".repeat(36);
+        config.guest_mount = "/w".into();
+        config.root_device = "/dev/vda".into();
+        assert!(config.validate().is_ok());
+
+        config.vcpus = 33;
+        assert!(config.validate().is_err(), "vcpus above 32 are rejected");
+        config.vcpus = 2;
+        config.memory_mib = 127;
+        assert!(
+            config.validate().is_err(),
+            "memory below 128 MiB is rejected"
+        );
+        config.memory_mib = 2048;
+        config.shared_tag = "a".repeat(37);
+        assert!(
+            config.validate().is_err(),
+            "tags above 36 bytes are rejected"
+        );
+        config.shared_tag = "workspace".into();
+        config.guest_mount = "/".into();
+        assert!(
+            config.validate().is_err(),
+            "the filesystem root is rejected"
+        );
+    }
+
+    #[test]
+    fn comma_paths_and_insecure_image_sources_are_rejected() {
+        let base = Config::default();
+
+        let mut config = base.clone();
+        config.state_dir = base.state_dir.join("a,b");
+        assert!(config.validate().is_err(), "state_dir commas are rejected");
+
+        let mut config = base.clone();
+        config.snapshots_dir = base.snapshots_dir.join("a,b");
+        assert!(
+            config.validate().is_err(),
+            "snapshots_dir commas are rejected"
+        );
+
+        let mut config = base.clone();
+        config.instances_dir = base.instances_dir.join("a,b");
+        assert!(
+            config.validate().is_err(),
+            "instances_dir commas are rejected"
+        );
+
+        let mut config = base.clone();
+        config.rootfs_image = base.rootfs_image.join("a,b");
+        assert!(
+            config.validate().is_err(),
+            "rootfs_image commas are rejected"
+        );
+
+        let mut config = base.clone();
+        config.rootfs_sha256 = "not-a-digest".into();
+        assert!(config.validate().is_err(), "invalid rootfs digests fail");
+
+        let mut config = base.clone();
+        config.rootfs_url = "http://example.test/rootfs".into();
+        assert!(config.validate().is_err(), "rootfs URLs must use https");
+
+        let mut config = base;
+        config.root_device = "/dev/vda,readonly".into();
+        assert!(
+            config.validate().is_err(),
+            "root_device commas are rejected"
+        );
+    }
 }

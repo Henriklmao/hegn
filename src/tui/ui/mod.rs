@@ -71,7 +71,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(area);
 
@@ -134,6 +134,13 @@ mod tests {
     use crate::config::form::ConfigForm;
     use crate::tui::app::{CreateProjectForm, HelpState, Modal};
     use crate::tui::ui::test_support::*;
+
+    #[test]
+    fn footer_hint_row_is_visible() {
+        let (_dir, app) = app();
+        let (text, _) = render(&app);
+        assert!(text.contains("/ filter"), "{text}");
+    }
 
     #[test]
     fn tiny_terminals_render_modals_without_panicking() {

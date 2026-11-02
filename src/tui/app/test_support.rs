@@ -6,6 +6,8 @@
 #![allow(clippy::field_reassign_with_default)]
 
 pub(super) use std::path::PathBuf;
+pub(super) use std::sync::atomic::{AtomicBool, Ordering};
+pub(super) use std::sync::{Arc, Mutex};
 
 pub(super) use crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -81,6 +83,82 @@ impl TerminalConsole for FakeConsole {
 
     fn instance_name(&self) -> &str {
         "fake"
+    }
+}
+
+/// Shared handle for a [`RecordingConsole`], so a test can inspect what the
+/// UI actually forwarded to the guest after the console was boxed.
+#[derive(Clone, Default)]
+pub(super) struct ConsoleLog {
+    sent: Arc<Mutex<Vec<u8>>>,
+    output: Arc<Mutex<Vec<Vec<u8>>>>,
+    exited: Arc<AtomicBool>,
+}
+
+impl ConsoleLog {
+    pub(super) fn console(&self, project: impl Into<PathBuf>) -> Box<dyn TerminalConsole> {
+        self.console_named(project, "fake")
+    }
+
+    pub(super) fn console_named(
+        &self,
+        project: impl Into<PathBuf>,
+        name: &str,
+    ) -> Box<dyn TerminalConsole> {
+        Box::new(RecordingConsole {
+            log: self.clone(),
+            project: project.into(),
+            name: name.to_string(),
+        })
+    }
+
+    pub(super) fn sent(&self) -> Vec<u8> {
+        self.sent.lock().unwrap().clone()
+    }
+
+    pub(super) fn sent_text(&self) -> String {
+        String::from_utf8_lossy(&self.sent()).into_owned()
+    }
+
+    pub(super) fn push_output(&self, bytes: &[u8]) {
+        self.output.lock().unwrap().push(bytes.to_vec());
+    }
+
+    pub(super) fn set_exited(&self, exited: bool) {
+        self.exited.store(exited, Ordering::SeqCst);
+    }
+}
+
+pub(super) struct RecordingConsole {
+    log: ConsoleLog,
+    project: PathBuf,
+    name: String,
+}
+
+impl TerminalConsole for RecordingConsole {
+    fn send(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.log.sent.lock().unwrap().extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn drain(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut *self.log.output.lock().unwrap())
+    }
+
+    fn is_exited(&mut self) -> bool {
+        self.log.exited.load(Ordering::SeqCst)
+    }
+
+    fn project(&self) -> &std::path::Path {
+        &self.project
+    }
+
+    fn label(&self) -> &str {
+        "recording · serial"
+    }
+
+    fn instance_name(&self) -> &str {
+        &self.name
     }
 }
 

@@ -106,4 +106,39 @@ mod tests {
             Some(fallback)
         );
     }
+
+    #[test]
+    fn resolve_binary_prefers_path_over_fallbacks() {
+        let path_dir = tempfile::tempdir().unwrap();
+        let fallback_dir = tempfile::tempdir().unwrap();
+        let from_path = path_dir.path().join("hegn-path-tool");
+        let from_fallback = fallback_dir.path().join("hegn-path-tool");
+        fs::write(&from_path, b"").unwrap();
+        fs::write(&from_fallback, b"").unwrap();
+
+        let path = std::env::join_paths([path_dir.path()]).unwrap();
+        let path_str = path.to_str().unwrap();
+        let fallback_str = from_fallback.to_str().unwrap();
+
+        let _lock = crate::config::env::env_lock();
+        let _guard = crate::config::env::EnvVarGuard::set(&["PATH"], &[("PATH", path_str)]);
+
+        assert_eq!(
+            resolve_binary(Path::new("hegn-path-tool"), &[fallback_str]),
+            Some(from_path)
+        );
+    }
+
+    #[test]
+    fn resolve_binary_rejects_directories_and_missing_names() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_binary(dir.path(), &[]), None);
+
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let path_str = path.to_str().unwrap();
+        let _lock = crate::config::env::env_lock();
+        let _guard = crate::config::env::EnvVarGuard::set(&["PATH"], &[("PATH", path_str)]);
+
+        assert_eq!(resolve_binary(Path::new("hegn-missing-tool"), &[]), None);
+    }
 }

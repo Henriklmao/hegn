@@ -65,4 +65,23 @@ mod tests {
         assert!(err.to_string().contains("refusing to remove"), "{err}");
         assert!(outside.exists());
     }
+
+    #[test]
+    fn remove_temp_project_refuses_a_symlinked_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            projects_root: dir.path().join("projects"),
+            ..Config::default()
+        };
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), b"x").unwrap();
+        fs::create_dir_all(&config.projects_root).unwrap();
+        let link = config.projects_root.join("hegn-benchmark-link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let err = remove_temp_project(&config, &link).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        assert!(outside.join("keep").exists());
+    }
 }

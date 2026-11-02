@@ -182,9 +182,31 @@ pub(crate) fn render_delete_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Harness;
     use crate::project::GitSummary;
     use crate::tui::app::Modal;
     use crate::tui::ui::test_support::*;
+    use crate::vm::instance::InstanceSummary;
+    use std::path::PathBuf;
+
+    fn instance(app: &App, name: &str, state: &str) -> InstanceSummary {
+        InstanceSummary {
+            name: name.into(),
+            project: PathBuf::from("/projects/demo"),
+            workspace: PathBuf::from(format!("/workspaces/{name}")),
+            harness: Harness::Opencode,
+            ephemeral: false,
+            source_instance: None,
+            created_at: chrono::Utc::now(),
+            state: state.into(),
+            vm_pid: None,
+            serial_log: None,
+            config_path: app.config.instances_dir.join(name).join("hegn.toml"),
+            vcpus: 2,
+            memory_mib: 2048,
+            error: None,
+        }
+    }
 
     #[test]
     fn delete_project_modal_shows_git_status_and_file_choices() {
@@ -212,6 +234,106 @@ mod tests {
             hits.footer
                 .iter()
                 .any(|hit| hit.action == ActionId::Confirm)
+        );
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::DeleteProjectFiles)
+        );
+    }
+
+    #[test]
+    fn delete_instance_confirm_stage_names_the_instance_and_stop_first() {
+        let (_dir, mut app) = app();
+        app.modal = Some(Modal::DeleteInstance(DeleteInstanceModal {
+            instance: instance(&app, "build", "running"),
+            stage: DeleteInstanceStage::Confirm,
+            error: None,
+            scroll: 0,
+        }));
+        let (text, hits) = render(&app);
+
+        assert!(text.contains("delete instance"), "{text}");
+        assert!(text.contains("Delete instance 'build'"), "{text}");
+        assert!(text.contains("Project: /projects/demo"), "{text}");
+        assert!(text.contains("Workspace: /workspaces/build"), "{text}");
+        assert!(text.contains("The VM is stopped first."), "{text}");
+        assert!(text.contains("<y> Continue"), "{text}");
+        assert!(text.contains("<n> Cancel"), "{text}");
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::Confirm)
+        );
+        assert!(hits.footer.iter().any(|hit| hit.action == ActionId::Cancel));
+        assert!(
+            !hits
+                .footer
+                .iter()
+                .any(|hit| hit.action == ActionId::KeepFiles),
+            "the file question must not appear before the first confirmation"
+        );
+    }
+
+    #[test]
+    fn delete_instance_files_stage_offers_keep_files_and_shows_errors() {
+        let (_dir, mut app) = app();
+        app.modal = Some(Modal::DeleteInstance(DeleteInstanceModal {
+            instance: instance(&app, "build", "stopped"),
+            stage: DeleteInstanceStage::Files,
+            error: Some("workspace is still mounted".into()),
+            scroll: 0,
+        }));
+        let (text, hits) = render(&app);
+
+        assert!(
+            text.contains("Also delete the cloned workspace files?"),
+            "{text}"
+        );
+        assert!(text.contains("Choose 'Keep files'"), "{text}");
+        assert!(text.contains("<y> Delete files"), "{text}");
+        assert!(text.contains("<n> Keep files"), "{text}");
+        assert!(text.contains("<Esc> Cancel"), "{text}");
+        assert!(text.contains("workspace is still mounted"), "{text}");
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::KeepFiles)
+        );
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == ActionId::Confirm)
+        );
+        assert!(hits.footer.iter().any(|hit| hit.action == ActionId::Cancel));
+    }
+
+    #[test]
+    fn delete_project_modal_explains_a_missing_repository_and_kept_files() {
+        let (_dir, mut app) = app();
+        let project = app.selected_project().cloned().unwrap();
+        app.modal = Some(Modal::DeleteProject(DeleteProjectModal {
+            project,
+            git: GitSummary {
+                is_repo: false,
+                error: Some("git unavailable".into()),
+                ..GitSummary::default()
+            },
+            instances: Vec::new(),
+            scroll: 0,
+        }));
+        let (text, hits) = render(&app);
+
+        assert!(
+            text.contains("not a git repository (git unavailable)"),
+            "{text}"
+        );
+        assert!(!text.contains("uncommitted changes"), "{text}");
+        assert!(!text.contains("Instances to remove"), "{text}");
+        assert!(text.contains("keep every project file"), "{text}");
+        assert!(
+            text.contains("Imported projects only lose their picker symlink"),
+            "{text}"
         );
         assert!(
             hits.footer

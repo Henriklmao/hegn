@@ -141,7 +141,7 @@ pub(crate) fn render_security(
 
 #[cfg(test)]
 mod tests {
-    use crate::security::SecurityEngine;
+    use crate::security::{Decision, Finding, Inspection, SecurityEngine, Severity};
     use crate::tui::app::{Modal, SecurityPrompt};
     use crate::tui::ui::test_support::*;
     use std::path::PathBuf;
@@ -162,5 +162,97 @@ mod tests {
         assert!(text.contains("BLOCKED"));
         assert!(text.contains("rm -rf /workspace"));
         assert!(text.contains("workspace"));
+    }
+
+    #[test]
+    fn security_modal_review_lists_findings_and_destructive_warning() {
+        let (_dir, mut app) = app();
+        app.modal = Some(Modal::Security(SecurityPrompt {
+            command: "git reset --hard".into(),
+            project: PathBuf::from("/projects/demo"),
+            inspection: Inspection {
+                decision: Decision::Warn,
+                findings: vec![
+                    Finding {
+                        rule: "git.reset-hard".into(),
+                        severity: Severity::Critical,
+                        title: "Discards uncommitted work".into(),
+                        description: "Everything staged is lost".into(),
+                    },
+                    Finding {
+                        rule: "git.history".into(),
+                        severity: Severity::Medium,
+                        title: "Rewrites local history".into(),
+                        description: String::new(),
+                    },
+                ],
+                destructive: true,
+                suggest_checkpoint: true,
+            },
+            error: None,
+            scroll: 0,
+        }));
+        let (text, hits) = render(&app);
+
+        assert!(text.contains("REVIEW"), "{text}");
+        assert!(!text.contains("BLOCKED"), "{text}");
+        assert!(text.contains("[CRITICAL]"), "{text}");
+        assert!(text.contains("[MEDIUM]"), "{text}");
+        assert!(text.contains("git.reset-hard"), "{text}");
+        assert!(text.contains("Discards uncommitted work"), "{text}");
+        assert!(text.contains("Everything staged is lost"), "{text}");
+        assert!(text.contains("Rewrites local history"), "{text}");
+        assert!(
+            text.contains("Destructive operation: create a git checkpoint"),
+            "{text}"
+        );
+        assert!(text.contains("<a> Allow once"), "{text}");
+        assert!(text.contains("<c> Checkpoint + allow"), "{text}");
+        assert!(text.contains("<d> Deny"), "{text}");
+        assert!(
+            hits.footer
+                .iter()
+                .any(|hit| hit.action == crate::tui::app::ActionId::Checkpoint)
+        );
+    }
+
+    #[test]
+    fn security_modal_clips_long_findings_and_scrolls_with_an_error() {
+        let (_dir, mut app) = app();
+        let long = "x".repeat(200);
+        app.modal = Some(Modal::Security(SecurityPrompt {
+            command: format!("rm -rf {long}"),
+            project: PathBuf::from("/projects/demo"),
+            inspection: Inspection {
+                decision: Decision::Block,
+                findings: (0..6)
+                    .map(|index| Finding {
+                        rule: format!("rule.{index}"),
+                        severity: Severity::High,
+                        title: format!("Long finding {index} {long}"),
+                        description: format!("Description {index} {long}"),
+                    })
+                    .collect(),
+                destructive: true,
+                suggest_checkpoint: false,
+            },
+            error: Some("checkpoint repository is dirty".into()),
+            scroll: 20,
+        }));
+        let (text, hits) = render_sized(&app, 60, 20);
+
+        assert!(text.contains("checkpoint failed"), "{text}");
+        assert!(
+            text.contains("checkpoint failed: checkpoint repository"),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&"x".repeat(120)),
+            "the long command and findings must be ellipsized"
+        );
+        assert!(
+            hits.modal_scroll.is_some(),
+            "the overflowing findings list needs a scrollbar"
+        );
     }
 }

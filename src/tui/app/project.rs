@@ -213,6 +213,109 @@ mod tests {
     use crate::tui::app::test_support::*;
 
     #[test]
+    fn normal_mode_forwards_nothing_to_the_guest() {
+        let (_dir, mut app) = test_app();
+        let log = ConsoleLog::default();
+        app.attach_console(log.console("/projects/demo"));
+        assert_eq!(app.terminal_mode, TerminalMode::Normal);
+        assert!(app.terminal_focus);
+
+        // No `i`/`a` in this command: those keys intentionally switch modes.
+        for c in "rm -rf /tmp".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Backspace));
+
+        assert!(log.sent().is_empty(), "normal mode is not a passthrough");
+        assert!(app.input.is_empty());
+        assert_eq!(app.terminal_mode, TerminalMode::Normal);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn insert_mode_buffers_input_and_only_enter_sends_it() {
+        let (_dir, mut app) = test_app();
+        let log = ConsoleLog::default();
+        app.attach_console(log.console("/projects/demo"));
+
+        app.handle_key(key(KeyCode::Char('i')));
+        for c in "echo hi".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.input, "echo hi");
+        assert!(
+            log.sent().is_empty(),
+            "typing is not forwarded before Enter"
+        );
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.input.is_empty());
+        assert_eq!(log.sent_text(), "echo hi\r");
+        assert!(app.modal.is_none(), "a benign command is not flagged");
+    }
+
+    #[test]
+    fn raw_mode_forwards_keys_without_buffering_or_inspection() {
+        let (_dir, mut app) = test_app();
+        let log = ConsoleLog::default();
+        app.attach_console(log.console("/projects/demo"));
+        app.terminal_mode = TerminalMode::Raw;
+
+        for c in "ls".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.input.is_empty());
+        assert_eq!(log.sent(), b"ls\r");
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn detach_key_never_reaches_the_guest() {
+        let (_dir, mut app) = test_app();
+        let log = ConsoleLog::default();
+        app.attach_console(log.console("/projects/demo"));
+        app.terminal_mode = TerminalMode::Insert;
+
+        let effects = app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+
+        assert!(effects.is_empty());
+        assert_eq!(app.screen, Screen::Dashboard);
+        assert!(
+            log.sent().is_empty(),
+            "Ctrl-B is a UI chord, not guest input"
+        );
+        assert!(
+            app.session_active(),
+            "detaching the view keeps the VM alive"
+        );
+    }
+
+    #[test]
+    fn insert_ctrl_c_clears_the_buffer_and_sends_an_interrupt() {
+        let (_dir, mut app) = test_app();
+        let log = ConsoleLog::default();
+        app.attach_console(log.console("/projects/demo"));
+        app.terminal_mode = TerminalMode::Insert;
+        app.input = "rm -rf /workspace".into();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(
+            app.input.is_empty(),
+            "a secret half-typed command is dropped"
+        );
+        assert_eq!(log.sent(), vec![0x03]);
+        assert!(
+            app.modal.is_none(),
+            "Ctrl-C never inspects the buffer as a command"
+        );
+        assert_eq!(app.screen, Screen::Project);
+    }
+
+    #[test]
     fn benign_submit_without_session_warns_instead_of_crashing() {
         let (_dir, mut app) = test_app();
         app.screen = Screen::Project;

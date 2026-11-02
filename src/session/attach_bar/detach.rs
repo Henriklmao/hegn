@@ -39,4 +39,37 @@ mod tests {
             KeyModifiers::NONE
         )));
     }
+
+    #[test]
+    fn other_keys_never_detach() {
+        for code in [
+            KeyCode::Char('c'),
+            KeyCode::Char('d'),
+            KeyCode::Char('z'),
+            KeyCode::Char('B'),
+            KeyCode::Char(']'),
+            KeyCode::Esc,
+            KeyCode::Enter,
+            KeyCode::F(1),
+        ] {
+            assert!(
+                !detach_requested(KeyEvent::new(code, KeyModifiers::CONTROL)),
+                "{code:?} must not detach"
+            );
+        }
+    }
+
+    #[test]
+    fn detach_needs_the_control_modifier() {
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::ALT, KeyModifiers::SHIFT] {
+            assert!(!detach_requested(KeyEvent::new(
+                KeyCode::Char('b'),
+                modifiers
+            )));
+            assert!(!detach_requested(KeyEvent::new(
+                KeyCode::Char('5'),
+                modifiers
+            )));
+        }
+    }
 }

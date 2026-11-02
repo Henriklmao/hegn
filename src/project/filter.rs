@@ -128,4 +128,43 @@ mod tests {
         assert_eq!(filtered[0], 1);
         assert!(filter_projects(&projects, "zzz").is_empty());
     }
+
+    #[test]
+    fn fuzzy_score_handles_empty_long_and_prefixed_needles() {
+        assert_eq!(fuzzy_score("", "anything"), Some(0));
+        assert_eq!(fuzzy_score("longer-than-haystack", "short"), None);
+        assert!(fuzzy_score("ALPHA", "alpha").is_some());
+
+        let prefix = fuzzy_score("al", "alpha").unwrap();
+        let middle = fuzzy_score("al", "xalpha").unwrap();
+        assert!(prefix > middle, "prefix {prefix} <= middle {middle}");
+    }
+
+    #[test]
+    fn filter_projects_ranks_name_matches_and_keeps_input_order_for_ties() {
+        let project = |name: &str, path: &str| Project {
+            name: name.into(),
+            path: PathBuf::from(path),
+            git: GitSummary::default(),
+            last_opened: None,
+        };
+        let projects = vec![
+            project("alpha", "/work/alpha"),
+            project("beta", "/work/beta"),
+            project("workbench", "/p/zzz"),
+        ];
+
+        // A name match outranks path-only matches.
+        let filtered = filter_projects(&projects, "work");
+        assert_eq!(filtered[0], 2);
+        assert_eq!(filtered.len(), 3);
+
+        // Equal scores keep the original order.
+        let path_only = filter_projects(&projects[..2], "work");
+        assert_eq!(path_only, vec![0, 1]);
+
+        // Whitespace-only queries behave like an empty query (name order here).
+        let blank = filter_projects(&projects, "   ");
+        assert_eq!(blank, vec![0, 1, 2]);
+    }
 }

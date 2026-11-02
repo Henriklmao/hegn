@@ -102,3 +102,80 @@ pub(super) fn copy_file_private(source: &Path, dest: &Path) -> Result<()> {
         .with_context(|| format!("failed to set permissions on {}", dest.display()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn write_private_creates_0600_files_and_refuses_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        write_private(&path, b"secret").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"secret");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"do not touch").unwrap();
+        let link = dir.path().join("evil");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(write_private(&link, b"overwrite").is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
+    }
+
+    #[test]
+    fn secure_dir_is_private_and_rejects_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle");
+        secure_dir(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let trap = dir.path().join("trap");
+        fs::create_dir(&trap).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&trap, &link).unwrap();
+        assert!(secure_dir(&link).is_err());
+    }
+
+    #[test]
+    fn ensure_real_dir_replaces_a_planted_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let trap = dir.path().join("trap");
+        fs::create_dir(&trap).unwrap();
+        fs::write(trap.join("do-not-touch"), b"host").unwrap();
+        let planted = dir.path().join("files");
+        std::os::unix::fs::symlink(&trap, &planted).unwrap();
+
+        ensure_real_dir(&planted).unwrap();
+        let metadata = fs::symlink_metadata(&planted).unwrap();
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        assert_eq!(fs::read(trap.join("do-not-touch")).unwrap(), b"host");
+        assert!(!trap.join("new").exists());
+    }
+
+    #[test]
+    fn copy_file_private_never_writes_through_a_destination_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::write(&source, b"payload").unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"host").unwrap();
+        let dest = dir.path().join("dest");
+        std::os::unix::fs::symlink(&victim, &dest).unwrap();
+
+        copy_file_private(&source, &dest).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"host");
+        let metadata = fs::symlink_metadata(&dest).unwrap();
+        assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+        assert_eq!(metadata.uid(), fs::metadata(&source).unwrap().uid());
+        assert_eq!(fs::read(&dest).unwrap(), b"payload");
+        assert_eq!(metadata.permissions().mode() & 0o600, 0o600);
+    }
+}

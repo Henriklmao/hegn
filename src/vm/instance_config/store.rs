@@ -157,4 +157,167 @@ mod tests {
         );
         assert_eq!(store.load("demo").unwrap().memory_mib, 4096);
     }
+
+    #[test]
+    fn save_and_load_preserve_optional_instance_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        let mut instance = store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+        instance.rootfs_image = Some(dir.path().join("private.qcow2"));
+        instance.network_index = Some(3);
+        instance.extra_packages = vec!["build-essential".into(), "python3.12".into()];
+        instance.auto_branch = false;
+        instance.security = crate::config::SecurityMode::Warn;
+        store.save(&instance).unwrap();
+
+        let loaded = store.load("demo").unwrap();
+        assert_eq!(loaded.rootfs_image, instance.rootfs_image);
+        assert_eq!(loaded.network_index, Some(3));
+        assert_eq!(loaded.extra_packages, instance.extra_packages);
+        assert!(!loaded.auto_branch);
+        assert_eq!(loaded.security, crate::config::SecurityMode::Warn);
+        assert_eq!(loaded.project, instance.project);
+        assert_eq!(loaded.workspace, instance.workspace);
+    }
+
+    #[test]
+    fn instance_directory_and_config_file_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+
+        let instance_dir = store.dir("demo").unwrap();
+        assert_eq!(
+            fs::metadata(&instance_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(store.config_path("demo").unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        store.ensure_root().unwrap();
+        assert_eq!(
+            fs::metadata(store.root()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn list_ignores_foreign_broken_and_symlinked_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        store
+            .create_from_project(&project, Some("one"), None, false)
+            .unwrap();
+        let raw = fs::read_to_string(store.config_path("one").unwrap()).unwrap();
+
+        fs::create_dir_all(store.root().join("no-config")).unwrap();
+        fs::write(store.root().join("just-a-file"), b"x").unwrap();
+        std::os::unix::fs::symlink(store.root().join("one"), store.root().join("linked")).unwrap();
+        let invalid_name = store.root().join("bad name");
+        fs::create_dir_all(&invalid_name).unwrap();
+        fs::write(invalid_name.join(CONFIG_FILE), &raw).unwrap();
+        let broken = store.root().join("broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join(CONFIG_FILE), b"{not toml").unwrap();
+        let mismatch = store.root().join("mismatch");
+        fs::create_dir_all(&mismatch).unwrap();
+        fs::write(mismatch.join(CONFIG_FILE), &raw).unwrap();
+
+        let names: Vec<String> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|instance| instance.name)
+            .collect();
+        assert_eq!(names, vec!["one"]);
+    }
+
+    #[test]
+    fn list_is_empty_when_the_root_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        assert!(!store.root().exists());
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_reports_a_missing_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        fs::create_dir_all(store.dir("demo").unwrap()).unwrap();
+        let err = store.load("demo").unwrap_err().to_string();
+        assert!(err.contains("has no config"), "{err}");
+    }
+
+    #[test]
+    fn load_rejects_a_config_whose_name_disagrees_with_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        store
+            .create_from_project(&project, Some("one"), None, false)
+            .unwrap();
+        let raw = fs::read_to_string(store.config_path("one").unwrap()).unwrap();
+        fs::create_dir_all(store.dir("demo").unwrap()).unwrap();
+        fs::write(store.config_path("demo").unwrap(), raw).unwrap();
+
+        let err = store.load("demo").unwrap_err().to_string();
+        assert!(err.contains("names 'one'"), "{err}");
+    }
+
+    #[test]
+    fn ensure_root_refuses_a_symlinked_instances_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let root = dir.path().join("instances");
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+
+        let err = store.ensure_root().unwrap_err().to_string();
+        assert!(err.contains("symlinked instances directory"), "{err}");
+    }
+
+    #[test]
+    fn save_refuses_to_follow_a_symlinked_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        let instance = store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+        let config_path = store.config_path("demo").unwrap();
+        fs::remove_file(&config_path).unwrap();
+        let outside = dir.path().join("outside.toml");
+        fs::write(&outside, b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside, &config_path).unwrap();
+
+        assert!(store.save(&instance).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"secret");
+        assert!(config_path.is_symlink());
+    }
+
+    #[test]
+    fn dir_rejects_unsafe_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        for name in ["../escape", "a/b", "", ".hidden"] {
+            assert!(store.dir(name).is_err(), "{name:?}");
+        }
+        assert_eq!(store.dir("demo").unwrap(), store.root().join("demo"));
+    }
 }

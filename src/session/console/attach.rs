@@ -229,3 +229,27 @@ pub fn run_interactive_with_command(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_refuses_terminals_that_cannot_fit_the_bar() {
+        let mut guard = TerminalGuard { cols: 80, rows: 24 };
+        assert!(guard.update_size(MIN_COLS - 1, MIN_ROWS).is_err());
+        assert!(guard.update_size(MIN_COLS, MIN_ROWS - 1).is_err());
+        assert_eq!(guard.size(), (80, 24), "a rejected resize must not apply");
+    }
+
+    #[test]
+    fn resize_accepts_the_minimum_and_updates_the_size() {
+        let mut guard = TerminalGuard { cols: 80, rows: 24 };
+        guard.update_size(MIN_COLS, MIN_ROWS).unwrap();
+        assert_eq!(guard.size(), (MIN_COLS, MIN_ROWS));
+
+        let err = guard.update_size(1, 1).unwrap_err().to_string();
+        assert!(err.contains("terminal is too small"), "{err}");
+        assert!(err.contains(&format!("{MIN_COLS}x{MIN_ROWS}")), "{err}");
+    }
+}

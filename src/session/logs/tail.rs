@@ -83,4 +83,46 @@ mod tests {
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(tail_bytes(&link, 1).is_err());
     }
+
+    #[test]
+    fn tail_lines_handles_blank_and_unterminated_lines() {
+        assert_eq!(tail_lines(b"a\nb\n", 1), b"b\n");
+        assert_eq!(tail_lines(b"a\n\nb\n", 1), b"b\n");
+        assert_eq!(tail_lines(b"a\n\nb\n", 2), b"\nb\n");
+        assert_eq!(tail_lines(b"\n\n\n", 2), b"\n\n");
+        assert_eq!(tail_lines(b"no-newline", 1), b"no-newline");
+        assert_eq!(tail_lines(b"a\nb", 3), b"a\nb");
+    }
+
+    #[test]
+    fn tail_bytes_is_capped_to_the_last_four_mib() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-large.log");
+        let mut data = vec![b'x'; 4 * 1024 * 1024 + 100];
+        data[0] = b'S';
+        fs::write(&path, &data).unwrap();
+
+        let tail = tail_bytes(&path, 10).unwrap();
+        assert_eq!(tail.len(), 4 * 1024 * 1024);
+        assert_eq!(tail[0], b'x', "the file prefix must be skipped");
+    }
+
+    #[test]
+    fn tail_bytes_returns_binary_data_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-binary.log");
+        fs::write(&path, b"\xff\xfeab\n\x1b[31mcolor\x00\n").unwrap();
+        assert_eq!(
+            tail_bytes(&path, 1).unwrap(),
+            b"\x1b[31mcolor\x00\n",
+            "tail must not sanitise; rendering decides what is safe"
+        );
+    }
+
+    #[test]
+    fn tail_bytes_rejects_a_non_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = tail_bytes(dir.path(), 1).unwrap_err().to_string();
+        assert!(err.contains("not a regular log file"), "{err}");
+    }
 }

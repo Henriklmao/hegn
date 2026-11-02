@@ -130,4 +130,34 @@ mod tests {
         assert_eq!(human_size(2048), "2.0 KiB");
         assert_eq!(human_size(3 * 1024 * 1024), "3.0 MiB");
     }
+
+    #[test]
+    fn snapshot_names_reject_traversal_absolute_and_hidden_entries() {
+        for bad in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "../escape",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "/absolute",
+            "with space",
+            "ümlaut",
+        ] {
+            assert!(sanitize_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(sanitize_name(&"a".repeat(101)).is_err());
+        assert!(sanitize_name(&"a".repeat(100)).is_ok());
+    }
+
+    #[test]
+    fn snapshot_names_are_trimmed_and_keep_inner_dots() {
+        assert_eq!(sanitize_name("  demo.v1 ").unwrap(), "demo.v1");
+        assert_eq!(
+            sanitize_name("2026-01-02_03.04").unwrap(),
+            "2026-01-02_03.04"
+        );
+    }
 }

@@ -255,4 +255,41 @@ mod tests {
             b"version = 1\npackages = [\"jq\"]\n"
         );
     }
+
+    #[test]
+    fn refuses_symlinked_profile_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let store = ProfileStore::new(&config);
+        let target = dir.path().join("real-profile.toml");
+        fs::write(&target, b"version = 1\n").unwrap();
+        let link = store.path(Harness::Opencode);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = store.load(Harness::Opencode).unwrap_err().to_string();
+        assert!(err.contains("refusing symlinked profile"), "{err}");
+        let err = store.write_templates().unwrap_err().to_string();
+        assert!(
+            err.contains("not a regular file") || err.contains("refusing symlinked"),
+            "{err}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"version = 1\n");
+    }
+
+    #[test]
+    fn load_rejects_profiles_with_unsafe_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let store = ProfileStore::new(&config);
+        fs::create_dir_all(&config.profiles_dir).unwrap();
+        fs::write(
+            store.path(Harness::Opencode),
+            b"version = 1\npackages = [\"git;reboot\"]\n",
+        )
+        .unwrap();
+        let err = store.load(Harness::Opencode).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("invalid profile"), "{text}");
+        assert!(text.contains("invalid package name"), "{text}");
+    }
 }

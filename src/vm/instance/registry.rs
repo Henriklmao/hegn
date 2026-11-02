@@ -296,4 +296,107 @@ mod tests {
         assert!(summaries.iter().all(|summary| summary.state == "stopped"));
         assert_eq!(registry.unique_name("demo").unwrap(), "demo-1");
     }
+
+    #[test]
+    fn summaries_are_empty_when_no_instances_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = InstanceRegistry::new(config_with_assets(dir.path()));
+        assert!(!registry.config().instances_dir.exists());
+        assert!(registry.list().unwrap().is_empty());
+        assert!(registry.summaries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_names_both_lookup_locations_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = InstanceRegistry::new(config_with_assets(dir.path()));
+        let err = registry.resolve("missing").unwrap_err().to_string();
+        assert!(err.contains("no instance named 'missing'"), "{err}");
+        assert!(err.contains("projects"), "{err}");
+    }
+
+    #[test]
+    fn ensure_for_project_requires_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = InstanceRegistry::new(config_with_assets(dir.path()));
+        let missing = dir.path().join("missing-project");
+        let err = registry
+            .ensure_for_project(&missing, Harness::Shell)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(registry.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_prefers_the_base_instance_over_an_ephemeral_clone() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = InstanceRegistry::new(config_with_assets(dir.path()));
+        let project = dir.path().join("projects/demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let base = registry
+            .ensure_for_project(&project, Harness::Shell)
+            .unwrap();
+        // The clone sorts before the base alphabetically; resolve must still
+        // return the non-ephemeral instance.
+        let clone = registry
+            .clone_from(&base, "aaa-clone", Some(Harness::Codex))
+            .unwrap()
+            .instance;
+        assert!(clone.ephemeral);
+
+        let resolved = registry.resolve(project.to_str().unwrap()).unwrap();
+        assert_eq!(resolved.name, "demo");
+        assert!(!resolved.ephemeral);
+    }
+
+    #[test]
+    fn summary_hides_a_recycled_vm_pid() {
+        use chrono::Utc;
+
+        use crate::vm::instance::SessionRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let registry = InstanceRegistry::new(config_with_assets(dir.path()));
+        let project = dir.path().join("projects/demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let instance = registry
+            .ensure_for_project(&project, Harness::Shell)
+            .unwrap();
+        let manager = registry.manager(instance.clone());
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        let record = SessionRecord {
+            project: project.clone(),
+            workspace: project.clone(),
+            instance: instance.name.clone(),
+            harness: Harness::Shell,
+            started_at: Utc::now(),
+            vm_pid: std::process::id(),
+            // The recorded binary is gone, so a recycled pid must not be
+            // reported as a running VM.
+            vm_binary: Some(dir.path().join("missing-cloud-hypervisor")),
+            relay_pid: 0,
+            virtiofs_pid: 0,
+            profile_virtiofs_pid: 0,
+            boot_args: String::new(),
+            serial_log: None,
+        };
+        std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
+
+        let summary = registry.summary(&instance);
+        assert_eq!(summary.state, "stopped");
+        assert_eq!(summary.vm_pid, None);
+        assert_eq!(summary.name, "demo");
+        assert_eq!(summary.vcpus, instance.vcpus);
+    }
+
+    #[test]
+    fn same_project_handles_identical_and_unresolvable_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert!(same_project(&missing, &missing));
+        assert!(!same_project(&missing, &dir.path().join("other-missing")));
+        assert!(!same_project(dir.path(), &missing));
+    }
 }

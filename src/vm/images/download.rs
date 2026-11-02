@@ -467,4 +467,114 @@ mod tests {
         let err = download_all(&config, false, false).unwrap_err().to_string();
         assert!(err.contains("symlinked image"), "{err}");
     }
+
+    #[test]
+    fn invalid_checksums_are_rejected_before_any_file_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("kernel");
+        let err = install_from_reader(Cursor::new(b"hello"), &dest, "not-a-digest", false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid SHA-256"), "{err}");
+        assert!(!dest.exists());
+        assert!(
+            fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "a rejected digest must not create a temporary file"
+        );
+    }
+
+    #[test]
+    fn a_forced_install_replaces_a_symlink_instead_of_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"victim").unwrap();
+        let dest = dir.path().join("kernel");
+        std::os::unix::fs::symlink(&victim, &dest).unwrap();
+
+        install_from_reader(Cursor::new(b"hello"), &dest, SHA_HELLO, true, false).unwrap();
+
+        assert_eq!(fs::read(&victim).unwrap(), b"victim");
+        let metadata = fs::symlink_metadata(&dest).unwrap();
+        assert!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "the installed asset must be a real file"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn an_unforced_install_refuses_a_symlinked_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"victim").unwrap();
+        let dest = dir.path().join("kernel");
+        std::os::unix::fs::symlink(&victim, &dest).unwrap();
+
+        let err = install_from_reader(Cursor::new(b"hello"), &dest, SHA_HELLO, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(fs::read(&victim).unwrap(), b"victim");
+    }
+
+    #[test]
+    fn progress_is_reported_for_empty_and_small_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut empty = Vec::new();
+        let dest = dir.path().join("empty");
+        install_from_reader_with_progress(
+            Cursor::new(Vec::new()),
+            &dest,
+            "",
+            false,
+            true,
+            &mut |received| empty.push(received),
+        )
+        .unwrap();
+        assert_eq!(empty, vec![0]);
+
+        let mut small = Vec::new();
+        let dest = dir.path().join("small");
+        install_from_reader_with_progress(
+            Cursor::new(b"hello"),
+            &dest,
+            SHA_HELLO,
+            false,
+            false,
+            &mut |received| small.push(received),
+        )
+        .unwrap();
+        assert_eq!(small, vec![5]);
+    }
+
+    #[test]
+    fn private_directories_are_created_with_mode_0700() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("one/two/three");
+        create_private_dir(&nested).unwrap();
+        let mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        // Re-creating an existing private directory is a no-op.
+        create_private_dir(&nested).unwrap();
+        assert!(nested.is_dir());
+    }
+
+    #[test]
+    fn temporary_paths_stay_beside_the_destination() {
+        let dest = Path::new("/images/kernel");
+        let tmp = temp_path(dest);
+        assert_eq!(tmp.parent(), dest.parent());
+        let name = tmp.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with(".kernel.part-"), "{name}");
+        assert_ne!(tmp, dest);
+    }
+
+    #[test]
+    fn downloads_without_a_url_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = download_to("", &dir.path().join("kernel"), SHA_HELLO, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no download URL"), "{err}");
+    }
 }

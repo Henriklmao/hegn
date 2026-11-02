@@ -237,4 +237,207 @@ mod tests {
             "pkexec '/opt/hegn tools/hegn' network setup --user 'demo user'"
         );
     }
+
+    #[test]
+    fn shell_quoting_neutralizes_injection_metacharacters() {
+        for (raw, quoted) in [
+            ("a b", "'a b'"),
+            ("it's", r"'it'\''s'"),
+            ("$(id)", "'$(id)'"),
+            ("`id`", "'`id`'"),
+            ("a;b", "'a;b'"),
+            ("a&&b", "'a&&b'"),
+            ("a||b", "'a||b'"),
+            ("a|b", "'a|b'"),
+            ("a>b", "'a>b'"),
+            ("a<b", "'a<b'"),
+            ("a*b", "'a*b'"),
+            ("a\nb", "'a\nb'"),
+            ("$HOME", "'$HOME'"),
+            ("~root", "'~root'"),
+            ("a\\b", "'a\\b'"),
+            // A leading dash is not a shell metacharacter; quoting is not
+            // required for it to stay a single literal argument.
+            ("--force", "--force"),
+            ("", "''"),
+            ("safe-._@%+=:,/", "safe-._@%+=:,/"),
+        ] {
+            assert_eq!(
+                shell_quote(OsStr::new(raw)),
+                quoted,
+                "unexpected quoting for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_values_survive_a_roundtrip_through_the_shell() {
+        // Execute only `printf` in a throwaway shell; no host state is touched.
+        for raw in [
+            "a b", "it's", "$(id)", "`id`", "a;b", "a&&b", "a|b", "a>b", "a*b", "a\nb", "--force",
+            "", "100%", "$HOME", "~root", "a\\b",
+        ] {
+            let script = format!("printf %s {}", shell_quote(OsStr::new(raw)));
+            let output = Command::new("sh")
+                .args(["-c", &script])
+                .output()
+                .expect("sh must be available");
+            assert!(output.status.success(), "{raw:?} failed to parse: {script}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                raw,
+                "{raw:?} was not passed through as a single literal word"
+            );
+        }
+    }
+
+    #[test]
+    fn render_command_quotes_only_what_needs_it() {
+        assert_eq!(render_command("sudo", &[]), "sudo");
+        assert_eq!(
+            render_command("sudo", &[OsString::from("alice")]),
+            "sudo alice"
+        );
+        assert_eq!(
+            render_command("sudo", &[OsString::from("a b"), OsString::from("it's")]),
+            r"sudo 'a b' 'it'\''s'"
+        );
+        assert_eq!(
+            render_command("/opt/hegn tools/hegn", &[OsString::from("--user")]),
+            "'/opt/hegn tools/hegn' --user"
+        );
+    }
+
+    #[test]
+    fn setup_script_embeds_only_the_validated_user_name() {
+        let user = "_alice-1.2";
+        let script = setup_script(user, &[]).unwrap();
+        assert_eq!(
+            script.matches(user).count(),
+            TAP_POOL as usize,
+            "the user name belongs only on the tuntap lines"
+        );
+        for index in 0..TAP_POOL {
+            assert!(script.contains(&format!(
+                "ip tuntap add dev {} mode tap user {user}",
+                tap_name(index)
+            )));
+            // Tap ownership must not be granted to root implicitly.
+            assert!(!script.contains(&format!(
+                "ip tuntap add dev {} mode tap user root",
+                tap_name(index)
+            )));
+        }
+    }
+
+    #[test]
+    fn endpoint_ports_are_sorted_deduplicated_and_only_safe_ports_are_accepted() {
+        let script = setup_script("alice", &[11434, 1234, 11434]).unwrap();
+        assert!(
+            script.contains("elements = { 1234, 11434 }"),
+            "endpoint ports must be sorted and deduplicated:\n{script}"
+        );
+        assert_eq!(
+            script.matches("route_localnet=1").count(),
+            TAP_POOL as usize,
+            "route_localnet must be enabled for every TAP"
+        );
+        for index in 0..TAP_POOL {
+            assert!(script.contains(&format!(
+                "net.ipv4.conf.{}.route_localnet=1",
+                tap_name(index)
+            )));
+        }
+        assert!(
+            !script.contains("net.ipv4.route_localnet"),
+            "route_localnet must never be enabled globally"
+        );
+
+        for port in [0u16, 1, 22, 53, 443, 1023] {
+            assert!(
+                setup_script("alice", &[port]).is_err(),
+                "privileged endpoint port {port} must be rejected"
+            );
+        }
+        assert!(setup_script("alice", &[1024]).is_ok());
+    }
+
+    #[test]
+    fn setup_script_installs_the_guard_after_removing_the_old_table() {
+        let script = setup_script("alice", &[]).unwrap();
+        assert!(script.starts_with("set -eu\n"), "{script}");
+        assert!(script.contains("sysctl -q -w net.ipv4.ip_forward=1"));
+        let delete = script.find("nft delete table inet hegn").unwrap();
+        let heredoc = script.find("nft -f - <<'HEGN_NFT'").unwrap();
+        let close = script.find("\nHEGN_NFT\n").unwrap();
+        assert!(
+            delete < heredoc && heredoc < close,
+            "rules must be replaced atomically through one heredoc:\n{script}"
+        );
+        assert_eq!(script.matches("HEGN_NFT").count(), 2);
+        assert_eq!(script.matches("nft -f -").count(), 1);
+    }
+
+    #[test]
+    fn teardown_script_only_deletes_known_paths_and_never_fails() {
+        let script = teardown_script();
+        assert_eq!(
+            script.matches("rm -f /run/hegn/network.json").count(),
+            1,
+            "{script}"
+        );
+        assert!(
+            script.ends_with("rm -f /run/hegn/network.json\n"),
+            "{script}"
+        );
+        assert!(!script.contains("rm -r"), "{script}");
+        assert!(!script.contains("rm -rf"), "{script}");
+        assert!(!script.contains('*'), "no wildcards in teardown:\n{script}");
+        assert_eq!(
+            script.matches("network.json").count(),
+            1,
+            "the marker must be the only JSON path in teardown:\n{script}"
+        );
+        assert_eq!(
+            script.matches("ip link del dev hegn").count(),
+            TAP_POOL as usize
+        );
+        for line in script
+            .lines()
+            .filter(|line| line.starts_with("ip link del dev hegn"))
+        {
+            assert!(line.ends_with("2>/dev/null || true"), "{line}");
+        }
+        assert!(
+            script.find("nft delete table inet hegn").unwrap()
+                < script.find("ip link del dev hegn0").unwrap(),
+            "remove the rules before the devices:\n{script}"
+        );
+    }
+
+    #[test]
+    fn scripts_with_unusual_but_valid_users_are_valid_shell() {
+        for user in ["_alice-1.2", "A", "a_b-c.d"] {
+            for script in [
+                setup_script(user, &[]).unwrap(),
+                setup_script(user, &[11434]).unwrap(),
+                teardown_script(),
+            ] {
+                let parsed = Command::new("sh")
+                    .args(["-n", "-c", &script])
+                    .status()
+                    .expect("sh must be available");
+                assert!(parsed.success(), "shell syntax error for {user:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn run_script_surfaces_stderr_on_failure() {
+        assert!(run_script("true").is_ok());
+        let err = run_script("echo boom >&2; exit 7").unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("network script failed"), "{message}");
+        assert!(message.contains("boom"), "{message}");
+    }
 }

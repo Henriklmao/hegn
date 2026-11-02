@@ -123,4 +123,147 @@ mod tests {
         assert_eq!(parsed.host_firewall, HostFirewall::Ufw);
         assert!(raw.contains("\"host_firewall\": \"ufw\""), "{raw}");
     }
+
+    fn marker(endpoints: Vec<u16>, host_firewall: HostFirewall) -> ReadyMarker {
+        ReadyMarker {
+            version: MARKER_VERSION,
+            pool: TAP_POOL,
+            subnet: SUBNET.to_string(),
+            dns: DNS.iter().map(ToString::to_string).collect(),
+            endpoints,
+            host_firewall,
+            applied_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn marker_roundtrip_preserves_endpoints_and_firewall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("network.json");
+        let expected = marker(vec![1234, 11434], HostFirewall::Firewalld);
+
+        write_marker(&path, &expected).unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let parsed: ReadyMarker = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed, expected);
+        assert!(raw.contains("\"endpoints\": [\n"), "{raw}");
+        assert!(raw.contains("11434"), "{raw}");
+        assert!(raw.contains("\"host_firewall\": \"firewalld\""), "{raw}");
+    }
+
+    #[test]
+    fn marker_permissions_are_world_readable_but_never_group_or_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("network.json");
+        write_marker(&path, &marker(Vec::new(), HostFirewall::None)).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        // The unprivileged TUI/doctor must be able to read readiness, but an
+        // unprivileged process must not be able to forge readiness.
+        assert_eq!(mode & 0o444, 0o444, "marker must be readable: {mode:o}");
+        assert_eq!(mode & 0o022, 0, "marker must not be writable: {mode:o}");
+    }
+
+    #[test]
+    fn legacy_marker_without_optional_fields_still_deserializes() {
+        // A marker written before local endpoints existed has neither
+        // `endpoints` nor `host_firewall`; both default rather than failing.
+        let legacy = r#"{
+            "version": 1,
+            "pool": 16,
+            "subnet": "10.213.0.0",
+            "dns": ["1.1.1.1", "9.9.9.9"],
+            "applied_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let parsed: ReadyMarker = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.version, 1);
+        assert!(parsed.endpoints.is_empty());
+        assert_eq!(parsed.host_firewall, HostFirewall::None);
+        // The version gate is what makes a v1 marker unusable for v2 rules.
+        assert_ne!(
+            parsed.version, MARKER_VERSION,
+            "an old marker must never vouch for the current rules"
+        );
+    }
+
+    #[test]
+    fn malformed_or_incomplete_markers_are_rejected() {
+        for raw in [
+            "",
+            "not json",
+            "{}",
+            r#"{"version": 2}"#,
+            r#"{"version": "2", "pool": 16, "subnet": "10.213.0.0", "dns": [], "applied_at": "2024-01-01T00:00:00Z"}"#,
+            r#"{"version": 2, "pool": 16, "subnet": "10.213.0.0", "dns": [], "applied_at": "yesterday"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ReadyMarker>(raw).is_err(),
+                "malformed marker must be rejected: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_firewall_names_are_rejected() {
+        assert!(serde_json::from_str::<HostFirewall>("\"nftables\"").is_err());
+        assert!(serde_json::from_str::<HostFirewall>("\"\"").is_err());
+    }
+
+    #[test]
+    fn writing_a_marker_truncates_the_previous_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("network.json");
+        let long = marker(vec![1234, 4321, 9999], HostFirewall::Iptables);
+        write_marker(&path, &long).unwrap();
+
+        let short = marker(Vec::new(), HostFirewall::None);
+        write_marker(&path, &short).unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let parsed: ReadyMarker = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed, short);
+        assert!(!raw.contains("9999"), "old contents must be gone: {raw}");
+    }
+
+    #[test]
+    fn write_marker_refuses_to_follow_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "root owned").unwrap();
+        let link = dir.path().join("network.json");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        assert!(
+            write_marker(&link, &marker(Vec::new(), HostFirewall::None)).is_err(),
+            "O_NOFOLLOW must reject a symlinked marker"
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "root owned");
+    }
+
+    #[test]
+    fn marker_lives_on_the_volatile_run_filesystem() {
+        assert_eq!(marker_path(), Path::new("/run/hegn/network.json"));
+        assert!(marker_path().is_absolute());
+    }
+
+    #[test]
+    fn guard_ready_requires_a_valid_marker_matching_endpoints_and_all_taps() {
+        // Read-only: never writes to /run. On an unguarded host there is no
+        // marker and readiness must be false; on a guarded host readiness is
+        // exactly "endpoints match && every pool TAP exists".
+        let config = Config::default();
+        let marker = ready_marker();
+        let all_taps_exist = status(&config).iter().all(|tap| tap.exists);
+        let endpoints_match = marker
+            .as_ref()
+            .is_some_and(|marker| marker.endpoints == config.endpoint_ports());
+
+        assert_eq!(guard_ready(&config), endpoints_match && all_taps_exist);
+        if marker.is_none() {
+            assert!(!guard_ready(&config), "no marker means not ready");
+        }
+    }
 }

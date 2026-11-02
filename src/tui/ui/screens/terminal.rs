@@ -103,7 +103,7 @@ pub(crate) fn render_terminal_pane(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(Span::styled(line, Style::default().fg(color)))
         })
         .collect();
-    if visible.is_empty() {
+    if app.terminal.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "no console output yet — start an instance with Enter",
@@ -178,8 +178,77 @@ pub(crate) fn render_terminal_pane(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Harness;
+    use crate::session::console::TerminalConsole;
     use crate::tui::app::{ProjectView, Screen};
     use crate::tui::ui::test_support::*;
+    use crate::vm::instance::InstanceSummary;
+    use std::path::{Path, PathBuf};
+
+    struct FakeConsole {
+        project: PathBuf,
+    }
+
+    impl TerminalConsole for FakeConsole {
+        fn send(&mut self, _bytes: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn drain(&mut self) -> Vec<Vec<u8>> {
+            Vec::new()
+        }
+
+        fn is_exited(&mut self) -> bool {
+            false
+        }
+
+        fn project(&self) -> &Path {
+            &self.project
+        }
+
+        fn label(&self) -> &str {
+            "fake · serial"
+        }
+
+        fn instance_name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    fn instance(app: &App, name: &str, state: &str) -> InstanceSummary {
+        InstanceSummary {
+            name: name.into(),
+            project: PathBuf::from("/projects/demo"),
+            workspace: PathBuf::from(format!("/workspaces/{name}")),
+            harness: Harness::Shell,
+            ephemeral: false,
+            source_instance: None,
+            created_at: chrono::Utc::now(),
+            state: state.into(),
+            vm_pid: None,
+            serial_log: None,
+            config_path: app.config.instances_dir.join(name).join("hegn.toml"),
+            vcpus: 2,
+            memory_mib: 2048,
+            error: None,
+        }
+    }
+
+    fn project_app() -> (tempfile::TempDir, App) {
+        let (dir, mut app) = app();
+        app.screen = Screen::Project;
+        app.open_project = Some(PathBuf::from("/projects/demo"));
+        (dir, app)
+    }
+
+    #[test]
+    fn empty_terminal_shows_the_start_hint() {
+        let (_dir, mut app) = project_app();
+        app.project_view = ProjectView::Split;
+        app.terminal_focus = true;
+        let (text, _) = render(&app);
+        assert!(text.contains("no console output yet"), "{text}");
+    }
 
     #[test]
     fn terminal_view_renders_buffer_and_prompt() {
@@ -217,5 +286,88 @@ mod tests {
         assert!(text.contains("scrollback line 39"), "{text}");
         assert!(text.contains("scrollback line 38"), "{text}");
         assert!(!text.contains("scrollback line 0\n"), "{text}");
+    }
+
+    #[test]
+    fn collapsed_strip_describes_missing_running_and_attached_instances() {
+        let (_dir, mut app) = project_app();
+        let (text, hits) = render(&app);
+        assert!(hits.terminal_strip.is_some());
+        assert!(
+            text.contains("terminal · no instance · Enter to start"),
+            "{text}"
+        );
+
+        app.instances = vec![instance(&app, "build", "running")];
+        app.refresh_instance_filter();
+        let (text, hits) = render(&app);
+        assert!(hits.terminal_strip.is_some());
+        assert!(
+            text.contains("terminal · build · running · Enter to open · F2 attach"),
+            "{text}"
+        );
+
+        app.attach_console(Box::new(FakeConsole {
+            project: PathBuf::from("/projects/demo"),
+        }));
+        app.project_view = ProjectView::Compact;
+        let (text, _) = render(&app);
+        assert!(
+            text.contains("terminal · fake · running · i to open · F2 attach"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn terminal_pane_renders_empty_scrollback_and_tiny_panels() {
+        let (_dir, mut app) = project_app();
+        app.project_view = ProjectView::Split;
+        app.terminal_focus = true;
+        let (text, _) = render(&app);
+        // Note: TerminalBuffer::len() always counts the in-progress line, so
+        // the renderer's "no console output yet" branch is currently
+        // unreachable. Keep this test focused on the pane chrome.
+        assert!(text.contains("terminal · no instance · normal"), "{text}");
+
+        let (text, _) = render_sized(&app, 40, 5);
+        assert!(text.contains("terminal too small"), "{text}");
+    }
+
+    #[test]
+    fn normal_mode_hides_pending_input_until_insert_mode() {
+        let (_dir, mut app) = project_app();
+        app.project_view = ProjectView::Split;
+        app.terminal_focus = true;
+        app.input = "super-secret-token".into();
+        app.terminal_mode = TerminalMode::Normal;
+
+        let (text, _) = render(&app);
+        assert!(
+            !text.contains("super-secret-token"),
+            "normal mode must not render buffered input:\n{text}"
+        );
+        assert!(text.contains("normal mode"), "{text}");
+        assert!(text.contains("i type · Esc sections"), "{text}");
+
+        app.terminal_mode = TerminalMode::Insert;
+        let (text, _) = render(&app);
+        assert!(text.contains("super-secret-token"), "{text}");
+        assert!(text.contains("insert · command"), "{text}");
+    }
+
+    #[test]
+    fn long_insert_input_scrolls_to_keep_the_cursor_visible() {
+        let (_dir, mut app) = project_app();
+        app.project_view = ProjectView::Split;
+        app.terminal_focus = true;
+        app.terminal_mode = TerminalMode::Insert;
+        app.input = format!("HEAD{}TAIL", "x".repeat(200));
+
+        let (text, _) = render_sized(&app, 80, 24);
+        assert!(text.contains("TAIL"), "{text}");
+        assert!(
+            !text.contains("HEAD"),
+            "the beginning scrolls out of the input line:\n{text}"
+        );
     }
 }

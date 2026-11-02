@@ -264,4 +264,79 @@ mod tests {
         assert!(json["cleanup"].is_null());
         assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
     }
+
+    #[test]
+    fn human_bytes_handles_every_unit_boundary() {
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1024 * 1024 - 1), "1024.0 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_bytes(1024u64.pow(4)), "1.0 TiB");
+        // Above TiB the value keeps growing in TiB instead of overflowing.
+        assert_eq!(human_bytes(2 * 1024u64.pow(4)), "2.0 TiB");
+    }
+
+    #[test]
+    fn human_uptime_covers_seconds_minutes_and_days() {
+        assert_eq!(human_uptime(0), "0m 0s");
+        assert_eq!(human_uptime(59), "0m 59s");
+        assert_eq!(human_uptime(60), "1m 0s");
+        assert_eq!(human_uptime(3599), "59m 59s");
+        assert_eq!(human_uptime(3600), "1h 0m");
+        assert_eq!(human_uptime(24 * 3600 + 60), "24h 1m");
+    }
+
+    #[test]
+    fn report_serialises_nested_session_disk_and_cleanup_fields() {
+        let report = BenchmarkReport {
+            generated_at: Utc::now(),
+            sessions: vec![SessionCost {
+                instance: "demo".into(),
+                project: Some(PathBuf::from("/workspace/demo")),
+                workspace: None,
+                harness: Some("OpenCode".into()),
+                vcpus: 2,
+                memory_mib: 1024,
+                guest_memory_bytes: 1024 * MIB,
+                started_at: None,
+                uptime_secs: Some(90),
+                processes: vec![ProcessCost {
+                    role: "virtiofsd".into(),
+                    pid: 7,
+                    rss_bytes: 4096,
+                    virtual_bytes: 8192,
+                }],
+            }],
+            vcpus: 2,
+            guest_memory_bytes: 1024 * MIB,
+            process_rss_bytes: 4096,
+            started: true,
+            cleanup: Some(Cleanup {
+                project: PathBuf::from("/workspace/hegn-benchmark-1"),
+                instance: "bench".into(),
+                instance_stopped: true,
+                removed: true,
+            }),
+            snapshots: 1,
+            snapshot_estimate_bytes: 1024 * MIB,
+            disk: vec![DiskCost {
+                name: "logs".into(),
+                path: PathBuf::from("/state/logs"),
+                exists: true,
+                allocated_bytes: 4096,
+                apparent_bytes: 2048,
+                files: 1,
+            }],
+            disk_allocated_bytes: 4096,
+            notes: vec!["measured".into()],
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["sessions"][0]["instance"], "demo");
+        assert_eq!(json["sessions"][0]["processes"][0]["role"], "virtiofsd");
+        assert_eq!(json["sessions"][0]["uptime_secs"], 90);
+        assert_eq!(json["cleanup"]["removed"], true);
+        assert_eq!(json["cleanup"]["instance_stopped"], true);
+        assert_eq!(json["disk"][0]["allocated_bytes"], 4096);
+        assert_eq!(json["notes"][0], "measured");
+    }
 }

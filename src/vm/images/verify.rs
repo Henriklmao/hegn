@@ -82,4 +82,57 @@ mod tests {
         assert_eq!(verify_file(&path, SHA_HELLO).unwrap(), 5);
         assert!(verify_file(&path, &"0".repeat(64)).is_err());
     }
+
+    #[test]
+    fn verify_file_rejects_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = verify_file(&dir.path().join("absent"), SHA_HELLO).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to open"),
+            "missing assets must fail loudly: {err:#}"
+        );
+    }
+
+    #[test]
+    fn verify_file_rejects_a_malformed_configured_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel");
+        fs::write(&path, b"hello").unwrap();
+        for bad in ["", "abc", &"g".repeat(64)] {
+            let err = verify_file(&path, bad).unwrap_err();
+            assert!(
+                err.to_string().contains("no valid SHA-256"),
+                "{bad:?} must be rejected before hashing: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_file_refuses_symlinks_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"hello").unwrap();
+        let link = dir.path().join("kernel");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = verify_file(&link, SHA_HELLO).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to open"),
+            "symlinked assets must never be hashed through: {err:#}"
+        );
+
+        let directory = dir.path().join("images");
+        fs::create_dir(&directory).unwrap();
+        let err = verify_file(&directory, SHA_HELLO).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn verify_file_accepts_uppercase_and_surrounding_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel");
+        fs::write(&path, b"hello").unwrap();
+        let configured = format!("  {} \n", SHA_HELLO.to_uppercase());
+        assert_eq!(verify_file(&path, &configured).unwrap(), 5);
+    }
 }
