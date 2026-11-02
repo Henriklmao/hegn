@@ -5,7 +5,10 @@
 //! never to the host directory. Symlinks and special files are skipped in both
 //! directions so a poisoned guest cannot redirect host writes.
 
+use std::ffi::OsStr;
 use std::fs;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -15,7 +18,9 @@ use crate::config::Config;
 use crate::vm::instance_config::InstanceConfig;
 
 use super::PROFILE_VERSION;
-use super::fs::{copy_file_private, ensure_real_dir, remove_path, secure_dir};
+use super::fs::{
+    DirFd, EntryKind, copy_file_private, copy_source_to_file, ensure_real_dir, remove_path,
+};
 use super::model::{ProfilePlan, ProfileShare, SyncBackReport, SyncReport};
 use super::store::{ProfileLayout, ProfileState, ProfileStore, StoredFile, StoredSkill};
 use super::validate::expand_home;
@@ -148,6 +153,113 @@ fn copy_back_tree(
     dry_run: bool,
     report: &mut SyncBackReport,
 ) -> Result<()> {
+    if dry_run {
+        return copy_back_tree_dry(bundle, destination, report);
+    }
+    ensure_backup_root(destination)?;
+    let root = DirFd::open_root(destination)?;
+    copy_back_entries(bundle, &root, report)
+}
+
+/// The source root may be a symlink; only descendants are no-follow.
+fn ensure_backup_root(destination: &Path) -> Result<()> {
+    if destination.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure {}", destination.display()))?;
+    Ok(())
+}
+
+fn copy_back_entries(
+    bundle: &Path,
+    destination: &DirFd,
+    report: &mut SyncBackReport,
+) -> Result<()> {
+    for entry in
+        fs::read_dir(bundle).with_context(|| format!("failed to read {}", bundle.display()))?
+    {
+        let entry = entry?;
+        let from = entry.path();
+        let name = entry.file_name();
+        let metadata = fs::symlink_metadata(&from)?;
+        if metadata.file_type().is_symlink() {
+            report.warnings.push(format!(
+                "skipped symlink {} (only regular files are synced back)",
+                from.display()
+            ));
+            report.skipped_files += 1;
+        } else if metadata.is_dir() {
+            if matches!(destination.kind_at(&name)?, Some(EntryKind::Symlink)) {
+                bail!(
+                    "refusing symlinked profile directory {}",
+                    destination.path().join(&name).display()
+                );
+            }
+            let child = destination
+                .create_dir_at(&name)
+                .with_context(|| format!("failed to secure destination {name:?}"))?;
+            copy_back_entries(&from, &child, report)?;
+        } else if metadata.is_file() {
+            match destination.kind_at(&name)? {
+                Some(EntryKind::Symlink) => {
+                    report.warnings.push(format!(
+                        "refusing to replace host symlink {}",
+                        destination.path().join(&name).display()
+                    ));
+                    report.skipped_files += 1;
+                    continue;
+                }
+                Some(EntryKind::Dir) => {
+                    report.warnings.push(format!(
+                        "destination {} is a directory; skipping file",
+                        destination.path().join(&name).display()
+                    ));
+                    report.skipped_files += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            if same_contents_at(destination, &name, &from)? {
+                report.skipped_files += 1;
+                continue;
+            }
+            report.copied_files += 1;
+            let tmp_name = temporary_name();
+            let mut output = destination.create_file_at(OsStr::new(&tmp_name))?;
+            let result = (|| -> Result<()> {
+                let metadata = copy_source_to_file(&from, &mut output, false)?;
+                output.sync_all()?;
+                let mode = (metadata.permissions().mode() & 0o755).max(0o600);
+                output.set_permissions(fs::Permissions::from_mode(mode))?;
+                destination.rename_at(OsStr::new(&tmp_name), &name)?;
+                destination.sync()?;
+                Ok(())
+            })();
+            drop(output);
+            if result.is_err() {
+                let _ = destination.unlink_at(OsStr::new(&tmp_name));
+            }
+            result?;
+        } else {
+            report.warnings.push(format!(
+                "skipped special file {} (only regular files are synced back)",
+                from.display()
+            ));
+            report.skipped_files += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Read-only walk used by `--dry-run`; it never creates or replaces anything.
+fn copy_back_tree_dry(
+    bundle: &Path,
+    destination: &Path,
+    report: &mut SyncBackReport,
+) -> Result<()> {
     for entry in
         fs::read_dir(bundle).with_context(|| format!("failed to read {}", bundle.display()))?
     {
@@ -162,10 +274,7 @@ fn copy_back_tree(
             ));
             report.skipped_files += 1;
         } else if metadata.is_dir() {
-            if !dry_run {
-                secure_dir(&to)?;
-            }
-            copy_back_tree(&from, &to, dry_run, report)?;
+            copy_back_tree_dry(&from, &to, report)?;
         } else if metadata.is_file() {
             if let Ok(existing) = fs::symlink_metadata(&to)
                 && existing.file_type().is_symlink()
@@ -178,19 +287,9 @@ fn copy_back_tree(
             }
             if same_contents(&from, &to)? {
                 report.skipped_files += 1;
-                continue;
+            } else {
+                report.copied_files += 1;
             }
-            report.copied_files += 1;
-            if dry_run {
-                continue;
-            }
-            if let Some(parent) = to.parent() {
-                secure_dir(parent)?;
-            }
-            copy_file_private(&from, &to, false)?;
-            let mode = metadata.permissions().mode() & 0o755;
-            let mode = if mode == 0 { 0o600 } else { mode };
-            let _ = fs::set_permissions(&to, fs::Permissions::from_mode(mode));
         } else {
             report.warnings.push(format!(
                 "skipped special file {} (only regular files are synced back)",
@@ -200,6 +299,45 @@ fn copy_back_tree(
         }
     }
     Ok(())
+}
+
+fn same_contents_at(destination: &DirFd, name: &OsStr, source: &Path) -> Result<bool> {
+    let Ok(mut existing) = destination.open_file_read_at(name) else {
+        return Ok(false);
+    };
+    let mut input = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(source)
+        .with_context(|| format!("failed to open {}", source.display()))?;
+    let existing_meta = existing.metadata()?;
+    let source_meta = input.metadata()?;
+    if !existing_meta.is_file()
+        || !source_meta.is_file()
+        || existing_meta.len() != source_meta.len()
+    {
+        return Ok(false);
+    }
+    let mut left = [0u8; 64 * 1024];
+    let mut right = [0u8; 64 * 1024];
+    loop {
+        let left_read = existing.read(&mut left)?;
+        let right_read = input.read(&mut right)?;
+        if left_read != right_read || left[..left_read] != right[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn temporary_name() -> String {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!(".hegn-sync-{}-{nonce}", std::process::id())
 }
 
 fn materialize(

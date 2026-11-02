@@ -86,7 +86,11 @@ impl InstanceStore {
     pub fn save(&self, config: &InstanceConfig) -> Result<()> {
         config.validate()?;
         let dir = self.dir(&config.name)?;
+        let existed = dir.is_dir();
         create_private_dir(&dir)?;
+        if !existed {
+            sync_directory(&self.root)?;
+        }
         let path = dir.join(CONFIG_FILE);
         let raw = toml::to_string_pretty(config)?;
         let unique = SystemTime::now()
@@ -110,6 +114,7 @@ impl InstanceStore {
             file.sync_all()?;
             fs::rename(&tmp, &path)
                 .with_context(|| format!("failed to replace {}", path.display()))?;
+            sync_directory(&dir)?;
             Ok(())
         })();
         if result.is_err() {
@@ -148,6 +153,13 @@ impl InstanceStore {
         instances.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(instances)
     }
+}
+
+/// Persist a directory entry after creating, renaming or removing a child.
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|handle| handle.sync_all())
+        .with_context(|| format!("failed to sync {}", path.display()))
 }
 
 #[cfg(test)]

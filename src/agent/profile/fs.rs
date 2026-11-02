@@ -3,12 +3,183 @@
 //! These helpers never follow symlinks planted by a guest: secure directories
 //! are recreated instead, and files are opened with `O_NOFOLLOW`.
 
+use std::ffi::{CString, OsStr};
 use std::fs;
-use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+
+/// A directory descriptor used for descriptor-relative traversal.
+///
+/// Sync-back destinations must not be traversed by path: a guest-controlled
+/// name could otherwise race a symlink replacement between `symlink_metadata`
+/// and `create_dir_all`/`File::create`. Every operation below is relative to a
+/// held descriptor and uses `O_NOFOLLOW`.
+pub(super) struct DirFd {
+    fd: OwnedFd,
+    path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EntryKind {
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
+impl DirFd {
+    /// Open the configured source root with normal path resolution.
+    ///
+    /// The root itself may be a symlink; only descendants are no-follow.
+    pub(super) fn open_root(path: &Path) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        Ok(Self {
+            fd: file.into(),
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) fn create_dir_at(&self, name: &OsStr) -> Result<Self> {
+        let c_name = c_name(name)?;
+        let rc = unsafe { libc::mkdirat(self.fd.as_raw_fd(), c_name.as_ptr(), 0o700) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(err).with_context(|| format!("failed to create {name:?}"));
+            }
+        }
+        self.open_dir_at(name)
+    }
+
+    pub(super) fn open_dir_at(&self, name: &OsStr) -> Result<Self> {
+        let c_name = c_name(name)?;
+        let fd = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to open directory {name:?}"));
+        }
+        Ok(Self {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            path: self.path.join(name),
+        })
+    }
+
+    pub(super) fn kind_at(&self, name: &OsStr) -> Result<Option<EntryKind>> {
+        let c_name = c_name(name)?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                self.fd.as_raw_fd(),
+                c_name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(err).with_context(|| format!("failed to inspect {name:?}"));
+        }
+        let kind = match stat.st_mode & libc::S_IFMT {
+            libc::S_IFREG => EntryKind::File,
+            libc::S_IFDIR => EntryKind::Dir,
+            libc::S_IFLNK => EntryKind::Symlink,
+            _ => EntryKind::Other,
+        };
+        Ok(Some(kind))
+    }
+
+    pub(super) fn open_file_read_at(&self, name: &OsStr) -> Result<fs::File> {
+        let c_name = c_name(name)?;
+        let fd = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to open {name:?}"));
+        }
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+
+    pub(super) fn create_file_at(&self, name: &OsStr) -> Result<fs::File> {
+        let c_name = c_name(name)?;
+        let fd = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to create {name:?}"));
+        }
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+
+    pub(super) fn rename_at(&self, from: &OsStr, to: &OsStr) -> Result<()> {
+        let from = c_name(from)?;
+        let to = c_name(to)?;
+        let rc = unsafe {
+            libc::renameat(
+                self.fd.as_raw_fd(),
+                from.as_ptr(),
+                self.fd.as_raw_fd(),
+                to.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to replace destination");
+        }
+        Ok(())
+    }
+
+    pub(super) fn unlink_at(&self, name: &OsStr) -> Result<()> {
+        let name = c_name(name)?;
+        let rc = unsafe { libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), 0) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to remove temporary file");
+        }
+        Ok(())
+    }
+
+    pub(super) fn sync(&self) -> Result<()> {
+        let rc = unsafe { libc::fsync(self.fd.as_raw_fd()) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to sync directory");
+        }
+        Ok(())
+    }
+}
+
+fn c_name(name: &OsStr) -> Result<CString> {
+    CString::new(name.as_bytes()).map_err(|_| anyhow::anyhow!("file name contains a NUL byte"))
+}
 
 pub(super) fn secure_dir(path: &Path) -> Result<()> {
     if let Ok(metadata) = fs::symlink_metadata(path)
@@ -61,6 +232,35 @@ pub(super) fn copy_file_private(source: &Path, dest: &Path, follow_symlinks: boo
         secure_dir(parent)?;
     }
     let _ = fs::remove_file(dest);
+    let mut output = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dest)
+        .with_context(|| format!("failed to create {}", dest.display()))?;
+    let result = (|| -> Result<()> {
+        let source_metadata = copy_source_to_file(source, &mut output, follow_symlinks)?;
+        output.sync_all()?;
+        // Keep executable skill helpers usable while never widening the owner
+        // permissions (the profile directory itself is 0700).
+        let mode = (source_metadata.permissions().mode() & 0o755) | 0o600;
+        output
+            .set_permissions(fs::Permissions::from_mode(mode))
+            .with_context(|| format!("failed to set permissions on {}", dest.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(dest);
+    }
+    result
+}
+
+pub(super) fn copy_source_to_file(
+    source: &Path,
+    output: &mut fs::File,
+    follow_symlinks: bool,
+) -> Result<fs::Metadata> {
     let flags = if follow_symlinks {
         libc::O_CLOEXEC | libc::O_NONBLOCK
     } else {
@@ -71,34 +271,14 @@ pub(super) fn copy_file_private(source: &Path, dest: &Path, follow_symlinks: boo
         .custom_flags(flags)
         .open(source)
         .with_context(|| format!("failed to open profile source {}", source.display()))?;
-    let source_metadata = input
+    let metadata = input
         .metadata()
         .with_context(|| format!("failed to inspect {}", source.display()))?;
-    if !source_metadata.is_file() {
+    if !metadata.is_file() {
         bail!("profile source {} is not a regular file", source.display());
     }
-    let mut output = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(dest)
-        .with_context(|| format!("failed to create {}", dest.display()))?;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = input.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        output.write_all(&buffer[..read])?;
-    }
-    output.sync_all()?;
-    // Keep executable skill helpers usable while never widening the owner
-    // permissions (the profile directory itself is 0700).
-    let mode = (source_metadata.permissions().mode() & 0o755) | 0o600;
-    fs::set_permissions(dest, fs::Permissions::from_mode(mode))
-        .with_context(|| format!("failed to set permissions on {}", dest.display()))?;
-    Ok(())
+    std::io::copy(&mut input, output)?;
+    Ok(metadata)
 }
 
 #[cfg(test)]
