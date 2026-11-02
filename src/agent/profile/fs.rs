@@ -47,6 +47,31 @@ impl DirFd {
         })
     }
 
+    /// Open a guest-controlled root without following a replacement symlink.
+    pub(super) fn open_source_root(path: &Path) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .with_context(|| format!("failed to open source {}", path.display()))?;
+        Ok(Self {
+            fd: file.into(),
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub(super) fn entries(&self) -> Result<Vec<std::ffi::OsString>> {
+        let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()));
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&path)
+            .with_context(|| format!("failed to read directory {}", self.path.display()))?
+        {
+            names.push(entry?.file_name());
+        }
+        names.sort();
+        Ok(names)
+    }
+
     pub(super) fn path(&self) -> &Path {
         &self.path
     }
@@ -271,13 +296,20 @@ pub(super) fn copy_source_to_file(
         .custom_flags(flags)
         .open(source)
         .with_context(|| format!("failed to open profile source {}", source.display()))?;
+    copy_open_source_to_file(&mut input, output)
+}
+
+pub(super) fn copy_open_source_to_file(
+    input: &mut fs::File,
+    output: &mut fs::File,
+) -> Result<fs::Metadata> {
     let metadata = input
         .metadata()
-        .with_context(|| format!("failed to inspect {}", source.display()))?;
+        .context("failed to inspect profile source")?;
     if !metadata.is_file() {
-        bail!("profile source {} is not a regular file", source.display());
+        bail!("profile source is not a regular file");
     }
-    std::io::copy(&mut input, output)?;
+    std::io::copy(input, output)?;
     Ok(metadata)
 }
 

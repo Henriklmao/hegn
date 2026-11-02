@@ -7,8 +7,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{Read, Seek};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -19,7 +18,7 @@ use crate::vm::instance_config::InstanceConfig;
 
 use super::PROFILE_VERSION;
 use super::fs::{
-    DirFd, EntryKind, copy_file_private, copy_source_to_file, ensure_real_dir, remove_path,
+    DirFd, EntryKind, copy_file_private, copy_open_source_to_file, ensure_real_dir, remove_path,
 };
 use super::model::{ProfilePlan, ProfileShare, SyncBackReport, SyncReport};
 use super::store::{ProfileLayout, ProfileState, ProfileStore, StoredFile, StoredSkill};
@@ -156,9 +155,10 @@ fn copy_back_tree(
     if dry_run {
         return copy_back_tree_dry(bundle, destination, report);
     }
+    let source = DirFd::open_source_root(bundle)?;
     ensure_backup_root(destination)?;
     let root = DirFd::open_root(destination)?;
-    copy_back_entries(bundle, &root, report)
+    copy_back_entries(&source, &root, report)
 }
 
 /// The source root may be a symlink; only descendants are no-follow.
@@ -174,81 +174,90 @@ fn ensure_backup_root(destination: &Path) -> Result<()> {
 }
 
 fn copy_back_entries(
-    bundle: &Path,
+    source: &DirFd,
     destination: &DirFd,
     report: &mut SyncBackReport,
 ) -> Result<()> {
-    for entry in
-        fs::read_dir(bundle).with_context(|| format!("failed to read {}", bundle.display()))?
-    {
-        let entry = entry?;
-        let from = entry.path();
-        let name = entry.file_name();
-        let metadata = fs::symlink_metadata(&from)?;
-        if metadata.file_type().is_symlink() {
-            report.warnings.push(format!(
-                "skipped symlink {} (only regular files are synced back)",
-                from.display()
-            ));
-            report.skipped_files += 1;
-        } else if metadata.is_dir() {
-            if matches!(destination.kind_at(&name)?, Some(EntryKind::Symlink)) {
-                bail!(
-                    "refusing symlinked profile directory {}",
-                    destination.path().join(&name).display()
-                );
-            }
-            let child = destination
-                .create_dir_at(&name)
-                .with_context(|| format!("failed to secure destination {name:?}"))?;
-            copy_back_entries(&from, &child, report)?;
-        } else if metadata.is_file() {
-            match destination.kind_at(&name)? {
-                Some(EntryKind::Symlink) => {
-                    report.warnings.push(format!(
-                        "refusing to replace host symlink {}",
-                        destination.path().join(&name).display()
-                    ));
-                    report.skipped_files += 1;
-                    continue;
-                }
-                Some(EntryKind::Dir) => {
-                    report.warnings.push(format!(
-                        "destination {} is a directory; skipping file",
-                        destination.path().join(&name).display()
-                    ));
-                    report.skipped_files += 1;
-                    continue;
-                }
-                _ => {}
-            }
-            if same_contents_at(destination, &name, &from)? {
+    for name in source.entries()? {
+        let from = source.path().join(&name);
+        match source.kind_at(&name)? {
+            Some(EntryKind::Symlink) => {
+                report.warnings.push(format!(
+                    "skipped symlink {} (only regular files are synced back)",
+                    from.display()
+                ));
                 report.skipped_files += 1;
-                continue;
             }
-            report.copied_files += 1;
-            let tmp_name = temporary_name();
-            let mut output = destination.create_file_at(OsStr::new(&tmp_name))?;
-            let result = (|| -> Result<()> {
-                let metadata = copy_source_to_file(&from, &mut output, false)?;
-                output.sync_all()?;
-                let mode = (metadata.permissions().mode() & 0o755).max(0o600);
-                output.set_permissions(fs::Permissions::from_mode(mode))?;
-                destination.rename_at(OsStr::new(&tmp_name), &name)?;
-                destination.sync()?;
-                Ok(())
-            })();
-            drop(output);
-            if result.is_err() {
-                let _ = destination.unlink_at(OsStr::new(&tmp_name));
+            Some(EntryKind::Dir) => {
+                if matches!(destination.kind_at(&name)?, Some(EntryKind::Symlink)) {
+                    bail!(
+                        "refusing symlinked profile directory {}",
+                        destination.path().join(&name).display()
+                    );
+                }
+                let child_source = source.open_dir_at(&name)?;
+                let child_destination = destination
+                    .create_dir_at(&name)
+                    .with_context(|| format!("failed to secure destination {name:?}"))?;
+                copy_back_entries(&child_source, &child_destination, report)?;
             }
-            result?;
-        } else {
-            report.warnings.push(format!(
-                "skipped special file {} (only regular files are synced back)",
-                from.display()
-            ));
-            report.skipped_files += 1;
+            Some(EntryKind::File) => {
+                match destination.kind_at(&name)? {
+                    Some(EntryKind::Symlink) => {
+                        report.warnings.push(format!(
+                            "refusing to replace host symlink {}",
+                            destination.path().join(&name).display()
+                        ));
+                        report.skipped_files += 1;
+                        continue;
+                    }
+                    Some(EntryKind::Dir) => {
+                        report.warnings.push(format!(
+                            "destination {} is a directory; skipping file",
+                            destination.path().join(&name).display()
+                        ));
+                        report.skipped_files += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                let mut input = source.open_file_read_at(&name)?;
+                if same_contents_at(destination, &name, &mut input)? {
+                    report.skipped_files += 1;
+                    continue;
+                }
+                input.seek(std::io::SeekFrom::Start(0))?;
+                report.copied_files += 1;
+                let tmp_name = temporary_name();
+                let mut output = destination.create_file_at(OsStr::new(&tmp_name))?;
+                let result = (|| -> Result<()> {
+                    let metadata = copy_open_source_to_file(&mut input, &mut output)?;
+                    output.sync_all()?;
+                    let mode = (metadata.permissions().mode() & 0o755) | 0o600;
+                    output.set_permissions(fs::Permissions::from_mode(mode))?;
+                    destination.rename_at(OsStr::new(&tmp_name), &name)?;
+                    destination.sync()?;
+                    Ok(())
+                })();
+                drop(output);
+                if result.is_err() {
+                    let _ = destination.unlink_at(OsStr::new(&tmp_name));
+                }
+                result?;
+            }
+            None => {
+                report
+                    .warnings
+                    .push(format!("skipped vanished entry {}", from.display()));
+                report.skipped_files += 1;
+            }
+            Some(EntryKind::Other) => {
+                report.warnings.push(format!(
+                    "skipped special file {} (only regular files are synced back)",
+                    from.display()
+                ));
+                report.skipped_files += 1;
+            }
         }
     }
     Ok(())
@@ -301,17 +310,12 @@ fn copy_back_tree_dry(
     Ok(())
 }
 
-fn same_contents_at(destination: &DirFd, name: &OsStr, source: &Path) -> Result<bool> {
+fn same_contents_at(destination: &DirFd, name: &OsStr, source: &mut fs::File) -> Result<bool> {
     let Ok(mut existing) = destination.open_file_read_at(name) else {
         return Ok(false);
     };
-    let mut input = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(source)
-        .with_context(|| format!("failed to open {}", source.display()))?;
     let existing_meta = existing.metadata()?;
-    let source_meta = input.metadata()?;
+    let source_meta = source.metadata()?;
     if !existing_meta.is_file()
         || !source_meta.is_file()
         || existing_meta.len() != source_meta.len()
@@ -322,7 +326,7 @@ fn same_contents_at(destination: &DirFd, name: &OsStr, source: &Path) -> Result<
     let mut right = [0u8; 64 * 1024];
     loop {
         let left_read = existing.read(&mut left)?;
-        let right_read = input.read(&mut right)?;
+        let right_read = source.read(&mut right)?;
         if left_read != right_read || left[..left_read] != right[..right_read] {
             return Ok(false);
         }
