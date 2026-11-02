@@ -324,10 +324,10 @@ mod tests {
 
     #[test]
     fn check_tool_reports_success_without_a_version_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let tool = script(dir.path(), "silent", "exit 0");
-
-        let check = check_tool("silent", &tool, &[], true);
+        // `/bin/true` is a stable executable that exits successfully without
+        // printing anything; a temp script is more prone to transient exec
+        // failures under a loaded test runner.
+        let check = check_tool("silent", Path::new("/bin/true"), &[], true);
         assert!(check.ok);
         assert!(check.detail.contains("exit status"), "{check:?}");
     }
