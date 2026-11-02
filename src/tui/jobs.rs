@@ -36,7 +36,11 @@ pub(super) fn spawn_scan(config: Config, tx: mpsc::Sender<ScanMessage>) {
     }
 }
 
-pub(super) fn spawn_image_download(config: Config, tx: mpsc::Sender<ScanMessage>) {
+pub(super) fn spawn_image_download(
+    config: Config,
+    tx: mpsc::Sender<ScanMessage>,
+    setup_notes: Vec<String>,
+) {
     let thread_tx = tx.clone();
     let spawned = std::thread::Builder::new()
         .name("hegn-images".into())
@@ -50,11 +54,15 @@ pub(super) fn spawn_image_download(config: Config, tx: mpsc::Sender<ScanMessage>
                 },
             );
             let report = crate::diagnostics::doctor::run(&config);
-            let note = Some(match result {
+            let mut note = setup_notes;
+            note.push(match result {
                 Ok(_) => "VM images downloaded and verified".to_string(),
                 Err(err) => format!("image download failed: {err:#}"),
             });
-            let _ = thread_tx.send(ScanMessage::Doctor { report, note });
+            let _ = thread_tx.send(ScanMessage::Doctor {
+                report,
+                note: Some(note.join("; ")),
+            });
         });
     if let Err(err) = spawned {
         let _ = tx.send(ScanMessage::Error(format!(
@@ -339,6 +347,8 @@ mod tests {
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
         config.templates_dir = dir.path().join("templates");
+        config.instances_dir = dir.path().join("instances");
+        config.profiles_dir = dir.path().join("profiles");
         config.kernel_image = dir.path().join("missing-kernel");
         config.rootfs_image = dir.path().join("missing-rootfs");
         std::fs::create_dir_all(&config.projects_root).unwrap();

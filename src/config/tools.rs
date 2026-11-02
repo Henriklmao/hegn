@@ -44,11 +44,19 @@ pub(super) fn alternate_cloud_hypervisor_name(binary: &Path) -> Option<&'static 
 /// first and then in `fallbacks`; distribution helper daemons often live in a
 /// private lib directory instead of being symlinked into `PATH`.
 pub(super) fn resolve_binary(binary: &Path, fallbacks: &[&str]) -> Option<PathBuf> {
+    resolve_binary_in(binary, std::env::var_os("PATH").as_deref(), fallbacks)
+}
+
+fn resolve_binary_in(
+    binary: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+    fallbacks: &[&str],
+) -> Option<PathBuf> {
     if binary.components().count() > 1 {
         return binary.is_file().then(|| binary.to_path_buf());
     }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
+    if let Some(path) = path_var {
+        for dir in std::env::split_paths(path) {
             let candidate = dir.join(binary);
             if candidate.is_file() {
                 return Some(candidate);
@@ -117,14 +125,14 @@ mod tests {
         fs::write(&from_fallback, b"").unwrap();
 
         let path = std::env::join_paths([path_dir.path()]).unwrap();
-        let path_str = path.to_str().unwrap();
         let fallback_str = from_fallback.to_str().unwrap();
 
-        let _lock = crate::config::env::env_lock();
-        let _guard = crate::config::env::EnvVarGuard::set(&["PATH"], &[("PATH", path_str)]);
-
         assert_eq!(
-            resolve_binary(Path::new("hegn-path-tool"), &[fallback_str]),
+            resolve_binary_in(
+                Path::new("hegn-path-tool"),
+                Some(path.as_os_str()),
+                &[fallback_str]
+            ),
             Some(from_path)
         );
     }
@@ -135,10 +143,9 @@ mod tests {
         assert_eq!(resolve_binary(dir.path(), &[]), None);
 
         let path = std::env::join_paths([dir.path()]).unwrap();
-        let path_str = path.to_str().unwrap();
-        let _lock = crate::config::env::env_lock();
-        let _guard = crate::config::env::EnvVarGuard::set(&["PATH"], &[("PATH", path_str)]);
-
-        assert_eq!(resolve_binary(Path::new("hegn-missing-tool"), &[]), None);
+        assert_eq!(
+            resolve_binary_in(Path::new("hegn-missing-tool"), Some(path.as_os_str()), &[]),
+            None
+        );
     }
 }

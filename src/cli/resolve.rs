@@ -36,6 +36,13 @@ pub fn resolve_project_entry(config: &Config, arg: &str) -> Result<PathBuf> {
         .canonicalize()
         .unwrap_or_else(|_| config.projects_root.clone());
     for candidate in [config.projects_root.join(arg), PathBuf::from(arg)] {
+        // `..` and other non-normal final components never name a picker entry.
+        if !matches!(
+            candidate.components().next_back(),
+            Some(std::path::Component::Normal(_))
+        ) {
+            continue;
+        }
         if std::fs::symlink_metadata(&candidate).is_err() {
             continue;
         }
@@ -127,6 +134,10 @@ mod tests {
         assert!(
             resolve_project_entry(&config, "nested/deep").is_err(),
             "nested selectors are not root entries"
+        );
+        assert!(
+            resolve_project_entry(&config, "..").is_err(),
+            "parent traversal is not a picker entry"
         );
         assert!(resolve_project_entry(&config, "missing").is_err());
 

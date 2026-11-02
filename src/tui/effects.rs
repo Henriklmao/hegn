@@ -39,7 +39,7 @@ pub(super) fn handle_effects(
             }
             Effect::DownloadImages => {
                 app.toast("downloading VM images…", ToastLevel::Info);
-                spawn_image_download(app.config.clone(), scan_tx.clone());
+                spawn_image_download(app.config.clone(), scan_tx.clone(), Vec::new());
             }
             Effect::SetupEnvironment => {
                 let actions = crate::diagnostics::doctor::setup_actions(&app.config);
@@ -48,6 +48,7 @@ pub(super) fn handle_effects(
                 let mut modal =
                     crate::tui::app::DoctorModal::new(crate::diagnostics::doctor::run(&app.config));
                 modal.setting_up = true;
+                modal.downloading = actions.download_images;
                 app.modal = Some(crate::tui::app::Modal::Doctor(modal));
                 app.toast("setting up hegn…", ToastLevel::Info);
 
@@ -95,7 +96,7 @@ pub(super) fn handle_effects(
                 }
                 if actions.download_images {
                     app.toast("downloading VM images…", ToastLevel::Info);
-                    spawn_image_download(app.config.clone(), scan_tx.clone());
+                    spawn_image_download(app.config.clone(), scan_tx.clone(), notes);
                 } else {
                     let note = if notes.is_empty() {
                         "nothing to set up".to_string()
@@ -284,7 +285,7 @@ pub(super) fn handle_effects(
                         "restore failed: no instance for snapshot",
                         ToastLevel::Error,
                     );
-                    return Ok(());
+                    continue;
                 };
                 let manager = registry.manager(instance);
                 match runtime.block_on(manager.restore_snapshot(&snapshot)) {

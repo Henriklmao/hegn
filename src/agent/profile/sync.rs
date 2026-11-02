@@ -187,7 +187,7 @@ fn copy_back_tree(
             if let Some(parent) = to.parent() {
                 secure_dir(parent)?;
             }
-            copy_file_private(&from, &to)?;
+            copy_file_private(&from, &to, false)?;
             let mode = metadata.permissions().mode() & 0o755;
             let mode = if mode == 0 { 0o600 } else { mode };
             let _ = fs::set_permissions(&to, fs::Permissions::from_mode(mode));
@@ -266,7 +266,7 @@ fn materialize(
             let (copied, mut warnings) = if kind == "d" {
                 copy_tree(&source, &dest, false)?
             } else {
-                copy_file_private(&source, &dest)?;
+                copy_file_private(&source, &dest, true)?;
                 (1, Vec::new())
             };
             plan.warnings.append(&mut warnings);
@@ -395,7 +395,7 @@ fn copy_tree(source: &Path, dest: &Path, merge: bool) -> Result<(usize, Vec<Stri
             copied += child_copied;
             warnings.append(&mut child_warnings);
         } else if metadata.is_file() {
-            copy_file_private(&from, &to)?;
+            copy_file_private(&from, &to, true)?;
             copied += 1;
         } else {
             warnings.push(format!(
@@ -438,7 +438,7 @@ fn merge_tree(source: &Path, dest: &Path, dry_run: bool) -> Result<(usize, Vec<S
             if same_contents(&from, &to)? {
                 continue;
             }
-            copy_file_private(&from, &to)?;
+            copy_file_private(&from, &to, true)?;
             copied += 1;
         } else {
             warnings.push(format!(

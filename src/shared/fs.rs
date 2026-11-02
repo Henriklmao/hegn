@@ -33,18 +33,38 @@ pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> 
 /// Existing directories are tightened to `0700` as well, because all callers
 /// store sockets, logs or metadata below them.
 pub fn create_private_dir(path: &Path) -> io::Result<()> {
-    if let Ok(metadata) = fs::symlink_metadata(path)
-        && metadata.file_type().is_symlink()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("refusing symlinked directory {}", path.display()),
-        ));
+    create_private_dir_with(path, true)
+}
+
+/// Create `path` recursively, but never change the mode of a directory that
+/// already exists.
+///
+/// Use this for caller-supplied parent directories (for example the destination
+/// of an image download): hegn may create a missing parent with `0700`, but it
+/// must not tighten a directory owned or shared by another service.
+pub fn create_private_dir_if_missing(path: &Path) -> io::Result<()> {
+    create_private_dir_with(path, false)
+}
+
+fn create_private_dir_with(path: &Path, tighten_existing: bool) -> io::Result<()> {
+    let existing = fs::symlink_metadata(path).ok();
+    if let Some(metadata) = &existing {
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("refusing symlinked directory {}", path.display()),
+            ));
+        }
+        if metadata.is_dir() && !tighten_existing {
+            return Ok(());
+        }
     }
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
     builder.create(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    if existing.is_none() || tighten_existing {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
     Ok(())
 }
 
@@ -100,6 +120,27 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(create_private_dir(&link).is_err());
+    }
+
+    #[test]
+    fn create_private_dir_if_missing_does_not_tighten_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("shared");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+
+        create_private_dir_if_missing(&existing).unwrap();
+        assert_eq!(
+            fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        let created = dir.path().join("created/sub");
+        create_private_dir_if_missing(&created).unwrap();
+        assert_eq!(
+            fs::metadata(&created).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]

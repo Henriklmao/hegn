@@ -56,15 +56,27 @@ pub(super) fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-pub(super) fn copy_file_private(source: &Path, dest: &Path) -> Result<()> {
+pub(super) fn copy_file_private(source: &Path, dest: &Path, follow_symlinks: bool) -> Result<()> {
     if let Some(parent) = dest.parent() {
         secure_dir(parent)?;
     }
     let _ = fs::remove_file(dest);
-    let source_metadata =
-        fs::metadata(source).with_context(|| format!("failed to inspect {}", source.display()))?;
-    let mut input = fs::File::open(source)
+    let flags = if follow_symlinks {
+        libc::O_CLOEXEC | libc::O_NONBLOCK
+    } else {
+        libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+    };
+    let mut input = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(source)
         .with_context(|| format!("failed to open profile source {}", source.display()))?;
+    let source_metadata = input
+        .metadata()
+        .with_context(|| format!("failed to inspect {}", source.display()))?;
+    if !source_metadata.is_file() {
+        bail!("profile source {} is not a regular file", source.display());
+    }
     let mut output = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -147,6 +159,22 @@ mod tests {
     }
 
     #[test]
+    fn copy_file_private_rejects_symlinked_sources_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"payload").unwrap();
+        let source = dir.path().join("source-link");
+        std::os::unix::fs::symlink(&target, &source).unwrap();
+        let dest = dir.path().join("dest");
+
+        assert!(copy_file_private(&source, &dest, false).is_err());
+        assert!(!dest.exists());
+
+        copy_file_private(&source, &dest, true).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"payload");
+    }
+
+    #[test]
     fn copy_file_private_never_writes_through_a_destination_symlink() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
@@ -156,7 +184,7 @@ mod tests {
         let dest = dir.path().join("dest");
         std::os::unix::fs::symlink(&victim, &dest).unwrap();
 
-        copy_file_private(&source, &dest).unwrap();
+        copy_file_private(&source, &dest, true).unwrap();
         assert_eq!(fs::read(&victim).unwrap(), b"host");
         let metadata = fs::symlink_metadata(&dest).unwrap();
         assert!(metadata.is_file() && !metadata.file_type().is_symlink());

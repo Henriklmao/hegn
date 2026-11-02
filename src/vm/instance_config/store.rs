@@ -8,6 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
@@ -88,17 +89,33 @@ impl InstanceStore {
         create_private_dir(&dir)?;
         let path = dir.join(CONFIG_FILE);
         let raw = toml::to_string_pretty(config)?;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        file.write_all(raw.as_bytes())?;
-        file.sync_all()?;
-        Ok(())
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let tmp = dir.join(format!(
+            ".{CONFIG_FILE}.tmp-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&tmp);
+        let result = (|| -> Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&tmp)
+                .with_context(|| format!("failed to write {}", tmp.display()))?;
+            file.write_all(raw.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&tmp, &path)
+                .with_context(|| format!("failed to replace {}", path.display()))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
     }
 
     pub fn list(&self) -> Result<Vec<InstanceConfig>> {
@@ -293,7 +310,9 @@ mod tests {
     }
 
     #[test]
-    fn save_refuses_to_follow_a_symlinked_config_file() {
+    fn save_replaces_a_symlinked_config_file_without_following_it() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().unwrap();
         let store = InstanceStore::new(config(dir.path()));
         let project = project(dir.path(), "demo");
@@ -306,9 +325,14 @@ mod tests {
         fs::write(&outside, b"secret").unwrap();
         std::os::unix::fs::symlink(&outside, &config_path).unwrap();
 
-        assert!(store.save(&instance).is_err());
+        store.save(&instance).unwrap();
         assert_eq!(fs::read(&outside).unwrap(), b"secret");
-        assert!(config_path.is_symlink());
+        assert!(!config_path.is_symlink());
+        assert_eq!(store.load("demo").unwrap().name, "demo");
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

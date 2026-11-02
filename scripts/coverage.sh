@@ -31,9 +31,19 @@ export RUSTFLAGS="${RUSTFLAGS:-} -C instrument-coverage"
 export LLVM_PROFILE_FILE="$workdir/hegn-%p-%m.profraw"
 
 echo "coverage: building instrumented library tests" >&2
+set +e
+cargo test --lib --no-run --message-format=json \
+  >"$workdir/cargo.json" 2>"$workdir/build.log"
+cargo_status=$?
+set -e
+if (( cargo_status != 0 )); then
+  echo "coverage: instrumented build failed (cargo exit $cargo_status)" >&2
+  sed -n '1,120p' "$workdir/build.log" >&2
+  exit "$cargo_status"
+fi
+
 binary="$(
-  cargo test --lib --no-run --message-format=json 2>"$workdir/build.log" |
-    python3 -c '
+  python3 -c '
 import json, sys
 for line in sys.stdin:
     try:
@@ -47,11 +57,11 @@ for line in sys.stdin:
     ):
         print(message["executable"])
         break
-'
+' <"$workdir/cargo.json"
 )"
 if [[ -z "$binary" ]]; then
   echo "coverage: could not locate the instrumented test binary" >&2
-  sed -n '1,80p' "$workdir/build.log" >&2
+  sed -n '1,120p' "$workdir/build.log" >&2
   exit 1
 fi
 

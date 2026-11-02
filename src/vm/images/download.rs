@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
-use crate::shared::fs::create_private_dir;
+use crate::shared::fs::create_private_dir_if_missing;
 
 use super::MAX_ASSET_BYTES;
 use super::assets::{AssetStatus, status};
@@ -100,7 +100,7 @@ pub fn install_from_reader_with_progress(
     if let Some(parent) = dest.parent()
         && !parent.as_os_str().is_empty()
     {
-        create_private_dir(parent)?;
+        create_private_dir_if_missing(parent)?;
     }
 
     let tmp = temp_path(dest);
@@ -535,11 +535,11 @@ mod tests {
     fn private_directories_are_created_with_mode_0700() {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("one/two/three");
-        create_private_dir(&nested).unwrap();
+        crate::shared::fs::create_private_dir(&nested).unwrap();
         let mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         // Re-creating an existing private directory is a no-op.
-        create_private_dir(&nested).unwrap();
+        crate::shared::fs::create_private_dir(&nested).unwrap();
         assert!(nested.is_dir());
     }
 

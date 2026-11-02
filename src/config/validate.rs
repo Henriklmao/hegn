@@ -32,7 +32,8 @@ impl Config {
         }
         if !crate::vm::cloud_init::safe_mount(&self.guest_mount) {
             bail!(
-                "guest_mount must be an absolute path with simple components                  (letters, digits, '/', '-', '_' and '.')"
+                "guest_mount must be an absolute path with simple components \
+                 (letters, digits, '/', '-', '_' and '.')"
             );
         }
         if !self.root_device.starts_with("/dev/") || self.root_device.contains(',') {
