@@ -2,8 +2,26 @@
 //! XDG paths.
 //!
 //! [`form`] contains the interactive settings editor used by the TUI.
+//! Validation lives in [`validate`], path helpers in [`paths`], environment
+//! overrides in [`env`], value types in [`types`] and external-tool discovery
+//! in [`tools`]. Public items are re-exported here so callers keep using
+//! `crate::config::*`.
 
 pub mod form;
+
+mod defaults;
+mod env;
+mod paths;
+mod tools;
+mod types;
+mod validate;
+
+pub use self::defaults::DEFAULT_AGENTS_MD;
+pub use self::tools::{CLOUD_HYPERVISOR_FALLBACKS, CLOUD_HYPERVISOR_STATIC, VIRTIOFSD_FALLBACKS};
+pub use self::types::{
+    BackendKind, Harness, LocalEndpoint, NetworkMode, RootfsFormat, SecurityMode, VirtiofsSandbox,
+};
+pub use self::validate::{safe_package_name, validate_local_endpoints};
 
 use std::fs;
 use std::io::Write;
@@ -15,425 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::launch::LaunchConfig;
 
-/// How the instance is selected when a project is opened.
-///
-/// Both modes require a real Cloud Hypervisor VM. There is no local-shell
-/// fallback: a missing VM is always a hard error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum BackendKind {
-    /// Boot a VM on demand. Still requires all VM assets and binaries.
-    #[default]
-    Auto,
-    /// Boot a VM on demand. Present for explicitness; behaves like `auto`.
-    CloudHypervisor,
-}
-
-impl BackendKind {
-    pub const ALL: [Self; 2] = [Self::Auto, Self::CloudHypervisor];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::CloudHypervisor => "cloud-hypervisor",
-        }
-    }
-}
-
-/// On-disk format of the root filesystem image passed to Cloud Hypervisor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum RootfsFormat {
-    /// A raw ext4 filesystem or whole-disk image.
-    #[default]
-    Raw,
-    /// A qcow2 image (Cloud Hypervisor's official test images use this).
-    Qcow2,
-}
-
-impl RootfsFormat {
-    pub const ALL: [Self; 2] = [Self::Raw, Self::Qcow2];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Raw => "raw",
-            Self::Qcow2 => "qcow2",
-        }
-    }
-}
-
-/// A coding harness that can be launched inside the instance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-#[value(rename_all = "kebab-case")]
-pub enum Harness {
-    /// The user's login shell. Good for manual exploration.
-    #[default]
-    Shell,
-    Opencode,
-    ClaudeCode,
-    Codex,
-    Pi,
-    PrimeAgent,
-    Aider,
-    GeminiCli,
-}
-
-impl Harness {
-    pub const ALL: [Self; 8] = [
-        Self::Shell,
-        Self::Opencode,
-        Self::ClaudeCode,
-        Self::Codex,
-        Self::Pi,
-        Self::PrimeAgent,
-        Self::Aider,
-        Self::GeminiCli,
-    ];
-
-    /// Stable file-name fragment for per-harness profile templates.
-    pub fn slug(self) -> &'static str {
-        match self {
-            Self::Shell => "shell",
-            Self::Opencode => "opencode",
-            Self::ClaudeCode => "claude-code",
-            Self::Codex => "codex",
-            Self::Pi => "pi",
-            Self::PrimeAgent => "prime-agent",
-            Self::Aider => "aider",
-            Self::GeminiCli => "gemini-cli",
-        }
-    }
-
-    /// The executable that is launched for this harness.
-    pub fn command(self) -> &'static str {
-        match self {
-            Self::Shell => "shell",
-            Self::Opencode => "opencode",
-            Self::ClaudeCode => "claude",
-            Self::Codex => "codex",
-            Self::Pi => "pi",
-            Self::PrimeAgent => "prime-agent",
-            Self::Aider => "aider",
-            Self::GeminiCli => "gemini",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Shell => "shell",
-            Self::Opencode => "OpenCode",
-            Self::ClaudeCode => "Claude Code",
-            Self::Codex => "Codex",
-            Self::Pi => "pi",
-            Self::PrimeAgent => "prime-agent",
-            Self::Aider => "Aider",
-            Self::GeminiCli => "Gemini CLI",
-        }
-    }
-
-    /// Packages installed into a freshly created VM for this harness. Every
-    /// preset starts from the same base tool set and then adds the runtime the
-    /// harness actually needs; `extra_packages` is unioned on top.
-    pub fn packages(self) -> &'static [&'static str] {
-        const BASE: &[&str] = &[
-            "git",
-            "curl",
-            "ca-certificates",
-            "ripgrep",
-            "fd-find",
-            "less",
-            "jq",
-        ];
-        match self {
-            Self::Shell => BASE,
-            Self::Opencode | Self::ClaudeCode | Self::Codex | Self::Pi | Self::GeminiCli => &[
-                "git",
-                "curl",
-                "ca-certificates",
-                "ripgrep",
-                "fd-find",
-                "less",
-                "jq",
-                "nodejs",
-                "build-essential",
-            ],
-            Self::PrimeAgent => &[
-                "git",
-                "curl",
-                "ca-certificates",
-                "ripgrep",
-                "fd-find",
-                "less",
-                "jq",
-                "python3",
-                "python3-pip",
-                "python3-venv",
-                "xz-utils",
-            ],
-            Self::Aider => &[
-                "git",
-                "curl",
-                "ca-certificates",
-                "ripgrep",
-                "fd-find",
-                "less",
-                "jq",
-                "python3",
-                "python3-pip",
-                "python3-venv",
-                "build-essential",
-            ],
-        }
-    }
-
-    /// Short description used by the create form and CLI output.
-    pub fn preset_summary(self) -> &'static str {
-        match self {
-            Self::Shell => "base CLI tools",
-            Self::Opencode => "Node 22 + OpenCode CLI",
-            Self::ClaudeCode => "Node 22 + Claude Code CLI",
-            Self::Codex => "Node 22 + Codex CLI",
-            Self::Pi => "Node 22 + Pi coding agent",
-            Self::PrimeAgent => "Python + Prime Agent installer",
-            Self::Aider => "Python + Aider",
-            Self::GeminiCli => "Node 22 + Gemini CLI",
-        }
-    }
-
-    /// Whether the preset installs Node.js from NodeSource before the harness.
-    pub fn needs_node(self) -> bool {
-        matches!(
-            self,
-            Self::Opencode | Self::ClaudeCode | Self::Codex | Self::Pi | Self::GeminiCli
-        )
-    }
-
-    /// Shell commands run by the first-boot provisioner after the apt packages
-    /// are installed. They are static, auditable strings; user-provided package
-    /// names never become shell fragments.
-    pub fn install_commands(self) -> &'static [&'static str] {
-        match self {
-            Self::Shell => &[],
-            Self::Opencode => &["npm install --global --no-fund --no-audit opencode-ai"],
-            Self::ClaudeCode => {
-                &["npm install --global --no-fund --no-audit @anthropic-ai/claude-code"]
-            }
-            Self::Codex => &["npm install --global --no-fund --no-audit @openai/codex"],
-            Self::Pi => &[
-                "npm install --global --no-fund --no-audit --ignore-scripts @earendil-works/pi-coding-agent",
-            ],
-            Self::PrimeAgent => &[
-                "curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 https://app.primeintellect.ai/prime-agent/install.sh -o /tmp/hegn-prime-agent.sh",
-                "sh /tmp/hegn-prime-agent.sh",
-            ],
-            Self::Aider => &[
-                "python3 -m pip install --upgrade pip",
-                "python3 -m pip install --upgrade aider-chat",
-            ],
-            Self::GeminiCli => &["npm install --global --no-fund --no-audit @google/gemini-cli"],
-        }
-    }
-}
-
-/// Whether the guest gets a guarded network device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum NetworkMode {
-    /// No network device at all (air-gapped).
-    Off,
-    /// A host-guarded TAP device: public HTTP(S) and public DNS only.
-    #[default]
-    Guarded,
-}
-
-impl NetworkMode {
-    pub const ALL: [Self; 2] = [Self::Off, Self::Guarded];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Guarded => "guarded",
-        }
-    }
-}
-
-/// A host-local TCP service the guest may reach through the guarded network.
-///
-/// The service is expected to listen on `127.0.0.1:<port>` on the host (the
-/// default for Ollama, llama.cpp, LM Studio, vLLM, …). `hegn network setup`
-/// installs a per-TAP DNAT rule so the guest can use the same port on its TAP
-/// host address instead of the loopback address.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LocalEndpoint {
-    /// Short label, also used for the guest's `HEGN_ENDPOINT_<NAME>` variable.
-    pub name: String,
-    /// TCP port on the host loopback that is exposed on the TAP host address.
-    pub port: u16,
-}
-
-impl LocalEndpoint {
-    pub fn env_name(&self) -> String {
-        let mut name = String::from("HEGN_ENDPOINT_");
-        for ch in self.name.chars() {
-            if ch.is_ascii_alphanumeric() {
-                name.push(ch.to_ascii_uppercase());
-            } else {
-                name.push('_');
-            }
-        }
-        name
-    }
-
-    /// URL the guest uses. `host` is the instance's TAP host address.
-    pub fn url(&self, host: std::net::Ipv4Addr) -> String {
-        format!("http://{host}:{}", self.port)
-    }
-}
-
-/// Why a [`LocalEndpoint`] is invalid.
-pub fn validate_local_endpoints(endpoints: &[LocalEndpoint]) -> Result<()> {
-    let mut seen = Vec::new();
-    for endpoint in endpoints {
-        if !crate::vm::cloud_init::safe_token(&endpoint.name) || endpoint.name.len() > 32 {
-            bail!(
-                "invalid local endpoint name {:?}: use up to 32 ASCII letters, digits, '-', '_' or '.'",
-                endpoint.name
-            );
-        }
-        // Ports below 1024 are reserved for privileged host services (SSH,
-        // DNS, …). Exposing those to an instance is never an LLM passthrough.
-        if endpoint.port < 1024 {
-            bail!(
-                "local endpoint '{}' uses port {}; ports below 1024 are not exposed",
-                endpoint.name,
-                endpoint.port
-            );
-        }
-        let key = endpoint.name.to_ascii_lowercase();
-        if seen.contains(&key) {
-            bail!("duplicate local endpoint name '{}'", endpoint.name);
-        }
-        seen.push(key);
-    }
-    Ok(())
-}
-
-/// Validate a Debian package name before it reaches a root shell or YAML file.
-pub fn safe_package_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '_' | '-'))
-        && !name.starts_with('-')
-}
-
-/// Locations where distributions install `virtiofsd` outside `PATH`.
-///
-/// Arch ships `/usr/lib/virtiofsd`, Fedora/RHEL use `/usr/libexec/virtiofsd`,
-/// Debian/Ubuntu keep it in `/usr/lib/qemu/`, and openSUSE uses
-/// `/usr/libexec/qemu/`. `hegn doctor` and the instance preflight fall back to
-/// these after `PATH` so a plain package install works without editing
-/// `virtiofsd_bin`.
-pub const VIRTIOFSD_FALLBACKS: &[&str] = &[
-    "/usr/lib/virtiofsd",
-    "/usr/libexec/virtiofsd",
-    "/usr/lib/qemu/virtiofsd",
-    "/usr/libexec/qemu/virtiofsd",
-];
-
-/// The AUR package `cloud-hypervisor-bin` installs only the static binary.
-pub const CLOUD_HYPERVISOR_STATIC: &str = "cloud-hypervisor-static";
-
-/// Common install locations for Cloud Hypervisor.
-pub const CLOUD_HYPERVISOR_FALLBACKS: &[&str] = &[
-    "/usr/bin/cloud-hypervisor",
-    "/usr/bin/cloud-hypervisor-static",
-    "/usr/lib/cloud-hypervisor/cloud-hypervisor",
-];
-
-/// Map `cloud-hypervisor` to its static AUR variant and back.
-fn alternate_cloud_hypervisor_name(binary: &Path) -> Option<&'static str> {
-    if binary == Path::new("cloud-hypervisor") {
-        Some(CLOUD_HYPERVISOR_STATIC)
-    } else if binary == Path::new(CLOUD_HYPERVISOR_STATIC) {
-        Some("cloud-hypervisor")
-    } else {
-        None
-    }
-}
-
-/// Resolve a configured tool to an executable file.
-///
-/// A configured path (anything with a directory component) is used verbatim so
-/// an explicit `*_bin` always wins. A bare command name is looked up on `PATH`
-/// first and then in `fallbacks`; distribution helper daemons often live in a
-/// private lib directory instead of being symlinked into `PATH`.
-fn resolve_binary(binary: &Path, fallbacks: &[&str]) -> Option<PathBuf> {
-    if binary.components().count() > 1 {
-        return binary.is_file().then(|| binary.to_path_buf());
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(binary);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    fallbacks
-        .iter()
-        .map(Path::new)
-        .find(|candidate| candidate.is_file())
-        .map(Path::to_path_buf)
-}
-
-/// How strictly flagged commands are treated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum SecurityMode {
-    /// Do not inspect input.
-    Off,
-    /// Show findings but allow the command through.
-    Warn,
-    /// Block high/critical findings and prompt for medium ones.
-    #[default]
-    Enforce,
-}
-
-impl SecurityMode {
-    pub const ALL: [Self; 3] = [Self::Off, Self::Warn, Self::Enforce];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Warn => "warn",
-            Self::Enforce => "enforce",
-        }
-    }
-}
-
-/// Sandbox mode passed to virtiofsd.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum VirtiofsSandbox {
-    /// Run in separate namespaces (recommended on modern kernels).
-    #[default]
-    Namespace,
-    /// Chroot into the shared directory.
-    Chroot,
-}
-
-impl VirtiofsSandbox {
-    pub fn as_flag(self) -> &'static str {
-        match self {
-            Self::Namespace => "namespace",
-            Self::Chroot => "chroot",
-        }
-    }
-}
+use self::tools::{alternate_cloud_hypervisor_name, resolve_binary};
 
 /// User configuration, loaded from `~/.config/hegn/config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -503,66 +103,7 @@ pub struct Config {
     pub security: SecurityMode,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let config_dir = dirs::config_dir().unwrap_or_else(|| home.join(".config"));
-        let state_dir = dirs::state_dir().unwrap_or_else(|| home.join(".local/state"));
-        let data_dir = dirs::data_dir().unwrap_or_else(|| home.join(".local/share"));
-
-        Self {
-            projects_root: home.join("Projects/hegn"),
-            state_dir: state_dir.join("hegn"),
-            snapshots_dir: data_dir.join("hegn/snapshots"),
-            instances_dir: data_dir.join("hegn/instances"),
-            templates_dir: config_dir.join("hegn/templates"),
-            profiles_dir: config_dir.join("hegn/profiles"),
-            cloud_hypervisor_bin: PathBuf::from("cloud-hypervisor"),
-            virtiofsd_bin: PathBuf::from("virtiofsd"),
-            kernel_image: data_dir
-                .join("hegn/images")
-                .join(crate::vm::images::KERNEL_ARTIFACT),
-            rootfs_image: data_dir
-                .join("hegn/images")
-                .join(crate::vm::images::ROOTFS_ARTIFACT),
-            rootfs_format: crate::vm::images::ROOTFS_FORMAT,
-            root_device: "/dev/vda1".to_string(),
-            landlock: true,
-            seccomp: true,
-            cloud_init: true,
-            kernel_url: crate::vm::images::KERNEL_URL.to_string(),
-            kernel_sha256: crate::vm::images::KERNEL_SHA256.to_string(),
-            rootfs_url: crate::vm::images::ROOTFS_URL.to_string(),
-            rootfs_sha256: crate::vm::images::ROOTFS_SHA256.to_string(),
-            vcpus: 2,
-            memory_mib: 2048,
-            shared_tag: "workspace".to_string(),
-            guest_mount: "/workspace".to_string(),
-            virtiofs_sandbox: VirtiofsSandbox::Namespace,
-            backend: BackendKind::Auto,
-            harness: Harness::Shell,
-            launch: LaunchConfig::default(),
-            network: NetworkMode::Guarded,
-            local_endpoints: Vec::new(),
-            extra_packages: Vec::new(),
-            auto_branch: true,
-            security: SecurityMode::Enforce,
-        }
-    }
-}
-
 impl Config {
-    /// Path of the user configuration file.
-    pub fn config_path() -> PathBuf {
-        if let Some(path) = std::env::var_os("HEGN_CONFIG") {
-            return PathBuf::from(path);
-        }
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        dirs::config_dir()
-            .unwrap_or_else(|| home.join(".config"))
-            .join("hegn/config.toml")
-    }
-
     /// Load configuration, falling back to defaults when no file exists.
     ///
     /// Selected environment variables override the file so `hegn` can be
@@ -590,157 +131,6 @@ impl Config {
         let config: Self = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config {}", path.display()))?;
         Ok(config)
-    }
-
-    fn apply_env_overrides(&mut self) {
-        fn path_var(name: &str) -> Option<PathBuf> {
-            std::env::var_os(name).map(PathBuf::from)
-        }
-        if let Some(value) = path_var("HEGN_PROJECTS_ROOT") {
-            self.projects_root = value;
-        }
-        if let Some(value) = path_var("HEGN_STATE_DIR") {
-            self.state_dir = value;
-        }
-        if let Some(value) = path_var("HEGN_SNAPSHOTS_DIR") {
-            self.snapshots_dir = value;
-        }
-        if let Some(value) = path_var("HEGN_INSTANCES_DIR") {
-            self.instances_dir = value;
-        }
-        if let Some(value) = path_var("HEGN_TEMPLATES_DIR") {
-            self.templates_dir = value;
-        }
-        if let Some(value) = path_var("HEGN_PROFILES_DIR") {
-            self.profiles_dir = value;
-        }
-        if let Some(value) = path_var("HEGN_CLOUD_HYPERVISOR_BIN") {
-            self.cloud_hypervisor_bin = value;
-        }
-        if let Some(value) = path_var("HEGN_VIRTIOFSD_BIN") {
-            self.virtiofsd_bin = value;
-        }
-        if let Some(value) = path_var("HEGN_KERNEL_IMAGE") {
-            self.kernel_image = value;
-        }
-        if let Some(value) = path_var("HEGN_ROOTFS_IMAGE") {
-            self.rootfs_image = value;
-        }
-        if let Ok(value) = std::env::var("HEGN_ROOTFS_FORMAT") {
-            self.rootfs_format = match value.trim().to_ascii_lowercase().as_str() {
-                "raw" => RootfsFormat::Raw,
-                "qcow2" => RootfsFormat::Qcow2,
-                _ => self.rootfs_format,
-            };
-        }
-        if let Ok(value) = std::env::var("HEGN_ROOT_DEVICE") {
-            self.root_device = value;
-        }
-        if let Ok(value) = std::env::var("HEGN_KERNEL_URL") {
-            self.kernel_url = value;
-        }
-        if let Ok(value) = std::env::var("HEGN_KERNEL_SHA256") {
-            self.kernel_sha256 = value;
-        }
-        if let Ok(value) = std::env::var("HEGN_ROOTFS_URL") {
-            self.rootfs_url = value;
-        }
-        if let Ok(value) = std::env::var("HEGN_ROOTFS_SHA256") {
-            self.rootfs_sha256 = value;
-        }
-        if let Ok(value) = std::env::var("HEGN_NETWORK") {
-            self.network = match value.trim().to_ascii_lowercase().as_str() {
-                "off" | "disabled" => NetworkMode::Off,
-                "guarded" | "web" => NetworkMode::Guarded,
-                _ => self.network,
-            };
-        }
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        if self.vcpus == 0 || self.vcpus > 32 {
-            bail!("vcpus must be between 1 and 32 (got {})", self.vcpus);
-        }
-        if self.memory_mib < 128 {
-            bail!("memory_mib must be at least 128 (got {})", self.memory_mib);
-        }
-        if !crate::vm::cloud_init::safe_token(&self.shared_tag) {
-            bail!("shared_tag may only contain ASCII letters, digits, '-', '_' and '.'");
-        }
-        if self.shared_tag == crate::agent::profile::PROFILE_SHARE_TAG {
-            bail!(
-                "shared_tag '{}' is reserved for the harness profile share",
-                crate::agent::profile::PROFILE_SHARE_TAG
-            );
-        }
-        // virtio-fs tags are limited to 36 bytes including the terminator.
-        if self.shared_tag.len() > 36 {
-            bail!(
-                "shared_tag must be at most 36 bytes (got {})",
-                self.shared_tag.len()
-            );
-        }
-        if !crate::vm::cloud_init::safe_mount(&self.guest_mount) {
-            bail!(
-                "guest_mount must be an absolute path with simple components                  (letters, digits, '/', '-', '_' and '.')"
-            );
-        }
-        if !self.root_device.starts_with("/dev/") || self.root_device.contains(',') {
-            bail!("root_device must be a guest device path such as /dev/vda1");
-        }
-        // Cloud Hypervisor's CLI packs paths into comma-separated option
-        // values. A comma in one of these paths would silently change the
-        // device configuration, so refuse it up front.
-        for (name, path) in [
-            ("state_dir", &self.state_dir),
-            ("snapshots_dir", &self.snapshots_dir),
-            ("instances_dir", &self.instances_dir),
-            ("kernel_image", &self.kernel_image),
-            ("rootfs_image", &self.rootfs_image),
-        ] {
-            if path.to_string_lossy().contains(',') {
-                bail!("{name} must not contain a comma");
-            }
-        }
-        for (name, sha) in [
-            ("kernel_sha256", &self.kernel_sha256),
-            ("rootfs_sha256", &self.rootfs_sha256),
-        ] {
-            if !sha.trim().is_empty() && !crate::vm::images::is_sha256(sha.trim()) {
-                bail!("{name} must be a 64 character SHA-256 hex digest");
-            }
-        }
-        for (name, url) in [
-            ("kernel_url", &self.kernel_url),
-            ("rootfs_url", &self.rootfs_url),
-        ] {
-            if !url.trim().is_empty() && !url.starts_with("https://") {
-                bail!("{name} must use https://");
-            }
-        }
-        for package in &self.extra_packages {
-            if !safe_package_name(package) {
-                bail!("invalid package name in extra_packages: {package:?}");
-            }
-        }
-        self.launch.validate()?;
-        validate_local_endpoints(&self.local_endpoints)?;
-        if !self.local_endpoints.is_empty() && self.network != NetworkMode::Guarded {
-            bail!("local_endpoints need guarded networking; set network = \"guarded\"");
-        }
-        Ok(())
-    }
-
-    /// Deduplicated, sorted ports of the configured local endpoints.
-    pub fn endpoint_ports(&self) -> Vec<u16> {
-        let mut ports: Vec<u16> = self
-            .local_endpoints
-            .iter()
-            .map(|endpoint| endpoint.port)
-            .collect();
-        ports.sort_unstable();
-        ports.dedup();
-        ports
     }
 
     /// Create runtime and config directories. Safe to call repeatedly.
@@ -828,52 +218,6 @@ impl Config {
         result
     }
 
-    /// Runtime directory for API and virtiofs sockets.
-    pub fn run_dir(&self) -> PathBuf {
-        self.state_dir.join("run")
-    }
-
-    /// Private directory for persistent serial-console logs.
-    ///
-    /// Derived from `state_dir` so existing configurations keep working and
-    /// logs always live next to the run directory they belong to.
-    pub fn logs_dir(&self) -> PathBuf {
-        self.state_dir.join("logs")
-    }
-
-    /// Paths that must never be exported to a guest or imported as a project.
-    ///
-    /// This covers runtime sockets/logs, snapshots, templates and the config
-    /// directory. Project import and discovery both consult this list.
-    pub fn protected_paths(&self) -> Vec<PathBuf> {
-        let mut protected = vec![
-            self.state_dir.clone(),
-            self.snapshots_dir.clone(),
-            self.instances_dir.clone(),
-            self.templates_dir.clone(),
-            self.profiles_dir.clone(),
-        ];
-        if let Some(parent) = self.instances_dir.parent() {
-            let legacy = parent.join("sandboxes");
-            if legacy != self.instances_dir && legacy.exists() {
-                protected.push(legacy);
-            }
-        }
-        if let Some(parent) = Self::config_path().parent() {
-            protected.push(parent.to_path_buf());
-        }
-        protected
-    }
-
-    /// Import an existing directory into the project picker as a symlink.
-    ///
-    /// hegn state, snapshots and templates are protected so an imported
-    /// project can never expose VM sockets, logs or snapshot memory to the
-    /// guest.
-    pub fn import_project(&self, source: &Path, name: Option<&str>) -> Result<PathBuf> {
-        crate::project::import_project(&self.projects_root, source, name, &self.protected_paths())
-    }
-
     /// Locate the `virtiofsd` executable.
     ///
     /// An explicitly configured `virtiofsd_bin` is used as-is. A bare
@@ -944,25 +288,6 @@ impl Config {
     }
 }
 
-/// `AGENTS.md` seeded into new projects from `templates_dir`.
-pub const DEFAULT_AGENTS_MD: &str = r#"# Agent instructions
-
-This project runs inside a hegn instance.
-
-## Rules
-
-- Keep changes inside the workspace. The only writable mount is `/workspace`.
-- Run the test suite before declaring a task complete.
-- Do not print, copy, or transmit secrets (`.env`, SSH keys, tokens).
-- Prefer small, reviewable commits. hegn may create a safety checkpoint branch.
-- Ask before destructive operations (`rm -rf`, `git clean -fdx`, history rewrites).
-
-## Layout
-
-- Source: `/workspace/src`
-- Tests: `/workspace/tests`
-"#;
-
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
@@ -974,38 +299,6 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(&path, contents).unwrap();
         (dir, path)
-    }
-
-    #[test]
-    fn defaults_are_valid() {
-        let config = Config::default();
-        config.validate().unwrap();
-        assert_eq!(config.guest_mount, "/workspace");
-        assert_eq!(config.shared_tag, "workspace");
-        assert_eq!(config.security, SecurityMode::Enforce);
-        assert!(
-            config.projects_root.ends_with("Projects/hegn"),
-            "new projects belong in Projects/hegn: {}",
-            config.projects_root.display()
-        );
-        assert!(crate::vm::images::is_sha256(&config.kernel_sha256));
-        assert!(crate::vm::images::is_sha256(&config.rootfs_sha256));
-        assert!(config.kernel_url.starts_with("https://"));
-        assert!(config.rootfs_url.starts_with("https://"));
-        assert_eq!(config.root_device, "/dev/vda1");
-        assert_eq!(config.rootfs_format, RootfsFormat::Qcow2);
-        assert!(config.landlock);
-        assert!(config.seccomp);
-    }
-
-    #[test]
-    fn rejects_invalid_image_pins() {
-        let mut config = Config::default();
-        config.kernel_sha256 = "not-a-digest".into();
-        assert!(config.validate().is_err());
-        config.kernel_sha256 = crate::vm::images::KERNEL_SHA256.into();
-        config.rootfs_url = "http://example.com/rootfs".into();
-        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -1039,41 +332,6 @@ root_device = "/dev/vda"
     }
 
     #[test]
-    fn rejects_invalid_values() {
-        let mut config = Config::default();
-        config.vcpus = 0;
-        assert!(config.validate().is_err());
-        config.vcpus = 2;
-        config.memory_mib = 12;
-        assert!(config.validate().is_err());
-        config.memory_mib = 1024;
-        config.guest_mount = "workspace".into();
-        assert!(config.validate().is_err());
-        config.guest_mount = "/workspace".into();
-        config.root_device = "vda1".into();
-        assert!(config.validate().is_err());
-        config.root_device = "/dev/vda1".into();
-        config.shared_tag = "x".repeat(37);
-        assert!(config.validate().is_err());
-        config.shared_tag = "work space".into();
-        assert!(config.validate().is_err());
-        config.shared_tag = "workspace".into();
-        config.guest_mount = "/work space".into();
-        assert!(config.validate().is_err());
-        config.guest_mount = "/workspace".into();
-        config.kernel_image = PathBuf::from("/images/vmlinux,broken");
-        assert!(config.validate().is_err());
-        config.kernel_image = PathBuf::from("/images/vmlinux");
-        config.shared_tag = crate::agent::profile::PROFILE_SHARE_TAG.into();
-        assert!(
-            config.validate().is_err(),
-            "the profile share tag is reserved"
-        );
-        config.shared_tag = "workspace".into();
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
     fn profiles_dir_is_private_and_protected() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1103,35 +361,10 @@ root_device = "/dev/vda"
     }
 
     #[test]
-    fn harness_commands_are_non_empty() {
-        for harness in Harness::ALL {
-            assert!(!harness.command().is_empty());
-            assert!(!harness.label().is_empty());
-            assert!(!harness.packages().is_empty());
-        }
-    }
-
-    #[test]
     fn pty_backend_is_rejected() {
         let (_dir, path) = temp_config("backend = \"pty\"\n");
         let err = format!("{:#}", Config::load_from(&path).unwrap_err());
         assert!(err.contains("unknown variant"), "{err}");
-    }
-
-    #[test]
-    fn cloud_hypervisor_static_is_an_accepted_alias() {
-        assert_eq!(
-            alternate_cloud_hypervisor_name(Path::new("cloud-hypervisor")),
-            Some("cloud-hypervisor-static")
-        );
-        assert_eq!(
-            alternate_cloud_hypervisor_name(Path::new("cloud-hypervisor-static")),
-            Some("cloud-hypervisor")
-        );
-        assert_eq!(
-            alternate_cloud_hypervisor_name(Path::new("/opt/custom/ch")),
-            None
-        );
     }
 
     #[test]
@@ -1142,30 +375,6 @@ root_device = "/dev/vda"
         let mut config = Config::default();
         config.cloud_hypervisor_bin = dir.path().join("cloud-hypervisor");
         assert_eq!(config.resolved_cloud_hypervisor(), Some(static_binary));
-    }
-
-    #[test]
-    fn resolve_binary_prefers_an_explicit_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let explicit = dir.path().join("virtiofsd");
-        fs::write(&explicit, b"").unwrap();
-        assert_eq!(resolve_binary(&explicit, &[]), Some(explicit.clone()));
-        assert_eq!(
-            resolve_binary(&dir.path().join("missing-virtiofsd"), &[]),
-            None
-        );
-    }
-
-    #[test]
-    fn resolve_binary_falls_back_to_install_directories() {
-        let dir = tempfile::tempdir().unwrap();
-        let fallback = dir.path().join("virtiofsd");
-        fs::write(&fallback, b"").unwrap();
-        let fallback_str = fallback.to_str().unwrap();
-        assert_eq!(
-            resolve_binary(Path::new("hegn-test-missing-virtiofsd"), &[fallback_str]),
-            Some(fallback)
-        );
     }
 
     #[test]
@@ -1183,50 +392,6 @@ root_device = "/dev/vda"
         config.rootfs_image = rootfs;
         assert!(!config.vm_assets_ready());
         assert!(config.require_vm_assets().is_err());
-    }
-
-    #[test]
-    fn local_endpoints_are_validated() {
-        let mut config = Config::default();
-        assert!(config.validate().is_ok());
-
-        config.local_endpoints = vec![LocalEndpoint {
-            name: "ollama".into(),
-            port: 11434,
-        }];
-        assert!(config.validate().is_ok());
-        assert_eq!(config.endpoint_ports(), vec![11434]);
-
-        config.local_endpoints = vec![LocalEndpoint {
-            name: "bad name".into(),
-            port: 11434,
-        }];
-        assert!(config.validate().is_err(), "unsafe names are rejected");
-
-        config.local_endpoints = vec![LocalEndpoint {
-            name: "ssh".into(),
-            port: 22,
-        }];
-        assert!(config.validate().is_err(), "privileged ports are rejected");
-
-        config.local_endpoints = vec![
-            LocalEndpoint {
-                name: "ollama".into(),
-                port: 11434,
-            },
-            LocalEndpoint {
-                name: "OLLAMA".into(),
-                port: 1234,
-            },
-        ];
-        assert!(config.validate().is_err(), "names are unique");
-
-        config.local_endpoints = vec![LocalEndpoint {
-            name: "ollama".into(),
-            port: 11434,
-        }];
-        config.network = NetworkMode::Off;
-        assert!(config.validate().is_err(), "endpoints need a network");
     }
 
     #[test]

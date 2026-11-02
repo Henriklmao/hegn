@@ -1,19 +1,18 @@
-//! Hardened `virtiofsd` process management.
+//! Construction and spawning of one sandboxed `virtiofsd` daemon.
 //!
-//! Every session gets a dedicated virtiofsd instance whose `--shared-dir` is
-//! exactly one project directory. The daemon always runs with a sandbox
-//! (`namespace` by default, `chroot` available) so a guest cannot traverse out
-//! of the exported tree.
+//! [`VirtiofsConfig`] validates the exported directory and builds argv; it
+//! always insists on a sandbox so a guest cannot traverse out of the tree.
 
 use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
 use crate::config::VirtiofsSandbox;
+
+use super::process::VirtiofsProcess;
 
 /// Configuration for one virtiofsd instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,63 +112,10 @@ impl VirtiofsConfig {
     }
 }
 
-/// A running virtiofsd instance. Killed on drop.
-#[derive(Debug)]
-pub struct VirtiofsProcess {
-    child: Child,
-    socket_path: PathBuf,
-}
-
-impl VirtiofsProcess {
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
-    }
-
-    pub fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
-    pub fn is_running(&mut self) -> bool {
-        self.child.try_wait().ok().flatten().is_none()
-    }
-
-    /// Wait until virtiofsd has created its socket.
-    pub fn wait_for_socket(&mut self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .context("socket wait timeout is too large")?;
-        while Instant::now() < deadline {
-            if self.socket_path.exists() {
-                return Ok(());
-            }
-            if !self.is_running() {
-                let status = self.child.wait().context("failed to wait for virtiofsd")?;
-                bail!("virtiofsd exited before creating its socket ({status})");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        bail!(
-            "timed out waiting for virtiofsd socket {}",
-            self.socket_path.display()
-        );
-    }
-
-    pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = fs::remove_file(&self.socket_path);
-    }
-}
-
-impl Drop for VirtiofsProcess {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn setup() -> (tempfile::TempDir, tempfile::TempDir) {
         (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())

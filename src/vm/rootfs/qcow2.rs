@@ -1,28 +1,19 @@
-//! Growing per-instance root filesystems before the first boot.
+//! In-process qcow2 growth, with `qemu-img resize` as a fallback.
 //!
-//! The pinned cloud image is only about 2.2 GiB. That is enough for a bare
-//! Ubuntu cloud image, but not for Node.js, a global npm package and the
-//! user's extra apt selections. Each instance therefore gets a sparse disk
-//! with a comfortable floor: raw images are extended with `set_len`, and qcow2
-//! images get a larger virtual size (a bigger L1 table) without rewriting the
-//! existing clusters.
-//!
-//! Growing a qcow2 image is deliberately narrow: only images without backing
-//! files, snapshots, encryption or external data are handled in-process. For
-//! anything else `qemu-img resize` is used as a fallback when it is installed.
+//! Only images without backing files, snapshots, encryption or external data
+//! are handled here. Growing rewrites the header size and, when the virtual
+//! size outgrows the existing L1 table, appends a larger L1 table (and marks
+//! its cluster allocated in the refcount block) without touching the data
+//! clusters.
 
-use std::fs::{self, OpenOptions};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::fs;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::RootfsFormat;
-
-/// Comfortable floor for an instance root filesystem. Sparse files mean this
-/// costs almost no host disk space until the guest actually writes to it.
-pub const MIN_INSTANCE_ROOTFS_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+use super::open_rw;
 
 const QCOW2_MAGIC: u32 = 0x5146_49fb;
 const HEADER_BYTES: usize = 104;
@@ -30,58 +21,7 @@ const INCOMPAT_CORRUPT: u64 = 1 << 1;
 const INCOMPAT_EXTERNAL_DATA: u64 = 1 << 2;
 const INCOMPAT_COMPRESSION_TYPE: u64 = 1 << 3;
 
-/// Give `path` at least [`MIN_INSTANCE_ROOTFS_BYTES`] of virtual space.
-///
-/// Returns `true` when the file was extended.
-pub fn grow_to_minimum(path: &Path, format: RootfsFormat) -> Result<bool> {
-    grow(path, format, MIN_INSTANCE_ROOTFS_BYTES)
-}
-
-/// Extend `path` to `target` bytes. A larger file is left untouched.
-pub fn grow(path: &Path, format: RootfsFormat, target: u64) -> Result<bool> {
-    if !crate::vm::images::is_regular_file(path) {
-        bail!("{} is not a regular file", path.display());
-    }
-    match format {
-        RootfsFormat::Raw => grow_raw(path, target),
-        RootfsFormat::Qcow2 => match grow_qcow2(path, target) {
-            Ok(grew) => Ok(grew),
-            Err(err) => match qemu_img_resize(path, target) {
-                Ok(grew) => Ok(grew),
-                Err(fallback) => {
-                    Err(err).context(format!("qemu-img fallback also failed: {fallback:#}"))
-                }
-            },
-        },
-    }
-}
-
-fn open_rw(path: &Path) -> Result<fs::File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .with_context(|| format!("failed to open {} for resizing", path.display()))
-}
-
-fn grow_raw(path: &Path, target: u64) -> Result<bool> {
-    let len = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {}", path.display()))?
-        .len();
-    if len >= target {
-        return Ok(false);
-    }
-    let file = open_rw(path)?;
-    file.set_len(target)
-        .with_context(|| format!("failed to grow {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to sync {}", path.display()))?;
-    Ok(true)
-}
-
-fn qemu_img_resize(path: &Path, target: u64) -> Result<bool> {
+pub(super) fn qemu_img_resize(path: &Path, target: u64) -> Result<bool> {
     let output = Command::new("qemu-img")
         .arg("resize")
         .arg(path)
@@ -170,7 +110,7 @@ fn read_header(file: &fs::File) -> Result<Header> {
     })
 }
 
-fn grow_qcow2(path: &Path, target: u64) -> Result<bool> {
+pub(super) fn grow_qcow2(path: &Path, target: u64) -> Result<bool> {
     let file = open_rw(path)?;
     let header = read_header(&file)?;
     if header.backing_file_offset != 0 {
@@ -350,6 +290,9 @@ fn write_refcount(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RootfsFormat;
+    use crate::vm::rootfs::grow;
+    use std::fs::OpenOptions;
     use std::io::Write;
 
     const CLUSTER: usize = 512;
@@ -443,21 +386,6 @@ mod tests {
         let path = dir.path().join("disk.qcow2");
         let size = synthetic_qcow2(&path);
         assert!(!grow(&path, RootfsFormat::Qcow2, size).unwrap());
-    }
-
-    #[test]
-    fn raw_images_are_extended_sparsely() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("disk.raw");
-        fs::write(&path, b"rootfs").unwrap();
-        assert!(grow(&path, RootfsFormat::Raw, 1024 * 1024).unwrap());
-        assert_eq!(fs::metadata(&path).unwrap().len(), 1024 * 1024);
-        let mut prefix = [0u8; 6];
-        fs::File::open(&path)
-            .unwrap()
-            .read_exact_at(&mut prefix, 0)
-            .unwrap();
-        assert_eq!(&prefix, b"rootfs");
     }
 
     #[test]
