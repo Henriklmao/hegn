@@ -187,6 +187,14 @@ fn inspect_with_tirith(command: &str, cwd: Option<&std::path::Path>) -> Vec<Find
         clipboard_html: None,
         card_ref: None,
         clipboard_source: ClipboardSourceState::AbsentOrInvalid,
+        // hegn inspects commands before they reach the guest shell, so it never
+        // inherits the invoking process's PYTHONINSPECT or CDPATH state. A
+        // fresh cloud image leaves both unset.
+        python_inspect_inherited: false,
+        cdpath_inherited: false,
+        // Commands are typed into the guest's interactive POSIX shell, where a
+        // word-start `#` is a comment.
+        interactive_comments: true,
     };
 
     // A malformed rule or a panic in a third-party rule must never take down

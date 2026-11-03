@@ -1167,7 +1167,7 @@ pipeline.
 | `serde` | 1 (derive) | Config, metadata and API serialization |
 | `serde_json` | 1 | Cloud Hypervisor REST payloads and `--json` output |
 | `toml` | 0.9 | `config.toml` and `hegn.toml` |
-| `tirith-core` | 0.4.2 | In-memory command inspection and policy engine |
+| `tirith-core` | 0.5.0 | In-memory command inspection and policy engine |
 | `anyhow` | 1 | Context-rich application errors |
 | `thiserror` | 2 | Typed errors in library-facing modules |
 | `chrono` | 0.4 (serde) | Snapshot/session timestamps |

@@ -24,7 +24,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 thiserror = "2.0.21"
-tirith-core = "0.4.2"
+tirith-core = "0.5.0"
 tokio = { version = "1.54.1", features = ["full"] }
 toml = "1.1.8"
 unicode-width = "0.2.3"
@@ -32,8 +32,9 @@ unicode-width = "0.2.3"
 [dev-dependencies]
 tempfile = "3.27.0"
 
-# tirith-core 0.4.2 is the newest release, but its transitive dependencies
-# carry RUSTSEC advisories. The vendored copy only updates those dependencies
+# tirith-core 0.5.0 is the newest release, but its transitive dependencies
+# still carry RUSTSEC advisories upstream ignores for its MSRV 1.83. The
+# vendored copy only updates those dependencies; see vendor/tirith-core/PATCHES.md
 [patch.crates-io]
 tirith-core = { path = "vendor/tirith-core" }
 

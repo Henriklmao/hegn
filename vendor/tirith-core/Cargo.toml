@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.83"
 name = "tirith-core"
-version = "0.4.2"
+version = "0.5.0"
 build = "build.rs"
 autolib = false
 autobins = false
@@ -40,10 +40,6 @@ test-network-seams = []
 [lib]
 name = "tirith_core"
 path = "src/lib.rs"
-
-[dependencies.arboard]
-version = "3"
-default-features = false
 
 [dependencies.base64]
 version = "0.22"
@@ -188,13 +184,21 @@ version = "2"
 version = "1"
 features = ["v4"]
 
-[dependencies.walkdir]
-version = "2"
-
 [dependencies.zip]
 version = "9"
 features = ["deflate"]
 default-features = false
+
+[dev-dependencies.criterion]
+version = "0.5"
+features = ["html_reports"]
+
+[dev-dependencies.rand_core]
+version = "0.6"
+features = ["getrandom"]
+
+[dev-dependencies.toml]
+version = "0.8"
 
 [build-dependencies.regex]
 version = "1"
@@ -206,8 +210,16 @@ features = ["derive"]
 [build-dependencies.toml]
 version = "0.8"
 
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies.seccompiler]
+version = "0.4"
+default-features = false
+
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies.extrasafe]
 version = "0.5"
+
+[target.'cfg(not(target_os = "android"))'.dependencies.arboard]
+version = "3"
+default-features = false
 
 [target.'cfg(target_os = "linux")'.dependencies.landlock]
 version = "0.4"
@@ -242,6 +254,7 @@ features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_Memory",
     "Win32_System_Pipes",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
