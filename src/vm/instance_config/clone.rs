@@ -1,0 +1,760 @@
+//! Instance creation, workspace cloning and deletion.
+//!
+//! Cloning is deliberately conservative: a clone never ends up inside its
+//! source, git output is captured instead of written to the terminal, and a
+//! failed clone removes the half-initialised instance directory. Deleting an
+//! instance never removes a workspace outside its own directory.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, Result, bail};
+use chrono::Utc;
+
+use crate::config::Harness;
+use crate::shared::fs::create_private_dir;
+
+use super::model::{CONFIG_FILE, CONFIG_VERSION, InstanceConfig, WORKSPACE_DIR, validate_name};
+use super::store::InstanceStore;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    pub removed: bool,
+    /// Workspace kept on disk when files were not deleted.
+    pub kept_workspace: Option<PathBuf>,
+}
+
+/// Result of cloning an instance workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneOutcome {
+    pub instance: InstanceConfig,
+    /// Non-fatal diagnostics from workspace creation, such as git's "cloned an
+    /// empty repository" warning. Callers surface these instead of letting a
+    /// child process write directly to the terminal (which would corrupt the
+    /// TUI's alternate screen).
+    pub warnings: Vec<String>,
+}
+
+impl InstanceStore {
+    /// Create an instance from an existing project.
+    ///
+    /// With `clone = true`, the project is copied into the instance and marked
+    /// ephemeral. Without it, the instance exports the project directly.
+    pub fn create_from_project(
+        &self,
+        project: &Path,
+        name: Option<&str>,
+        harness: Option<Harness>,
+        clone: bool,
+    ) -> Result<InstanceConfig> {
+        Ok(self
+            .create_from_project_with_warnings(project, name, harness, clone)?
+            .instance)
+    }
+
+    /// Like [`Self::create_from_project`], but also returns non-fatal workspace
+    /// warnings such as git's "cloned an empty repository" notice.
+    pub fn create_from_project_with_warnings(
+        &self,
+        project: &Path,
+        name: Option<&str>,
+        harness: Option<Harness>,
+        clone: bool,
+    ) -> Result<CloneOutcome> {
+        let project = project
+            .canonicalize()
+            .with_context(|| format!("project {} does not exist", project.display()))?;
+        if !project.is_dir() {
+            bail!("{} is not a directory", project.display());
+        }
+        let name = name
+            .map(str::to_string)
+            .unwrap_or_else(|| InstanceConfig::suggested_name(&project));
+        validate_name(&name)?;
+        self.ensure_root()?;
+        let dir = self.root.join(&name);
+        if dir.exists() {
+            bail!("instance '{name}' already exists");
+        }
+        let (workspace, warnings) = if clone {
+            let workspace = dir.join(WORKSPACE_DIR);
+            match self.clone_workspace(&project, &workspace) {
+                Ok(warnings) => (workspace, warnings),
+                Err(err) => {
+                    // A failed clone must not leave a half-initialised instance
+                    // behind that blocks the next attempt with "already exists".
+                    let _ = fs::remove_dir_all(&dir);
+                    return Err(err);
+                }
+            }
+        } else {
+            (project.clone(), Vec::new())
+        };
+        let config = self.build_config(&name, &project, workspace, harness, clone, None, None);
+        if let Err(err) = self.save(&config) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(err);
+        }
+        Ok(CloneOutcome {
+            instance: config,
+            warnings,
+        })
+    }
+
+    /// Clone an existing instance into a new ephemeral workspace.
+    pub fn clone_from(
+        &self,
+        source: &InstanceConfig,
+        name: &str,
+        harness: Option<Harness>,
+    ) -> Result<CloneOutcome> {
+        validate_name(name)?;
+        self.ensure_root()?;
+        let dir = self.root.join(name);
+        if dir.exists() {
+            bail!("instance '{name}' already exists");
+        }
+        let workspace = dir.join(WORKSPACE_DIR);
+        let warnings = match self.clone_workspace(&source.workspace, &workspace) {
+            Ok(warnings) => warnings,
+            Err(err) => {
+                let _ = fs::remove_dir_all(&dir);
+                return Err(err);
+            }
+        };
+        let config = self.build_config(
+            name,
+            &source.project,
+            workspace,
+            harness.or(Some(source.harness)),
+            true,
+            Some(source.name.clone()),
+            Some(source),
+        );
+        if let Err(err) = self.save(&config) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(err);
+        }
+        Ok(CloneOutcome {
+            instance: config,
+            warnings,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_config(
+        &self,
+        name: &str,
+        project: &Path,
+        workspace: PathBuf,
+        harness: Option<Harness>,
+        ephemeral: bool,
+        source_instance: Option<String>,
+        template: Option<&InstanceConfig>,
+    ) -> InstanceConfig {
+        let base = template.cloned().unwrap_or_else(|| InstanceConfig {
+            harness: self.defaults.harness,
+            vcpus: self.defaults.vcpus,
+            memory_mib: self.defaults.memory_mib,
+            shared_tag: self.defaults.shared_tag.clone(),
+            guest_mount: self.defaults.guest_mount.clone(),
+            auto_branch: self.defaults.auto_branch,
+            security: self.defaults.security,
+            extra_packages: self.defaults.extra_packages.clone(),
+            ..InstanceConfig::default()
+        });
+        // Project-level package selections are data for the first-boot
+        // provisioner. The harness preset is always unioned in later, so this
+        // list stays additive.
+        let mut extra_packages = base.extra_packages;
+        for package in crate::project::read_meta(project).packages {
+            if crate::config::safe_package_name(&package)
+                && !extra_packages.iter().any(|existing| existing == &package)
+            {
+                extra_packages.push(package);
+            }
+        }
+        InstanceConfig {
+            version: CONFIG_VERSION,
+            name: name.to_string(),
+            project: project.to_path_buf(),
+            workspace,
+            rootfs_image: None,
+            harness: harness.unwrap_or(base.harness),
+            vcpus: base.vcpus,
+            memory_mib: base.memory_mib,
+            shared_tag: base.shared_tag,
+            guest_mount: base.guest_mount,
+            ephemeral,
+            source_instance,
+            created_at: Utc::now(),
+            auto_branch: base.auto_branch,
+            security: base.security,
+            extra_packages,
+            network_index: self.next_network_index(),
+        }
+    }
+
+    /// Lowest TAP slice not used by an existing instance. Assignment happens at
+    /// creation; a legacy instance with no index gets one on first start.
+    fn next_network_index(&self) -> Option<u8> {
+        let used: Vec<u8> = self
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|instance| instance.network_index)
+            .collect();
+        (0..crate::network::TAP_POOL).find(|index| !used.contains(index))
+    }
+
+    /// Remove an instance directory.
+    ///
+    /// A workspace outside the instance directory (the original project of a
+    /// normal instance) is never deleted. `delete_files = false` keeps an
+    /// in-instance clone by renaming it to `<name>-files-<timestamp>`.
+    pub fn delete(&self, name: &str, delete_files: bool) -> Result<DeleteOutcome> {
+        let config = self.load(name)?;
+        let dir = self.dir(name)?;
+        let workspace = config.workspace.clone();
+        let workspace_inside = path_is_inside(&workspace, &dir);
+        if delete_files && workspace_inside {
+            remove_dir_all(&dir)?;
+            return Ok(DeleteOutcome {
+                removed: true,
+                kept_workspace: None,
+            });
+        }
+        if !workspace_inside {
+            // The instance directory only contains config/runtime; the source
+            // project is outside and is left untouched.
+            remove_dir_all(&dir)?;
+            return Ok(DeleteOutcome {
+                removed: true,
+                kept_workspace: None,
+            });
+        }
+        // Keep the clone workspace, but unregister the instance. Rename first:
+        // if that fails, the original instance (with its hegn.toml) is still
+        // intact and the delete can be retried.
+        let kept = unique_kept_path(&self.root, name);
+        fs::rename(&dir, &kept)
+            .with_context(|| format!("failed to move {} to {}", dir.display(), kept.display()))?;
+        // The kept directory is no longer listed as an instance once hegn.toml
+        // is gone; runtime sockets are removed best-effort.
+        let _ = remove_runtime(&kept);
+        Ok(DeleteOutcome {
+            removed: true,
+            kept_workspace: Some(kept.join(WORKSPACE_DIR)),
+        })
+    }
+
+    fn clone_workspace(&self, source: &Path, dest: &Path) -> Result<Vec<String>> {
+        if !source.is_dir() {
+            bail!("workspace source {} is not a directory", source.display());
+        }
+        if path_is_inside(dest, source) || path_is_inside(source, dest) {
+            bail!(
+                "refusing to clone {} into itself ({})",
+                source.display(),
+                dest.display()
+            );
+        }
+        create_private_dir(dest.parent().unwrap_or(dest))?;
+        if is_git_repo(source) {
+            // Capture stdout/stderr: a child process must never write to the
+            // terminal while the TUI owns the alternate screen. Even a
+            // successful `git clone --quiet` can emit warnings (for example,
+            // "cloned an empty repository"), which would corrupt the UI.
+            let output = Command::new("git")
+                .arg("clone")
+                .arg("--no-hardlinks")
+                .arg("--quiet")
+                .arg("--")
+                .arg(source)
+                .arg(dest)
+                .output()
+                .context("failed to run git clone (is git installed?)")?;
+            if !output.status.success() {
+                let _ = fs::remove_dir_all(dest);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = stderr.trim();
+                if stderr.is_empty() {
+                    bail!(
+                        "git clone from {} failed with {}",
+                        source.display(),
+                        output.status
+                    );
+                }
+                bail!(
+                    "git clone from {} failed with {}: {stderr}",
+                    source.display(),
+                    output.status
+                );
+            }
+            copy_git_identity(source, dest);
+            let warning = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                // git prefixes diagnostics with "warning:"; callers add their
+                // own label, so avoid "warning: warning: ...".
+                .map(|line| line.strip_prefix("warning:").map(str::trim).unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Ok((!warning.is_empty())
+                .then_some(warning)
+                .into_iter()
+                .collect());
+        }
+        copy_tree(source, dest)?;
+        Ok(Vec::new())
+    }
+}
+
+fn is_git_repo(path: &Path) -> bool {
+    path.join(".git").exists()
+}
+
+/// Give a clone the source repository's commit identity when available.
+///
+/// `git clone` copies tracked files and the object database, but not the local
+/// `user.name`/`user.email`. Without this, an agent's first commit in a clone
+/// fails with "Author identity unknown".
+fn copy_git_identity(source: &Path, dest: &Path) {
+    let mut found = false;
+    for key in ["user.name", "user.email"] {
+        let Some(value) = git_config_get(source, key) else {
+            continue;
+        };
+        if git_config_set(dest, key, &value).is_ok() {
+            found = true;
+        }
+    }
+    if !found {
+        let _ = git_config_set(dest, "user.name", "hegn agent");
+        let _ = git_config_set(dest, "user.email", "agent@hegn.local");
+    }
+}
+
+fn git_config_get(repo: &Path, key: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn git_config_set(repo: &Path, key: &str, value: &str) -> Result<()> {
+    // Capture output for the same reason as `git clone`: this runs while the
+    // TUI owns the terminal.
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["config", "--local", key, value])
+        .output()
+        .context("failed to run git config")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!("git config {key} failed with {}", output.status);
+        }
+        bail!("git config {key} failed with {}: {stderr}", output.status);
+    }
+    Ok(())
+}
+
+fn copy_tree(source: &Path, dest: &Path) -> Result<()> {
+    create_private_dir(dest)?;
+    for entry in
+        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
+    {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&from)?;
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&from)?;
+            std::os::unix::fs::symlink(target, &to)
+                .with_context(|| format!("failed to copy symlink {}", from.display()))?;
+        } else if metadata.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if metadata.is_file() {
+            fs::copy(&from, &to).with_context(|| format!("failed to copy {}", from.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_runtime(dir: &Path) -> Result<()> {
+    for name in ["run", CONFIG_FILE] {
+        let path = dir.join(name);
+        if path.is_dir() {
+            remove_dir_all(&path)?;
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn remove_dir_all(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(path).with_context(|| format!("failed to delete {}", path.display()))
+}
+
+fn unique_kept_path(root: &Path, name: &str) -> PathBuf {
+    let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+    let mut candidate = root.join(format!("{name}-files-{stamp}"));
+    let mut counter = 1;
+    while candidate.exists() {
+        candidate = root.join(format!("{name}-files-{stamp}-{counter}"));
+        counter += 1;
+    }
+    candidate
+}
+
+fn path_is_inside(path: &Path, parent: &Path) -> bool {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let parent = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    path != parent && path.starts_with(&parent)
+}
+
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
+mod tests {
+    use super::*;
+    use crate::vm::instance_config::test_support::{config, project};
+
+    #[test]
+    fn creates_and_lists_a_normal_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let store = InstanceStore::new(cfg);
+        let project = project(dir.path(), "demo");
+        let instance = store
+            .create_from_project(&project, None, Some(Harness::Codex), false)
+            .unwrap();
+        assert_eq!(instance.name, "demo");
+        assert_eq!(instance.workspace, project.canonicalize().unwrap());
+        assert!(!instance.ephemeral);
+        assert_eq!(store.list().unwrap().len(), 1);
+        let loaded = store.load("demo").unwrap();
+        assert_eq!(loaded.harness, Harness::Codex);
+        assert_eq!(loaded.vcpus, cfg_default_vcpus());
+    }
+
+    fn cfg_default_vcpus() -> u8 {
+        crate::config::Config::default().vcpus
+    }
+
+    #[test]
+    fn clone_creates_an_isolated_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let store = InstanceStore::new(cfg);
+        let project = project(dir.path(), "demo");
+        let base = store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+        let clone = store
+            .clone_from(&base, "demo-agent-1", None)
+            .unwrap()
+            .instance;
+        assert!(clone.ephemeral);
+        assert_eq!(clone.source_instance.as_deref(), Some("demo"));
+        assert!(clone.workspace.starts_with(store.root()));
+        assert!(clone.workspace.join("README.md").is_file());
+        // Changing the clone does not change the source project.
+        fs::write(clone.workspace.join("README.md"), b"clone\n").unwrap();
+        assert_eq!(fs::read(project.join("README.md")).unwrap(), b"hello\n");
+    }
+
+    #[test]
+    fn deleting_never_removes_the_source_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let store = InstanceStore::new(cfg);
+        let project = project(dir.path(), "demo");
+        store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+        let outcome = store.delete("demo", true).unwrap();
+        assert!(outcome.removed);
+        assert!(project.join("README.md").is_file());
+        assert!(!store.dir("demo").unwrap().exists());
+    }
+
+    #[test]
+    fn keeping_clone_files_renames_the_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let store = InstanceStore::new(cfg);
+        let project = project(dir.path(), "demo");
+        let base = store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+        let clone = store
+            .clone_from(&base, "demo-agent-1", None)
+            .unwrap()
+            .instance;
+        let outcome = store.delete("demo-agent-1", false).unwrap();
+        let kept = outcome.kept_workspace.unwrap();
+        assert!(kept.join("README.md").is_file());
+        assert!(!store.dir("demo-agent-1").unwrap().exists());
+        assert!(!kept.starts_with(store.root().join("demo-agent-1")));
+        let _ = clone;
+    }
+
+    #[test]
+    fn rejects_unsafe_names_and_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        for name in ["", ".hidden", "../x", "a/b", "a b"] {
+            assert!(
+                store
+                    .create_from_project(&project, Some(name), None, false)
+                    .is_err(),
+                "{name}"
+            );
+        }
+        store
+            .create_from_project(&project, Some("one"), None, false)
+            .unwrap();
+        assert!(
+            store
+                .create_from_project(&project, Some("one"), None, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn git_clone_copies_the_source_commit_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&project)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Demo Agent"]);
+        git(&["config", "user.email", "demo@example.com"]);
+        git(&["add", "README.md"]);
+        git(&["commit", "-qm", "init"]);
+
+        let base = store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+        let clone = store
+            .clone_from(&base, "demo-agent-2", None)
+            .unwrap()
+            .instance;
+        assert_eq!(
+            git_config_get(&clone.workspace, "user.name").as_deref(),
+            Some("Demo Agent")
+        );
+        assert_eq!(
+            git_config_get(&clone.workspace, "user.email").as_deref(),
+            Some("demo@example.com")
+        );
+    }
+
+    #[test]
+    fn cloning_an_empty_repository_returns_the_git_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        // Initialised, but no commits: `git clone --quiet` still warns. The
+        // warning must be captured instead of written to the TUI's terminal.
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let base = store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+        let outcome = store.clone_from(&base, "demo-agent-1", None).unwrap();
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        let warning = outcome.warnings[0].to_lowercase();
+        assert!(warning.contains("empty"), "{:?}", outcome.warnings);
+    }
+
+    #[test]
+    fn failed_clone_does_not_leave_a_partial_instance_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        // A `.git` entry that is not a repository makes `git clone` fail.
+        fs::create_dir(project.join(".git")).unwrap();
+        let err = store
+            .create_from_project(&project, Some("broken"), None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("git clone"), "{err}");
+        assert!(!store.dir("broken").unwrap().exists());
+    }
+
+    #[test]
+    fn non_git_clone_copies_files_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        std::os::unix::fs::symlink("README.md", project.join("link")).unwrap();
+        let clone = store
+            .clone_from(
+                &store
+                    .create_from_project(&project, None, None, false)
+                    .unwrap(),
+                "copy",
+                None,
+            )
+            .unwrap()
+            .instance;
+        assert!(clone.workspace.join("README.md").is_file());
+        assert!(clone.workspace.join("link").is_symlink());
+    }
+
+    #[test]
+    fn deleting_a_clone_never_removes_the_source_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        let base = store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+        store.clone_from(&base, "demo-agent-1", None).unwrap();
+
+        let outcome = store.delete("demo-agent-1", true).unwrap();
+        assert!(outcome.removed);
+        assert!(outcome.kept_workspace.is_none());
+        assert!(!store.dir("demo-agent-1").unwrap().exists());
+        assert_eq!(
+            fs::read(project.join("README.md")).unwrap(),
+            b"hello\n",
+            "the source project must survive clone deletion"
+        );
+        assert!(store.dir("demo").unwrap().exists());
+    }
+
+    #[test]
+    fn path_is_inside_accepts_only_strict_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let child = root.join("workspace");
+        let sibling = dir.path().join("sibling");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+
+        assert!(path_is_inside(&child, &root));
+        assert!(!path_is_inside(&root, &root));
+        assert!(!path_is_inside(&root, &child));
+        assert!(!path_is_inside(&sibling, &root));
+        assert!(!path_is_inside(&root, &sibling));
+    }
+
+    #[test]
+    fn clone_workspace_refuses_nested_source_and_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let source = dir.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file"), b"x").unwrap();
+
+        let err = store
+            .clone_workspace(&source, &source.join("nested"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("into itself"), "{err}");
+        let err = store
+            .clone_workspace(&source, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("into itself"), "{err}");
+        assert!(!source.join("nested").exists());
+    }
+
+    #[test]
+    fn creation_assigns_distinct_network_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        let mut indices = Vec::new();
+        for name in ["one", "two", "three"] {
+            let instance = store
+                .create_from_project(&project, Some(name), None, false)
+                .unwrap();
+            indices.push(instance.network_index.unwrap());
+        }
+        indices.sort_unstable();
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn creation_rejects_a_non_directory_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let file = dir.path().join("not-a-project");
+        fs::write(&file, b"x").unwrap();
+        let err = store
+            .create_from_project(&file, Some("demo"), None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn private_directories_are_tightened_and_symlinks_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing");
+        fs::create_dir_all(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir(&existing).unwrap();
+        assert_eq!(
+            fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let target = dir.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = create_private_dir(&link).unwrap_err().to_string();
+        assert!(err.contains("symlinked directory"), "{err}");
+    }
+
+    #[test]
+    fn deleting_a_missing_instance_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let err = store.delete("missing", true).unwrap_err().to_string();
+        assert!(err.contains("has no config"), "{err}");
+    }
+}

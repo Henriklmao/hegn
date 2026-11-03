@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Refresh the pinned upstream Cloud Hypervisor VM images in src/images.rs.
+"""Refresh the pinned upstream Cloud Hypervisor VM images in
+src/vm/images/assets.rs.
 
 hegn does not build its own guest image. This script discovers the newest
 official Cloud Hypervisor Linux kernel release and the newest official Cloud
@@ -176,7 +177,9 @@ def update_block(text: str, arch: str, candidate: Candidate, kind: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--arch", choices=["x86_64", "aarch64"], required=True)
-    parser.add_argument("--file", type=Path, default=Path("src/images.rs"))
+    parser.add_argument(
+        "--file", type=Path, default=Path("src/vm/images/assets.rs")
+    )
     parser.add_argument("--check", action="store_true", help="fail if an update is needed")
     args = parser.parse_args()
 
