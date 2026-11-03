@@ -133,7 +133,7 @@ install -Dm755 "/tmp/$asset" ~/.local/bin/"$asset"
 
 ### 2d. Build from source
 
-Requires Rust **1.88+** (edition 2024):
+Requires Rust **1.89+** (edition 2024):
 
 ```bash
 git clone https://github.com/Henriklmao/hegn
