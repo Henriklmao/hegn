@@ -34,9 +34,10 @@ pub use firewall::{HostFirewall, detect_host_firewall, live_guard_status, nft_ru
 pub use marker::{ReadyMarker, guard_ready, marker_path, ready_marker};
 pub use pool::{Lease, TapStatus, acquire, instance_is_running, release, status};
 pub use privilege::{
-    ensure_ready, invoking_user, is_privileged, safe_user, setup, setup_with_privilege, teardown,
+    ensure_ready, invoking_user, is_privileged, reload, safe_user, setup, setup_with_privilege,
+    teardown,
 };
-pub use script::{setup_script, teardown_script};
+pub use script::{reload_script, setup_script, teardown_script};
 
 /// TAP devices created by `hegn network setup`.
 pub const TAP_POOL: u8 = 16;

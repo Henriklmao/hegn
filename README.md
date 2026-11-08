@@ -738,7 +738,8 @@ bar             = false      # full-screen commands should own every row
 
 # Optional: host-loopback services the guest may reach (local LLM servers).
 # The guest URL is http://<tap-ip>:<port>; the host must listen on
-# 127.0.0.1:<port>. Re-run `sudo hegn network setup` after changing this list.
+# 127.0.0.1:<port>. After changing this list, run `sudo hegn network reload`
+# (or `sudo hegn network setup` for a full reinstall).
 # [[local_endpoints]]
 # name = "ollama"   # guest env: HEGN_ENDPOINT_OLLAMA (and OLLAMA_HOST)
 # port = 11434
@@ -845,6 +846,7 @@ The guarded network is a one-time privileged host setup:
 sudo hegn network setup --user "$USER"   # TAP pool + nftables table + /run marker
 hegn network status                      # marker, taps and reservations
 hegn network setup --dry-run --user "$USER"  # inspect the exact script
+sudo hegn network reload                 # rules only; TAPs stay up
 sudo hegn network teardown               # remove taps and rules
 ```
 
@@ -884,8 +886,10 @@ port = 11434      # host target: 127.0.0.1:11434
 input accept. The guest uses `http://10.213.0.<n>:11434`; host loopback is never
 bridged, other host interfaces stay unreachable, and ports below 1024 are
 rejected. Endpoints require `network = "guarded"`. After editing the list,
-re-run `sudo hegn network setup` — `hegn instance start` fails closed with a hint
-until the root-owned marker matches. With `cloud_init = true`, the URLs are
+run `sudo hegn network reload` to replace only the nftables rules (the TAP pool
+and running guests are left untouched), or `sudo hegn network setup` for a full
+reinstall — `hegn instance start` fails closed with a hint until the root-owned
+marker matches. With `cloud_init = true`, the URLs are
 exported in the guest through `/etc/profile.d/hegn-endpoints.sh`; every endpoint
 is also available as `HEGN_ENDPOINT_<NAME>`. `hegn instance status` prints the
 guest URLs.

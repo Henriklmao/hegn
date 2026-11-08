@@ -479,7 +479,9 @@ These are product requirements, not implementation details.
   and the marker version is bumped so an older guard cannot vouch for rules that
   lack them. A privileged reader (`hegn network setup`, root-run `hegn doctor`)
   also lists the live `inet hegn` table and refuses to trust the marker when the
-  rules are absent or partially flushed.
+  rules are absent or partially flushed. `hegn network reload` rewrites only the
+  table (including `route_localnet` and the endpoint DNAT set) when the endpoint
+  list changes, leaving TAPs and host-firewall exemptions untouched.
 - The only guest-to-host exception is the configured
   `local_endpoints` list: those TCP ports are DNATed from the instance's own TAP
   host address to `127.0.0.1` and accepted in the input chain, and

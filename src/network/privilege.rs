@@ -10,7 +10,7 @@ use chrono::Utc;
 
 use super::firewall::{command_exists, detect_host_firewall};
 use super::marker::{ReadyMarker, marker_path, ready_marker, write_marker};
-use super::script::{render_command, run_script, setup_script, teardown_script};
+use super::script::{reload_script, render_command, run_script, setup_script, teardown_script};
 use super::{DNS, MARKER_VERSION, SUBNET, TAP_POOL};
 use crate::config::{Config, NetworkMode};
 
@@ -130,24 +130,55 @@ pub fn setup(user: &str, endpoints: &[u16]) -> Result<()> {
     // The script replaces the nftables table. Drop the marker first so a
     // failed re-run cannot leave a "ready" marker vouching for a guard that no
     // longer exists; new instance starts then fail closed until setup succeeds.
-    match fs::remove_file(marker_path()) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to clear {}", marker_path().display()));
-        }
-    }
+    clear_marker()?;
     run_script(&script).context("failed to configure the guarded network")?;
     // Do not write a readiness receipt unless the rules actually landed. A
     // host firewall or a concurrent `nft flush` must not leave a marker that
     // vouches for a table that does not exist.
-    if super::firewall::live_guard_status(&endpoints) == Some(false) {
+    ensure_guard_live(&endpoints, "setup")?;
+    record_ready(endpoints)
+}
+
+/// Reinstall the nftables guard without touching the TAP pool or the host
+/// firewall exemptions. Used when only the endpoint list changed.
+pub fn reload(endpoints: &[u16]) -> Result<()> {
+    if !is_privileged() {
+        bail!("`hegn network reload` must run as root (try `sudo hegn network reload`)");
+    }
+    if ready_marker().is_none() {
+        bail!("guarded networking is not set up; run `sudo hegn network setup --user $USER` first");
+    }
+    let mut endpoints = endpoints.to_vec();
+    endpoints.sort_unstable();
+    endpoints.dedup();
+    let script = reload_script(&endpoints)?;
+    clear_marker()?;
+    run_script(&script).context("failed to reload the guarded network")?;
+    ensure_guard_live(&endpoints, "reload")?;
+    record_ready(endpoints)
+}
+
+fn clear_marker() -> Result<()> {
+    match fs::remove_file(marker_path()) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to clear {}", marker_path().display()))
+        }
+    }
+}
+
+fn ensure_guard_live(endpoints: &[u16], phase: &str) -> Result<()> {
+    if super::firewall::live_guard_status(endpoints) == Some(false) {
         bail!(
-            "the nftables guard is missing after setup; refusing to write {}",
+            "the nftables guard is missing after {phase}; refusing to write {}",
             marker_path().display()
         );
     }
+    Ok(())
+}
+
+fn record_ready(endpoints: Vec<u16>) -> Result<()> {
     let marker = ReadyMarker {
         version: MARKER_VERSION,
         pool: TAP_POOL,
@@ -352,6 +383,11 @@ mod tests {
         assert!(
             format!("{teardown_err:#}").contains("must run as root"),
             "{teardown_err:#}"
+        );
+        let reload_err = reload(&[]).unwrap_err();
+        assert!(
+            format!("{reload_err:#}").contains("must run as root"),
+            "{reload_err:#}"
         );
     }
 

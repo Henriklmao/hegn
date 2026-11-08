@@ -378,6 +378,13 @@ pub enum NetworkCommands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Reinstall the nftables rules and endpoint DNAT without touching the TAP
+    /// pool (requires root).
+    Reload {
+        /// Print the script instead of applying it (does not require root).
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Remove the TAP pool and the nftables table (requires root).
     Teardown,
 }

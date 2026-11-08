@@ -62,6 +62,37 @@ pub fn setup_script(user: &str, endpoints: &[u16]) -> Result<String> {
     Ok(script)
 }
 
+/// Reinstall only the nftables guard and endpoint DNAT rules. The TAP pool and
+/// the host-firewall exemptions stay untouched, so changing an endpoint port
+/// does not interrupt running guests.
+pub fn reload_script(endpoints: &[u16]) -> Result<String> {
+    for port in endpoints {
+        if *port < 1024 {
+            bail!("endpoint port {port} is privileged and cannot be exposed");
+        }
+    }
+    let mut endpoints = endpoints.to_vec();
+    endpoints.sort_unstable();
+    endpoints.dedup();
+    let mut script = String::from("set -eu\n");
+    // DNAT to 127.0.0.1 needs route_localnet; turn it off again when the last
+    // endpoint is removed.
+    let route_localnet = if endpoints.is_empty() { 0 } else { 1 };
+    for index in 0..TAP_POOL {
+        script.push_str(&format!(
+            "sysctl -q -w net.ipv4.conf.{}.route_localnet={route_localnet}\n",
+            tap_name(index)
+        ));
+    }
+    script.push_str(
+        "nft delete table inet hegn 2>/dev/null || true\n\
+         nft -f - <<'HEGN_NFT'\n",
+    );
+    script.push_str(&nft_rules(&endpoints));
+    script.push_str("HEGN_NFT\n");
+    Ok(script)
+}
+
 pub fn teardown_script() -> String {
     let mut script = String::from("nft delete table inet hegn 2>/dev/null || true\n");
     for index in 0..TAP_POOL {
@@ -180,10 +211,42 @@ mod tests {
     }
 
     #[test]
+    fn reload_script_replaces_only_the_rules() {
+        let script = reload_script(&[11434]).unwrap();
+        assert!(script.contains("nft delete table inet hegn"), "{script}");
+        assert!(script.contains("elements = { 11434 }"), "{script}");
+        assert!(script.contains("route_localnet=1"), "{script}");
+        assert!(script.contains("tcp dport { 80, 443 } accept"), "{script}");
+        // The TAPs and the host-firewall exemptions must survive a reload.
+        for untouched in [
+            "ip tuntap",
+            "ip link del",
+            "ufw",
+            "firewall-cmd",
+            "iptables",
+            "network.json",
+        ] {
+            assert!(!script.contains(untouched), "{untouched} in:\n{script}");
+        }
+
+        let plain = reload_script(&[]).unwrap();
+        assert!(plain.contains("route_localnet=0"), "{plain}");
+        assert!(!plain.contains("dnat"), "{plain}");
+    }
+
+    #[test]
+    fn reload_script_rejects_privileged_ports() {
+        assert!(reload_script(&[22]).is_err());
+        assert!(reload_script(&[0]).is_err());
+    }
+
+    #[test]
     fn setup_and_teardown_scripts_are_valid_shell() {
         for script in [
             setup_script("alice", &[]).unwrap(),
             setup_script("alice", &[11434]).unwrap(),
+            reload_script(&[]).unwrap(),
+            reload_script(&[11434]).unwrap(),
             teardown_script(),
         ] {
             let parsed = Command::new("sh")

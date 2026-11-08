@@ -95,6 +95,26 @@ pub(crate) fn network_command(command: NetworkCommands, config: Config, json: bo
             }
             Ok(0)
         }
+        NetworkCommands::Reload { dry_run } => {
+            let endpoints = config.endpoint_ports();
+            if dry_run {
+                println!("{}", crate::network::reload_script(&endpoints)?);
+                return Ok(0);
+            }
+            crate::network::reload(&endpoints)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"ready": true, "endpoints": endpoints})
+                );
+            } else {
+                println!(
+                    "network guard reloaded with {} endpoint(s); the TAP pool was left untouched.",
+                    endpoints.len()
+                );
+            }
+            Ok(0)
+        }
         NetworkCommands::Teardown => {
             crate::network::teardown()?;
             if json {
