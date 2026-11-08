@@ -36,6 +36,10 @@ pub struct InstanceConfig {
     pub memory_mib: u32,
     pub shared_tag: String,
     pub guest_mount: String,
+    /// Export the workspace as a read-only virtio-fs share. Useful for
+    /// review-only runs where the agent must not modify the project.
+    #[serde(default)]
+    pub read_only_workspace: bool,
     /// Clone created for multi-agent work.
     pub ephemeral: bool,
     #[serde(alias = "source_sandbox")]
@@ -64,6 +68,7 @@ impl Default for InstanceConfig {
             memory_mib: 2048,
             shared_tag: "workspace".to_string(),
             guest_mount: "/workspace".to_string(),
+            read_only_workspace: false,
             ephemeral: false,
             source_instance: None,
             created_at: Utc::now(),

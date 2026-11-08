@@ -327,7 +327,12 @@ impl InstanceManager {
         }
         cleanup_files(&paths);
 
-        let mut virtiofs = match spawn_virtiofsd(&self.config, &paths, &project) {
+        let mut virtiofs = match spawn_virtiofsd(
+            &self.config,
+            &paths,
+            &project,
+            self.instance.read_only_workspace,
+        ) {
             Ok(process) => process,
             Err(err) => {
                 cleanup_files(&paths);
@@ -345,7 +350,12 @@ impl InstanceManager {
 
         let mut profile_virtiofs = None;
         if needs_profile && let Some(share) = &profile_plan.share {
-            match spawn_virtiofsd_at(&self.config, &share.bundle_dir, &paths.profile_socket) {
+            match spawn_virtiofsd_at(
+                &self.config,
+                &share.bundle_dir,
+                &paths.profile_socket,
+                false,
+            ) {
                 Ok(process) => profile_virtiofs = Some(process),
                 Err(err) => {
                     virtiofs.kill();
@@ -389,12 +399,14 @@ impl InstanceManager {
                     network_lease.as_ref(),
                     &self.config.local_endpoints,
                     self.config.guest_credential_hardening,
+                    self.instance.read_only_workspace,
                 ),
                 &provision,
                 profile_share,
                 network_lease.as_ref(),
                 &self.config.local_endpoints,
                 self.config.guest_credential_hardening,
+                self.instance.read_only_workspace,
             )
         {
             virtiofs.kill();

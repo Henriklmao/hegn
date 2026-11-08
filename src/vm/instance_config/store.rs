@@ -178,6 +178,7 @@ mod tests {
             .create_from_project(&project, None, None, false)
             .unwrap();
         instance.memory_mib = 4096;
+        instance.read_only_workspace = true;
         store.save(&instance).unwrap();
         let path = store.config_path("demo").unwrap();
         assert_eq!(
@@ -185,6 +186,7 @@ mod tests {
             0o600
         );
         assert_eq!(store.load("demo").unwrap().memory_mib, 4096);
+        assert!(store.load("demo").unwrap().read_only_workspace);
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub(super) fn user_data(
     profile: Option<&ProfileShare>,
     endpoints: Option<&str>,
     credential_hardening: bool,
+    read_only_workspace: bool,
 ) -> String {
     let script = indent(&provision.script(), 6);
     let endpoint_file = match endpoints {
@@ -64,6 +65,15 @@ pub(super) fn user_data(
     } else {
         ("root", "ALL=(ALL) NOPASSWD:ALL")
     };
+    // virtiofsd enforces read-only exports; marking the guest mount read-only
+    // as well keeps write attempts failing with a clear error instead of the
+    // daemon's permission error.
+    let mount_options = if read_only_workspace {
+        r#""defaults,nofail,ro""#
+    } else {
+        r#""defaults,nofail""#
+    };
+    let mount_flag = if read_only_workspace { " -o ro" } else { "" };
     format!(
         r#"#cloud-config
 users:
@@ -74,7 +84,7 @@ users:
     sudo: {sudo_rule}
     lock_passwd: true
 mounts:
-  - [ '{shared_tag}', '{guest_mount}', virtiofs, "defaults,nofail", "0", "0" ]
+  - [ '{shared_tag}', '{guest_mount}', virtiofs, {mount_options}, "0", "0" ]
 {profile_mount}write_files:
   - path: /etc/gitconfig
     permissions: '0644'
@@ -158,7 +168,7 @@ runcmd:
   - systemctl enable serial-getty@ttyAMA0.service || true
   - systemctl restart serial-getty@ttyAMA0.service || true
   - mkdir -p '{guest_mount}' || true
-  - mountpoint -q '{guest_mount}' || mount -t virtiofs '{shared_tag}' '{guest_mount}' || true
+  - mountpoint -q '{guest_mount}' || mount -t virtiofs{mount_flag} '{shared_tag}' '{guest_mount}' || true
 {profile_runcmd}  - systemctl enable --now hegn-provision.service || true
   - systemctl enable hegn-health.service || true
   - systemctl start --no-block hegn-health.service || true
@@ -197,7 +207,7 @@ mod tests {
 
     #[test]
     fn mount_and_tag_are_single_quoted_everywhere() {
-        let data = user_data("workspace", "/workspace", &plan(), None, None, false);
+        let data = user_data("workspace", "/workspace", &plan(), None, None, false, false);
         assert!(
             data.contains("- [ 'workspace', '/workspace', virtiofs"),
             "{data}"
@@ -218,19 +228,42 @@ mod tests {
 
     #[test]
     fn credential_hardening_is_opt_in() {
-        let relaxed = user_data("workspace", "/workspace", &plan(), None, None, false);
+        let relaxed = user_data("workspace", "/workspace", &plan(), None, None, false, false);
         assert!(relaxed.contains("--autologin root"), "{relaxed}");
         assert!(
             relaxed.contains("sudo: ALL=(ALL) NOPASSWD:ALL"),
             "{relaxed}"
         );
 
-        let hardened = user_data("workspace", "/workspace", &plan(), None, None, true);
+        let hardened = user_data("workspace", "/workspace", &plan(), None, None, true, false);
         assert!(hardened.contains("--autologin hegn"), "{hardened}");
         assert!(!hardened.contains("--autologin root"), "{hardened}");
         assert!(hardened.contains("sudo: ALL=(ALL) ALL"), "{hardened}");
         assert!(!hardened.contains("NOPASSWD"), "{hardened}");
         assert!(hardened.contains("lock_passwd: true"), "{hardened}");
+    }
+
+    #[test]
+    fn read_only_workspace_marks_the_guest_mount_read_only() {
+        let writable = user_data("workspace", "/workspace", &plan(), None, None, false, false);
+        assert!(
+            writable.contains(r#"virtiofs, "defaults,nofail", "0", "0""#),
+            "{writable}"
+        );
+        assert!(
+            writable.contains("mount -t virtiofs 'workspace' '/workspace' || true"),
+            "{writable}"
+        );
+
+        let read_only = user_data("workspace", "/workspace", &plan(), None, None, false, true);
+        assert!(
+            read_only.contains(r#"virtiofs, "defaults,nofail,ro", "0", "0""#),
+            "{read_only}"
+        );
+        assert!(
+            read_only.contains("mount -t virtiofs -o ro 'workspace' '/workspace' || true"),
+            "{read_only}"
+        );
     }
 
     #[test]
@@ -244,6 +277,7 @@ mod tests {
             &plan(),
             None,
             Some(&content),
+            false,
             false,
         );
         assert!(
@@ -273,6 +307,7 @@ mod tests {
             Some(&profile),
             None,
             false,
+            false,
         );
         assert!(
             data.contains("[ 'hegn-profile', '/run/hegn/profile', virtiofs"),
@@ -293,7 +328,7 @@ mod tests {
     #[test]
     fn the_embedded_provision_script_is_fully_indented() {
         let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
-        let data = user_data("workspace", "/workspace", &plan, None, None, false);
+        let data = user_data("workspace", "/workspace", &plan, None, None, false, false);
         assert!(
             data.contains("  - path: /usr/local/sbin/hegn-provision\n    permissions: '0700'\n"),
             "{data}"

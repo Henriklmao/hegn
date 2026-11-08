@@ -186,6 +186,7 @@ impl InstanceStore {
             memory_mib: base.memory_mib,
             shared_tag: base.shared_tag,
             guest_mount: base.guest_mount,
+            read_only_workspace: false,
             ephemeral,
             source_instance,
             created_at: Utc::now(),

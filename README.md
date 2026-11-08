@@ -474,6 +474,11 @@ hegn instance config my-app --path   # print the path
 hegn instance config my-app --edit   # open it in $EDITOR
 ```
 
+Set `read_only_workspace = true` in an instance's `hegn.toml` (or toggle
+**Read-only workspace** with `F5`) to export the project read-only: virtiofsd
+gets `--readonly` and the guest mount is mounted `ro`, so an agent cannot modify
+the workspace.
+
 Every instance gets a private rootfs copy on first start (reflink on btrfs/XFS,
 otherwise a full copy). This is required for concurrent VMs: sharing one
 writable disk would corrupt it. Existing instances keep their copy until they

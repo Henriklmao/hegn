@@ -65,6 +65,7 @@ pub fn write_seed(
     network: Option<&Lease>,
     endpoints: &[LocalEndpoint],
     credential_hardening: bool,
+    read_only_workspace: bool,
 ) -> Result<()> {
     if !safe_token(shared_tag) {
         anyhow::bail!("unsafe virtio-fs tag for the cloud-init seed: {shared_tag:?}");
@@ -85,6 +86,7 @@ pub fn write_seed(
         profile,
         endpoint_env.as_deref(),
         credential_hardening,
+        read_only_workspace,
     );
     let meta_data = meta_data(instance_id);
     let mut file = OpenOptions::new()
@@ -148,12 +150,13 @@ pub fn instance_id(
     network: Option<&Lease>,
     endpoints: &[LocalEndpoint],
     credential_hardening: bool,
+    read_only_workspace: bool,
 ) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
     hasher.update(SEED_VERSION.to_le_bytes());
-    hasher.update([credential_hardening as u8]);
+    hasher.update([credential_hardening as u8, read_only_workspace as u8]);
     hasher.update(provision.harness.label().as_bytes());
     hasher.update(provision.script().as_bytes());
     if let Some(profile) = profile {
@@ -230,6 +233,7 @@ mod tests {
             Some(&lease()),
             &[],
             false,
+            false,
         )
         .unwrap();
 
@@ -278,6 +282,7 @@ mod tests {
             Some(&lease()),
             &endpoints,
             false,
+            false,
         )
         .unwrap();
         let (user_data, _, _) = read_seed(&path);
@@ -320,6 +325,7 @@ mod tests {
             None,
             &[],
             false,
+            false,
         )
         .unwrap();
         let (user_data, _, _) = read_seed(&path);
@@ -345,16 +351,22 @@ mod tests {
     fn instance_id_changes_with_preset_and_network() {
         let shell = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
         let opencode = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
-        let a = instance_id("demo", &shell, None, None, &[], false);
-        assert_eq!(a, instance_id("demo", &shell, None, None, &[], false));
-        assert_ne!(a, instance_id("demo", &opencode, None, None, &[], false));
-        assert_ne!(
+        let a = instance_id("demo", &shell, None, None, &[], false, false);
+        assert_eq!(
             a,
-            instance_id("demo", &shell, None, Some(&lease()), &[], false)
+            instance_id("demo", &shell, None, None, &[], false, false)
         );
         assert_ne!(
             a,
-            instance_id("demo", &shell, None, None, &[], true),
+            instance_id("demo", &opencode, None, None, &[], false, false)
+        );
+        assert_ne!(
+            a,
+            instance_id("demo", &shell, None, Some(&lease()), &[], false, false)
+        );
+        assert_ne!(
+            a,
+            instance_id("demo", &shell, None, None, &[], true, false),
             "toggling credential hardening must re-run cloud-init"
         );
         assert!(a.starts_with("hegn-demo-v"));
@@ -374,6 +386,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
             false,
         )
         .unwrap();
@@ -401,6 +414,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                false,
                 false
             )
             .is_err()
@@ -423,6 +437,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                false,
                 false
             )
             .is_err()
@@ -437,6 +452,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                false,
                 false
             )
             .is_err()
@@ -451,6 +467,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                false,
                 false
             )
             .is_err()
@@ -465,6 +482,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                false,
                 false
             )
             .is_err()
@@ -487,6 +505,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
             false,
         )
         .unwrap();
@@ -582,6 +601,7 @@ mod tests {
                     None,
                     &[],
                     false,
+                    false,
                 )
                 .is_err(),
                 "{bad:?} must be rejected"
@@ -593,8 +613,11 @@ mod tests {
     #[test]
     fn instance_id_is_stable_and_tracks_profile_and_endpoints() {
         let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
-        let plain = instance_id("demo", &plan, None, None, &[], false);
-        assert_eq!(plain, instance_id("demo", &plan, None, None, &[], false));
+        let plain = instance_id("demo", &plan, None, None, &[], false, false);
+        assert_eq!(
+            plain,
+            instance_id("demo", &plan, None, None, &[], false, false)
+        );
         assert_eq!(
             plain,
             format!("hegn-demo-v{SEED_VERSION}-{}", &plain[plain.len() - 12..])
@@ -604,16 +627,17 @@ mod tests {
             bundle_dir: PathBuf::from("/tmp/bundle"),
             manifest_id: "b".repeat(64),
         };
-        let with_profile = instance_id("demo", &plan, Some(&profile), None, &[], false);
+        let with_profile = instance_id("demo", &plan, Some(&profile), None, &[], false, false);
         assert_ne!(plain, with_profile);
 
         let lease = lease();
-        let no_endpoints = instance_id("demo", &plan, None, Some(&lease), &[], false);
+        let no_endpoints = instance_id("demo", &plan, None, Some(&lease), &[], false, false);
         let endpoint = LocalEndpoint {
             name: "ollama".into(),
             port: 11434,
         };
-        let with_endpoint = instance_id("demo", &plan, None, Some(&lease), &[endpoint], false);
+        let with_endpoint =
+            instance_id("demo", &plan, None, Some(&lease), &[endpoint], false, false);
         assert_ne!(no_endpoints, with_endpoint);
     }
 

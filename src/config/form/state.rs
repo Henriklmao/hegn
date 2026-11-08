@@ -225,6 +225,7 @@ impl ConfigForm {
                 ConfigField::Security => instance.security.label().to_string(),
                 ConfigField::SharedTag => instance.shared_tag.clone(),
                 ConfigField::GuestMount => instance.guest_mount.clone(),
+                ConfigField::ReadOnlyWorkspace => on_off(instance.read_only_workspace),
                 ConfigField::ExtraPackages => list_value(&instance.extra_packages),
                 ConfigField::Project => instance.project.display().to_string(),
                 ConfigField::Workspace => instance.workspace.display().to_string(),
@@ -564,6 +565,9 @@ impl ConfigForm {
                 config.guest_credential_hardening
             }
             (Draft::Instance(instance), ConfigField::AutoBranch) => instance.auto_branch,
+            (Draft::Instance(instance), ConfigField::ReadOnlyWorkspace) => {
+                instance.read_only_workspace
+            }
             _ => false,
         }
     }
@@ -576,6 +580,9 @@ impl ConfigForm {
                 config.guest_credential_hardening = value
             }
             (Draft::Instance(instance), ConfigField::AutoBranch) => instance.auto_branch = value,
+            (Draft::Instance(instance), ConfigField::ReadOnlyWorkspace) => {
+                instance.read_only_workspace = value
+            }
             _ => anyhow::bail!("{} is not a toggle", field.label()),
         }
         Ok(())

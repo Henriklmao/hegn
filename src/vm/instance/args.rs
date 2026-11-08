@@ -45,13 +45,14 @@ fn virtiofs_config(
     paths: &InstancePaths,
     project: &Path,
 ) -> Result<VirtiofsConfig> {
-    virtiofs_config_at(config, project, &paths.virtiofs_socket)
+    virtiofs_config_at(config, project, &paths.virtiofs_socket, false)
 }
 
 pub(super) fn virtiofs_config_at(
     config: &Config,
     shared_dir: &Path,
     socket_path: &Path,
+    read_only: bool,
 ) -> Result<VirtiofsConfig> {
     let binary = config.resolved_virtiofsd().with_context(|| {
         format!(
@@ -65,6 +66,7 @@ pub(super) fn virtiofs_config_at(
     // Honour the configured sandbox mode. The default is namespace; chroot is
     // available for hosts where user namespaces are restricted.
     virtiofs.sandbox = config.virtiofs_sandbox;
+    virtiofs.read_only = read_only;
     Ok(virtiofs)
 }
 
@@ -72,16 +74,18 @@ pub(super) fn spawn_virtiofsd(
     config: &Config,
     paths: &InstancePaths,
     project: &Path,
+    read_only: bool,
 ) -> Result<VirtiofsProcess> {
-    spawn_virtiofsd_at(config, project, &paths.virtiofs_socket)
+    spawn_virtiofsd_at(config, project, &paths.virtiofs_socket, read_only)
 }
 
 pub(super) fn spawn_virtiofsd_at(
     config: &Config,
     shared_dir: &Path,
     socket_path: &Path,
+    read_only: bool,
 ) -> Result<VirtiofsProcess> {
-    let virtiofs = virtiofs_config_at(config, shared_dir, socket_path)?;
+    let virtiofs = virtiofs_config_at(config, shared_dir, socket_path, read_only)?;
     let mut process = virtiofs.spawn().context("failed to start virtiofsd")?;
     if let Err(err) = process.wait_for_socket(Duration::from_secs(5)) {
         process.kill();
@@ -352,6 +356,30 @@ mod tests {
         let paths = InstancePaths::from_instance(&config, &instance);
         let virtiofs = virtiofs_config(&config, &paths, dir.path()).unwrap();
         assert_eq!(virtiofs.sandbox, crate::config::VirtiofsSandbox::Chroot);
+    }
+
+    #[test]
+    fn read_only_workspace_sets_virtiofsd_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.virtiofsd_bin = std::env::current_exe().unwrap();
+        let socket = dir.path().join("virtiofs.sock");
+        let writable = virtiofs_config_at(&config, dir.path(), &socket, false).unwrap();
+        assert!(
+            !writable
+                .build_args()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--readonly")
+        );
+        let read_only = virtiofs_config_at(&config, dir.path(), &socket, true).unwrap();
+        assert!(
+            read_only
+                .build_args()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--readonly")
+        );
     }
 
     #[test]

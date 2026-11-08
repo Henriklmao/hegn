@@ -47,6 +47,7 @@ pub enum ConfigField {
     RootfsImage,
     SharedTag,
     GuestMount,
+    ReadOnlyWorkspace,
     Network,
     Security,
     Backend,
@@ -102,6 +103,7 @@ impl ConfigField {
             Self::RootfsImage => "Rootfs image",
             Self::SharedTag => "Shared tag",
             Self::GuestMount => "Guest mount",
+            Self::ReadOnlyWorkspace => "Read-only workspace",
             Self::Network => "Network",
             Self::Security => "Security",
             Self::Backend => "Backend",
@@ -138,7 +140,9 @@ impl ConfigField {
                 max: 262_144,
                 step: 256,
             },
-            Self::AutoBranch | Self::CloudInit | Self::GuestHardening => FieldKind::Bool,
+            Self::AutoBranch | Self::CloudInit | Self::GuestHardening | Self::ReadOnlyWorkspace => {
+                FieldKind::Bool
+            }
             Self::Profile(_) => FieldKind::Action,
             Self::Project | Self::Workspace | Self::RootfsPath | Self::NetworkIndex => {
                 FieldKind::Locked
@@ -240,6 +244,7 @@ const INSTANCE_ROWS: &[ConfigRow] = &[
     ConfigRow::Group("Guest sharing"),
     ConfigRow::Field(ConfigField::SharedTag),
     ConfigRow::Field(ConfigField::GuestMount),
+    ConfigRow::Field(ConfigField::ReadOnlyWorkspace),
     ConfigRow::Group("Packages"),
     ConfigRow::Field(ConfigField::ExtraPackages),
     ConfigRow::Group("Instance (read-only)"),

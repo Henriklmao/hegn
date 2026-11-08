@@ -168,7 +168,12 @@ impl InstanceManager {
         };
 
         // 1. virtiofsd, sandboxed to exactly this project.
-        let mut virtiofs = match spawn_virtiofsd(&self.config, &paths, project) {
+        let mut virtiofs = match spawn_virtiofsd(
+            &self.config,
+            &paths,
+            project,
+            self.instance.read_only_workspace,
+        ) {
             Ok(process) => process,
             Err(err) => {
                 network::release(&self.config, &self.instance.name);
@@ -186,7 +191,12 @@ impl InstanceManager {
         // 1b. Optional second virtiofsd for the copied profile and skills.
         let mut profile_virtiofs = None;
         if let Some(share) = &profile_plan.share {
-            match spawn_virtiofsd_at(&self.config, &share.bundle_dir, &paths.profile_socket) {
+            match spawn_virtiofsd_at(
+                &self.config,
+                &share.bundle_dir,
+                &paths.profile_socket,
+                false,
+            ) {
                 Ok(process) => profile_virtiofs = Some(process),
                 Err(err) => {
                     virtiofs.kill();
@@ -228,12 +238,14 @@ impl InstanceManager {
                     network_lease.as_ref(),
                     &self.config.local_endpoints,
                     self.config.guest_credential_hardening,
+                    self.instance.read_only_workspace,
                 ),
                 &provision,
                 profile_plan.share.as_ref(),
                 network_lease.as_ref(),
                 &self.config.local_endpoints,
                 self.config.guest_credential_hardening,
+                self.instance.read_only_workspace,
             )
         {
             virtiofs.kill();
