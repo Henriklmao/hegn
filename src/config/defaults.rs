@@ -40,6 +40,8 @@ impl Default for Config {
             rootfs_sha256: crate::vm::images::ROOTFS_SHA256.to_string(),
             vcpus: 2,
             memory_mib: 2048,
+            max_rootfs_gib: 64,
+            disk_usage_warn_percent: 80,
             shared_tag: "workspace".to_string(),
             guest_mount: "/workspace".to_string(),
             virtiofs_sandbox: VirtiofsSandbox::Namespace,

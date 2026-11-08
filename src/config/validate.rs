@@ -14,6 +14,18 @@ impl Config {
         if self.memory_mib < 128 {
             bail!("memory_mib must be at least 128 (got {})", self.memory_mib);
         }
+        if !(16..=1024).contains(&self.max_rootfs_gib) {
+            bail!(
+                "max_rootfs_gib must be between 16 and 1024 (got {})",
+                self.max_rootfs_gib
+            );
+        }
+        if self.disk_usage_warn_percent == 0 || self.disk_usage_warn_percent >= 100 {
+            bail!(
+                "disk_usage_warn_percent must be between 1 and 99 (got {})",
+                self.disk_usage_warn_percent
+            );
+        }
         if !crate::vm::cloud_init::safe_token(&self.shared_tag) {
             bail!("shared_tag may only contain ASCII letters, digits, '-', '_' and '.'");
         }
@@ -92,6 +104,11 @@ impl Config {
         ports.sort_unstable();
         ports.dedup();
         ports
+    }
+
+    /// Rootfs growth ceiling in bytes.
+    pub fn max_rootfs_bytes(&self) -> u64 {
+        u64::from(self.max_rootfs_gib) * 1024 * 1024 * 1024
     }
 }
 
@@ -317,6 +334,26 @@ mod tests {
             config.validate().is_err(),
             "the filesystem root is rejected"
         );
+    }
+
+    #[test]
+    fn resource_caps_are_bounded() {
+        let mut config = Config::default();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.max_rootfs_bytes(), 64 * 1024 * 1024 * 1024);
+
+        config.max_rootfs_gib = 15;
+        assert!(config.validate().is_err(), "below the 16 GiB floor");
+        config.max_rootfs_gib = 1025;
+        assert!(config.validate().is_err(), "unreasonably large ceiling");
+
+        config.max_rootfs_gib = 64;
+        config.disk_usage_warn_percent = 0;
+        assert!(config.validate().is_err());
+        config.disk_usage_warn_percent = 100;
+        assert!(config.validate().is_err());
+        config.disk_usage_warn_percent = 80;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

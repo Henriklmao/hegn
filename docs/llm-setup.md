@@ -176,6 +176,8 @@ rootfs_format   = "qcow2"   # "raw" or "qcow2"
 root_device     = "/dev/vda1"
 vcpus           = 2         # 1-32
 memory_mib      = 2048      # >= 128
+max_rootfs_gib  = 64        # 16-1024
+disk_usage_warn_percent = 80
 shared_tag      = "workspace"  # virtio-fs tag, <= 36 bytes
 guest_mount     = "/workspace" # mount point inside the guest
 cloud_init      = true

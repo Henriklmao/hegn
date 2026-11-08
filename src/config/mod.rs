@@ -82,6 +82,13 @@ pub struct Config {
     pub vcpus: u8,
     /// Guest memory in MiB.
     pub memory_mib: u32,
+    /// Hard ceiling for per-instance root filesystem growth, in GiB. Sparse
+    /// images only consume host space when the guest writes, but a runaway
+    /// guest must not be able to fill the host filesystem.
+    pub max_rootfs_gib: u32,
+    /// Warn in `hegn doctor` when the filesystem holding the instances is
+    /// fuller than this percentage.
+    pub disk_usage_warn_percent: u8,
     /// virtiofs tag; mounted at `guest_mount` inside the guest.
     pub shared_tag: String,
     pub guest_mount: String,

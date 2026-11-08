@@ -38,6 +38,8 @@ pub enum ConfigField {
     Harness,
     Vcpus,
     Memory,
+    MaxRootfs,
+    DiskWarn,
     AutoBranch,
     RootfsFormat,
     RootDevice,
@@ -94,6 +96,8 @@ impl ConfigField {
             Self::Harness => "Harness",
             Self::Vcpus => "vCPUs",
             Self::Memory => "Memory (MiB)",
+            Self::MaxRootfs => "Max rootfs (GiB)",
+            Self::DiskWarn => "Disk warn (%)",
             Self::AutoBranch => "Session branch",
             Self::RootfsFormat => "Rootfs format",
             Self::RootDevice => "Root device",
@@ -139,6 +143,16 @@ impl ConfigField {
                 min: 128,
                 max: 262_144,
                 step: 256,
+            },
+            Self::MaxRootfs => FieldKind::Integer {
+                min: 16,
+                max: 1024,
+                step: 8,
+            },
+            Self::DiskWarn => FieldKind::Integer {
+                min: 1,
+                max: 99,
+                step: 5,
             },
             Self::AutoBranch | Self::CloudInit | Self::GuestHardening | Self::ReadOnlyWorkspace => {
                 FieldKind::Bool
@@ -186,6 +200,8 @@ const GENERAL_ROWS: &[ConfigRow] = &[
     ConfigRow::Group("Storage"),
     ConfigRow::Field(ConfigField::RootfsFormat),
     ConfigRow::Field(ConfigField::RootDevice),
+    ConfigRow::Field(ConfigField::MaxRootfs),
+    ConfigRow::Field(ConfigField::DiskWarn),
     ConfigRow::Field(ConfigField::CloudInit),
     ConfigRow::Field(ConfigField::KernelImage),
     ConfigRow::Field(ConfigField::RootfsImage),

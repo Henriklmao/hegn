@@ -708,6 +708,8 @@ rootfs_url      = "https://ch-images.azureedge.net/jammy-server-cloudimg-amd64-c
 rootfs_sha256   = "e05cb642d633e20e8e1390be23856744d3867744764bf3000ad0a9c22dd794e8"
 vcpus           = 2          # 1–32
 memory_mib      = 2048       # >= 128
+max_rootfs_gib  = 64         # 16–1024; rootfs growth ceiling
+disk_usage_warn_percent = 80 # doctor warns above this usage
 shared_tag      = "workspace" # virtio-fs tag, <= 36 bytes, no whitespace
 guest_mount     = "/workspace" # absolute guest path
 virtiofs_sandbox = "namespace" # "namespace" (recommended) or "chroot"

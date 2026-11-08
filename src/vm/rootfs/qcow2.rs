@@ -353,7 +353,7 @@ mod tests {
         let path = dir.path().join("disk.qcow2");
         synthetic_qcow2(&path);
         let target = 1024 * 1024;
-        assert!(grow(&path, RootfsFormat::Qcow2, target).unwrap());
+        assert!(grow(&path, RootfsFormat::Qcow2, target, u64::MAX).unwrap());
 
         let file = OpenOptions::new().read(true).open(&path).unwrap();
         assert_eq!(read_u64(&file, 24), target);
@@ -385,7 +385,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("disk.qcow2");
         let size = synthetic_qcow2(&path);
-        assert!(!grow(&path, RootfsFormat::Qcow2, size).unwrap());
+        assert!(!grow(&path, RootfsFormat::Qcow2, size, u64::MAX).unwrap());
     }
 
     #[test]
@@ -393,7 +393,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("disk.qcow2");
         fs::write(&path, b"not a disk").unwrap();
-        let err = grow(&path, RootfsFormat::Qcow2, 1024 * 1024).unwrap_err();
+        let err = grow(&path, RootfsFormat::Qcow2, 1024 * 1024, u64::MAX).unwrap_err();
         assert!(format!("{err:#}").contains("not a qcow2 image"), "{err:#}");
     }
 
@@ -403,9 +403,9 @@ mod tests {
         let path = dir.path().join("disk.qcow2");
         synthetic_qcow2(&path);
         let target = 1024 * 1024;
-        grow(&path, RootfsFormat::Qcow2, target).unwrap();
+        grow(&path, RootfsFormat::Qcow2, target, u64::MAX).unwrap();
         let before = fs::metadata(&path).unwrap().len();
-        assert!(!grow(&path, RootfsFormat::Qcow2, target).unwrap());
+        assert!(!grow(&path, RootfsFormat::Qcow2, target, u64::MAX).unwrap());
         assert_eq!(fs::metadata(&path).unwrap().len(), before);
     }
 
@@ -424,7 +424,7 @@ mod tests {
         file.write_all_at(&1u64.to_be_bytes(), 72).unwrap();
         file.sync_all().unwrap();
         let target = 1024 * 1024;
-        assert!(grow(&path, RootfsFormat::Qcow2, target).unwrap());
+        assert!(grow(&path, RootfsFormat::Qcow2, target, u64::MAX).unwrap());
         let file = OpenOptions::new().read(true).open(&path).unwrap();
         assert_eq!(read_u64(&file, 24), target);
         assert_eq!(read_u32(&file, 36), 32);

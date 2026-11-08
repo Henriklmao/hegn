@@ -124,6 +124,22 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
         true,
         config.projects_root.display().to_string(),
     ));
+    let usage =
+        filesystem_usage(&config.instances_dir).or_else(|| filesystem_usage(&config.state_dir));
+    let (disk_ok, disk_detail) = match usage {
+        Some((used, total)) if total > 0 => {
+            let percent = used.saturating_mul(100) / total;
+            (
+                percent < u64::from(config.disk_usage_warn_percent),
+                format!(
+                    "{}% used on the instance filesystem (warn at {}%)",
+                    percent, config.disk_usage_warn_percent
+                ),
+            )
+        }
+        _ => (true, "instance filesystem not created yet".to_string()),
+    };
+    checks.push(Check::new("disk space", disk_ok, false, disk_detail));
     let guarded = config.network == crate::config::NetworkMode::Guarded;
     let marker = crate::network::ready_marker();
     let live = crate::network::live_guard_status(&config.endpoint_ports());
@@ -210,6 +226,22 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
             .unwrap_or_else(|_| "$EDITOR is unset".into()),
     ));
     checks
+}
+
+/// Used and total bytes of the filesystem holding `path`.
+fn filesystem_usage(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // Safety: `c_path` is NUL-terminated and `stat` is a valid out pointer.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let total = stat.f_blocks.checked_mul(stat.f_frsize)?;
+    let free = stat.f_bavail.checked_mul(stat.f_frsize)?;
+    Some((total.saturating_sub(free), total))
 }
 
 /// Is the Landlock ABI version Cloud Hypervisor requires (V3) available?

@@ -38,7 +38,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("disk.raw");
         fs::write(&path, b"rootfs").unwrap();
-        assert!(grow(&path, RootfsFormat::Raw, 1024 * 1024).unwrap());
+        assert!(grow(&path, RootfsFormat::Raw, 1024 * 1024, u64::MAX).unwrap());
         assert_eq!(fs::metadata(&path).unwrap().len(), 1024 * 1024);
         let mut prefix = [0u8; 6];
         fs::File::open(&path)

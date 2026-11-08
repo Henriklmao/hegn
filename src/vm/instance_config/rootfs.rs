@@ -86,7 +86,8 @@ impl InstanceConfig {
         if !config.cloud_init {
             return Ok(());
         }
-        crate::vm::rootfs::grow_to_minimum(path, config.rootfs_format).with_context(|| {
+        crate::vm::rootfs::grow_to_minimum(path, config.rootfs_format, config.max_rootfs_bytes())
+            .with_context(|| {
             format!(
                 "failed to grow the instance rootfs {} (the first boot needs room for the \
                  harness preset)",

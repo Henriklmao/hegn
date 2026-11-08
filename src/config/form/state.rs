@@ -190,6 +190,8 @@ impl ConfigForm {
                 ConfigField::Harness => config.harness.label().to_string(),
                 ConfigField::Vcpus => config.vcpus.to_string(),
                 ConfigField::Memory => config.memory_mib.to_string(),
+                ConfigField::MaxRootfs => config.max_rootfs_gib.to_string(),
+                ConfigField::DiskWarn => config.disk_usage_warn_percent.to_string(),
                 ConfigField::AutoBranch => on_off(config.auto_branch),
                 ConfigField::RootfsFormat => config.rootfs_format.as_str().to_string(),
                 ConfigField::RootDevice => config.root_device.clone(),
@@ -538,6 +540,10 @@ impl ConfigForm {
         let current = match (&self.draft, field) {
             (Draft::Global(config), ConfigField::Vcpus) => i64::from(config.vcpus),
             (Draft::Global(config), ConfigField::Memory) => i64::from(config.memory_mib),
+            (Draft::Global(config), ConfigField::MaxRootfs) => i64::from(config.max_rootfs_gib),
+            (Draft::Global(config), ConfigField::DiskWarn) => {
+                i64::from(config.disk_usage_warn_percent)
+            }
             (Draft::Instance(instance), ConfigField::Vcpus) => i64::from(instance.vcpus),
             (Draft::Instance(instance), ConfigField::Memory) => i64::from(instance.memory_mib),
             _ => return Ok(()),
@@ -550,6 +556,10 @@ impl ConfigForm {
         match (&mut self.draft, field) {
             (Draft::Global(config), ConfigField::Vcpus) => config.vcpus = value as u8,
             (Draft::Global(config), ConfigField::Memory) => config.memory_mib = value as u32,
+            (Draft::Global(config), ConfigField::MaxRootfs) => config.max_rootfs_gib = value as u32,
+            (Draft::Global(config), ConfigField::DiskWarn) => {
+                config.disk_usage_warn_percent = value as u8
+            }
             (Draft::Instance(instance), ConfigField::Vcpus) => instance.vcpus = value as u8,
             (Draft::Instance(instance), ConfigField::Memory) => instance.memory_mib = value as u32,
             _ => anyhow::bail!("{} is not a number", field.label()),
