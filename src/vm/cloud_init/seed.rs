@@ -26,7 +26,7 @@ const SEED_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Increment when the seed's user-data changes so existing instances re-run
 /// cloud-init on their next boot.
-pub const SEED_VERSION: u32 = 9;
+pub const SEED_VERSION: u32 = 10;
 
 /// Reject values that could break out of the cloud-init shell command.
 pub(crate) fn safe_token(value: &str) -> bool {

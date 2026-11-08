@@ -629,7 +629,11 @@ repository are reported as a warning toast.
 The health section reads the host hegn version, VM image readiness, instance
 creation date, the newest project snapshot, the project template, and the last
 `hegn-health` line from the selected instance's serial log. The guest writes
-that line at boot; the host never queries the guest from the renderer.
+that line at boot; the host never queries the guest from the renderer. The line
+also carries `provision=` and `mount=` so a failed first-boot provision or a
+missing workspace mount is visible. `hegn doctor` parses the newest line from
+the five newest session logs and warns when provisioning failed, the mount is
+missing, or the report is older than 24 hours.
 
 VM starts run on a named worker thread (`hegn-start-vm`) and report through the
 same channel as project scans. The UI therefore keeps drawing an animated

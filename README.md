@@ -603,7 +603,7 @@ exemption:
 
 ```bash
 sudo hegn network setup --user "$USER"
-hegn doctor            # `network guard` names the firewall it routed through
+hegn doctor            # network guard + guest health from the newest serial logs
 ```
 
 The kernel log shows which rule set dropped a packet:

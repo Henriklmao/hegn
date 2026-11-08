@@ -134,6 +134,18 @@ mounts:
       checked=$(date +%s)
       count=unknown
       reason=ok
+      provision=unknown
+      if systemctl is-failed --quiet hegn-provision.service 2>/dev/null; then
+        provision=failed
+      elif systemctl is-active --quiet hegn-provision.service 2>/dev/null; then
+        provision=running
+      else
+        provision=ok
+      fi
+      mount=missing
+      if mountpoint -q '{guest_mount}' 2>/dev/null; then
+        mount=ok
+      fi
       if [ -d /var/lib/apt/lists ] && [ -z "$(find /var/lib/apt/lists -maxdepth 0 -mmin -360 2>/dev/null)" ]; then
         if ! apt-get update -qq >/tmp/hegn-health.log 2>&1; then
           reason=offline
@@ -143,7 +155,7 @@ mounts:
         count=$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst ' || true)
         [ -n "$count" ] || count=unknown
       fi
-      echo "hegn-health v1 apt=$count checked=$checked reason=$reason"
+      echo "hegn-health v2 apt=$count checked=$checked reason=$reason provision=$provision mount=$mount"
   - path: /etc/systemd/system/hegn-health.service
     permissions: '0644'
     content: |

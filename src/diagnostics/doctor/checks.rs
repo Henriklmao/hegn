@@ -207,6 +207,17 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
             config.logs_dir().display()
         ),
     ));
+    let health = latest_guest_health(config);
+    let now = chrono::Utc::now().timestamp();
+    checks.push(Check::new(
+        "guest health",
+        health.as_ref().is_some_and(|health| health.healthy(now)),
+        false,
+        match &health {
+            Some(health) => health.summary(now),
+            None => "no hegn-health line yet (boot an instance)".to_string(),
+        },
+    ));
     checks.push(Check::new(
         "backend",
         config.vm_assets_ready(),
@@ -226,6 +237,80 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
             .unwrap_or_else(|_| "$EDITOR is unset".into()),
     ));
     checks
+}
+
+/// Latest `hegn-health` line from the guest's serial logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuestHealth {
+    version: u32,
+    apt: String,
+    checked: i64,
+    reason: String,
+    provision: String,
+    mount: String,
+}
+
+impl GuestHealth {
+    fn healthy(&self, now: i64) -> bool {
+        self.reason == "ok"
+            && self.provision != "failed"
+            && self.mount != "missing"
+            && now.saturating_sub(self.checked) <= 24 * 60 * 60
+    }
+
+    fn summary(&self, now: i64) -> String {
+        let minutes = now.saturating_sub(self.checked).max(0) / 60;
+        format!(
+            "v{} apt={} provision={} mount={} reason={} (checked {} min ago)",
+            self.version, self.apt, self.provision, self.mount, self.reason, minutes
+        )
+    }
+}
+
+/// Read the newest health line from the most recent session logs.
+fn latest_guest_health(config: &Config) -> Option<GuestHealth> {
+    let store = crate::session::logs::LogStore::new(config.logs_dir());
+    for entry in store.list().ok()?.into_iter().take(5) {
+        let Ok(raw) = crate::session::logs::tail_bytes(&entry.path, 4_000) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&raw);
+        if let Some(health) = text.lines().rev().find_map(parse_health) {
+            return Some(health);
+        }
+    }
+    None
+}
+
+/// Parse `hegn-health v2 apt=… checked=… reason=… provision=… mount=…`.
+fn parse_health(line: &str) -> Option<GuestHealth> {
+    let start = line.find("hegn-health v")?;
+    let mut tokens = line[start..].split_whitespace();
+    if tokens.next()? != "hegn-health" {
+        return None;
+    }
+    let version = tokens.next()?.strip_prefix('v')?.parse().ok()?;
+    let mut fields = std::collections::HashMap::new();
+    for token in tokens {
+        let (key, value) = token.split_once('=')?;
+        fields.insert(key, value);
+    }
+    Some(GuestHealth {
+        version,
+        apt: fields.get("apt")?.to_string(),
+        checked: fields.get("checked")?.parse().ok()?,
+        reason: fields.get("reason")?.to_string(),
+        provision: fields
+            .get("provision")
+            .copied()
+            .unwrap_or("unknown")
+            .to_string(),
+        mount: fields
+            .get("mount")
+            .copied()
+            .unwrap_or("unknown")
+            .to_string(),
+    })
 }
 
 /// Used and total bytes of the filesystem holding `path`.
@@ -370,5 +455,59 @@ mod tests {
         let check = check_tool("silent", Path::new("/bin/true"), &[], true);
         assert!(check.ok);
         assert!(check.detail.contains("exit status"), "{check:?}");
+    }
+
+    #[test]
+    fn health_lines_are_parsed_and_classified() {
+        let now = 1_700_000_000;
+        let line = "hegn-health v2 apt=5 checked=1699999900 reason=ok provision=ok mount=ok";
+        let health = parse_health(line).unwrap();
+        assert_eq!(health.version, 2);
+        assert_eq!(health.apt, "5");
+        assert_eq!(health.provision, "ok");
+        assert!(health.healthy(now));
+        assert!(health.summary(now).contains("1 min ago"));
+
+        let failed = parse_health(
+            "hegn-health v2 apt=0 checked=1699999900 reason=ok provision=failed mount=ok",
+        )
+        .unwrap();
+        assert!(!failed.healthy(now));
+        let missing = parse_health(
+            "hegn-health v2 apt=0 checked=1699999900 reason=ok provision=ok mount=missing",
+        )
+        .unwrap();
+        assert!(!missing.healthy(now));
+        let stale =
+            parse_health("hegn-health v2 apt=0 checked=1 reason=ok provision=ok mount=ok").unwrap();
+        assert!(!stale.healthy(now));
+
+        // Version 1 lines predate the provision/mount fields but stay readable.
+        let old = parse_health("hegn-health v1 apt=2 checked=1699999900 reason=ok").unwrap();
+        assert_eq!(old.provision, "unknown");
+        assert_eq!(old.mount, "unknown");
+        assert!(old.healthy(now));
+
+        assert!(parse_health("booting linux").is_none());
+        assert!(parse_health("hegn-health v2 apt=1").is_none());
+    }
+
+    #[test]
+    fn latest_health_reads_the_newest_session_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            state_dir: dir.path().join("state"),
+            ..Config::default()
+        };
+        let logs = config.logs_dir();
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("session-a.log"),
+            "boot\nhegn-health v2 apt=1 checked=1699999900 reason=ok provision=ok mount=ok\n",
+        )
+        .unwrap();
+        let health = latest_guest_health(&config).expect("health line");
+        assert_eq!(health.apt, "1");
+        assert!(health.healthy(1_700_000_000));
     }
 }
