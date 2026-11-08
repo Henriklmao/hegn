@@ -99,7 +99,7 @@ pub(super) fn cloud_hypervisor_args(
     network: Option<&network::Lease>,
     profile_socket: Option<&Path>,
 ) -> Vec<OsString> {
-    let mut args = common_args(config, paths, true);
+    let mut args = common_args(config, paths);
     args.push("--kernel".into());
     args.push(config.kernel_image.clone().into_os_string());
     args.push("--cmdline".into());
@@ -163,20 +163,28 @@ pub(super) fn cloud_hypervisor_args(
 }
 
 /// Build the command line for a restore. The VM configuration comes from the
-/// snapshot itself, so only VMM-level options are set here.
+/// snapshot itself, but the VMM process is new, so seccomp and Landlock must be
+/// requested again — otherwise a restored VM would run unsandboxed.
 pub(super) fn restore_args(
     config: &Config,
     paths: &InstancePaths,
     snapshot: &SnapshotMeta,
+    network: Option<&network::Lease>,
 ) -> Vec<OsString> {
-    let mut args = common_args(config, paths, false);
+    let mut args = common_args(config, paths);
+    if let Some(lease) = network {
+        // Same sysfs read as a cold boot: Cloud Hypervisor probes the existing
+        // TAP's multiqueue flags while recreating the virtio-net device.
+        args.push("--landlock-rules".into());
+        args.push(format!("path=/sys/devices/virtual/net/{},access=r", lease.tap).into());
+    }
     args.push("--restore".into());
     args.push(format!("source_url={},resume=true", snapshot.source_url()).into());
     args
 }
 
-pub(super) fn common_args(config: &Config, paths: &InstancePaths, landlock: bool) -> Vec<OsString> {
-    let mut args: Vec<OsString> = vec![
+pub(super) fn common_args(config: &Config, paths: &InstancePaths) -> Vec<OsString> {
+    let args: Vec<OsString> = vec![
         "--api-socket".into(),
         paths.api_socket.clone().into_os_string(),
         "--log-file".into(),
@@ -185,15 +193,20 @@ pub(super) fn common_args(config: &Config, paths: &InstancePaths, landlock: bool
         // exposes a way to turn it off.
         "--seccomp".into(),
         "true".into(),
-    ];
-    if landlock {
-        args.push("--landlock".into());
+        // Landlock is applied per process, so both a cold boot and a restore
+        // ask for it explicitly.
+        "--landlock".into(),
         // Cloud Hypervisor applies Landlock at VM create. Snapshot writes
         // happen later, so the snapshot root has to be granted up front.
-        args.push("--landlock-rules".into());
-        let staging = SnapshotStore::new(&config.snapshots_dir).staging_dir();
-        args.push(format!("path={},access=rw", staging.display()).into());
-    }
+        "--landlock-rules".into(),
+        format!(
+            "path={},access=rw",
+            SnapshotStore::new(&config.snapshots_dir)
+                .staging_dir()
+                .display()
+        )
+        .into(),
+    ];
     args
 }
 
@@ -218,7 +231,7 @@ pub(super) fn spawn_cloud_hypervisor(
         .with_context(|| format!("failed to open {}", paths.log.display()))?;
     let stderr = log.try_clone()?;
     let args = match restore {
-        Some(snapshot) => restore_args(config, paths, snapshot),
+        Some(snapshot) => restore_args(config, paths, snapshot, network),
         None => {
             let rootfs = instance.prepare_rootfs(config)?;
             cloud_hypervisor_args(config, instance, paths, &rootfs, network, profile_socket)
@@ -288,6 +301,14 @@ pub(super) async fn wait_for_vm(socket: &Path, child: &mut Child, timeout: Durat
             && let Ok(info) = client.info().await
             && info.state.is_alive()
         {
+            // The API answering means the VMM has finished starting. A live VM
+            // without its seccomp filter would defeat the sandbox, so treat it
+            // as a hard failure. Landlock has no `/proc` probe; the argv tests
+            // cover that layer.
+            if !seccomp_active(child.id()) {
+                let _ = child.kill();
+                bail!("Cloud Hypervisor is running without its seccomp filter");
+            }
             return Ok(());
         }
         if let Ok(Some(status)) = child.try_wait() {
@@ -299,6 +320,20 @@ pub(super) async fn wait_for_vm(socket: &Path, child: &mut Child, timeout: Durat
         "timed out after {timeout:?} waiting for a running Cloud Hypervisor VM at {}",
         socket.display()
     )
+}
+
+/// The kernel reports an active seccomp filter as `Seccomp: 2`.
+fn seccomp_active(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .map(|status| status_reports_seccomp(&status))
+        .unwrap_or(false)
+}
+
+fn status_reports_seccomp(status: &str) -> bool {
+    status.lines().any(|line| {
+        line.strip_prefix("Seccomp:")
+            .is_some_and(|value| value.trim() == "2")
+    })
 }
 
 #[cfg(test)]
@@ -481,7 +516,7 @@ mod tests {
             size_bytes: 0,
             note: None,
         };
-        let joined = strings(&restore_args(&config, &paths, &snapshot)).join(" ");
+        let joined = strings(&restore_args(&config, &paths, &snapshot, None)).join(" ");
         assert!(
             joined.contains(&format!(
                 "source_url=file://{},resume=true",
@@ -491,8 +526,18 @@ mod tests {
         );
         assert!(!joined.contains("--kernel"), "{joined}");
         assert!(!joined.contains("--fs"), "{joined}");
-        // Landlock is part of the saved VM config on restore, not a CLI flag.
-        assert!(!joined.contains("--landlock"), "{joined}");
+        // The VMM process is new, so the sandbox must be requested again.
+        assert!(joined.contains("--landlock"), "{joined}");
+    }
+
+    #[test]
+    fn seccomp_status_parser_requires_filter_mode() {
+        assert!(status_reports_seccomp(
+            "Name:\tcloud-hypervisor\nSeccomp:\t2\n"
+        ));
+        assert!(!status_reports_seccomp("Seccomp:\t0\n"));
+        assert!(!status_reports_seccomp("Seccomp:\t1\n"));
+        assert!(!status_reports_seccomp("Name:\tcloud-hypervisor\n"));
     }
 
     #[test]
@@ -590,9 +635,11 @@ mod tests {
             size_bytes: 0,
             note: None,
         };
-        let args = restore_args(&config, &paths, &snapshot);
+        let args = restore_args(&config, &paths, &snapshot, None);
         let joined = strings(&args).join(" ");
         assert!(joined.contains("--seccomp true"), "{joined}");
+        assert!(joined.contains("--landlock"), "{joined}");
+        assert!(joined.contains("--landlock-rules"), "{joined}");
         assert!(
             joined.contains(&format!("--api-socket {}", paths.api_socket.display())),
             "{joined}"
@@ -606,31 +653,53 @@ mod tests {
         // The saved VM config owns these devices; passing them again would
         // override the snapshot.
         for forbidden in [
-            "--kernel",
-            "--disk",
-            "--fs",
-            "--net",
-            "--serial",
-            "--cpus",
-            "--memory",
-            "--landlock",
+            "--kernel", "--disk", "--fs", "--net", "--serial", "--cpus", "--memory",
         ] {
             assert!(!joined.contains(forbidden), "{forbidden} in {joined}");
         }
     }
 
     #[test]
-    fn restore_common_args_never_add_landlock_twice() {
+    fn restore_args_keep_landlock_and_add_the_tap_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let instance = instance_for(dir.path());
+        let paths = InstancePaths::from_instance(&config, &instance);
+        let snapshot = SnapshotMeta {
+            name: "demo".into(),
+            created_at: chrono::Utc::now(),
+            vm_state: "Paused".into(),
+            dir: dir.path().join("snap"),
+            instance: Some("demo".into()),
+            project: None,
+            size_bytes: 0,
+            note: None,
+        };
+        let lease = crate::network::Lease {
+            index: 4,
+            instance: instance.name.clone(),
+            tap: crate::network::tap_name(4),
+            mac: crate::network::mac(4),
+            host_ip: crate::network::host_ip(4),
+            guest_ip: crate::network::guest_ip(4),
+        };
+        let joined = strings(&restore_args(&config, &paths, &snapshot, Some(&lease))).join(" ");
+        assert!(joined.contains("--landlock"), "{joined}");
+        assert!(
+            joined.contains("--landlock-rules path=/sys/devices/virtual/net/hegn4,access=r"),
+            "{joined}"
+        );
+        assert!(joined.contains("--seccomp true"), "{joined}");
+    }
+
+    #[test]
+    fn common_args_always_enable_the_sandbox() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
         let instance = instance_for(dir.path());
         let paths = InstancePaths::from_instance(&config, &instance);
 
-        let restore = strings(&common_args(&config, &paths, false)).join(" ");
-        assert!(restore.contains("--seccomp true"), "{restore}");
-        assert!(!restore.contains("--landlock"), "{restore}");
-
-        let boot = strings(&common_args(&config, &paths, true)).join(" ");
+        let boot = strings(&common_args(&config, &paths)).join(" ");
         assert!(boot.contains("--seccomp true"), "{boot}");
         assert!(boot.contains("--landlock"), "{boot}");
         assert!(

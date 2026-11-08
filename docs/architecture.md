@@ -314,7 +314,9 @@ Restore:
    snapshot contains the `hegn-profile` device, restart the profile virtiofsd on
    the same socket; otherwise restore without it. Regenerate the seed, create a
    new session log, then start Cloud Hypervisor with
-   `--restore source_url=file://<dir>,resume=true`.
+   `--restore source_url=file://<dir>,resume=true`. Restore repeats
+   `--seccomp true` and `--landlock` (with the snapshot-staging and per-TAP
+   sysfs rules) because the restored VMM is a new process.
 5. Start the relay, wait for the API, write the new session record; on failure
    kill the children and remove the new log.
 
@@ -895,8 +897,8 @@ normal mode.
 - Snapshot restore intentionally stops the current VM after preflight; there is
   no live migration.
 - Cloud Hypervisor snapshots embed absolute device and socket paths (rootfs,
-  serial, virtio-fs and Landlock rules). Restore assumes the same
-  `state_dir`/`snapshots_dir`; moving them fails closed.
+  serial, virtio-fs). Restore assumes the same `state_dir`/`snapshots_dir`;
+  moving them fails closed.
 - The upstream rootfs is generic; harness-specific package installation is
   recorded but not baked into the downloaded image.
 - The default rootfs is writable and reused between sessions; guest changes
