@@ -18,9 +18,9 @@ missing VM is always a hard error.
    (ABI v3, Linux 6.2+) and `cloud-hypervisor` plus `virtiofsd`. If the host
    cannot provide them, stop and report the gap instead of substituting another
    runtime.
-2. **Never weaken the instance.** Do not set `landlock = false`, `seccomp =
-   false`, `security = "off"` or `virtiofs_sandbox = "chroot"` to get past an
-   error. Report the failure and let the user decide.
+2. **Never weaken the instance.** Do not set `security = "off"`,
+   `virtiofs_sandbox = "chroot"` or edit the VMM argv to drop seccomp/Landlock to
+   get past an error. Report the failure and let the user decide.
 3. **Ask before system-wide changes.** Package installation, `usermod` and
    writes outside the user's home need explicit confirmation.
 4. **Stay non-interactive.** Do not launch the TUI (`hegn` without a
@@ -178,8 +178,6 @@ vcpus           = 2         # 1-32
 memory_mib      = 2048      # >= 128
 shared_tag      = "workspace"  # virtio-fs tag, <= 36 bytes
 guest_mount     = "/workspace" # mount point inside the guest
-landlock        = true
-seccomp         = true
 cloud_init      = true
 security        = "enforce"
 harness         = "shell"   # shell | opencode | claude-code | codex | pi | prime-agent | aider | gemini-cli

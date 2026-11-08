@@ -189,7 +189,7 @@ const GENERAL_ROWS: &[ConfigRow] = &[
     ConfigRow::Group("Network & security"),
     ConfigRow::Field(ConfigField::Network),
     ConfigRow::Field(ConfigField::Security),
-    ConfigRow::Note("landlock and seccomp stay enabled (required)"),
+    ConfigRow::Note("seccomp and Landlock are always enabled (required)"),
     ConfigRow::Group("Tools"),
     ConfigRow::Field(ConfigField::Backend),
     ConfigRow::Field(ConfigField::CloudHypervisorBin),

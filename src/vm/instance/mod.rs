@@ -27,8 +27,8 @@
 //! concurrent `hegn open` calls cannot boot a VMM on the same sockets.
 //!
 //! Cloud Hypervisor supports virtio-fs natively, so no special fork or
-//! patched build is required. The VMM runs with seccomp filters and, when
-//! enabled, Landlock restricting its filesystem view to the kernel, disks and
+//! patched build is required. The VMM always runs with seccomp filters and
+//! Landlock restricting its filesystem view to the kernel, disks and
 //! serial/fs sockets.
 //!
 //! The implementation is split by concern: `paths` owns the runtime path

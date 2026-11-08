@@ -32,8 +32,6 @@ impl Default for Config {
                 .join(crate::vm::images::ROOTFS_ARTIFACT),
             rootfs_format: crate::vm::images::ROOTFS_FORMAT,
             root_device: "/dev/vda1".to_string(),
-            landlock: true,
-            seccomp: true,
             cloud_init: true,
             kernel_url: crate::vm::images::KERNEL_URL.to_string(),
             kernel_sha256: crate::vm::images::KERNEL_SHA256.to_string(),
@@ -99,7 +97,5 @@ mod tests {
         assert!(config.rootfs_url.starts_with("https://"));
         assert_eq!(config.root_device, "/dev/vda1");
         assert_eq!(config.rootfs_format, RootfsFormat::Qcow2);
-        assert!(config.landlock);
-        assert!(config.seccomp);
     }
 }

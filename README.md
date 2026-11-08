@@ -127,7 +127,7 @@ fix.
 | --- | --- |
 | Linux with KVM | `/dev/kvm` must exist and be accessible to your user (`kvm` group). x86_64 and aarch64 targets are published. |
 | [Cloud Hypervisor](https://www.cloudhypervisor.org/) | `cloud-hypervisor` **or** `cloud-hypervisor-static` on `PATH` (AUR's `cloud-hypervisor-bin` installs the static name), or set `cloud_hypervisor_bin`. Native virtio-fs support is required; hegn enables seccomp and Landlock. |
-| Landlock | A host kernel with Landlock ABI v3 (Linux 6.2 or newer). `hegn doctor` probes it; set `landlock = false` only if you accept the reduced isolation. |
+| Landlock | A host kernel with Landlock ABI v3 (Linux 6.2 or newer). `hegn doctor` probes it; hegn refuses to start without it. |
 | [virtiofsd](https://gitlab.com/virtio-fs/virtiofsd) | `virtiofsd` on `PATH` (or set `virtiofsd_bin`). Distribution install locations such as `/usr/lib/virtiofsd` (Arch), `/usr/libexec/virtiofsd` (Fedora) and `/usr/lib/qemu/virtiofsd` (Debian) are detected automatically. |
 | Kernel + rootfs images | A guest kernel and qcow2/raw root filesystem. Defaults under `~/.local/share/hegn/images/`; see `kernel_image`, `rootfs_image`, `rootfs_format` and `root_device`. |
 | Free disk | ~2.5 GiB for the pinned images and tools, plus ~`memory_mib` per snapshot and log space. |
@@ -210,7 +210,9 @@ Then update `config.toml`:
   (the static AUR binary `cloud-hypervisor-static` is detected automatically)
 - set `rootfs_format` (`raw` or `qcow2`) and `root_device` (`/dev/vda1` for the
   official cloud image, `/dev/vda` for a whole-disk ext4 image)
-- `landlock`, `seccomp` and `cloud_init` default to `true`
+- `cloud_init` defaults to `true` (seccomp and Landlock are always enabled)
+- remove the `landlock` and `seccomp` keys: they are no longer configurable and
+  an old `config.toml` containing them is rejected
 - re-run `hegn images download` if the old kernel/rootfs paths are still
   configured
 
@@ -576,11 +578,10 @@ the currently running session.
 
 ### "Landlock is not active" / Cloud Hypervisor fails to start
 
-hegn enables Cloud Hypervisor's Landlock sandbox by default. If the host kernel
-was built without Landlock (or securityfs is unavailable), the VMM refuses to
-start. Run `hegn doctor`: it reports the `landlock` check. Install a kernel with
-Landlock enabled; if you must run without this layer, set `landlock = false` in
-`config.toml` (explicitly not recommended).
+hegn enables Cloud Hypervisor's Landlock sandbox unconditionally. If the host
+kernel was built without Landlock (or securityfs is unavailable), the VMM refuses
+to start. Run `hegn doctor`: it reports the `landlock` check. Install a kernel
+with Landlock enabled; there is no configuration switch to run without it.
 
 The TUI doctor modal also opens automatically after a start failure so the
 remaining host checks and image state are visible.
@@ -704,8 +705,6 @@ shared_tag      = "workspace" # virtio-fs tag, <= 36 bytes, no whitespace
 guest_mount     = "/workspace" # absolute guest path
 virtiofs_sandbox = "namespace" # "namespace" (recommended) or "chroot"
 backend         = "auto"      # "auto" or "cloud-hypervisor"; both need a VM
-landlock        = true        # Cloud Hypervisor Landlock sandbox
-seccomp         = true        # Cloud Hypervisor seccomp filters
 cloud_init      = true        # NoCloud seed for the official cloud image
 harness         = "shell"     # shell | opencode | claude-code | codex | pi |
                               # prime-agent | aider | gemini-cli
@@ -805,7 +804,7 @@ project-level `hegn.toml` (harness, launch command, terminal integration and
 auto-launch). Rows are grouped by runtime,
 storage, sharing, network/security, tools, directories and packages; the
 instance editor also shows its project, workspace, rootfs and TAP slot as
-read-only rows. `landlock` and `seccomp` are deliberately not editable — hegn
+read-only rows. Seccomp and Landlock have no configuration keys at all — hegn
 never weakens the Cloud Hypervisor instances.
 
 | Input | Action |

@@ -83,15 +83,13 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
     checks.push(Check::new(
         "landlock",
         landlock,
-        config.landlock,
+        true,
         if landlock {
             "Landlock active (VMM filesystem sandbox)".to_string()
-        } else if config.landlock {
-            "Landlock is not active in /sys/kernel/security/lsm; install a kernel with Landlock \
-             or set `landlock = false` (not recommended)"
-                .to_string()
         } else {
-            "disabled in config (not recommended)".to_string()
+            "Landlock is not active in /sys/kernel/security/lsm; hegn requires a kernel with \
+             Landlock (Linux 6.2+)"
+                .to_string()
         },
     ));
     checks.push(Check::new(

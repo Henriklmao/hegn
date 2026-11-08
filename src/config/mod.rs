@@ -65,10 +65,6 @@ pub struct Config {
     /// Guest root device, e.g. `/dev/vda` for a whole-disk ext4 image or
     /// `/dev/vda1` for a partitioned cloud image.
     pub root_device: String,
-    /// Enable Cloud Hypervisor's Landlock sandbox. A hard requirement.
-    pub landlock: bool,
-    /// Enable Cloud Hypervisor's seccomp filters (on by default upstream).
-    pub seccomp: bool,
     /// Attach the generated NoCloud seed so official cloud images auto-login
     /// on the serial console. Ignored by images without cloud-init.
     pub cloud_init: bool,

@@ -152,10 +152,8 @@ pub(super) fn cloud_hypervisor_args(
         // dies while creating the virtio-net device. Grant exactly this
         // instance's TAP directory, read-only: other interfaces and the rest of
         // /sys stay invisible to the VMM.
-        if config.landlock {
-            args.push("--landlock-rules".into());
-            args.push(format!("path=/sys/devices/virtual/net/{},access=r", lease.tap).into());
-        }
+        args.push("--landlock-rules".into());
+        args.push(format!("path=/sys/devices/virtual/net/{},access=r", lease.tap).into());
     }
     args.push("--serial".into());
     args.push(format!("socket={}", paths.serial_socket.display()).into());
@@ -183,10 +181,12 @@ pub(super) fn common_args(config: &Config, paths: &InstancePaths, landlock: bool
         paths.api_socket.clone().into_os_string(),
         "--log-file".into(),
         paths.log.clone().into_os_string(),
+        // Cloud Hypervisor's seccomp filter is a hard requirement; hegn never
+        // exposes a way to turn it off.
         "--seccomp".into(),
-        if config.seccomp { "true" } else { "false" }.into(),
+        "true".into(),
     ];
-    if config.landlock && landlock {
+    if landlock {
         args.push("--landlock".into());
         // Cloud Hypervisor applies Landlock at VM create. Snapshot writes
         // happen later, so the snapshot root has to be granted up front.
@@ -447,34 +447,6 @@ mod tests {
     }
 
     #[test]
-    fn sysfs_tap_rule_is_skipped_when_landlock_is_disabled() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = config_with_assets(dir.path());
-        config.landlock = false;
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
-        let lease = crate::network::Lease {
-            index: 2,
-            instance: instance.name.clone(),
-            tap: crate::network::tap_name(2),
-            mac: crate::network::mac(2),
-            host_ip: crate::network::host_ip(2),
-            guest_ip: crate::network::guest_ip(2),
-        };
-        let joined = strings(&cloud_hypervisor_args(
-            &config,
-            &instance,
-            &paths,
-            &instance.rootfs_path(&config),
-            Some(&lease),
-            None,
-        ))
-        .join(" ");
-        assert!(!joined.contains("--landlock"), "{joined}");
-        assert!(!joined.contains("/sys/devices/virtual/net"), "{joined}");
-    }
-
-    #[test]
     fn air_gapped_boot_has_no_network_device() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
@@ -490,27 +462,6 @@ mod tests {
         ))
         .join(" ");
         assert!(!joined.contains("--net"), "{joined}");
-    }
-
-    #[test]
-    fn seccomp_and_landlock_can_be_disabled_explicitly() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = config_with_assets(dir.path());
-        config.seccomp = false;
-        config.landlock = false;
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
-        let joined = strings(&cloud_hypervisor_args(
-            &config,
-            &instance,
-            &paths,
-            &instance.rootfs_path(&config),
-            None,
-            None,
-        ))
-        .join(" ");
-        assert!(joined.contains("--seccomp false"), "{joined}");
-        assert!(!joined.contains("--landlock"), "{joined}");
     }
 
     #[test]

@@ -73,8 +73,9 @@ Cloud Hypervisor implements virtio-fs natively. hegn passes the workspace as
 `--fs tag=<tag>,socket=<virtiofsd socket>` together with
 `--memory size=<MiB>M,shared=on`; no patched VMM build is required.
 
-The VMM is launched with seccomp filters and, unless explicitly disabled,
-Landlock. Landlock restricts the VMM's filesystem view to the kernel, the
+The VMM is always launched with seccomp filters and Landlock; there is no
+configuration switch to disable either layer. Landlock restricts the VMM's
+filesystem view to the kernel, the
 disks, the serial socket, the virtio-fs socket and a dedicated snapshot
 staging directory. When a guarded-network TAP is passed, hegn adds a
 read-only rule for that instance's TAP directory
@@ -701,7 +702,7 @@ needs to recover or audit has a CLI form.
 | Missing kernel/rootfs | Hard error before spawn; doctor modal/CLI report; `hegn images download` offered |
 | Missing Cloud Hypervisor/virtiofsd | Hard error before any child is spawned |
 | Missing `/dev/kvm` | Hard error; doctor reports it |
-| Landlock unavailable | Hard error when `landlock = true`; doctor names the missing LSM |
+| Landlock unavailable | Hard error; there is no bypass; doctor names the missing LSM |
 | VMM keeps the API socket open | Client frames by `Content-Length`/chunked encoding and returns as soon as the response is complete; bodyless `204` ends at the headers |
 | VM boot is slow | Worker thread; UI shows an animated `STARTING` spinner and remains responsive |
 | Start fails before guest boot | `run/hegn.log` gets the error; the serial log is preserved and `hegn logs show` exposes VMM messages |
