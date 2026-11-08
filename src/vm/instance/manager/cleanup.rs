@@ -5,7 +5,9 @@ use std::fs;
 use crate::network;
 
 use super::super::paths::InstancePaths;
-use super::super::process::{hegn_binary, process_matches, terminate, terminate_relay};
+use super::super::process::{
+    hegn_binary, process_matches, read_pid, terminate, terminate_autosave, terminate_relay,
+};
 use super::InstanceManager;
 
 impl InstanceManager {
@@ -24,6 +26,13 @@ impl InstanceManager {
             if session.profile_virtiofs_pid != 0 {
                 terminate(session.profile_virtiofs_pid, &self.config.virtiofsd_bin);
             }
+        }
+        // The worker may outlive a crashed session; terminate it before the
+        // next VM starts so it cannot checkpoint the wrong instance.
+        if let Ok(binary) = hegn_binary()
+            && let Some(pid) = read_pid(&paths.autosave_pid)
+        {
+            terminate_autosave(pid, &binary);
         }
         cleanup_files(&paths);
         network::release(&self.config, &self.instance.name);
@@ -45,6 +54,7 @@ pub(super) fn cleanup_files(paths: &InstancePaths) {
         &paths.relay_pid,
         &paths.virtiofs_pid,
         &paths.profile_virtiofs_pid,
+        &paths.autosave_pid,
         &paths.session,
         &paths.cloud_init,
     ] {
@@ -107,6 +117,7 @@ mod tests {
             &paths.relay_pid,
             &paths.virtiofs_pid,
             &paths.profile_virtiofs_pid,
+            &paths.autosave_pid,
             &paths.session,
             &paths.cloud_init,
         ] {
@@ -125,6 +136,7 @@ mod tests {
             &paths.relay_pid,
             &paths.virtiofs_pid,
             &paths.profile_virtiofs_pid,
+            &paths.autosave_pid,
             &paths.session,
             &paths.cloud_init,
         ] {

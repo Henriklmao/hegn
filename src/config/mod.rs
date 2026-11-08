@@ -107,6 +107,16 @@ pub struct Config {
     pub extra_packages: Vec<String>,
     /// Create `agent/hegn-session-<timestamp>` before launching.
     pub auto_branch: bool,
+    /// Keep a rolling automatic snapshot of a running VM so it can be resumed
+    /// instead of cold booted.
+    pub periodic_snapshots: bool,
+    /// Seconds between automatic snapshots. Must be at least 30.
+    pub snapshot_interval_secs: u64,
+    /// Number of automatic snapshots kept per instance. Older ones are pruned.
+    pub snapshot_keep: u32,
+    /// Restore the newest automatic snapshot when starting an instance instead
+    /// of cold booting it.
+    pub auto_resume: bool,
     pub security: SecurityMode,
 }
 

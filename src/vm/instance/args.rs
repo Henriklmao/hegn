@@ -126,6 +126,11 @@ pub(super) fn cloud_hypervisor_args(
     args.push(format!("boot={},max={}", instance.vcpus, instance.vcpus).into());
     args.push("--memory".into());
     args.push(format!("size={}M,shared=on", instance.memory_mib).into());
+    // The host is the entropy source. A restored guest keeps its virtio-rng
+    // device and receives fresh bytes from /dev/urandom instead of reusing the
+    // CRNG state captured in the snapshot.
+    args.push("--rng".into());
+    args.push("src=/dev/urandom".into());
     args.push("--fs".into());
     args.push(
         format!(
@@ -401,6 +406,7 @@ mod tests {
         assert!(joined.contains("--disk"), "{joined}");
         assert!(joined.contains("image_type=qcow2"), "{joined}");
         assert!(joined.contains("--memory size=128M,shared=on"), "{joined}");
+        assert!(joined.contains("--rng src=/dev/urandom"), "{joined}");
         assert!(joined.contains("--fs tag=workspace"), "{joined}");
         assert!(joined.contains("--serial socket="), "{joined}");
         assert!(joined.contains("--console off"), "{joined}");
@@ -681,7 +687,7 @@ mod tests {
         // The saved VM config owns these devices; passing them again would
         // override the snapshot.
         for forbidden in [
-            "--kernel", "--disk", "--fs", "--net", "--serial", "--cpus", "--memory",
+            "--kernel", "--disk", "--fs", "--net", "--serial", "--cpus", "--memory", "--rng",
         ] {
             assert!(!joined.contains(forbidden), "{forbidden} in {joined}");
         }

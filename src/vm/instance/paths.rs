@@ -27,11 +27,15 @@ pub struct InstancePaths {
     pub relay_pid: PathBuf,
     pub virtiofs_pid: PathBuf,
     pub profile_virtiofs_pid: PathBuf,
+    /// Detached periodic-snapshot worker.
+    pub autosave_pid: PathBuf,
     pub session: PathBuf,
     pub log: PathBuf,
     /// Relay stderr. A detached relay has no terminal, so this file is the only
     /// place its startup error can be read from.
     pub relay_log: PathBuf,
+    /// Automatic snapshot worker stderr, for diagnosing a failed checkpoint.
+    pub autosave_log: PathBuf,
     /// hegn lifecycle/start errors, kept in the run directory for post-mortems.
     pub event_log: PathBuf,
     /// Exclusive lock serializing VM lifecycle operations.
@@ -53,9 +57,11 @@ impl InstancePaths {
             relay_pid: run_dir.join("console-relay.pid"),
             virtiofs_pid: run_dir.join("virtiofs.pid"),
             profile_virtiofs_pid: run_dir.join("profile-virtiofs.pid"),
+            autosave_pid: run_dir.join("autosave.pid"),
             session: run_dir.join("session.json"),
             log: run_dir.join("cloud-hypervisor.log"),
             relay_log: run_dir.join("console-relay.log"),
+            autosave_log: run_dir.join("autosave.log"),
             event_log: run_dir.join("hegn.log"),
             lock: run_dir.join("hegn.lock"),
             cloud_init: run_dir.join("cloud-init.img"),
@@ -195,9 +201,11 @@ mod tests {
             &paths.relay_pid,
             &paths.virtiofs_pid,
             &paths.profile_virtiofs_pid,
+            &paths.autosave_pid,
             &paths.session,
             &paths.log,
             &paths.relay_log,
+            &paths.autosave_log,
             &paths.event_log,
             &paths.lock,
             &paths.cloud_init,

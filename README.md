@@ -78,7 +78,9 @@ fix.
   operations. Flagged commands can be allowed once, denied, or preceded by an
   automatic git checkpoint.
 - **Snapshot manager** — pause, snapshot RAM + CPU, restore and delete full VM
-  states, with private (`0700`/`0600`) on-disk metadata.
+  states, with private (`0700`/`0600`) on-disk metadata. A detached worker keeps
+  rolling checkpoints so `hegn instance start` resumes the newest one instead of
+  cold booting, and every resume refreshes the guest clock and CRNG.
 - **Project picker** — fuzzy filtering over `projects_root` (default
   `~/Projects/hegn`), git status badges, recent-session history, and one-key
   launch into `$EDITOR` or `lazygit`.
@@ -130,7 +132,7 @@ fix.
 | Landlock | A host kernel with Landlock ABI v3 (Linux 6.2 or newer). `hegn doctor` probes it; hegn refuses to start without it. |
 | [virtiofsd](https://gitlab.com/virtio-fs/virtiofsd) | `virtiofsd` on `PATH` (or set `virtiofsd_bin`). Distribution install locations such as `/usr/lib/virtiofsd` (Arch), `/usr/libexec/virtiofsd` (Fedora) and `/usr/lib/qemu/virtiofsd` (Debian) are detected automatically. |
 | Kernel + rootfs images | A guest kernel and qcow2/raw root filesystem. Defaults under `~/.local/share/hegn/images/`; see `kernel_image`, `rootfs_image`, `rootfs_format` and `root_device`. |
-| Free disk | ~2.5 GiB for the pinned images and tools, plus ~`memory_mib` per snapshot and log space. |
+| Free disk | ~2.5 GiB for the pinned images and tools, plus ~`memory_mib` per snapshot (automatic checkpoints default to 2 per running instance) and log space. |
 | `git` | Used for project status, session branches and checkpoints. |
 | `lazygit`, `$EDITOR` | Optional, for the `g` and `e` shortcuts. |
 
@@ -150,7 +152,9 @@ while the TUI is open. When a harness profile exports files, skills or
 environment, a second `virtiofsd` adds about another 12 MiB. Base instances and
 clones can run concurrently, so the cost scales per instance. On disk, the pinned
 images take ~2.2 GiB (shared by every project), the binary ~19 MiB, and a
-snapshot about as much as the guest RAM; session logs are pruned by count.
+snapshot about as much as the guest RAM. Automatic checkpoints keep the newest
+`snapshot_keep` per instance (2 by default), so budget ~2× guest RAM per running
+instance; session logs are pruned by count.
 
 Compute runs near-native under KVM, while many-small-file I/O is slower because
 the workspace is exported through virtio-fs with `--cache=never`. Measured
@@ -543,6 +547,39 @@ hegn snapshot restore before-refactor
 hegn snapshot delete before-refactor
 ```
 
+#### Automatic resume
+
+While a VM runs, a detached worker (`run/autosave.pid`) pauses it every
+`snapshot_interval_secs`, writes a checkpoint tagged `autosave`, and keeps the
+newest `snapshot_keep` per instance. `hegn instance start` (and the TUI's start
+path) restores the newest automatic checkpoint before falling back to a cold
+boot, so routine stops and crashes cost seconds instead of a full boot. Manual
+snapshots are never auto-loaded or pruned. A checkpoint that cannot be restored
+is logged in `run/hegn.log` and the instance cold boots instead.
+
+Two guest-side safeguards make resuming safe:
+
+- Cloud Hypervisor gets a `virtio-rng` device backed by the host's
+  `/dev/urandom`, so a restored VM does not replay the CRNG state captured in
+  the snapshot.
+- The guest runs `hegn-maintenance` as a small daemon. Every 15 seconds it reads
+  the host wall clock from the guest RTC (`hwclock --hctosys`, backed by Cloud
+  Hypervisor's host clock) and mixes fresh bytes from `/dev/hwrng` into
+  `/dev/urandom`. This works with `network = "off"` and with the guarded
+  network, which does not allow NTP. Images booted with `cloud_init = false`
+  must ship an equivalent guest unit; the host-backed RNG still applies.
+
+Automatic checkpoints rewind guest RAM/CPU, not the writable rootfs. They are a
+fast-resume aid, not a crash-consistent disk backup: stop the instance cleanly
+before kernel upgrades or anything that must survive a rollback.
+
+```toml
+periodic_snapshots      = true
+snapshot_interval_secs  = 300  # 30–86400
+snapshot_keep           = 2    # 1–32 per instance
+auto_resume             = true
+```
+
 ### Start diagnostics
 
 A failed start leaves diagnostics in the run directory:
@@ -721,6 +758,11 @@ harness         = "shell"     # shell | opencode | claude-code | codex | pi |
 network         = "guarded"   # "guarded" (web+DNS only) or "off" (no NIC)
 extra_packages  = []
 auto_branch     = true
+# Rolling checkpoints let a restart resume instead of cold booting.
+periodic_snapshots     = true
+snapshot_interval_secs = 300 # 30–86400
+snapshot_keep          = 2   # 1–32 automatic checkpoints per instance
+auto_resume            = true
 security        = "enforce"   # "off", "warn" or "enforce"
 
 # Launch the agent (or another command) after Enter boots a VM.

@@ -173,6 +173,58 @@ mounts:
 
       [Install]
       WantedBy=multi-user.target
+  - path: /usr/local/sbin/hegn-maintenance
+    permissions: '0700'
+    content: |
+      #!/bin/bash
+      set -u
+      sync_clock() {{
+        # A restored snapshot resumes the guest clock from the moment the
+        # checkpoint was written. Cloud Hypervisor's RTC is backed by the host
+        # realtime clock, so read it even when the guarded network blocks NTP.
+        for clock in hwclock /sbin/hwclock /usr/sbin/hwclock; do
+          if command -v "$clock" >/dev/null 2>&1; then
+            "$clock" --hctosys --utc >/dev/null 2>&1 || "$clock" --hctosys >/dev/null 2>&1 || true
+            return
+          fi
+        done
+      }}
+      sync_entropy() {{
+        # virtio-rng is backed by the host's /dev/urandom. Mix fresh bytes into
+        # the kernel CRNG after every resume so a snapshot never replays stale
+        # random output.
+        if [ -c /dev/hwrng ]; then
+          for _ in 1 2 3 4; do
+            dd if=/dev/hwrng of=/dev/urandom bs=512 count=1 2>/dev/null || break
+          done
+        fi
+      }}
+      refresh() {{ sync_clock; sync_entropy; }}
+      if [ "${{1:-}}" = "--daemon" ]; then
+        while true; do
+          refresh
+          sleep 15
+        done
+      else
+        refresh
+      fi
+  - path: /etc/systemd/system/hegn-maintenance.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=hegn clock and entropy refresh
+      After=dev-rtc0.device dev-hwrng.device
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/sbin/hegn-maintenance --daemon
+      Restart=always
+      RestartSec=5
+      StandardOutput=null
+      StandardError=journal+console
+
+      [Install]
+      WantedBy=multi-user.target
 runcmd:
   - systemctl daemon-reload || true
   - systemctl enable serial-getty@ttyS0.service || true
@@ -184,6 +236,7 @@ runcmd:
 {profile_runcmd}  - systemctl enable --now hegn-provision.service || true
   - systemctl enable hegn-health.service || true
   - systemctl start --no-block hegn-health.service || true
+  - systemctl enable --now hegn-maintenance.service || true
 "#
     )
 }
@@ -235,6 +288,25 @@ mod tests {
         assert!(
             data.contains("directory = /workspace"),
             "git safe.directory must point at the guest mount: {data}"
+        );
+    }
+
+    #[test]
+    fn guest_maintenance_syncs_the_clock_and_reseeds_the_rng() {
+        let data = user_data("workspace", "/workspace", &plan(), None, None, false, false);
+        assert!(
+            data.contains("  - path: /usr/local/sbin/hegn-maintenance\n    permissions: '0700'\n"),
+            "{data}"
+        );
+        assert!(data.contains("--hctosys --utc"), "{data}");
+        assert!(data.contains("dd if=/dev/hwrng of=/dev/urandom"), "{data}");
+        assert!(
+            data.contains("  - path: /etc/systemd/system/hegn-maintenance.service\n"),
+            "{data}"
+        );
+        assert!(
+            data.contains("systemctl enable --now hegn-maintenance.service"),
+            "{data}"
         );
     }
 

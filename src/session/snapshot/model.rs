@@ -44,6 +44,11 @@ impl SnapshotMeta {
 
 use crate::shared::text::human_bytes as human_size;
 
+/// Note written into metadata of automatic rolling snapshots. Only these are
+/// eligible for auto-resume and retention pruning; manual checkpoints are
+/// never deleted or loaded implicitly.
+pub const AUTOSAVE_NOTE: &str = "autosave";
+
 /// Paths reserved for a new snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotPaths {

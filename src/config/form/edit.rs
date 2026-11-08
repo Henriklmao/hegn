@@ -118,6 +118,12 @@ impl ConfigForm {
             (Draft::Global(config), ConfigField::Memory) => {
                 config.memory_mib = parse_number(text, 128, 262_144)? as u32;
             }
+            (Draft::Global(config), ConfigField::SnapshotInterval) => {
+                config.snapshot_interval_secs = parse_number(text, 30, 86_400)? as u64;
+            }
+            (Draft::Global(config), ConfigField::SnapshotKeep) => {
+                config.snapshot_keep = parse_number(text, 1, 32)? as u32;
+            }
             (Draft::Global(config), ConfigField::RootDevice) => {
                 if !text.starts_with("/dev/") || text.contains(',') {
                     bail!("root device must look like /dev/vda1 and must not contain a comma");

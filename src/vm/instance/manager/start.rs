@@ -14,6 +14,7 @@ use crate::network;
 use crate::session::logs::{DEFAULT_KEEP, LogStore};
 use crate::session::snapshot::SnapshotStore;
 use crate::vm::cloud_init;
+use crate::vm::instance::autosave;
 use crate::vm::virtiofs::VirtiofsProcess;
 
 use super::super::args::{
@@ -97,8 +98,55 @@ impl InstanceManager {
         if self.is_running() {
             bail!("an instance is already running (use `hegn instance stop` first)");
         }
-        if self.session().is_some() {
-            self.cleanup_stale();
+        // Clear stale sockets/pid files and any orphaned autosave worker before
+        // restoring or booting. A live VM returned above via `is_running`.
+        self.cleanup_stale();
+        // Build the runtime before any spawn so the auto-resume attempt and the
+        // cold boot share one async runtime.
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                return Err(err).context("failed to build async runtime");
+            }
+        };
+        // Try the newest automatic checkpoint first: this is what turns a
+        // restart into a resume instead of a full cold boot. A broken or
+        // foreign checkpoint must not brick the instance, so failures fall
+        // through to a normal boot and are recorded in the lifecycle log.
+        if self.config.auto_resume {
+            let store = SnapshotStore::new(&self.config.snapshots_dir);
+            match store.latest_autosave(&self.instance.name) {
+                Ok(Some(snapshot)) => {
+                    append_event_log(
+                        &paths.event_log,
+                        &format!("auto-resuming from snapshot {}", snapshot.name),
+                    );
+                    match runtime.block_on(self.restore_snapshot_locked(&snapshot)) {
+                        Ok(()) => {
+                            append_event_log(
+                                &paths.event_log,
+                                &format!("auto-resume from {} succeeded", snapshot.name),
+                            );
+                            return self.status();
+                        }
+                        Err(err) => append_event_log(
+                            &paths.event_log,
+                            &format!(
+                                "auto-resume from {} failed, cold booting: {err:#}",
+                                snapshot.name
+                            ),
+                        ),
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => append_event_log(
+                    &paths.event_log,
+                    &format!("warning: could not inspect automatic snapshots: {err:#}"),
+                ),
+            }
         }
         if self.config.network == crate::config::NetworkMode::Off
             && self.config.cloud_init
@@ -138,18 +186,6 @@ impl InstanceManager {
             network::release(&self.config, &self.instance.name);
             return Err(err);
         }
-        // Build the runtime before spawning anything so a failure here cannot
-        // leak a running virtiofsd or VMM process.
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                network::release(&self.config, &self.instance.name);
-                return Err(err).context("failed to build async runtime");
-            }
-        };
 
         let started_at = Utc::now();
         let logs = LogStore::new(self.config.logs_dir());
@@ -355,6 +391,14 @@ impl InstanceManager {
         std::mem::forget(virtiofs);
         if let Some(process) = profile_virtiofs.take() {
             std::mem::forget(process);
+        }
+        // Keep rolling checkpoints so the next start is a resume. This is a
+        // helper for recovery, never a reason to fail a successful boot.
+        if let Err(err) = autosave::spawn(&self.config, &self.instance, &paths) {
+            append_event_log(
+                &paths.event_log,
+                &format!("autosnapshot: could not start worker: {err:#}"),
+            );
         }
 
         Ok(InstanceReport {

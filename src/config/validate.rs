@@ -26,6 +26,20 @@ impl Config {
                 self.disk_usage_warn_percent
             );
         }
+        // A snapshot pauses the guest while memory is written, so an interval
+        // below 30 seconds would spend most of the VM's life paused.
+        if !(30..=86_400).contains(&self.snapshot_interval_secs) {
+            bail!(
+                "snapshot_interval_secs must be between 30 and 86400 (got {})",
+                self.snapshot_interval_secs
+            );
+        }
+        if self.snapshot_keep == 0 || self.snapshot_keep > 32 {
+            bail!(
+                "snapshot_keep must be between 1 and 32 (got {})",
+                self.snapshot_keep
+            );
+        }
         if !crate::vm::cloud_init::safe_token(&self.shared_tag) {
             bail!("shared_tag may only contain ASCII letters, digits, '-', '_' and '.'");
         }
@@ -198,6 +212,12 @@ mod tests {
             "the profile share tag is reserved"
         );
         config.shared_tag = "workspace".into();
+        config.snapshot_interval_secs = 29;
+        assert!(config.validate().is_err());
+        config.snapshot_interval_secs = 300;
+        config.snapshot_keep = 0;
+        assert!(config.validate().is_err());
+        config.snapshot_keep = 2;
         assert!(config.validate().is_ok());
     }
 

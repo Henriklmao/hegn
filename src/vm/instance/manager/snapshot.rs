@@ -24,7 +24,9 @@ use super::super::args::{
     API_START_TIMEOUT, boot_args, spawn_cloud_hypervisor, spawn_virtiofsd, spawn_virtiofsd_at,
     start_relay, wait_for_vm,
 };
-use super::super::process::{ensure_socket, hegn_binary, read_pid, terminate, terminate_relay};
+use super::super::process::{
+    ensure_socket, hegn_binary, read_pid, terminate, terminate_autosave, terminate_relay,
+};
 use super::super::registry::same_project;
 use super::super::session::SessionRecord;
 use super::super::util::{append_event_log, dir_size, secure_snapshot_dir, write_private};
@@ -74,6 +76,19 @@ fn snapshot_fs_tags(dir: &Path) -> Result<Vec<String>> {
 impl InstanceManager {
     /// Pause, snapshot RAM+CPU into `snapshots_dir`, resume.
     pub async fn create_snapshot(&self, name: &str) -> Result<SnapshotMeta> {
+        self.create_snapshot_tagged(name, None).await
+    }
+
+    /// Like [`Self::create_snapshot`], but records a note in the metadata.
+    ///
+    /// Automatic checkpoints use [`crate::session::snapshot::AUTOSAVE_NOTE`]
+    /// so they can be pruned and auto-resumed without ever touching a manual
+    /// checkpoint.
+    pub async fn create_snapshot_tagged(
+        &self,
+        name: &str,
+        note: Option<&str>,
+    ) -> Result<SnapshotMeta> {
         let paths = self.paths();
         ensure_socket(&paths.api_socket)?;
         // Serialize with start/stop/restore so the VM cannot be torn down
@@ -123,7 +138,7 @@ impl InstanceManager {
             instance: Some(self.instance.name.clone()),
             project: Some(self.instance.project.clone()),
             size_bytes: size,
-            note: None,
+            note: note.map(str::to_string),
         };
         if let Err(err) = store.save_meta(&meta) {
             let _ = client.resume().await;
@@ -145,6 +160,16 @@ impl InstanceManager {
     /// project so the restored guest finds a healthy backend on the same
     /// socket path.
     pub async fn restore_snapshot(&self, snapshot: &SnapshotMeta) -> Result<()> {
+        let paths = self.paths();
+        paths.ensure()?;
+        // Serialize with start/stop so another hegn process cannot recreate the
+        // sockets while the snapshot boot is in flight.
+        let _lock = self.lock(&paths)?;
+        self.restore_snapshot_locked(snapshot).await
+    }
+
+    /// Restore while the caller already holds the lifecycle lock.
+    pub(super) async fn restore_snapshot_locked(&self, snapshot: &SnapshotMeta) -> Result<()> {
         // The snapshot config embeds the disk paths from the instance that
         // created it. Restoring it elsewhere would make two instances share one
         // writable rootfs, so only the owning instance may load it.
@@ -207,9 +232,6 @@ impl InstanceManager {
             );
         }
         let hegn = hegn_binary()?;
-        // Serialize with start/stop so another hegn process cannot recreate the
-        // sockets while the snapshot boot is in flight.
-        let _lock = self.lock(&paths)?;
         if self.unreadable_session() {
             bail!(
                 "session metadata in {} is unreadable or from an older hegn version; \
@@ -324,6 +346,9 @@ impl InstanceManager {
         }
         if let Some(pid) = read_pid(&paths.profile_virtiofs_pid) {
             terminate(pid, &self.config.virtiofsd_bin);
+        }
+        if let Some(pid) = read_pid(&paths.autosave_pid) {
+            terminate_autosave(pid, &hegn);
         }
         cleanup_files(&paths);
 
@@ -529,6 +554,14 @@ impl InstanceManager {
         std::mem::forget(virtiofs);
         if let Some(process) = profile_virtiofs.take() {
             std::mem::forget(process);
+        }
+        // Checkpoints keep flowing after a resume, so the next restart can use
+        // the newest one. A worker failure must never fail the restore itself.
+        if let Err(err) = super::super::autosave::spawn(&self.config, &self.instance, &paths) {
+            append_event_log(
+                &paths.event_log,
+                &format!("autosnapshot: could not start worker: {err:#}"),
+            );
         }
         Ok(())
     }

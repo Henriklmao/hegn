@@ -52,6 +52,10 @@ impl Default for Config {
             local_endpoints: Vec::new(),
             extra_packages: Vec::new(),
             auto_branch: true,
+            periodic_snapshots: true,
+            snapshot_interval_secs: 300,
+            snapshot_keep: 2,
+            auto_resume: true,
             security: SecurityMode::Enforce,
         }
     }

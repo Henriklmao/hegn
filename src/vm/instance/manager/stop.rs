@@ -8,7 +8,9 @@ use anyhow::{Result, bail};
 
 use crate::network;
 
-use super::super::process::{hegn_binary, read_pid, terminate, terminate_relay};
+use super::super::process::{
+    hegn_binary, read_pid, terminate, terminate_autosave, terminate_relay,
+};
 use super::InstanceManager;
 use super::cleanup::cleanup_files;
 
@@ -47,11 +49,13 @@ impl InstanceManager {
             .map(|s| s.profile_virtiofs_pid)
             .filter(|pid| *pid != 0)
             .or_else(|| read_pid(&paths.profile_virtiofs_pid));
+        let autosave_pid = read_pid(&paths.autosave_pid);
 
         if vm_pid.is_none()
             && relay_pid.is_none()
             && virtiofs_pid.is_none()
             && profile_virtiofs_pid.is_none()
+            && autosave_pid.is_none()
         {
             bail!("no instance session found in {}", paths.run_dir.display());
         }
@@ -71,6 +75,9 @@ impl InstanceManager {
         }
         if let Some(pid) = profile_virtiofs_pid {
             terminate(pid, &self.config.virtiofsd_bin);
+        }
+        if let Some(pid) = autosave_pid {
+            terminate_autosave(pid, &hegn);
         }
         cleanup_files(&paths);
         network::release(&self.config, &self.instance.name);

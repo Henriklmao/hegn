@@ -164,7 +164,7 @@ never the log of the running session.
 | --- | --- | --- |
 | `~/.config/hegn/config.toml` | User config | user default |
 | `~/.config/hegn/templates/` | `AGENTS.md` templates | user default |
-| `~/.local/state/hegn/run/` | Sockets, cloud-init seed, session record, lock | `0700` |
+| `~/.local/state/hegn/instances/<name>/run/` | Sockets, cloud-init seed, session record, pids (relay, autosave), lock | `0700` |
 | `~/.local/state/hegn/logs/` | Persistent serial logs | `0700`, files `0600` |
 | `~/.local/state/hegn/state.json` | Recent projects / last project | user default |
 | `~/.local/share/hegn/snapshots/` | Completed snapshots (`config.json`, `state.json`, `memory-ranges`, `snapshot.json`) | `0700`, files `0600` |
@@ -304,6 +304,25 @@ Create:
 5. Always attempt to resume; if saving metadata fails, remove the snapshot
    directory and resume.
 
+Automatic checkpoints:
+
+1. `start` and `restore` spawn a detached `hegn __autosnapshot --instance <name>`
+   worker (`run/autosave.pid`).
+2. Every `snapshot_interval_secs` it verifies the API reports `Running`
+   (never resuming a deliberately paused VM), creates a snapshot tagged
+   `autosave`, and prunes older automatic snapshots beyond `snapshot_keep`.
+3. The worker exits when the VMM disappears; `stop` and stale-session cleanup
+   terminate it by verified pid.
+4. `start` looks up the newest restorable automatic checkpoint for the instance
+   and restores it before a cold boot. Manual snapshots are never selected. A
+   failed auto-resume is recorded in `run/hegn.log` and falls back to a cold
+   boot.
+
+The cold-boot command line adds a host-backed `--rng src=/dev/urandom` device.
+The cloud seed installs `hegn-maintenance.service`, which reads the host clock
+from the guest RTC and mixes `/dev/hwrng` into the guest CRNG every 15 seconds.
+A restored guest therefore corrects its clock and reseeds without NTP.
+
 Restore:
 
 1. Validate the snapshot directory and its `config.json`, `state.json` and
@@ -318,7 +337,8 @@ Restore:
    `--seccomp true` and `--landlock` (with the snapshot-staging and per-TAP
    sysfs rules) because the restored VMM is a new process.
 5. Start the relay, wait for the API, write the new session record; on failure
-   kill the children and remove the new log.
+   kill the children and remove the new log. On success, restart the autosave
+   worker so the next restart can use a newer checkpoint.
 
 ### 5.5 Project create / import
 

@@ -41,6 +41,10 @@ pub enum ConfigField {
     MaxRootfs,
     DiskWarn,
     AutoBranch,
+    PeriodicSnapshots,
+    SnapshotInterval,
+    SnapshotKeep,
+    AutoResume,
     RootfsFormat,
     RootDevice,
     CloudInit,
@@ -99,6 +103,10 @@ impl ConfigField {
             Self::MaxRootfs => "Max rootfs (GiB)",
             Self::DiskWarn => "Disk warn (%)",
             Self::AutoBranch => "Session branch",
+            Self::PeriodicSnapshots => "Periodic snapshots",
+            Self::SnapshotInterval => "Snapshot interval (s)",
+            Self::SnapshotKeep => "Snapshots kept",
+            Self::AutoResume => "Auto-resume",
             Self::RootfsFormat => "Rootfs format",
             Self::RootDevice => "Root device",
             Self::CloudInit => "Cloud-init seed",
@@ -144,6 +152,16 @@ impl ConfigField {
                 max: 262_144,
                 step: 256,
             },
+            Self::SnapshotInterval => FieldKind::Integer {
+                min: 30,
+                max: 86_400,
+                step: 60,
+            },
+            Self::SnapshotKeep => FieldKind::Integer {
+                min: 1,
+                max: 32,
+                step: 1,
+            },
             Self::MaxRootfs => FieldKind::Integer {
                 min: 16,
                 max: 1024,
@@ -154,9 +172,12 @@ impl ConfigField {
                 max: 99,
                 step: 5,
             },
-            Self::AutoBranch | Self::CloudInit | Self::GuestHardening | Self::ReadOnlyWorkspace => {
-                FieldKind::Bool
-            }
+            Self::AutoBranch
+            | Self::CloudInit
+            | Self::GuestHardening
+            | Self::ReadOnlyWorkspace
+            | Self::PeriodicSnapshots
+            | Self::AutoResume => FieldKind::Bool,
             Self::Profile(_) => FieldKind::Action,
             Self::Project | Self::Workspace | Self::RootfsPath | Self::NetworkIndex => {
                 FieldKind::Locked
@@ -202,6 +223,12 @@ const GENERAL_ROWS: &[ConfigRow] = &[
     ConfigRow::Field(ConfigField::RootDevice),
     ConfigRow::Field(ConfigField::MaxRootfs),
     ConfigRow::Field(ConfigField::DiskWarn),
+    ConfigRow::Group("Resume"),
+    ConfigRow::Field(ConfigField::PeriodicSnapshots),
+    ConfigRow::Field(ConfigField::SnapshotInterval),
+    ConfigRow::Field(ConfigField::SnapshotKeep),
+    ConfigRow::Field(ConfigField::AutoResume),
+    ConfigRow::Group("Images & guest"),
     ConfigRow::Field(ConfigField::CloudInit),
     ConfigRow::Field(ConfigField::KernelImage),
     ConfigRow::Field(ConfigField::RootfsImage),

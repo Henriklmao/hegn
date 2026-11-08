@@ -193,6 +193,10 @@ impl ConfigForm {
                 ConfigField::MaxRootfs => config.max_rootfs_gib.to_string(),
                 ConfigField::DiskWarn => config.disk_usage_warn_percent.to_string(),
                 ConfigField::AutoBranch => on_off(config.auto_branch),
+                ConfigField::PeriodicSnapshots => on_off(config.periodic_snapshots),
+                ConfigField::SnapshotInterval => config.snapshot_interval_secs.to_string(),
+                ConfigField::SnapshotKeep => config.snapshot_keep.to_string(),
+                ConfigField::AutoResume => on_off(config.auto_resume),
                 ConfigField::RootfsFormat => config.rootfs_format.as_str().to_string(),
                 ConfigField::RootDevice => config.root_device.clone(),
                 ConfigField::CloudInit => on_off(config.cloud_init),
@@ -544,6 +548,10 @@ impl ConfigForm {
             (Draft::Global(config), ConfigField::DiskWarn) => {
                 i64::from(config.disk_usage_warn_percent)
             }
+            (Draft::Global(config), ConfigField::SnapshotInterval) => {
+                config.snapshot_interval_secs as i64
+            }
+            (Draft::Global(config), ConfigField::SnapshotKeep) => i64::from(config.snapshot_keep),
             (Draft::Instance(instance), ConfigField::Vcpus) => i64::from(instance.vcpus),
             (Draft::Instance(instance), ConfigField::Memory) => i64::from(instance.memory_mib),
             _ => return Ok(()),
@@ -560,6 +568,12 @@ impl ConfigForm {
             (Draft::Global(config), ConfigField::DiskWarn) => {
                 config.disk_usage_warn_percent = value as u8
             }
+            (Draft::Global(config), ConfigField::SnapshotInterval) => {
+                config.snapshot_interval_secs = value as u64
+            }
+            (Draft::Global(config), ConfigField::SnapshotKeep) => {
+                config.snapshot_keep = value as u32
+            }
             (Draft::Instance(instance), ConfigField::Vcpus) => instance.vcpus = value as u8,
             (Draft::Instance(instance), ConfigField::Memory) => instance.memory_mib = value as u32,
             _ => anyhow::bail!("{} is not a number", field.label()),
@@ -574,6 +588,8 @@ impl ConfigForm {
             (Draft::Global(config), ConfigField::GuestHardening) => {
                 config.guest_credential_hardening
             }
+            (Draft::Global(config), ConfigField::PeriodicSnapshots) => config.periodic_snapshots,
+            (Draft::Global(config), ConfigField::AutoResume) => config.auto_resume,
             (Draft::Instance(instance), ConfigField::AutoBranch) => instance.auto_branch,
             (Draft::Instance(instance), ConfigField::ReadOnlyWorkspace) => {
                 instance.read_only_workspace
@@ -589,6 +605,10 @@ impl ConfigForm {
             (Draft::Global(config), ConfigField::GuestHardening) => {
                 config.guest_credential_hardening = value
             }
+            (Draft::Global(config), ConfigField::PeriodicSnapshots) => {
+                config.periodic_snapshots = value
+            }
+            (Draft::Global(config), ConfigField::AutoResume) => config.auto_resume = value,
             (Draft::Instance(instance), ConfigField::AutoBranch) => instance.auto_branch = value,
             (Draft::Instance(instance), ConfigField::ReadOnlyWorkspace) => {
                 instance.read_only_workspace = value

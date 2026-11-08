@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
-use super::model::{SnapshotMeta, SnapshotPaths, sanitize_name};
+use super::model::{AUTOSAVE_NOTE, SnapshotMeta, SnapshotPaths, sanitize_name};
 use crate::shared::fs::{create_private_dir, dir_size};
 
 #[derive(Debug, Clone)]
@@ -174,6 +174,40 @@ impl SnapshotStore {
         Ok(snapshots)
     }
 
+    /// Newest restorable automatic snapshot for `instance`.
+    ///
+    /// Only snapshots tagged with [`AUTOSAVE_NOTE`] are considered: a manual
+    /// checkpoint must never be loaded just because hegn restarts.
+    pub fn latest_autosave(&self, instance: &str) -> Result<Option<SnapshotMeta>> {
+        Ok(self.list()?.into_iter().find(|snapshot| {
+            snapshot.note.as_deref() == Some(AUTOSAVE_NOTE)
+                && snapshot.instance.as_deref() == Some(instance)
+                && snapshot.is_restorable()
+        }))
+    }
+
+    /// Delete automatic snapshots beyond `keep` for one instance.
+    ///
+    /// Manual snapshots and other instances' checkpoints are never touched.
+    /// Returns the removed names.
+    pub fn prune_autosaves(&self, instance: &str, keep: u32) -> Result<Vec<String>> {
+        let keep = keep.max(1) as usize;
+        let mut removed = Vec::new();
+        for snapshot in self
+            .list()?
+            .into_iter()
+            .filter(|snapshot| {
+                snapshot.note.as_deref() == Some(AUTOSAVE_NOTE)
+                    && snapshot.instance.as_deref() == Some(instance)
+            })
+            .skip(keep)
+        {
+            self.delete(&snapshot.name)?;
+            removed.push(snapshot.name);
+        }
+        Ok(removed)
+    }
+
     /// Delete a snapshot directory. Refuses names that escape the root.
     pub fn delete(&self, name: &str) -> Result<()> {
         let name = sanitize_name(name)?;
@@ -308,6 +342,60 @@ mod tests {
         for bad in ["", "../escape", ".hidden", "a/b", "a b"] {
             assert!(store.prepare(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn latest_autosave_ignores_manual_and_foreign_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let auto = store.prepare("autosave-1").unwrap();
+        write_snapshot_files(&auto);
+        let mut auto_meta = meta("autosave-1", &auto);
+        auto_meta.note = Some(AUTOSAVE_NOTE.into());
+        auto_meta.created_at = Utc::now() - chrono::Duration::seconds(10);
+        store.save_meta(&auto_meta).unwrap();
+
+        let manual = store.prepare("manual").unwrap();
+        write_snapshot_files(&manual);
+        let mut manual_meta = meta("manual", &manual);
+        manual_meta.note = Some("before-upgrade".into());
+        store.save_meta(&manual_meta).unwrap();
+
+        let foreign = store.prepare("autosave-foreign").unwrap();
+        write_snapshot_files(&foreign);
+        let mut foreign_meta = meta("autosave-foreign", &foreign);
+        foreign_meta.note = Some(AUTOSAVE_NOTE.into());
+        foreign_meta.instance = Some("other".into());
+        store.save_meta(&foreign_meta).unwrap();
+
+        assert_eq!(
+            store.latest_autosave("demo").unwrap().unwrap().name,
+            "autosave-1"
+        );
+        assert!(store.latest_autosave("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_autosaves_per_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        for (index, offset) in [("auto-old", 0), ("auto-new", 20)] {
+            let paths = store.prepare(index).unwrap();
+            write_snapshot_files(&paths);
+            let mut m = meta(index, &paths);
+            m.note = Some(AUTOSAVE_NOTE.into());
+            m.created_at = Utc::now() + chrono::Duration::seconds(offset);
+            store.save_meta(&m).unwrap();
+        }
+        let manual = store.prepare("manual").unwrap();
+        write_snapshot_files(&manual);
+        store.save_meta(&meta("manual", &manual)).unwrap();
+
+        let removed = store.prune_autosaves("demo", 1).unwrap();
+        assert_eq!(removed, vec!["auto-old"]);
+        assert!(store.load("auto-new").is_ok());
+        assert!(store.load("manual").is_ok());
+        assert!(store.load("auto-old").is_err());
     }
 
     #[test]

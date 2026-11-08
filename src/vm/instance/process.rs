@@ -39,6 +39,13 @@ pub(super) fn terminate_relay(pid: u32, binary: &Path) {
     signal_and_wait(pid, || relay::process_matches_relay(pid, binary));
 }
 
+pub(super) fn terminate_autosave(pid: u32, binary: &Path) {
+    if !super::autosave::process_matches(pid, binary) {
+        return;
+    }
+    signal_and_wait(pid, || super::autosave::process_matches(pid, binary));
+}
+
 fn signal_and_wait(pid: u32, still_running: impl Fn() -> bool) {
     // Safety: the pid was verified to belong to the expected executable.
     unsafe {

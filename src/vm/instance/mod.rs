@@ -13,9 +13,11 @@
 //!   console-relay.pid
 //!   virtiofs.pid
 //!   profile-virtiofs.pid
+//!   autosave.pid            detached periodic-snapshot worker
 //!   session.json
 //!   cloud-hypervisor.log    VMM log
 //!   console-relay.log       relay stderr (diagnostics only)
+//!   autosave.log            autosnapshot worker stderr (diagnostics only)
 //!   hegn.log                lifecycle/start diagnostics
 //!   hegn.lock               lifecycle flock
 //!   cloud-init.img          NoCloud seed for the official cloud images
@@ -38,6 +40,7 @@
 //! the lifecycle operations themselves.
 
 mod args;
+pub mod autosave;
 mod manager;
 mod paths;
 mod process;

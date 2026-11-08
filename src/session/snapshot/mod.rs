@@ -21,5 +21,5 @@
 mod model;
 mod store;
 
-pub use model::{SnapshotMeta, SnapshotPaths, sanitize_name};
+pub use model::{AUTOSAVE_NOTE, SnapshotMeta, SnapshotPaths, sanitize_name};
 pub use store::SnapshotStore;
