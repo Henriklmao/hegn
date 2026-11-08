@@ -59,11 +59,19 @@ pub fn ready_marker() -> Option<ReadyMarker> {
     .then_some(marker)
 }
 
-/// Marker present, every TAP in the pool exists and the endpoint DNAT rules
-/// match the current configuration. Used by doctor and the automatic setup.
+/// Marker present, every TAP in the pool exists and — when the caller can
+/// inspect the kernel — the live nftables table still matches the marker.
+///
+/// Unprivileged callers (TUI, `hegn network status`) cannot read nftables, so
+/// they fall back to the root-owned marker and TAP presence.
 pub fn guard_ready(config: &Config) -> bool {
-    ready_marker().is_some_and(|marker| marker.endpoints == config.endpoint_ports())
-        && status(config).iter().all(|tap| tap.exists)
+    let endpoints = config.endpoint_ports();
+    if !(ready_marker().is_some_and(|marker| marker.endpoints == endpoints)
+        && status(config).iter().all(|tap| tap.exists))
+    {
+        return false;
+    }
+    super::firewall::live_guard_status(&endpoints).unwrap_or(true)
 }
 
 /// The marker is deliberately world-readable: the unprivileged TUI reads it to

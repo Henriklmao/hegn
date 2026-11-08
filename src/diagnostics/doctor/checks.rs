@@ -126,6 +126,7 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
     ));
     let guarded = config.network == crate::config::NetworkMode::Guarded;
     let marker = crate::network::ready_marker();
+    let live = crate::network::live_guard_status(&config.endpoint_ports());
     let guard_ready = crate::network::guard_ready(config);
     checks.push(Check::new(
         "network guard",
@@ -156,12 +157,21 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
                 // offline. Naming it here turns that into a one-line answer.
                 detail.push_str(&format!("; routed through {}", firewall.label()));
             }
+            match live {
+                Some(true) => detail.push_str("; rules verified live"),
+                None => detail.push_str("; marker only (run as root to verify rules)"),
+                Some(false) => {}
+            }
             detail
         } else if marker
             .as_ref()
             .is_some_and(|marker| marker.endpoints != config.endpoint_ports())
         {
             "local endpoints changed; re-run `sudo hegn network setup --user $USER`".to_string()
+        } else if live == Some(false) {
+            "nftables guard is missing or incomplete; re-run `sudo hegn network setup --user \
+             $USER`"
+                .to_string()
         } else if marker.is_some() {
             "TAP pool incomplete (deleted or renamed); re-run `sudo hegn network setup --user \
              $USER`"

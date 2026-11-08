@@ -82,6 +82,111 @@ fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Whether the live nftables table still matches what [`nft_rules`] installs.
+///
+/// The readiness marker is only a receipt: root can flush the table while the
+/// root-owned JSON still says "ready". This check inspects the kernel state.
+/// Returns `None` when it cannot run (unprivileged caller, missing `nft`), so
+/// callers can distinguish "unverified" from "absent".
+pub fn live_guard_status(endpoints: &[u16]) -> Option<bool> {
+    if !super::privilege::is_privileged() {
+        return None;
+    }
+    let output = Command::new("nft")
+        .args(["-j", "list", "table", "inet", "hegn"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return Some(false);
+    }
+    Some(parse_live_guard(
+        &String::from_utf8_lossy(&output.stdout),
+        endpoints,
+    ))
+}
+
+/// Validate `nft -j list table inet hegn` output against the guard layout.
+fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let Some(items) = value.get("nftables").and_then(|items| items.as_array()) else {
+        return false;
+    };
+    let mut has_table = false;
+    let mut forward_rules = 0usize;
+    let mut has_egress_drop = false;
+    let mut has_input_drop = false;
+    let mut has_masquerade = false;
+    let mut endpoint_elements: Option<Vec<u64>> = None;
+    for item in items {
+        if let Some(table) = item.get("table")
+            && table.get("family").and_then(|v| v.as_str()) == Some("inet")
+            && table.get("name").and_then(|v| v.as_str()) == Some("hegn")
+        {
+            has_table = true;
+        }
+        if let Some(set) = item.get("set")
+            && set.get("name").and_then(|v| v.as_str()) == Some("endpoint_ports")
+        {
+            endpoint_elements = Some(
+                set.get("elem")
+                    .and_then(|elem| elem.as_array())
+                    .map(|elem| elem.iter().filter_map(|value| value.as_u64()).collect())
+                    .unwrap_or_default(),
+            );
+        }
+        if let Some(rule) = item.get("rule") {
+            let chain = rule
+                .get("chain")
+                .and_then(|chain| chain.as_str())
+                .unwrap_or_default();
+            let expr = rule
+                .get("expr")
+                .map(|expr| expr.to_string())
+                .unwrap_or_default();
+            match chain {
+                "forward" => {
+                    forward_rules += 1;
+                    if expr.contains("hegn-egress-drop") && expr.contains("\"drop\"") {
+                        has_egress_drop = true;
+                    }
+                }
+                "input" => {
+                    if expr.contains("\"drop\"") {
+                        has_input_drop = true;
+                    }
+                }
+                "postrouting" if expr.contains("masquerade") => {
+                    has_masquerade = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut expected: Vec<u64> = endpoints.iter().map(|port| u64::from(*port)).collect();
+    expected.sort_unstable();
+    expected.dedup();
+    let endpoints_match = match endpoint_elements {
+        Some(mut elements) => {
+            elements.sort_unstable();
+            elements.dedup();
+            elements == expected
+        }
+        None => expected.is_empty(),
+    };
+    // The guard's forward chain has ten rules (source/private/IPv6 drops,
+    // conntrack, 80/443, two DNS rules, rate-limited log-drop and the inbound
+    // pair). Requiring all of them makes a partial flush visible.
+    has_table
+        && forward_rules >= 10
+        && has_egress_drop
+        && has_input_drop
+        && has_masquerade
+        && endpoints_match
+}
+
 /// nftables rules. Public HTTP(S) and public DNS only; everything else from a
 /// instance TAP is dropped, including RFC1918, link-local, CGNAT, multicast and
 /// all IPv6.
@@ -641,5 +746,98 @@ mod tests {
     #[test]
     fn nft_rules_are_deterministic() {
         assert_eq!(nft_rules(&[11434]), nft_rules(&[11434]));
+    }
+
+    /// Minimal `nft -j` shape for a healthy guard with `endpoints` exposed.
+    fn live_fixture(endpoints: &[u16]) -> serde_json::Value {
+        use serde_json::json;
+
+        let mut items = vec![
+            json!({"metainfo": {"version": "1.0.9"}}),
+            json!({"table": {"family": "inet", "name": "hegn"}}),
+            json!({"chain": {"family": "inet", "table": "hegn", "name": "forward"}}),
+            json!({"chain": {"family": "inet", "table": "hegn", "name": "input"}}),
+            json!({"chain": {"family": "inet", "table": "hegn", "name": "postrouting"}}),
+        ];
+        for handle in 0..10 {
+            let expr = if handle == 7 {
+                json!([
+                    {"counter": null},
+                    {"log": {"prefix": "hegn-egress-drop "}},
+                    {"drop": null}
+                ])
+            } else {
+                json!([{"counter": null}])
+            };
+            items.push(json!({"rule": {
+                "family": "inet", "table": "hegn", "chain": "forward",
+                "handle": handle, "expr": expr
+            }}));
+        }
+        items.push(json!({"rule": {
+            "family": "inet", "table": "hegn", "chain": "input",
+            "handle": 100, "expr": [{"drop": null}]
+        }}));
+        items.push(json!({"rule": {
+            "family": "inet", "table": "hegn", "chain": "postrouting",
+            "handle": 101, "expr": [{"masquerade": null}]
+        }}));
+        if !endpoints.is_empty() {
+            let mut ports = endpoints.to_vec();
+            ports.sort_unstable();
+            ports.dedup();
+            items.push(json!({"set": {
+                "family": "inet", "table": "hegn", "name": "endpoint_ports",
+                "type": "inet_service", "elem": ports
+            }}));
+        }
+        json!({"nftables": items})
+    }
+
+    #[test]
+    fn live_guard_accepts_the_installed_layout() {
+        let empty = live_fixture(&[]);
+        assert!(parse_live_guard(&empty.to_string(), &[]));
+
+        let exposed = live_fixture(&[11434, 1234]);
+        assert!(parse_live_guard(&exposed.to_string(), &[1234, 11434, 1234]));
+    }
+
+    #[test]
+    fn live_guard_rejects_a_missing_or_stale_table() {
+        let mut items = live_fixture(&[]);
+        items["nftables"].as_array_mut().unwrap().remove(1); // drop the table
+        assert!(!parse_live_guard(&items.to_string(), &[]));
+
+        assert!(!parse_live_guard("not json", &[]));
+        assert!(!parse_live_guard("{}", &[]));
+    }
+
+    #[test]
+    fn live_guard_rejects_a_partial_flush() {
+        let mut missing_rule = live_fixture(&[]);
+        missing_rule["nftables"].as_array_mut().unwrap().remove(5); // a forward rule
+        assert!(!parse_live_guard(&missing_rule.to_string(), &[]));
+
+        let mut missing_drop = live_fixture(&[]);
+        for item in missing_drop["nftables"].as_array_mut().unwrap() {
+            if item
+                .get("rule")
+                .is_some_and(|rule| rule["chain"] == "forward")
+            {
+                item["rule"]["expr"] = serde_json::json!([{"counter": null}]);
+            }
+        }
+        assert!(!parse_live_guard(&missing_drop.to_string(), &[]));
+    }
+
+    #[test]
+    fn live_guard_requires_the_configured_endpoint_ports() {
+        let no_set = live_fixture(&[]);
+        assert!(!parse_live_guard(&no_set.to_string(), &[11434]));
+
+        let stale = live_fixture(&[11434]);
+        assert!(!parse_live_guard(&stale.to_string(), &[]));
+        assert!(!parse_live_guard(&stale.to_string(), &[4321]));
     }
 }

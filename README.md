@@ -849,6 +849,10 @@ only; the HTTP(S)/DNS allow-list stays in hegn's table, so the guest's reach is
 unchanged. Re-run setup after installing, enabling or resetting a host firewall,
 and after upgrading from a hegn release whose marker is a previous version.
 
+The marker is only a receipt. Setup refuses to write it unless the live nftables
+table matches the expected guard, and a root-run `hegn doctor` re-lists the table
+instead of trusting the JSON, so a flushed table fails closed.
+
 When hegn invokes `sudo` or `pkexec` itself (`hegn doctor --fix`, the doctor's
 `Set up everything` action), it prints the exact command line with shell quoting
 before the password prompt, so it can be inspected first.
@@ -1073,7 +1077,8 @@ diagnostic cells use a small ANSI background color.
    the VMM's staging directory and its files are tightened to `0600`, so the
    VMM never has write access to completed checkpoints.
 3. **Console access** — the official cloud image is bootstrapped with a private
-   NoCloud seed that enables an automatic root login on the serial console. The
+   NoCloud seed that enables an automatic root login on the serial console
+   (set `guest_credential_hardening = true` for a non-root console). The
    serial and relay sockets are only reachable by the owning user.
 4. **Network guard** — with `network = "guarded"`, each VM gets a dedicated TAP
    from a host-created pool. Host nftables rules allow only outbound TCP 80/443

@@ -89,6 +89,14 @@ pub fn ensure_ready(config: &Config) -> Result<()> {
             marker.endpoints
         );
     }
+    // A root-owned receipt can outlive its rules; verify the kernel state when
+    // this process is allowed to read it (root-only).
+    if super::firewall::live_guard_status(&expected) == Some(false) {
+        bail!(
+            "the nftables guard is missing or incomplete; re-run `sudo hegn network setup --user \
+             $USER`"
+        );
+    }
     Ok(())
 }
 
@@ -131,6 +139,15 @@ pub fn setup(user: &str, endpoints: &[u16]) -> Result<()> {
         }
     }
     run_script(&script).context("failed to configure the guarded network")?;
+    // Do not write a readiness receipt unless the rules actually landed. A
+    // host firewall or a concurrent `nft flush` must not leave a marker that
+    // vouches for a table that does not exist.
+    if super::firewall::live_guard_status(&endpoints) == Some(false) {
+        bail!(
+            "the nftables guard is missing after setup; refusing to write {}",
+            marker_path().display()
+        );
+    }
     let marker = ReadyMarker {
         version: MARKER_VERSION,
         pool: TAP_POOL,

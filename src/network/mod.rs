@@ -30,7 +30,7 @@ mod privilege;
 mod script;
 
 pub use addressing::{guest_ip, host_ip, mac, tap_name};
-pub use firewall::{HostFirewall, detect_host_firewall, nft_rules};
+pub use firewall::{HostFirewall, detect_host_firewall, live_guard_status, nft_rules};
 pub use marker::{ReadyMarker, guard_ready, marker_path, ready_marker};
 pub use pool::{Lease, TapStatus, acquire, instance_is_running, release, status};
 pub use privilege::{
