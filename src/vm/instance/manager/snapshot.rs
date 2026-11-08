@@ -388,11 +388,13 @@ impl InstanceManager {
                     profile_share,
                     network_lease.as_ref(),
                     &self.config.local_endpoints,
+                    self.config.guest_credential_hardening,
                 ),
                 &provision,
                 profile_share,
                 network_lease.as_ref(),
                 &self.config.local_endpoints,
+                self.config.guest_credential_hardening,
             )
         {
             virtiofs.kill();

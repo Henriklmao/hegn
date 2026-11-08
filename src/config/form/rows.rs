@@ -42,6 +42,7 @@ pub enum ConfigField {
     RootfsFormat,
     RootDevice,
     CloudInit,
+    GuestHardening,
     KernelImage,
     RootfsImage,
     SharedTag,
@@ -96,6 +97,7 @@ impl ConfigField {
             Self::RootfsFormat => "Rootfs format",
             Self::RootDevice => "Root device",
             Self::CloudInit => "Cloud-init seed",
+            Self::GuestHardening => "Guest hardening",
             Self::KernelImage => "Kernel image",
             Self::RootfsImage => "Rootfs image",
             Self::SharedTag => "Shared tag",
@@ -136,7 +138,7 @@ impl ConfigField {
                 max: 262_144,
                 step: 256,
             },
-            Self::AutoBranch | Self::CloudInit => FieldKind::Bool,
+            Self::AutoBranch | Self::CloudInit | Self::GuestHardening => FieldKind::Bool,
             Self::Profile(_) => FieldKind::Action,
             Self::Project | Self::Workspace | Self::RootfsPath | Self::NetworkIndex => {
                 FieldKind::Locked
@@ -186,6 +188,7 @@ const GENERAL_ROWS: &[ConfigRow] = &[
     ConfigRow::Group("Guest sharing"),
     ConfigRow::Field(ConfigField::SharedTag),
     ConfigRow::Field(ConfigField::GuestMount),
+    ConfigRow::Field(ConfigField::GuestHardening),
     ConfigRow::Group("Network & security"),
     ConfigRow::Field(ConfigField::Network),
     ConfigRow::Field(ConfigField::Security),

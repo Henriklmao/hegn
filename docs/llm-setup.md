@@ -179,6 +179,7 @@ memory_mib      = 2048      # >= 128
 shared_tag      = "workspace"  # virtio-fs tag, <= 36 bytes
 guest_mount     = "/workspace" # mount point inside the guest
 cloud_init      = true
+guest_credential_hardening = false
 security        = "enforce"
 harness         = "shell"   # shell | opencode | claude-code | codex | pi | prime-agent | aider | gemini-cli
 network         = "guarded" # "guarded" (web+DNS only) or "off" (no NIC)

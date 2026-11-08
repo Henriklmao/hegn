@@ -26,7 +26,7 @@ const SEED_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Increment when the seed's user-data changes so existing instances re-run
 /// cloud-init on their next boot.
-pub const SEED_VERSION: u32 = 8;
+pub const SEED_VERSION: u32 = 9;
 
 /// Reject values that could break out of the cloud-init shell command.
 pub(crate) fn safe_token(value: &str) -> bool {
@@ -64,6 +64,7 @@ pub fn write_seed(
     profile: Option<&ProfileShare>,
     network: Option<&Lease>,
     endpoints: &[LocalEndpoint],
+    credential_hardening: bool,
 ) -> Result<()> {
     if !safe_token(shared_tag) {
         anyhow::bail!("unsafe virtio-fs tag for the cloud-init seed: {shared_tag:?}");
@@ -83,6 +84,7 @@ pub fn write_seed(
         provision,
         profile,
         endpoint_env.as_deref(),
+        credential_hardening,
     );
     let meta_data = meta_data(instance_id);
     let mut file = OpenOptions::new()
@@ -145,11 +147,13 @@ pub fn instance_id(
     profile: Option<&ProfileShare>,
     network: Option<&Lease>,
     endpoints: &[LocalEndpoint],
+    credential_hardening: bool,
 ) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
     hasher.update(SEED_VERSION.to_le_bytes());
+    hasher.update([credential_hardening as u8]);
     hasher.update(provision.harness.label().as_bytes());
     hasher.update(provision.script().as_bytes());
     if let Some(profile) = profile {
@@ -225,6 +229,7 @@ mod tests {
             None,
             Some(&lease()),
             &[],
+            false,
         )
         .unwrap();
 
@@ -272,6 +277,7 @@ mod tests {
             None,
             Some(&lease()),
             &endpoints,
+            false,
         )
         .unwrap();
         let (user_data, _, _) = read_seed(&path);
@@ -313,6 +319,7 @@ mod tests {
             Some(&profile),
             None,
             &[],
+            false,
         )
         .unwrap();
         let (user_data, _, _) = read_seed(&path);
@@ -338,10 +345,18 @@ mod tests {
     fn instance_id_changes_with_preset_and_network() {
         let shell = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
         let opencode = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
-        let a = instance_id("demo", &shell, None, None, &[]);
-        assert_eq!(a, instance_id("demo", &shell, None, None, &[]));
-        assert_ne!(a, instance_id("demo", &opencode, None, None, &[]));
-        assert_ne!(a, instance_id("demo", &shell, None, Some(&lease()), &[]));
+        let a = instance_id("demo", &shell, None, None, &[], false);
+        assert_eq!(a, instance_id("demo", &shell, None, None, &[], false));
+        assert_ne!(a, instance_id("demo", &opencode, None, None, &[], false));
+        assert_ne!(
+            a,
+            instance_id("demo", &shell, None, Some(&lease()), &[], false)
+        );
+        assert_ne!(
+            a,
+            instance_id("demo", &shell, None, None, &[], true),
+            "toggling credential hardening must re-run cloud-init"
+        );
         assert!(a.starts_with("hegn-demo-v"));
     }
 
@@ -359,6 +374,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
         )
         .unwrap();
         let (user_data, _, network) = read_seed(&path);
@@ -384,7 +400,8 @@ mod tests {
                 &plan,
                 None,
                 None,
-                &[]
+                &[],
+                false
             )
             .is_err()
         );
@@ -405,7 +422,8 @@ mod tests {
                 &plan,
                 None,
                 None,
-                &[]
+                &[],
+                false
             )
             .is_err()
         );
@@ -418,7 +436,8 @@ mod tests {
                 &plan,
                 None,
                 None,
-                &[]
+                &[],
+                false
             )
             .is_err()
         );
@@ -431,7 +450,8 @@ mod tests {
                 &plan,
                 None,
                 None,
-                &[]
+                &[],
+                false
             )
             .is_err()
         );
@@ -444,7 +464,8 @@ mod tests {
                 &plan,
                 None,
                 None,
-                &[]
+                &[],
+                false
             )
             .is_err()
         );
@@ -466,6 +487,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
         )
         .unwrap();
         assert!(std::fs::metadata(&path).unwrap().len() >= SEED_BYTES);
@@ -559,6 +581,7 @@ mod tests {
                     None,
                     None,
                     &[],
+                    false,
                 )
                 .is_err(),
                 "{bad:?} must be rejected"
@@ -570,8 +593,8 @@ mod tests {
     #[test]
     fn instance_id_is_stable_and_tracks_profile_and_endpoints() {
         let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
-        let plain = instance_id("demo", &plan, None, None, &[]);
-        assert_eq!(plain, instance_id("demo", &plan, None, None, &[]));
+        let plain = instance_id("demo", &plan, None, None, &[], false);
+        assert_eq!(plain, instance_id("demo", &plan, None, None, &[], false));
         assert_eq!(
             plain,
             format!("hegn-demo-v{SEED_VERSION}-{}", &plain[plain.len() - 12..])
@@ -581,16 +604,16 @@ mod tests {
             bundle_dir: PathBuf::from("/tmp/bundle"),
             manifest_id: "b".repeat(64),
         };
-        let with_profile = instance_id("demo", &plan, Some(&profile), None, &[]);
+        let with_profile = instance_id("demo", &plan, Some(&profile), None, &[], false);
         assert_ne!(plain, with_profile);
 
         let lease = lease();
-        let no_endpoints = instance_id("demo", &plan, None, Some(&lease), &[]);
+        let no_endpoints = instance_id("demo", &plan, None, Some(&lease), &[], false);
         let endpoint = LocalEndpoint {
             name: "ollama".into(),
             port: 11434,
         };
-        let with_endpoint = instance_id("demo", &plan, None, Some(&lease), &[endpoint]);
+        let with_endpoint = instance_id("demo", &plan, None, Some(&lease), &[endpoint], false);
         assert_ne!(no_endpoints, with_endpoint);
     }
 

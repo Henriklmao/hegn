@@ -214,7 +214,8 @@ impl InstanceManager {
             .unwrap_or(0);
 
         // 2. Optional NoCloud seed for the official cloud images. It contains
-        // no secrets and only enables a serial root login.
+        // no secrets and only enables a serial login (root unless credential
+        // hardening is enabled).
         if self.config.cloud_init
             && let Err(err) = cloud_init::write_seed(
                 &paths.cloud_init,
@@ -226,11 +227,13 @@ impl InstanceManager {
                     profile_plan.share.as_ref(),
                     network_lease.as_ref(),
                     &self.config.local_endpoints,
+                    self.config.guest_credential_hardening,
                 ),
                 &provision,
                 profile_plan.share.as_ref(),
                 network_lease.as_ref(),
                 &self.config.local_endpoints,
+                self.config.guest_credential_hardening,
             )
         {
             virtiofs.kill();

@@ -194,6 +194,7 @@ impl ConfigForm {
                 ConfigField::RootfsFormat => config.rootfs_format.as_str().to_string(),
                 ConfigField::RootDevice => config.root_device.clone(),
                 ConfigField::CloudInit => on_off(config.cloud_init),
+                ConfigField::GuestHardening => on_off(config.guest_credential_hardening),
                 ConfigField::KernelImage => config.kernel_image.display().to_string(),
                 ConfigField::RootfsImage => config.rootfs_image.display().to_string(),
                 ConfigField::SharedTag => config.shared_tag.clone(),
@@ -559,6 +560,9 @@ impl ConfigForm {
         match (&self.draft, field) {
             (Draft::Global(config), ConfigField::AutoBranch) => config.auto_branch,
             (Draft::Global(config), ConfigField::CloudInit) => config.cloud_init,
+            (Draft::Global(config), ConfigField::GuestHardening) => {
+                config.guest_credential_hardening
+            }
             (Draft::Instance(instance), ConfigField::AutoBranch) => instance.auto_branch,
             _ => false,
         }
@@ -568,6 +572,9 @@ impl ConfigForm {
         match (&mut self.draft, field) {
             (Draft::Global(config), ConfigField::AutoBranch) => config.auto_branch = value,
             (Draft::Global(config), ConfigField::CloudInit) => config.cloud_init = value,
+            (Draft::Global(config), ConfigField::GuestHardening) => {
+                config.guest_credential_hardening = value
+            }
             (Draft::Instance(instance), ConfigField::AutoBranch) => instance.auto_branch = value,
             _ => anyhow::bail!("{} is not a toggle", field.label()),
         }

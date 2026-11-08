@@ -33,6 +33,7 @@ impl Default for Config {
             rootfs_format: crate::vm::images::ROOTFS_FORMAT,
             root_device: "/dev/vda1".to_string(),
             cloud_init: true,
+            guest_credential_hardening: false,
             kernel_url: crate::vm::images::KERNEL_URL.to_string(),
             kernel_sha256: crate::vm::images::KERNEL_SHA256.to_string(),
             rootfs_url: crate::vm::images::ROOTFS_URL.to_string(),

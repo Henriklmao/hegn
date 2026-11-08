@@ -68,6 +68,10 @@ pub struct Config {
     /// Attach the generated NoCloud seed so official cloud images auto-login
     /// on the serial console. Ignored by images without cloud-init.
     pub cloud_init: bool,
+    /// Opt-in guest credential hardening. When enabled, the serial console
+    /// auto-logs in as the unprivileged `hegn` user and `sudo` requires a
+    /// password instead of the default passwordless root console.
+    pub guest_credential_hardening: bool,
     /// Upstream kernel URL and pinned SHA-256 used by `hegn images download`.
     pub kernel_url: String,
     pub kernel_sha256: String,
