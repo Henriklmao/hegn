@@ -137,6 +137,41 @@ impl SnapshotStore {
         Ok(())
     }
 
+    /// Verify that loaded metadata points inside the snapshot root.
+    ///
+    /// Cloud Hypervisor receives the directory as `source_url=file://<dir>`
+    /// and Landlock rules are derived from the same path, so a forged
+    /// `snapshot.json` must not be able to point at an arbitrary host
+    /// directory. A comma or equals sign would also be split as an option
+    /// separator on the command line.
+    fn contain_dir(&self, meta: &mut SnapshotMeta) -> Result<()> {
+        let recorded = meta.dir.to_string_lossy();
+        if recorded.contains(',') || recorded.contains('=') {
+            bail!(
+                "snapshot '{}' records a directory with unsafe characters: {}",
+                meta.name,
+                recorded
+            );
+        }
+        let root = self
+            .root
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", self.root.display()))?;
+        let dir = meta
+            .dir
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", meta.dir.display()))?;
+        if !dir.starts_with(&root) {
+            bail!(
+                "snapshot '{}' points outside the snapshot root {}",
+                meta.name,
+                root.display()
+            );
+        }
+        meta.dir = dir;
+        Ok(())
+    }
+
     /// Load one snapshot's metadata.
     pub fn load(&self, name: &str) -> Result<SnapshotMeta> {
         let name = sanitize_name(name)?;
@@ -145,6 +180,7 @@ impl SnapshotStore {
             .with_context(|| format!("failed to read snapshot {}", path.display()))?;
         let mut meta: SnapshotMeta = serde_json::from_str(&raw)
             .with_context(|| format!("failed to parse snapshot {}", path.display()))?;
+        self.contain_dir(&mut meta)?;
         if meta.size_bytes == 0 {
             meta.size_bytes = dir_size(&meta.dir);
         }
@@ -434,6 +470,63 @@ mod tests {
         fs::write(store.root().join("broken/snapshot.json"), "{not json").unwrap();
         let err = store.load("broken").unwrap_err().to_string();
         assert!(err.contains("failed to parse snapshot"), "{err}");
+    }
+
+    #[test]
+    fn load_rejects_a_snapshot_directory_outside_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path().join("snapshots"));
+        let entry = store.root().join("escape");
+        fs::create_dir_all(&entry).unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let escaped = SnapshotMeta {
+            name: "escape".into(),
+            created_at: Utc::now(),
+            vm_state: "Paused".into(),
+            dir: outside.clone(),
+            instance: Some("demo".into()),
+            project: None,
+            size_bytes: 0,
+            note: None,
+        };
+        fs::write(
+            entry.join("snapshot.json"),
+            serde_json::to_string(&escaped).unwrap(),
+        )
+        .unwrap();
+
+        let err = store.load("escape").unwrap_err().to_string();
+        assert!(err.contains("outside"), "{err}");
+        assert!(store.list().unwrap().is_empty());
+        assert!(outside.is_dir(), "the target must never be touched");
+    }
+
+    #[test]
+    fn load_rejects_a_snapshot_directory_with_option_separators() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path().join("snapshots"));
+        let entry = store.root().join("commas");
+        fs::create_dir_all(&entry).unwrap();
+        let unsafe_meta = SnapshotMeta {
+            name: "commas".into(),
+            created_at: Utc::now(),
+            vm_state: "Paused".into(),
+            dir: store.root().join("a,b"),
+            instance: Some("demo".into()),
+            project: None,
+            size_bytes: 0,
+            note: None,
+        };
+        fs::write(
+            entry.join("snapshot.json"),
+            serde_json::to_string(&unsafe_meta).unwrap(),
+        )
+        .unwrap();
+
+        let err = store.load("commas").unwrap_err().to_string();
+        assert!(err.contains("unsafe"), "{err}");
+        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 use std::fs;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -21,8 +21,28 @@ const INCOMPAT_CORRUPT: u64 = 1 << 1;
 const INCOMPAT_EXTERNAL_DATA: u64 = 1 << 2;
 const INCOMPAT_COMPRESSION_TYPE: u64 = 1 << 3;
 
+/// Absolute locations checked before falling back to `PATH`.
+const QEMU_IMG_CANDIDATES: [&str; 3] = [
+    "/usr/bin/qemu-img",
+    "/usr/local/bin/qemu-img",
+    "/usr/sbin/qemu-img",
+];
+
+/// Resolve `qemu-img` without trusting `PATH`.
+///
+/// An attacker-controlled `PATH` could run an arbitrary binary with hegn's
+/// privileges. Prefer the known system locations and only fall back to the
+/// bare name when none of them exists.
+fn qemu_img_binary() -> PathBuf {
+    QEMU_IMG_CANDIDATES
+        .iter()
+        .map(PathBuf::from)
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from("qemu-img"))
+}
+
 pub(super) fn qemu_img_resize(path: &Path, target: u64) -> Result<bool> {
-    let output = Command::new("qemu-img")
+    let output = Command::new(qemu_img_binary())
         .arg("resize")
         .arg(path)
         .arg(target.to_string())
@@ -345,6 +365,23 @@ mod tests {
         let mut buf = [0u8; 4];
         file.read_exact_at(&mut buf, offset).unwrap();
         u32::from_be_bytes(buf)
+    }
+
+    #[test]
+    fn qemu_img_resolver_avoids_a_hijacked_path() {
+        let resolved = qemu_img_binary();
+        let installed = QEMU_IMG_CANDIDATES
+            .iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.is_file());
+        match installed {
+            Some(expected) => assert_eq!(resolved, expected),
+            None => assert_eq!(resolved, PathBuf::from("qemu-img")),
+        }
+        assert!(
+            resolved.is_absolute() || resolved == Path::new("qemu-img"),
+            "only the documented fallback may be relative"
+        );
     }
 
     #[test]

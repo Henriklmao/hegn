@@ -96,13 +96,20 @@ pub(super) fn remove_socket(path: &Path) -> Result<()> {
 }
 
 pub(super) fn ensure_socket(path: &Path) -> Result<()> {
-    if !path.exists() {
-        bail!(
+    if is_socket(path) {
+        return Ok(());
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => bail!(
+            "refusing to use {}: it exists and is not a socket",
+            path.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => bail!(
             "no Cloud Hypervisor API socket at {} — start an instance first",
             path.display()
-        );
+        ),
+        Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -216,7 +223,27 @@ mod tests {
         let err = ensure_socket(&path).unwrap_err().to_string();
         assert!(err.contains("no Cloud Hypervisor API socket"), "{err}");
         assert!(err.contains(&path.display().to_string()), "{err}");
-        std::fs::write(&path, b"x").unwrap();
-        assert!(ensure_socket(&path).is_ok());
+    }
+
+    #[test]
+    fn ensure_socket_rejects_regular_files_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("cloud-hypervisor.sock");
+        std::fs::write(&regular, b"not a socket").unwrap();
+        let err = ensure_socket(&regular).unwrap_err().to_string();
+        assert!(err.contains("not a socket"), "{err}");
+        assert_eq!(std::fs::read(&regular).unwrap(), b"not a socket");
+
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"keep me").unwrap();
+        let link = dir.path().join("linked.sock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = ensure_socket(&link).unwrap_err().to_string();
+        assert!(err.contains("not a socket"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+
+        let socket = dir.path().join("real.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(ensure_socket(&socket).is_ok());
     }
 }

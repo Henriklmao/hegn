@@ -144,6 +144,9 @@ impl InstanceConfig {
         if self.memory_mib < 128 {
             bail!("instance memory_mib must be at least 128");
         }
+        if self.memory_mib > 262_144 {
+            bail!("instance memory_mib must be at most 262144 MiB (256 GiB)");
+        }
         crate::vm::cloud_init::safe_token(&self.shared_tag)
             .then_some(())
             .context("instance shared_tag contains unsafe characters")?;
@@ -312,14 +315,16 @@ mod tests {
             instance.vcpus = vcpus;
             assert!(instance.validate().is_ok(), "vcpus={vcpus}");
         }
-        for memory in [0, 127] {
+        for memory in [0, 127, 262_145, u32::MAX] {
             let mut instance = valid();
             instance.memory_mib = memory;
             assert!(instance.validate().is_err(), "memory={memory}");
         }
-        let mut instance = valid();
-        instance.memory_mib = 128;
-        assert!(instance.validate().is_ok());
+        for memory in [128, 262_144] {
+            let mut instance = valid();
+            instance.memory_mib = memory;
+            assert!(instance.validate().is_ok(), "memory={memory}");
+        }
     }
 
     #[test]

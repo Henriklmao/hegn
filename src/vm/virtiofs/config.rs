@@ -4,13 +4,13 @@
 //! always insists on a sandbox so a guest cannot traverse out of the tree.
 
 use std::ffi::OsString;
-use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
 use crate::config::VirtiofsSandbox;
+use crate::vm::instance::InstanceManager;
 
 use super::process::VirtiofsProcess;
 
@@ -89,10 +89,10 @@ impl VirtiofsConfig {
     /// blocks virtiofsd mid-session.
     pub fn spawn(&self) -> Result<VirtiofsProcess> {
         let args = self.build_args()?;
-        // The socket may be left over from a crashed session.
-        if self.socket_path.exists() {
-            let _ = fs::remove_file(&self.socket_path);
-        }
+        // The socket may be left over from a crashed session. Refuse to
+        // replace anything that is not a socket instead of deleting it or
+        // letting virtiofsd follow a symlink.
+        InstanceManager::remove_stale_socket(&self.socket_path)?;
         let child = Command::new(&self.binary)
             .args(&args)
             .stdin(Stdio::null())
@@ -115,6 +115,7 @@ impl VirtiofsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::time::Duration;
 
     fn setup() -> (tempfile::TempDir, tempfile::TempDir) {
@@ -213,6 +214,18 @@ mod tests {
             .wait_for_socket(Duration::from_secs(5))
             .expect("noisy virtiofsd should still create its socket");
         process.kill();
+    }
+
+    #[test]
+    fn spawn_refuses_to_replace_a_non_socket_path() {
+        let (project, run) = setup();
+        let socket = run.path().join("fs.sock");
+        fs::write(&socket, b"do not delete").unwrap();
+        let cfg = VirtiofsConfig::new("virtiofsd", project.path(), &socket);
+
+        let err = cfg.spawn().unwrap_err().to_string();
+        assert!(err.contains("not a socket"), "{err}");
+        assert_eq!(fs::read(&socket).unwrap(), b"do not delete");
     }
 
     #[test]

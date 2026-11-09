@@ -59,10 +59,7 @@ impl InstanceManager {
         {
             bail!("no instance session found in {}", paths.run_dir.display());
         }
-        let vm_binary = session
-            .as_ref()
-            .and_then(|session| session.vm_binary.clone())
-            .unwrap_or_else(|| self.config.vm_binary());
+        let vm_binary = self.trusted_vm_binary(session.as_ref().and_then(|s| s.vm_binary.as_ref()));
 
         if let Some(pid) = vm_pid {
             terminate(pid, &vm_binary);

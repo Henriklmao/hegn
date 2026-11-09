@@ -62,7 +62,11 @@ impl Config {
                  (letters, digits, '/', '-', '_' and '.')"
             );
         }
-        if !self.root_device.starts_with("/dev/") || self.root_device.contains(',') {
+        if !self.root_device.starts_with("/dev/")
+            || !self.root_device.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+            })
+        {
             bail!("root_device must be a guest device path such as /dev/vda1");
         }
         // Cloud Hypervisor's CLI packs paths into comma-separated option
@@ -413,11 +417,35 @@ mod tests {
         config.rootfs_url = "http://example.test/rootfs".into();
         assert!(config.validate().is_err(), "rootfs URLs must use https");
 
-        let mut config = base;
+        let mut config = base.clone();
         config.root_device = "/dev/vda,readonly".into();
         assert!(
             config.validate().is_err(),
             "root_device commas are rejected"
+        );
+
+        // Whitespace and shell/kernel metacharacters would append arguments to
+        // the guest kernel command line.
+        for injected in [
+            "/dev/vda1 init=/bin/sh",
+            "/dev/vda1\tro",
+            "/dev/vda1;reboot",
+            "/dev/vda1=",
+            "/dev/vda1\"",
+            "vda1",
+        ] {
+            let mut config = base.clone();
+            config.root_device = injected.into();
+            assert!(
+                config.validate().is_err(),
+                "root_device {injected:?} must be rejected"
+            );
+        }
+        let mut config = base;
+        config.root_device = "/dev/disk/by-label/hegn_root".into();
+        assert!(
+            config.validate().is_ok(),
+            "dots, dashes, underscores and slashes stay valid"
         );
     }
 }

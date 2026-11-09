@@ -323,10 +323,11 @@ impl InstanceManager {
 
         // Stop the old VM, relay and filesystem daemon. The sockets are freed
         // and recreated below with the same paths the snapshot expects.
-        let existing_vm_binary = existing
-            .as_ref()
-            .and_then(|session| session.vm_binary.clone())
-            .unwrap_or_else(|| self.config.vm_binary());
+        let existing_vm_binary = self.trusted_vm_binary(
+            existing
+                .as_ref()
+                .and_then(|session| session.vm_binary.as_ref()),
+        );
         if let Some(session) = &existing {
             terminate(session.vm_pid, &existing_vm_binary);
             terminate_relay(session.relay_pid, &hegn);

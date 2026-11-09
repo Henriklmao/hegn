@@ -7,6 +7,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -74,13 +75,39 @@ impl InstanceManager {
         path.exists() && self.session().is_none()
     }
 
+    /// The binary hegn may use to identify and terminate a recorded VMM.
+    ///
+    /// `session.json` lives in a directory a compromised guest cannot read but
+    /// a local attacker can write, so the recorded path must not become an
+    /// arbitrary process it can point at. Only accept the configured binary
+    /// (or its resolved Cloud Hypervisor form) and fall back to the
+    /// configuration otherwise.
+    fn trusted_vm_binary(&self, recorded: Option<&PathBuf>) -> PathBuf {
+        let configured = self.config.vm_binary();
+        match recorded {
+            Some(path)
+                if *path == configured
+                    || self.config.resolved_cloud_hypervisor().as_deref()
+                        == Some(path.as_path()) =>
+            {
+                path.clone()
+            }
+            _ => configured,
+        }
+    }
+
+    /// Remove a stale socket without deleting a regular file or symlink.
+    ///
+    /// The virtiofs spawner shares this guard so an attacker-controlled
+    /// `socket-path` cannot redirect cleanup at another file.
+    pub(crate) fn remove_stale_socket(path: &Path) -> Result<()> {
+        super::process::remove_socket(path)
+    }
+
     pub fn is_running(&self) -> bool {
         self.session()
             .map(|session| {
-                let binary = session
-                    .vm_binary
-                    .clone()
-                    .unwrap_or_else(|| self.config.vm_binary());
+                let binary = self.trusted_vm_binary(session.vm_binary.as_ref());
                 process_matches(session.vm_pid, &binary)
             })
             .unwrap_or(false)
@@ -152,10 +179,12 @@ mod tests {
     }
 
     #[test]
-    fn running_state_uses_the_recorded_vm_binary() {
+    fn running_state_ignores_a_forged_vm_binary() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
-        config.cloud_hypervisor_bin = PathBuf::from("/definitely/missing/cloud-hypervisor");
+        // The configured binary is this test process; the session record tries
+        // to point the identity check at an unrelated path.
+        config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
         let manager = manager(config, dir.path());
         let paths = manager.paths();
         paths.ensure().unwrap();
@@ -166,7 +195,7 @@ mod tests {
             harness: Harness::Shell,
             started_at: Utc::now(),
             vm_pid: std::process::id(),
-            vm_binary: Some(std::env::current_exe().unwrap()),
+            vm_binary: Some(PathBuf::from("/definitely/missing/cloud-hypervisor")),
             relay_pid: 0,
             virtiofs_pid: 0,
             profile_virtiofs_pid: 0,
@@ -174,6 +203,9 @@ mod tests {
             serial_log: None,
         };
         std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
-        assert!(manager.is_running());
+        assert!(
+            manager.is_running(),
+            "the configured binary must win over the recorded one"
+        );
     }
 }
