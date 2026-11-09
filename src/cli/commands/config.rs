@@ -66,14 +66,25 @@ pub(crate) fn config_command(command: ConfigCommands, config: Config, json: bool
     }
 }
 
+/// Split an `$EDITOR`/`$VISUAL` value into the program and its arguments.
+///
+/// Quoted shell syntax is intentionally no longer interpreted: the value is
+/// split on whitespace and executed directly, never through a shell, so it can
+/// not inject commands. An empty or whitespace-only value yields `None` and the
+/// caller falls back to `vi`.
+fn split_editor(value: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = value.split_whitespace();
+    let program = parts.next()?.to_string();
+    Some((program, parts.map(str::to_string).collect()))
+}
+
 pub(crate) fn run_editor(path: &Path) -> Result<i32> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!("exec {editor} \"$1\""))
-        .arg("hegn-editor")
+    let (program, extra) = split_editor(&editor).unwrap_or_else(|| ("vi".to_string(), Vec::new()));
+    let status = Command::new(&program)
+        .args(&extra)
         .arg(path)
         .status()
         .with_context(|| format!("failed to launch editor '{editor}'"))?;
@@ -83,6 +94,20 @@ pub(crate) fn run_editor(path: &Path) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_editor_separates_program_and_arguments() {
+        let (program, args) = split_editor("code --wait").expect("editor value");
+        assert_eq!(program, "code");
+        assert_eq!(args, ["--wait"]);
+
+        let (program, args) = split_editor("vi").expect("editor value");
+        assert_eq!(program, "vi");
+        assert!(args.is_empty());
+
+        assert!(split_editor("").is_none());
+        assert!(split_editor("   \t ").is_none());
+    }
 
     #[test]
     fn config_init_is_idempotent() {

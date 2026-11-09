@@ -289,6 +289,26 @@ fn connect_backend(path: &Path) -> Result<UnixStream> {
     }
 }
 
+/// RAII guard that temporarily narrows the process umask.
+///
+/// The previous mask is restored on drop, so an early return or panic while
+/// binding can not leave the process with a permissive umask.
+struct UmaskGuard(libc::mode_t);
+
+impl UmaskGuard {
+    fn new(mask: libc::mode_t) -> Self {
+        Self(unsafe { libc::umask(mask) })
+    }
+}
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::umask(self.0);
+        }
+    }
+}
+
 fn bind_frontend(path: &Path) -> Result<UnixListener> {
     remove_stale_socket(path)?;
     if let Some(parent) = path.parent()
@@ -297,6 +317,10 @@ fn bind_frontend(path: &Path) -> Result<UnixListener> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
+    // Create the socket without group/other access from the very first instant.
+    // The guard restores the previous mask on drop (including early returns and
+    // panics); the chmod below stays as belt-and-braces.
+    let _umask = UmaskGuard::new(0o077);
     let listener = UnixListener::bind(path)
         .with_context(|| format!("failed to bind relay socket {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
@@ -359,6 +383,23 @@ mod tests {
         let _old = StdListener::bind(&path).unwrap();
         drop(_old);
         let _listener = bind_frontend(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn socket_is_private_even_with_a_permissive_umask() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.sock");
+
+        // A permissive ambient umask must not leak a wider socket mode in the
+        // window before the explicit chmod runs.
+        let previous = unsafe { libc::umask(0o000) };
+        let listener = bind_frontend(&path);
+        let restored = unsafe { libc::umask(previous) };
+        assert_eq!(restored, 0o000, "bind must restore the previous umask");
+
+        let _listener = listener.unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }

@@ -64,7 +64,19 @@ impl StateStore {
         }
         let raw = serde_json::to_string_pretty(&self.state)?;
         let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, raw).with_context(|| format!("failed to write {}", tmp.display()))?;
+        // A stale temp entry may be a symlink planted by an attacker; removing
+        // the directory entry itself is safe and lets the O_NOFOLLOW write below
+        // create a fresh private regular file instead of following it.
+        match fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to remove stale {}", tmp.display()));
+            }
+        }
+        crate::shared::fs::write_private(&tmp, raw.as_bytes())
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
         fs::rename(&tmp, &self.path)
             .with_context(|| format!("failed to replace {}", self.path.display()))?;
         Ok(())
@@ -173,6 +185,20 @@ mod tests {
             StateStore::load(&path).state().recent[0].path,
             PathBuf::from("/projects/a")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_a_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut store = StateStore::load(&path);
+        store.touch(Path::new("/projects/a")).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "persisted state must be private");
     }
 
     #[test]
