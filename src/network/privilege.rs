@@ -8,7 +8,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
-use super::firewall::{command_exists, detect_host_firewall};
+use super::firewall::{SAFE_PATH, command_exists, detect_host_firewall};
 use super::marker::{ReadyMarker, marker_path, ready_marker, write_marker};
 use super::script::{reload_script, render_command, run_script, setup_script, teardown_script};
 use super::{DNS, MARKER_VERSION, SUBNET, TAP_POOL};
@@ -44,6 +44,10 @@ pub fn setup_with_privilege(user: &str, endpoints: &[u16]) -> Result<()> {
              hegn network setup --user {user}` manually"
         );
     };
+    // Resolve the helper itself through the fixed path; the caller's PATH must
+    // not be able to substitute a different `sudo`/`pkexec`.
+    let helper_path = super::firewall::safe_command_path(helper)
+        .with_context(|| format!("failed to locate {helper} in the fixed root path {SAFE_PATH}"))?;
     let mut args: Vec<OsString> = Vec::new();
     if prefix {
         args.push("--".into());
@@ -59,8 +63,11 @@ pub fn setup_with_privilege(user: &str, endpoints: &[u16]) -> Result<()> {
         "hegn: requesting root privileges; about to run:\n  {}",
         render_command(helper, &args)
     );
-    let status = Command::new(helper)
+    let status = Command::new(&helper_path)
         .args(&args)
+        // The escalated process inherits this PATH; pin it rather than passing
+        // the caller's environment into a root command.
+        .env("PATH", SAFE_PATH)
         .status()
         .with_context(|| format!("failed to run {helper}"))?;
     if !status.success() {
@@ -90,11 +97,16 @@ pub fn ensure_ready(config: &Config) -> Result<()> {
         );
     }
     // A root-owned receipt can outlive its rules; verify the kernel state when
-    // this process is allowed to read it (root-only).
-    if super::firewall::live_guard_status(&expected) == Some(false) {
+    // this process is allowed to read it (root-only). A privileged caller can
+    // always run nft, so an unverifiable guard is not ready; unprivileged
+    // callers keep the root-owned marker as their gate.
+    if !super::firewall::guard_ready_from_status(
+        super::firewall::live_guard_status(&expected),
+        is_privileged(),
+    ) {
         bail!(
-            "the nftables guard is missing or incomplete; re-run `sudo hegn network setup --user \
-             $USER`"
+            "the nftables guard is missing, incomplete, or could not be verified; re-run `sudo \
+             hegn network setup --user $USER`"
         );
     }
     Ok(())
@@ -169,9 +181,14 @@ fn clear_marker() -> Result<()> {
 }
 
 fn ensure_guard_live(endpoints: &[u16], phase: &str) -> Result<()> {
-    if super::firewall::live_guard_status(endpoints) == Some(false) {
+    // setup/reload are root-only, so an unverified guard must never be turned
+    // into a readiness receipt.
+    if !super::firewall::guard_ready_from_status(
+        super::firewall::live_guard_status(endpoints),
+        is_privileged(),
+    ) {
         bail!(
-            "the nftables guard is missing after {phase}; refusing to write {}",
+            "the nftables guard is missing or unverifiable after {phase}; refusing to write {}",
             marker_path().display()
         );
     }
@@ -352,6 +369,13 @@ mod tests {
             return;
         };
         if marker.endpoints.iter().any(|port| *port < 1024) {
+            return;
+        }
+        // A privileged test process must also see a live guard; a host without
+        // the exact table installed is not a valid fixture for this test.
+        if is_privileged()
+            && super::super::firewall::live_guard_status(&marker.endpoints) != Some(true)
+        {
             return;
         }
         let config = Config {

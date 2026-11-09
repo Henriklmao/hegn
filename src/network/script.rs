@@ -28,7 +28,21 @@ pub fn setup_script(user: &str, endpoints: &[u16]) -> Result<String> {
     }
     let mut script = String::from(
         "set -eu\n\
-         sysctl -q -w net.ipv4.ip_forward=1\n\
+         PATH=/usr/sbin:/usr/bin:/sbin:/bin\n\
+         export PATH\n",
+    );
+    script.push_str(&format!("uid=$(id -u {user})\n"));
+    // A TAP's owner can attach to it and inject traffic without
+    // CAP_NET_ADMIN, so ownership must be reconciled on every setup run. The
+    // check is fail-safe: `ip tuntap show` output is free-form, and if it does
+    // not prove that the requested user owns the device we recreate it instead
+    // of keeping a foreign owner.
+    let user_pattern = user.replace('.', "\\.");
+    script.push_str(&format!(
+        "hegn_owner_re=\"(^|[^[:alnum:]_.-])({user_pattern}|$uid)([^[:alnum:]_.-]|\\$)\"\n"
+    ));
+    script.push_str(
+        "sysctl -q -w net.ipv4.ip_forward=1\n\
          install -d -m 0755 /run/hegn\n",
     );
     for index in 0..TAP_POOL {
@@ -36,8 +50,13 @@ pub fn setup_script(user: &str, endpoints: &[u16]) -> Result<String> {
         let addr = host_ip(index);
         let tap_mac = mac(index);
         script.push_str(&format!(
-            "if ! ip link show dev {tap} >/dev/null 2>&1; then\n\
-               ip tuntap add dev {tap} mode tap user {user}\n\
+            "if ip link show dev {tap} >/dev/null 2>&1; then\n\
+             \x20 if ! ip tuntap show dev {tap} 2>/dev/null | grep -Eq \"$hegn_owner_re\"; then\n\
+             \x20   ip link del dev {tap}\n\
+             \x20 fi\n\
+             fi\n\
+             if ! ip link show dev {tap} >/dev/null 2>&1; then\n\
+             \x20 ip tuntap add dev {tap} mode tap user {user}\n\
              fi\n\
              ip link set dev {tap} address {tap_mac}\n\
              ip addr replace {addr}/30 dev {tap}\n\
@@ -52,9 +71,16 @@ pub fn setup_script(user: &str, endpoints: &[u16]) -> Result<String> {
             ));
         }
     }
+    // One nft file is one transaction. `add` makes the delete idempotent and
+    // `table` recreates the guard in the same batch, so a failed apply leaves
+    // the previous table installed. Clearing it in a separate call would open
+    // a window where guests run without the guard while the host-firewall
+    // carve-outs below still accept their traffic.
     script.push_str(
-        "nft delete table inet hegn 2>/dev/null || true\n\
-         nft -f - <<'HEGN_NFT'\n",
+        "# Replace the guard atomically: add+delete+recreate in one nft batch.\n\
+         nft -f - <<'HEGN_NFT'\n\
+         add table inet hegn\n\
+         delete table inet hegn\n",
     );
     script.push_str(&nft_rules(endpoints));
     script.push_str("HEGN_NFT\n");
@@ -74,7 +100,11 @@ pub fn reload_script(endpoints: &[u16]) -> Result<String> {
     let mut endpoints = endpoints.to_vec();
     endpoints.sort_unstable();
     endpoints.dedup();
-    let mut script = String::from("set -eu\n");
+    let mut script = String::from(
+        "set -eu\n\
+         PATH=/usr/sbin:/usr/bin:/sbin:/bin\n\
+         export PATH\n",
+    );
     // DNAT to 127.0.0.1 needs route_localnet; turn it off again when the last
     // endpoint is removed.
     let route_localnet = if endpoints.is_empty() { 0 } else { 1 };
@@ -84,9 +114,13 @@ pub fn reload_script(endpoints: &[u16]) -> Result<String> {
             tap_name(index)
         ));
     }
+    // Same single-transaction replacement as setup: a broken reload must leave
+    // the running guard in place rather than removing it and failing to re-add.
     script.push_str(
-        "nft delete table inet hegn 2>/dev/null || true\n\
-         nft -f - <<'HEGN_NFT'\n",
+        "# Replace the guard atomically: add+delete+recreate in one nft batch.\n\
+         nft -f - <<'HEGN_NFT'\n\
+         add table inet hegn\n\
+         delete table inet hegn\n",
     );
     script.push_str(&nft_rules(&endpoints));
     script.push_str("HEGN_NFT\n");
@@ -94,7 +128,12 @@ pub fn reload_script(endpoints: &[u16]) -> Result<String> {
 }
 
 pub fn teardown_script() -> String {
-    let mut script = String::from("nft delete table inet hegn 2>/dev/null || true\n");
+    let mut script = String::from(
+        "set -eu\n\
+         PATH=/usr/sbin:/usr/bin:/sbin:/bin\n\
+         export PATH\n\
+         nft delete table inet hegn 2>/dev/null || true\n",
+    );
     for index in 0..TAP_POOL {
         script.push_str(&format!(
             "ip link del dev {} 2>/dev/null || true\n",
@@ -107,7 +146,9 @@ pub fn teardown_script() -> String {
 }
 
 pub(super) fn run_script(script: &str) -> Result<()> {
-    let output = Command::new("sh")
+    // Absolute shell: the privileged caller's PATH must not choose the
+    // interpreter that parses the root script.
+    let output = Command::new("/bin/sh")
         .arg("-c")
         .arg(script)
         .stdin(Stdio::null())
@@ -213,7 +254,7 @@ mod tests {
     #[test]
     fn reload_script_replaces_only_the_rules() {
         let script = reload_script(&[11434]).unwrap();
-        assert!(script.contains("nft delete table inet hegn"), "{script}");
+        assert!(script.contains("delete table inet hegn"), "{script}");
         assert!(script.contains("elements = { 11434 }"), "{script}");
         assert!(script.contains("route_localnet=1"), "{script}");
         assert!(script.contains("tcp dport { 80, 443 } accept"), "{script}");
@@ -357,13 +398,19 @@ mod tests {
 
     #[test]
     fn setup_script_embeds_only_the_validated_user_name() {
-        let user = "_alice-1.2";
+        let user = "_alice-1";
         let script = setup_script(user, &[]).unwrap();
+        // One `id -u` lookup, one ownership-regex occurrence and the owner on
+        // every `ip tuntap add` line.
         assert_eq!(
             script.matches(user).count(),
-            TAP_POOL as usize,
-            "the user name belongs only on the tuntap lines"
+            2 + TAP_POOL as usize,
+            "the user name belongs only on the validated ownership lines"
         );
+        // A dot is the only regex metacharacter `safe_user` allows; it must be
+        // escaped so the ownership probe cannot match a foreign user.
+        let dotted = setup_script("alice.b", &[]).unwrap();
+        assert!(dotted.contains("(alice\\.b|$uid)"), "{dotted}");
         for index in 0..TAP_POOL {
             assert!(script.contains(&format!(
                 "ip tuntap add dev {} mode tap user {user}",
@@ -410,19 +457,76 @@ mod tests {
     }
 
     #[test]
-    fn setup_script_installs_the_guard_after_removing_the_old_table() {
+    fn setup_script_replaces_the_guard_in_one_atomic_nft_transaction() {
         let script = setup_script("alice", &[]).unwrap();
         assert!(script.starts_with("set -eu\n"), "{script}");
         assert!(script.contains("sysctl -q -w net.ipv4.ip_forward=1"));
-        let delete = script.find("nft delete table inet hegn").unwrap();
         let heredoc = script.find("nft -f - <<'HEGN_NFT'").unwrap();
-        let close = script.find("\nHEGN_NFT\n").unwrap();
+        let body = &script[heredoc..];
+        let add = body.find("add table inet hegn\n").unwrap();
+        let delete = body.find("delete table inet hegn\n").unwrap();
+        let table = body.find("table inet hegn {\n").unwrap();
         assert!(
-            delete < heredoc && heredoc < close,
-            "rules must be replaced atomically through one heredoc:\n{script}"
+            add < delete && delete < table,
+            "add+delete+recreate must be one idempotent batch:\n{script}"
         );
         assert_eq!(script.matches("HEGN_NFT").count(), 2);
         assert_eq!(script.matches("nft -f -").count(), 1);
+        // No separate transaction may clear the table first: that window is
+        // the fail-open state this batch prevents.
+        assert!(
+            !script.contains("nft delete table inet hegn 2>/dev/null || true"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn reload_script_replaces_the_guard_in_one_atomic_nft_transaction() {
+        let script = reload_script(&[]).unwrap();
+        let heredoc = script.find("nft -f - <<'HEGN_NFT'").unwrap();
+        let body = &script[heredoc..];
+        let add = body.find("add table inet hegn\n").unwrap();
+        let delete = body.find("delete table inet hegn\n").unwrap();
+        let table = body.find("table inet hegn {\n").unwrap();
+        assert!(add < delete && delete < table, "{script}");
+        assert_eq!(script.matches("nft -f -").count(), 1);
+        assert!(!script.contains("nft delete table inet hegn 2>/dev/null || true"));
+    }
+
+    #[test]
+    fn every_privileged_script_pins_a_safe_path() {
+        for script in [
+            setup_script("alice", &[]).unwrap(),
+            reload_script(&[]).unwrap(),
+            teardown_script(),
+        ] {
+            assert!(
+                script.contains("PATH=/usr/sbin:/usr/bin:/sbin:/bin\nexport PATH\n"),
+                "missing fixed PATH:\n{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_reconciles_tap_ownership_before_reusing_a_device() {
+        let script = setup_script("alice", &[]).unwrap();
+        assert!(script.contains("uid=$(id -u alice)\n"), "{script}");
+        assert!(
+            script
+                .contains("hegn_owner_re=\"(^|[^[:alnum:]_.-])(alice|$uid)([^[:alnum:]_.-]|\\$)\""),
+            "{script}"
+        );
+        for index in 0..TAP_POOL {
+            let tap = tap_name(index);
+            assert!(
+                script.contains(&format!("ip tuntap show dev {tap} 2>/dev/null | grep -Eq")),
+                "missing ownership probe for {tap}:\n{script}"
+            );
+            assert!(
+                script.contains(&format!("ip link del dev {tap}\n")),
+                "a foreign owner must replace {tap}:\n{script}"
+            );
+        }
     }
 
     #[test]

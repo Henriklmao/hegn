@@ -154,8 +154,10 @@ fn try_claim(config: &Config, index: u8, instance: &str) -> Result<Option<Lease>
         && owner != instance
     {
         // A live hegn process may still be booting the owner VM, before its
-        // session record exists. A live VM is equally authoritative.
-        if crate::vm::instance::process_alive(pid) || instance_is_running(config, &owner) {
+        // session record exists. A live VM is equally authoritative. The pid
+        // alone is not proof: it may have been recycled by an unrelated
+        // process, so require it to still execute the hegn binary.
+        if owner_process_alive(pid) || instance_is_running(config, &owner) {
             return Ok(None);
         }
         // A crashed hegn process and a stopped VM left the reservation behind.
@@ -191,6 +193,15 @@ pub fn release(config: &Config, instance: &str) {
             let _ = fs::remove_file(&path);
         }
     }
+}
+
+/// Whether the recorded owner pid is still the hegn process that wrote the
+/// file. A recycled pid running any other program must not pin the slice.
+fn owner_process_alive(pid: u32) -> bool {
+    let Ok(binary) = std::env::current_exe() else {
+        return false;
+    };
+    crate::vm::instance::process_matches(pid, &binary)
 }
 
 pub fn instance_is_running(config: &Config, instance: &str) -> bool {
@@ -363,6 +374,27 @@ mod tests {
             "a live owner must win the reservation"
         );
         assert_eq!(owner_file(&config, 2), live, "live owner must be untouched");
+    }
+
+    #[test]
+    fn try_claim_reclaims_a_slice_pinned_by_a_recycled_pid() {
+        let (_dir, config) = test_config();
+        fs::create_dir_all(network_dir(&config)).unwrap();
+        // The pid is alive but runs a different executable: pid reuse must not
+        // keep the reservation alive after the hegn process exited.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep must be available");
+        write_private(&owner_path(&config, 4), format!("other\n{}\n", child.id())).unwrap();
+
+        let lease = try_claim(&config, 4, "demo")
+            .expect("a recycled pid must not block the slice")
+            .expect("the slice must be reclaimed");
+        assert_eq!(lease.index, 4);
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

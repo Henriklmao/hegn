@@ -71,7 +71,13 @@ pub fn guard_ready(config: &Config) -> bool {
     {
         return false;
     }
-    super::firewall::live_guard_status(&endpoints).unwrap_or(true)
+    // A privileged caller can always inspect nftables, so an unverifiable
+    // guard must fail closed. Unprivileged callers keep the root-owned marker
+    // as their only gate.
+    super::firewall::guard_ready_from_status(
+        super::firewall::live_guard_status(&endpoints),
+        super::privilege::is_privileged(),
+    )
 }
 
 /// The marker is deliberately world-readable: the unprivileged TUI reads it to
@@ -269,9 +275,23 @@ mod tests {
             .as_ref()
             .is_some_and(|marker| marker.endpoints == config.endpoint_ports());
 
-        assert_eq!(guard_ready(&config), endpoints_match && all_taps_exist);
+        let expected = endpoints_match
+            && all_taps_exist
+            && super::super::firewall::guard_ready_from_status(
+                super::super::firewall::live_guard_status(&config.endpoint_ports()),
+                super::super::privilege::is_privileged(),
+            );
+        assert_eq!(guard_ready(&config), expected);
         if marker.is_none() {
             assert!(!guard_ready(&config), "no marker means not ready");
         }
+    }
+
+    #[test]
+    fn privileged_callers_fail_closed_when_the_live_guard_cannot_be_verified() {
+        // `guard_ready_from_status` owns this policy; keep the marker-side
+        // behavior explicit so a future refactor cannot silently fail open.
+        assert!(!super::super::firewall::guard_ready_from_status(None, true));
+        assert!(super::super::firewall::guard_ready_from_status(None, false));
     }
 }

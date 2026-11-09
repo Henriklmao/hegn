@@ -3,9 +3,15 @@
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use super::addressing::{host_ip, tap_name};
+use super::addressing::{guest_ip, host_ip, tap_name};
 use super::{DNS, TAP_POOL};
+
+/// Fixed `PATH` for every privileged command. root must never resolve `sh`,
+/// `ip`, `nft`, `sysctl`, `ufw`, `firewall-cmd` or `iptables` through an
+/// inherited, user-controlled `PATH`.
+pub(super) const SAFE_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Host firewalls that filter the netfilter `forward` hook in their own base
 /// chain. Recorded in the marker for `doctor`/`status` output only; the setup
@@ -64,15 +70,23 @@ pub fn detect_host_firewall() -> HostFirewall {
     HostFirewall::None
 }
 
+/// Absolute path of `name` inside [`SAFE_PATH`], bypassing the caller's PATH.
+pub(super) fn safe_command_path(name: &str) -> Option<std::path::PathBuf> {
+    std::env::split_paths(SAFE_PATH)
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+}
+
 pub(super) fn command_exists(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
-        .unwrap_or(false)
+    // Search the same fixed path the spawned commands run with, so detection
+    // cannot be influenced by the caller's environment.
+    safe_command_path(name).is_some()
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(program)
         .args(args)
+        .env("PATH", SAFE_PATH)
         .stdin(Stdio::null())
         .output()
         .ok()?;
@@ -94,6 +108,7 @@ pub fn live_guard_status(endpoints: &[u16]) -> Option<bool> {
     }
     let output = Command::new("nft")
         .args(["-j", "list", "table", "inet", "hegn"])
+        .env("PATH", SAFE_PATH)
         .stdin(Stdio::null())
         .output()
         .ok()?;
@@ -106,21 +121,103 @@ pub fn live_guard_status(endpoints: &[u16]) -> Option<bool> {
     ))
 }
 
+/// Resolve a live-guard probe for readiness.
+///
+/// Unprivileged callers cannot read nftables, so the root-owned marker is the
+/// gate and `None` is acceptable. A privileged caller can always run `nft`, so
+/// an unverifiable guard must fail closed instead of being treated as ready.
+pub(super) fn guard_ready_from_status(status: Option<bool>, privileged: bool) -> bool {
+    match status {
+        Some(live) => live,
+        None => !privileged,
+    }
+}
+
+/// The `match` expression for `field`, as `(operator, right-hand side)`.
+///
+/// `nft -j` stores the matched key either under `meta` (`iifname`, `nfproto`)
+/// or under `payload` (`saddr`, `daddr`). Rule ordering in the JSON is not
+/// meaningful; callers rely on handles for sequencing.
+fn find_match<'a>(expr: &'a Value, field: &str) -> Option<(&'a str, &'a Value)> {
+    for item in expr.as_array()? {
+        let Some(m) = item.get("match") else {
+            continue;
+        };
+        let Some(left) = m.get("left") else {
+            continue;
+        };
+        let key = left
+            .get("meta")
+            .and_then(|meta| meta.get("key"))
+            .or_else(|| left.get("payload").and_then(|payload| payload.get("field")))
+            .and_then(|key| key.as_str());
+        if key == Some(field) {
+            let op = m.get("op").and_then(|op| op.as_str()).unwrap_or_default();
+            return Some((op, m.get("right").unwrap_or(&Value::Null)));
+        }
+    }
+    None
+}
+
+/// Render a `nft -j` right-hand side as text.
+///
+/// nft uses a plain string for host addresses and set references, but renders a
+/// network as `{"prefix": {"addr": "10.213.0.0", "len": 24}}`.
+fn value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(value_text)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        Value::Object(map) => {
+            let prefix = map.get("prefix")?;
+            let addr = prefix.get("addr")?.as_str()?;
+            let len = prefix.get("len")?.as_u64()?;
+            Some(format!("{addr}/{len}"))
+        }
+        _ => None,
+    }
+}
+
+fn match_text(expr: &Value, field: &str) -> Option<String> {
+    find_match(expr, field).and_then(|(_, right)| value_text(right))
+}
+
+/// Whether the rule has a `drop` or `accept` verdict expression.
+fn has_verdict(expr: &Value, verdict: &str) -> bool {
+    expr.as_array()
+        .is_some_and(|items| items.iter().any(|item| item.get(verdict).is_some()))
+}
+
+fn min_handle(slot: &mut Option<u64>, handle: u64) {
+    *slot = Some(slot.map_or(handle, |current| current.min(handle)));
+}
+
 /// Validate `nft -j list table inet hegn` output against the guard layout.
+///
+/// The verifier is deliberately structural rather than count-based: nft JSON
+/// ordering is not guaranteed, and a stale table can still have the same number
+/// of rules. It checks every per-interface source drop, the semantic anchors
+/// (IPv6/private drops, egress log-drop, input catch-all, masquerade) and the
+/// relative order of drops and accepts via nft handles.
 fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
         return false;
     };
     let Some(items) = value.get("nftables").and_then(|items| items.as_array()) else {
         return false;
     };
     let mut has_table = false;
-    let mut forward_rules = 0usize;
-    let mut has_egress_drop = false;
     let mut has_input_drop = false;
     let mut has_masquerade = false;
     let mut endpoint_elements: Option<Vec<u64>> = None;
-    for item in items {
+    let mut forward_rules: Vec<(u64, Value)> = Vec::new();
+    for (position, item) in items.iter().enumerate() {
         if let Some(table) = item.get("table")
             && table.get("family").and_then(|v| v.as_str()) == Some("inet")
             && table.get("name").and_then(|v| v.as_str()) == Some("hegn")
@@ -142,29 +239,86 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
                 .get("chain")
                 .and_then(|chain| chain.as_str())
                 .unwrap_or_default();
-            let expr = rule
-                .get("expr")
-                .map(|expr| expr.to_string())
-                .unwrap_or_default();
+            let handle = rule
+                .get("handle")
+                .and_then(|handle| handle.as_u64())
+                .unwrap_or(position as u64);
+            let expr = rule.get("expr").cloned().unwrap_or(Value::Null);
             match chain {
-                "forward" => {
-                    forward_rules += 1;
-                    if expr.contains("hegn-egress-drop") && expr.contains("\"drop\"") {
-                        has_egress_drop = true;
-                    }
-                }
+                "forward" => forward_rules.push((handle, expr)),
                 "input" => {
-                    if expr.contains("\"drop\"") {
+                    // `iifname @hegn_ifaces counter drop` is the host-input
+                    // catch-all; endpoint DNAT accepts sit before it.
+                    if has_verdict(&expr, "drop")
+                        && match_text(&expr, "iifname").as_deref() == Some("@hegn_ifaces")
+                    {
                         has_input_drop = true;
                     }
                 }
-                "postrouting" if expr.contains("masquerade") => {
+                "postrouting" if has_verdict(&expr, "masquerade") => {
                     has_masquerade = true;
                 }
                 _ => {}
             }
         }
     }
+
+    let mut seen_sources = std::collections::BTreeSet::new();
+    let mut source_drop_handles = Vec::new();
+    let mut first_accept: Option<u64> = None;
+    let mut ipv6_drop: Option<u64> = None;
+    let mut private_drop: Option<u64> = None;
+    let mut egress_drop: Option<u64> = None;
+    let mut inbound_accept: Option<u64> = None;
+    let mut inbound_drop: Option<u64> = None;
+    for (handle, expr) in &forward_rules {
+        let drop = has_verdict(expr, "drop");
+        let accept = has_verdict(expr, "accept");
+        if accept {
+            min_handle(&mut first_accept, *handle);
+        }
+        let iface = match_text(expr, "iifname");
+        let saddr = find_match(expr, "saddr").and_then(|(op, right)| {
+            // Only the inverted per-interface source drop is the guard.
+            (op == "!=")
+                .then(|| value_text(right))
+                .flatten()
+                .map(|right| right.trim_end_matches("/32").to_owned())
+        });
+        if drop
+            && let Some(iface) = &iface
+            && let Some(saddr) = &saddr
+        {
+            source_drop_handles.push(*handle);
+            for index in 0..TAP_POOL {
+                if iface == &tap_name(index) && saddr == &guest_ip(index).to_string() {
+                    seen_sources.insert(index);
+                }
+            }
+        }
+        if drop
+            && find_match(expr, "nfproto")
+                .and_then(|(_, right)| right.as_str())
+                .is_some_and(|proto| proto == "ipv6")
+        {
+            min_handle(&mut ipv6_drop, *handle);
+        }
+        let text = expr.to_string();
+        if drop && text.contains("private_v4") {
+            min_handle(&mut private_drop, *handle);
+        }
+        if drop && text.contains("hegn-egress-drop") {
+            min_handle(&mut egress_drop, *handle);
+        }
+        if match_text(expr, "daddr").as_deref() == Some("10.213.0.0/24") {
+            if accept {
+                min_handle(&mut inbound_accept, *handle);
+            } else if drop {
+                min_handle(&mut inbound_drop, *handle);
+            }
+        }
+    }
+
     let mut expected: Vec<u64> = endpoints.iter().map(|port| u64::from(*port)).collect();
     expected.sort_unstable();
     expected.dedup();
@@ -176,15 +330,29 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
         }
         None => expected.is_empty(),
     };
-    // The guard's forward chain has ten rules (source/private/IPv6 drops,
-    // conntrack, 80/443, two DNS rules, rate-limited log-drop and the inbound
-    // pair). Requiring all of them makes a partial flush visible.
+    let early_drops: Vec<u64> = source_drop_handles
+        .iter()
+        .copied()
+        .chain(ipv6_drop)
+        .chain(private_drop)
+        .collect();
+    let early_drops_precede_accepts = first_accept.is_some_and(|accept| {
+        early_drops.iter().all(|handle| *handle < accept)
+            && egress_drop.is_some_and(|handle| handle > accept)
+    });
+    let inbound_order = matches!(
+        (inbound_accept, inbound_drop),
+        (Some(accept), Some(drop)) if accept < drop
+    );
     has_table
-        && forward_rules >= 10
-        && has_egress_drop
+        && seen_sources.len() == TAP_POOL as usize
+        && ipv6_drop.is_some()
+        && private_drop.is_some()
         && has_input_drop
         && has_masquerade
         && endpoints_match
+        && early_drops_precede_accepts
+        && inbound_order
 }
 
 /// nftables rules. Public HTTP(S) and public DNS only; everything else from a
@@ -274,9 +442,19 @@ pub fn nft_rules(endpoints: &[u16]) -> String {
         "\x20   iifname @hegn_ifaces counter drop\n\
          \x20 }\n\
          \x20 chain forward {\n\
-         \x20   type filter hook forward priority filter; policy accept;\n\
-         \x20   iifname @hegn_ifaces ip saddr != 10.213.0.0/24 counter drop\n\
-         \x20   iifname @hegn_ifaces meta nfproto ipv6 counter drop\n\
+         \x20   type filter hook forward priority filter; policy accept;\n",
+    );
+    // Scope each guest to its own address. A pool-wide source check would let
+    // one guest spoof another guest's `/30` address and inherit its slice.
+    for index in 0..TAP_POOL {
+        rules.push_str(&format!(
+            "\x20   iifname \"{}\" ip saddr != {}/32 counter drop\n",
+            tap_name(index),
+            guest_ip(index)
+        ));
+    }
+    rules.push_str(
+        "\x20   iifname @hegn_ifaces meta nfproto ipv6 counter drop\n\
          \x20   iifname @hegn_ifaces ip daddr @private_v4 counter drop\n\
          \x20   iifname @hegn_ifaces ct state established,related accept\n\
          \x20   iifname @hegn_ifaces ip protocol tcp tcp dport { 80, 443 } accept\n\
@@ -393,6 +571,7 @@ pub(super) fn host_firewall_cleanup() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn nft_rules_block_private_ranges_and_allow_web_only() {
@@ -749,6 +928,7 @@ mod tests {
     }
 
     /// Minimal `nft -j` shape for a healthy guard with `endpoints` exposed.
+    /// Handles increase in rule order, exactly like the kernel's handles.
     fn live_fixture(endpoints: &[u16]) -> serde_json::Value {
         use serde_json::json;
 
@@ -759,29 +939,131 @@ mod tests {
             json!({"chain": {"family": "inet", "table": "hegn", "name": "input"}}),
             json!({"chain": {"family": "inet", "table": "hegn", "name": "postrouting"}}),
         ];
-        for handle in 0..10 {
-            let expr = if handle == 7 {
-                json!([
-                    {"counter": null},
-                    {"log": {"prefix": "hegn-egress-drop "}},
-                    {"drop": null}
-                ])
-            } else {
-                json!([{"counter": null}])
+        let mut handle = 0u64;
+        let mut push =
+            |items: &mut Vec<serde_json::Value>, chain: &str, expr: serde_json::Value| {
+                items.push(json!({"rule": {
+                    "family": "inet", "table": "hegn", "chain": chain,
+                    "handle": handle, "expr": expr
+                }}));
+                handle += 1;
             };
-            items.push(json!({"rule": {
-                "family": "inet", "table": "hegn", "chain": "forward",
-                "handle": handle, "expr": expr
-            }}));
+        for index in 0..TAP_POOL {
+            push(
+                &mut items,
+                "forward",
+                json!([
+                    {"match": {"op": "==", "left": {"meta": {"key": "iifname"}},
+                     "right": tap_name(index)}},
+                    {"match": {"op": "!=",
+                     "left": {"payload": {"protocol": "ip", "field": "saddr"}},
+                     "right": guest_ip(index).to_string()}},
+                    {"counter": null},
+                    {"drop": null}
+                ]),
+            );
         }
-        items.push(json!({"rule": {
-            "family": "inet", "table": "hegn", "chain": "input",
-            "handle": 100, "expr": [{"drop": null}]
-        }}));
-        items.push(json!({"rule": {
-            "family": "inet", "table": "hegn", "chain": "postrouting",
-            "handle": 101, "expr": [{"masquerade": null}]
-        }}));
+        push(
+            &mut items,
+            "forward",
+            json!([
+                {"match": {"op": "==", "left": {"meta": {"key": "nfproto"}}, "right": "ipv6"}},
+                {"counter": null},
+                {"drop": null}
+            ]),
+        );
+        push(
+            &mut items,
+            "forward",
+            json!([
+                {"match": {"op": "==",
+                 "left": {"payload": {"protocol": "ip", "field": "daddr"}},
+                 "right": "@private_v4"}},
+                {"counter": null},
+                {"drop": null}
+            ]),
+        );
+        push(
+            &mut items,
+            "forward",
+            json!([
+                {"match": {"op": "in", "left": {"ct": {"key": "state"}},
+                 "right": ["established", "related"]}},
+                {"counter": null},
+                {"accept": null}
+            ]),
+        );
+        push(
+            &mut items,
+            "forward",
+            json!([
+                {"match": {"op": "==",
+                 "left": {"payload": {"protocol": "tcp", "field": "dport"}},
+                 "right": [80, 443]}},
+                {"counter": null},
+                {"accept": null}
+            ]),
+        );
+        for protocol in ["tcp", "udp"] {
+            push(
+                &mut items,
+                "forward",
+                json!([
+                    {"match": {"op": "==",
+                     "left": {"payload": {"protocol": protocol, "field": "dport"}},
+                     "right": 53}},
+                    {"match": {"op": "==",
+                     "left": {"payload": {"protocol": "ip", "field": "daddr"}},
+                     "right": "@web_dns"}},
+                    {"counter": null},
+                    {"accept": null}
+                ]),
+            );
+        }
+        push(
+            &mut items,
+            "forward",
+            json!([
+                {"counter": null},
+                {"limit": {"rate": 10, "burst": 20}},
+                {"log": {"prefix": "hegn-egress-drop "}},
+                {"drop": null}
+            ]),
+        );
+        push(
+            &mut items,
+            "forward",
+            json!([
+                {"match": {"op": "==",
+                 "left": {"payload": {"protocol": "ip", "field": "daddr"}},
+                 "right": {"prefix": {"addr": "10.213.0.0", "len": 24}}}},
+                {"match": {"op": "in", "left": {"ct": {"key": "state"}},
+                 "right": ["established", "related"]}},
+                {"accept": null}
+            ]),
+        );
+        push(
+            &mut items,
+            "forward",
+            json!([
+                {"match": {"op": "==",
+                 "left": {"payload": {"protocol": "ip", "field": "daddr"}},
+                 "right": {"prefix": {"addr": "10.213.0.0", "len": 24}}}},
+                {"counter": null},
+                {"drop": null}
+            ]),
+        );
+        push(
+            &mut items,
+            "input",
+            json!([
+                {"match": {"op": "==", "left": {"meta": {"key": "iifname"}},
+                 "right": "@hegn_ifaces"}},
+                {"counter": null},
+                {"drop": null}
+            ]),
+        );
+        push(&mut items, "postrouting", json!([{"masquerade": null}]));
         if !endpoints.is_empty() {
             let mut ports = endpoints.to_vec();
             ports.sort_unstable();
@@ -829,6 +1111,100 @@ mod tests {
             }
         }
         assert!(!parse_live_guard(&missing_drop.to_string(), &[]));
+    }
+
+    #[test]
+    fn forward_source_drops_are_scoped_to_each_guests_own_slice() {
+        let rules = nft_rules(&[]);
+        for index in 0..TAP_POOL {
+            let expected = format!(
+                "iifname \"{}\" ip saddr != {}/32 counter drop",
+                tap_name(index),
+                guest_ip(index)
+            );
+            assert!(rules.contains(&expected), "missing {expected}:\n{rules}");
+        }
+        // The old pool-wide check would accept a guest using another slice.
+        assert!(
+            !rules.contains("iifname @hegn_ifaces ip saddr != 10.213.0.0/24"),
+            "{rules}"
+        );
+    }
+
+    #[test]
+    fn live_guard_requires_every_per_interface_source_drop() {
+        let mut missing = live_fixture(&[]);
+        let items = missing["nftables"].as_array_mut().unwrap();
+        let position = items
+            .iter()
+            .position(|item| {
+                item.get("rule").is_some_and(|rule| {
+                    rule["expr"]
+                        .to_string()
+                        .contains(&format!("\"{}\"", tap_name(7)))
+                })
+            })
+            .expect("fixture must contain the hegn7 source drop");
+        items.remove(position);
+        assert!(
+            !parse_live_guard(&missing.to_string(), &[]),
+            "a missing per-interface source drop must be rejected"
+        );
+
+        // A rule that lets hegn7 use another guest's address is not a guard.
+        let mut wrong_peer = live_fixture(&[]);
+        for item in wrong_peer["nftables"].as_array_mut().unwrap() {
+            let Some(rule) = item.get_mut("rule") else {
+                continue;
+            };
+            if rule["chain"] == "forward" && rule["expr"].to_string().contains(tap_name(7).as_str())
+            {
+                rule["expr"][1]["match"]["right"] = json!(guest_ip(8).to_string());
+            }
+        }
+        assert!(!parse_live_guard(&wrong_peer.to_string(), &[]));
+    }
+
+    #[test]
+    fn live_guard_tolerates_nft_json_ordering() {
+        let mut reordered = live_fixture(&[11434]);
+        reordered["nftables"].as_array_mut().unwrap().reverse();
+        assert!(parse_live_guard(&reordered.to_string(), &[11434]));
+    }
+
+    #[test]
+    fn live_guard_rejects_old_pool_wide_source_rule() {
+        // The previous guard had one `iifname @hegn_ifaces ip saddr !=
+        // 10.213.0.0/24` rule instead of per-interface drops.
+        let mut fixture = live_fixture(&[]);
+        for item in fixture["nftables"].as_array_mut().unwrap() {
+            let Some(rule) = item.get_mut("rule") else {
+                continue;
+            };
+            if rule["chain"] == "forward"
+                && rule["expr"].to_string().contains("saddr")
+                && rule["expr"].to_string().contains("hegn0")
+            {
+                rule["expr"][0]["match"]["right"] = json!("@hegn_ifaces");
+                rule["expr"][1]["match"]["right"] = json!("10.213.0.0/24");
+            }
+        }
+        assert!(!parse_live_guard(&fixture.to_string(), &[]));
+    }
+
+    #[test]
+    fn unverified_guard_fails_closed_for_privileged_callers() {
+        assert!(guard_ready_from_status(Some(true), true));
+        assert!(!guard_ready_from_status(Some(false), true));
+        assert!(
+            !guard_ready_from_status(None, true),
+            "root can always run nft; an unverified guard is not ready"
+        );
+        // Unprivileged callers cannot inspect nftables; the root-owned marker
+        // remains the gate.
+        assert!(guard_ready_from_status(Some(true), false));
+        assert!(!guard_ready_from_status(Some(false), false));
+        assert!(guard_ready_from_status(None, false));
     }
 
     #[test]
