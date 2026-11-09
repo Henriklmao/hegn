@@ -184,9 +184,9 @@ fn snapshot_worktree(path: &Path, label: &str) -> Result<String> {
         // Neutralise every filter driver declared in the repository/global
         // configuration. The repository controls both `.gitattributes` and
         // `filter.<name>.clean`, so `git add` would otherwise execute arbitrary
-        // host code. `/bin/cat` keeps the blob content unchanged; a driver that
-        // really needs a process filter degrades to a warning/failure but can
-        // never run the repository's command.
+        // host code. `/bin/cat` keeps the blob content unchanged; the process
+        // driver is emptied so it can never spawn, and no filter command from
+        // the repository runs.
         let overrides = filter_config_overrides(path)?;
         git_stdout(path, &["add", "-A"], Some(&index), &overrides)?;
         // `write-tree` can re-run the clean filter while hashing the index, so
@@ -248,14 +248,21 @@ fn filter_config_overrides(path: &Path) -> Result<Vec<(String, String)>> {
         let Some(key) = line.split_whitespace().next() else {
             continue;
         };
-        let value =
-            if key.ends_with(".clean") || key.ends_with(".smudge") || key.ends_with(".process") {
-                "/bin/cat"
-            } else if key.ends_with(".required") {
-                "false"
-            } else {
-                continue;
-            };
+        // `.clean`/`.smudge` become a pass-through so the captured blob is the
+        // literal working-tree content. `.process` is emptied rather than
+        // replaced: an empty command makes git skip the multi-file filter and
+        // fall back to the clean/smudge pair, whereas pointing it at `/bin/cat`
+        // would still spawn a subprocess that fails the process handshake
+        // (stderr noise and a fragile cross-version fallback).
+        let value = if key.ends_with(".clean") || key.ends_with(".smudge") {
+            "/bin/cat"
+        } else if key.ends_with(".process") {
+            ""
+        } else if key.ends_with(".required") {
+            "false"
+        } else {
+            continue;
+        };
         // Re-pass the key verbatim so a subsection's case is preserved.
         overrides.push((key.to_string(), value.to_string()));
     }
@@ -618,6 +625,51 @@ mod tests {
             blob.trim(),
             "modified",
             "/bin/cat must pass content through"
+        );
+    }
+
+    #[test]
+    fn checkpoint_does_not_run_process_filters_and_keeps_content() {
+        let _guard = checkpoint_guard();
+        let repo = git_repo();
+        std::fs::write(repo.path().join("keep.txt"), "original").unwrap();
+        commit_all(repo.path(), "init");
+
+        let marker = repo.path().join("process-ran");
+        let script = repo.path().join("process.sh");
+        write_script(
+            &script,
+            &format!("#!/bin/sh\necho ran > '{}'\ncat\n", marker.display()),
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["config", "filter.evil.process"])
+                .arg(&script)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(repo.path().join(".gitattributes"), "*.txt filter=evil\n").unwrap();
+        std::fs::write(repo.path().join("keep.txt"), "modified").unwrap();
+
+        let branch = create_checkpoint(repo.path(), "before process").unwrap();
+        assert!(
+            !marker.exists(),
+            "the process filter declared by the repository must not run"
+        );
+        let blob = git_stdout(
+            repo.path(),
+            &["show", &format!("{branch}:keep.txt")],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            blob.trim(),
+            "modified",
+            "the emptied process driver must fall back to the /bin/cat pass-through"
         );
     }
 
