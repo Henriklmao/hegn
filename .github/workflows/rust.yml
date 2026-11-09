@@ -4,13 +4,10 @@ on:
   push:
   pull_request:
 
-# One run per ref at a time. A newer push/PR queues behind the running check
-# instead of cancelling it, so every started run finishes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
-# Read-only by default; only the release job widens it.
 permissions:
   contents: read
 
@@ -24,10 +21,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0 # Holt die gesamte Historie für die Commit-Schleife
 
-    # The toolchain is pinned so a new stable clippy cannot break a commit that
-    # was green before (clippy 1.99 added needless_borrows_for_generic_args).
-    # Bump deliberately; the action itself is pinned to a commit SHA.
     - name: Install Rust Toolchain
       uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
       with:
@@ -37,14 +33,34 @@ jobs:
     - name: Cache cargo
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-    - name: Format check
-      run: cargo fmt --check
+    - name: Run checks and tests on each commit
+      run: |
+        ORIGINAL_SHA=$(git rev-parse HEAD)
 
-    - name: Clippy
-      run: cargo clippy --all-targets -- -D warnings
+        BEFORE=""
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          BEFORE="${{ github.event.pull_request.base.sha }}"
+        elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+          BEFORE="${{ github.event.before }}"
+        fi
 
-    - name: Run tests
-      run: cargo test --verbose
+        if [ -n "$BEFORE" ] && git merge-base --is-ancestor "$BEFORE" HEAD 2>/dev/null; then
+          COMMITS=$(git rev-list --reverse ${BEFORE}..HEAD)
+        else
+          COMMITS="$ORIGINAL_SHA"
+        fi
+
+        for commit in $COMMITS; do
+          echo "::group::Testing commit $commit"
+          git checkout --detach "$commit"
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --verbose
+          echo "::endgroup::"
+        done
+
+        # Git-Status auf das ursprüngliche Push-Ziel zurücksetzen für den Release-Build
+        git checkout "$ORIGINAL_SHA"
 
     - name: Build release binary
       run: cargo build --release --verbose
@@ -93,9 +109,6 @@ jobs:
       uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
       with:
         files: "dist/hegn-*-x86_64-linux-gnu"
-        # download-artifact@v8 has no if-no-artifact-found input and the release
-        # action ignores unmatched globs by default, so a re-run without
-        # artifacts would publish a binary-less release and still pass.
         fail_on_unmatched_files: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
