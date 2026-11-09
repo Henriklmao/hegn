@@ -268,6 +268,12 @@ impl InstanceStore {
             // successful `git clone --quiet` can emit warnings (for example,
             // "cloned an empty repository"), which would corrupt the UI.
             let output = Command::new("git")
+                // The source repository is untrusted: never let it select the
+                // `ext` transport (which runs an arbitrary host command) and
+                // never run hooks while cloning. https/ssh/file clones still
+                // work.
+                .args(["-c", "protocol.ext.allow=never"])
+                .args(["-c", "core.hooksPath=/dev/null"])
                 .arg("clone")
                 .arg("--no-hardlinks")
                 .arg("--quiet")

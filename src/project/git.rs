@@ -1,6 +1,7 @@
 //! Git integration: status summaries, safety checkpoints and session branches.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -8,6 +9,21 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 use super::model::GitSummary;
+
+/// A git invocation hardened against repo-controlled code execution.
+///
+/// Project repositories are untrusted: `core.fsmonitor`, hooks and clean
+/// filters in `.git/config`/`.gitattributes` would otherwise run host code
+/// merely by opening or checkpointing a project.
+fn hardened_git(path: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(path)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(["-c", "core.fsmonitor=false"]);
+    command
+}
 
 /// Parse `git status --porcelain=v1 --branch` output.
 pub fn parse_git_status(output: &str) -> GitSummary {
@@ -77,9 +93,7 @@ pub fn read_git_summary(path: &Path) -> GitSummary {
             ..GitSummary::default()
         };
     }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
+    let output = hardened_git(path)
         .args(["status", "--porcelain=v1", "--branch"])
         .env("GIT_OPTIONAL_LOCKS", "0")
         .output();
@@ -125,9 +139,7 @@ pub fn create_checkpoint(path: &Path, label: &str) -> Result<String> {
         if slug.is_empty() { "manual" } else { slug }
     );
     let commit = snapshot_worktree(path, label)?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
+    let output = hardened_git(path)
         .args(["branch", &branch, &commit])
         .output()
         .context("failed to run git branch")?;
@@ -146,15 +158,40 @@ fn snapshot_worktree(path: &Path, label: &str) -> Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let index = std::env::temp_dir().join(format!(
-        "hegn-checkpoint-{}-{unique}.index",
-        std::process::id()
-    ));
-    let _ = fs::remove_file(&index);
+    // A private directory (0700, never a symlink) keeps the checkpoint index
+    // away from other users of the shared temp directory. The index itself is
+    // created with O_NOFOLLOW/O_CLOEXEC and mode 0600.
+    let dir = std::env::temp_dir().join(format!("hegn-checkpoint-{}-{unique}", std::process::id()));
+    crate::shared::fs::create_private_dir(&dir)
+        .with_context(|| format!("failed to create checkpoint directory {}", dir.display()))?;
+    let index = dir.join("index");
+    if let Err(err) = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&index)
+        .with_context(|| format!("failed to create checkpoint index {}", index.display()))
+    {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(err);
+    }
 
     let result = (|| -> Result<String> {
-        git_stdout(path, &["add", "-A"], Some(&index))?;
-        let tree = git_stdout(path, &["write-tree"], Some(&index))?;
+        // `git read-tree --empty` seeds a valid empty index into the file we
+        // pre-created above; git rejects a zero-length index file outright.
+        git_stdout(path, &["read-tree", "--empty"], Some(&index), &[])?;
+        // Neutralise every filter driver declared in the repository/global
+        // configuration. The repository controls both `.gitattributes` and
+        // `filter.<name>.clean`, so `git add` would otherwise execute arbitrary
+        // host code. `/bin/cat` keeps the blob content unchanged; a driver that
+        // really needs a process filter degrades to a warning/failure but can
+        // never run the repository's command.
+        let overrides = filter_config_overrides(path)?;
+        git_stdout(path, &["add", "-A"], Some(&index), &overrides)?;
+        // `write-tree` can re-run the clean filter while hashing the index, so
+        // it needs the same overrides as `add`.
+        let tree = git_stdout(path, &["write-tree"], Some(&index), &overrides)?;
         let message = format!(
             "hegn checkpoint: {}",
             if label.trim().is_empty() {
@@ -165,10 +202,8 @@ fn snapshot_worktree(path: &Path, label: &str) -> Result<String> {
         );
         // `commit-tree` needs an identity even when the repository has none
         // configured; use a synthetic one so the safety net always works.
-        let mut command = Command::new("git");
+        let mut command = hardened_git(path);
         command
-            .arg("-C")
-            .arg(path)
             .args(["-c", "user.name=hegn", "-c", "user.email=hegn@localhost"])
             .args(["commit-tree", tree.trim(), "-m", &message]);
         if has_head(path) {
@@ -184,13 +219,60 @@ fn snapshot_worktree(path: &Path, label: &str) -> Result<String> {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     })();
 
-    let _ = fs::remove_file(&index);
+    let _ = fs::remove_dir_all(&dir);
     result
 }
 
-fn git_stdout(path: &Path, args: &[&str], index: Option<&Path>) -> Result<String> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(path).args(args);
+/// `-c key=value` overrides that disable every configured filter driver.
+///
+/// `git config --get-regexp` only reads configuration; it never executes the
+/// commands it prints, which makes the hardened helper safe here. Exit code 1
+/// means "no matches", which is not an error for us.
+fn filter_config_overrides(path: &Path) -> Result<Vec<(String, String)>> {
+    let output = hardened_git(path)
+        .args(["config", "--get-regexp", r"^filter\."])
+        .output()
+        .context("failed to inspect git filter configuration")?;
+    if !output.status.success() {
+        if output.status.code() == Some(1) {
+            return Ok(Vec::new());
+        }
+        bail!(
+            "git config --get-regexp failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let mut overrides = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(key) = line.split_whitespace().next() else {
+            continue;
+        };
+        let value =
+            if key.ends_with(".clean") || key.ends_with(".smudge") || key.ends_with(".process") {
+                "/bin/cat"
+            } else if key.ends_with(".required") {
+                "false"
+            } else {
+                continue;
+            };
+        // Re-pass the key verbatim so a subsection's case is preserved.
+        overrides.push((key.to_string(), value.to_string()));
+    }
+    Ok(overrides)
+}
+
+fn git_stdout(
+    path: &Path,
+    args: &[&str],
+    index: Option<&Path>,
+    config: &[(String, String)],
+) -> Result<String> {
+    let mut command = hardened_git(path);
+    for (key, value) in config {
+        command.arg("-c").arg(format!("{key}={value}"));
+    }
+    command.args(args);
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
     }
@@ -208,9 +290,7 @@ fn git_stdout(path: &Path, args: &[&str], index: Option<&Path>) -> Result<String
 }
 
 fn has_head(path: &Path) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(path)
+    hardened_git(path)
         .args(["rev-parse", "--verify", "--quiet", "HEAD"])
         .output()
         .map(|output| output.status.success())
@@ -221,17 +301,13 @@ fn has_head(path: &Path) -> bool {
 pub fn create_session_branch(path: &Path) -> Result<String> {
     ensure_git_repo(path)?;
     let branch = format!("agent/hegn-session-{}", Utc::now().format("%Y%m%d-%H%M%S"));
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
+    let output = hardened_git(path)
         .args(["switch", "-c", &branch])
         .output()
         .context("failed to run git switch")?;
     if !output.status.success() {
         // Older git versions use checkout.
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(path)
+        let output = hardened_git(path)
             .args(["checkout", "-b", &branch])
             .output()
             .context("failed to run git checkout")?;
@@ -246,9 +322,7 @@ pub fn create_session_branch(path: &Path) -> Result<String> {
 }
 
 fn ensure_git_repo(path: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
+    let output = hardened_git(path)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .context("failed to run git")?;
@@ -283,6 +357,52 @@ mod tests {
         dir
     }
 
+    /// Serialise tests that create checkpoint index directories so the
+    /// "no directory left behind" assertion cannot observe a concurrent test.
+    fn checkpoint_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn commit_all(repo: &Path, message: &str) {
+        for args in [vec!["add", "."], vec!["commit", "-m", message, "--quiet"]] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+
+    fn write_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn checkpoint_dirs() -> Vec<std::path::PathBuf> {
+        let prefix = format!("hegn-checkpoint-{}-", std::process::id());
+        let mut dirs: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with(&prefix))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        dirs.sort();
+        dirs
+    }
+
     #[test]
     fn parses_clean_branch_with_tracking() {
         let summary = parse_git_status("## main...origin/main [ahead 2, behind 1]\n");
@@ -314,6 +434,7 @@ mod tests {
 
     #[test]
     fn creates_checkpoint_and_session_branch() {
+        let _guard = checkpoint_guard();
         let repo = git_repo();
         std::fs::write(repo.path().join("a.txt"), "hello").unwrap();
         let status = Command::new("git")
@@ -346,6 +467,7 @@ mod tests {
 
     #[test]
     fn checkpoint_captures_uncommitted_and_untracked_files() {
+        let _guard = checkpoint_guard();
         let repo = git_repo();
         std::fs::write(repo.path().join("tracked.txt"), "original").unwrap();
         for args in [vec!["add", "."], vec!["commit", "-m", "init", "--quiet"]] {
@@ -368,6 +490,7 @@ mod tests {
             repo.path(),
             &["show", &format!("{branch}:tracked.txt")],
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(tracked.trim(), "modified");
@@ -375,24 +498,143 @@ mod tests {
             repo.path(),
             &["show", &format!("{branch}:untracked.txt")],
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(untracked.trim(), "new file");
 
         // The checkpoint must not commit or stage anything in the real repo.
-        let status = git_stdout(repo.path(), &["status", "--porcelain"], None).unwrap();
+        let status = git_stdout(repo.path(), &["status", "--porcelain"], None, &[]).unwrap();
         assert!(status.contains("M tracked.txt"), "{status}");
         assert!(status.contains("?? untracked.txt"), "{status}");
     }
 
     #[test]
     fn checkpoint_works_in_a_repository_without_commits() {
+        let _guard = checkpoint_guard();
         let repo = git_repo();
         std::fs::write(repo.path().join("first.txt"), "hello").unwrap();
         let branch = create_checkpoint(repo.path(), "before first commit").unwrap();
-        let content =
-            git_stdout(repo.path(), &["show", &format!("{branch}:first.txt")], None).unwrap();
+        let content = git_stdout(
+            repo.path(),
+            &["show", &format!("{branch}:first.txt")],
+            None,
+            &[],
+        )
+        .unwrap();
         assert_eq!(content.trim(), "hello");
+    }
+
+    #[test]
+    fn session_branch_does_not_run_post_checkout_hooks() {
+        let repo = git_repo();
+        std::fs::write(repo.path().join("a.txt"), "hello").unwrap();
+        commit_all(repo.path(), "init");
+
+        let marker = repo.path().join("hook-ran");
+        write_script(
+            &repo.path().join(".git/hooks/post-checkout"),
+            &format!("#!/bin/sh\necho ran > '{}'\n", marker.display()),
+        );
+
+        let branch = create_session_branch(repo.path()).unwrap();
+        assert!(branch.starts_with("agent/hegn-session-"));
+        assert!(
+            !marker.exists(),
+            "the post-checkout hook from .git/hooks must not run"
+        );
+    }
+
+    #[test]
+    fn read_git_summary_does_not_run_core_fsmonitor() {
+        let repo = git_repo();
+        std::fs::write(repo.path().join("a.txt"), "hello").unwrap();
+        commit_all(repo.path(), "init");
+
+        let marker = repo.path().join("fsmonitor-ran");
+        let script = repo.path().join("fsmonitor.sh");
+        write_script(
+            &script,
+            &format!("#!/bin/sh\necho ran > '{}'\nexit 0\n", marker.display()),
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["config", "core.fsmonitor"])
+                .arg(&script)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let summary = read_git_summary(repo.path());
+        assert!(summary.is_repo, "{summary:?}");
+        assert!(
+            !marker.exists(),
+            "core.fsmonitor from the repository config must not run"
+        );
+    }
+
+    #[test]
+    fn checkpoint_does_not_run_clean_filters_and_keeps_content() {
+        let _guard = checkpoint_guard();
+        let repo = git_repo();
+        std::fs::write(repo.path().join("keep.txt"), "original").unwrap();
+        commit_all(repo.path(), "init");
+
+        let marker = repo.path().join("filter-ran");
+        let script = repo.path().join("clean.sh");
+        write_script(
+            &script,
+            &format!("#!/bin/sh\necho ran > '{}'\ncat\n", marker.display()),
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["config", "filter.evil.clean"])
+                .arg(&script)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(repo.path().join(".gitattributes"), "*.txt filter=evil\n").unwrap();
+        std::fs::write(repo.path().join("keep.txt"), "modified").unwrap();
+
+        let branch = create_checkpoint(repo.path(), "before filter").unwrap();
+        assert!(
+            !marker.exists(),
+            "the clean filter declared by the repository must not run"
+        );
+        let blob = git_stdout(
+            repo.path(),
+            &["show", &format!("{branch}:keep.txt")],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            blob.trim(),
+            "modified",
+            "/bin/cat must pass content through"
+        );
+    }
+
+    #[test]
+    fn checkpoint_leaves_no_private_index_directory_behind() {
+        let _guard = checkpoint_guard();
+        let repo = git_repo();
+        std::fs::write(repo.path().join("a.txt"), "hello").unwrap();
+
+        let before = checkpoint_dirs();
+        create_checkpoint(repo.path(), "cleanup").unwrap();
+        let after = checkpoint_dirs();
+
+        assert_eq!(
+            after, before,
+            "checkpoint must remove its private temp directory"
+        );
     }
 
     #[test]
@@ -467,6 +709,7 @@ mod tests {
 
     #[test]
     fn checkpoint_and_session_branch_refuse_non_repositories() {
+        let _guard = checkpoint_guard();
         let dir = tempfile::tempdir().unwrap();
         let err = create_checkpoint(dir.path(), "manual")
             .unwrap_err()
@@ -478,6 +721,7 @@ mod tests {
 
     #[test]
     fn checkpoint_sanitizes_labels_and_falls_back_to_manual() {
+        let _guard = checkpoint_guard();
         let repo = git_repo();
         std::fs::write(repo.path().join("a.txt"), "hello").unwrap();
 
