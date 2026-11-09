@@ -744,7 +744,7 @@ kernel_sha256   = "edfeb8a8a6c04ff2979e9f1c700feaa29b8f564f952261834ef0b7d2e673a
 rootfs_url      = "https://ch-images.azureedge.net/jammy-server-cloudimg-amd64-custom-20241017-0.qcow2"
 rootfs_sha256   = "e05cb642d633e20e8e1390be23856744d3867744764bf3000ad0a9c22dd794e8"
 vcpus           = 2          # 1–32
-memory_mib      = 2048       # >= 128
+memory_mib      = 2048       # 128–262144 (256 GiB)
 max_rootfs_gib  = 64         # 16–1024; rootfs growth ceiling
 disk_usage_warn_percent = 80 # doctor warns above this usage
 shared_tag      = "workspace" # virtio-fs tag, <= 36 bytes, no whitespace
@@ -931,7 +931,9 @@ rejected. Endpoints require `network = "guarded"`. After editing the list,
 run `sudo hegn network reload` to replace only the nftables rules (the TAP pool
 and running guests are left untouched), or `sudo hegn network setup` for a full
 reinstall — `hegn instance start` fails closed with a hint until the root-owned
-marker matches. With `cloud_init = true`, the URLs are
+marker matches. A full setup recreates any TAP whose owner does not match
+`--user` (that tap's guest link is interrupted), so a re-run cannot leave a
+previous local user with attach rights. With `cloud_init = true`, the URLs are
 exported in the guest through `/etc/profile.d/hegn-endpoints.sh`; every endpoint
 is also available as `HEGN_ENDPOINT_<NAME>`. `hegn instance status` prints the
 guest URLs.
