@@ -204,6 +204,29 @@ fn owner_process_alive(pid: u32) -> bool {
     crate::vm::instance::process_matches(pid, &binary)
 }
 
+/// Wait (bounded) until `pid` has completed its `exec`.
+///
+/// Immediately after `spawn`, `/proc/<pid>/exe` can still report the parent
+/// image, which would make the identity check believe the expected binary is
+/// running. Production never samples a freshly spawned pid this way; tests do,
+/// so they must wait for the exec to become visible first.
+#[cfg(test)]
+fn wait_until_exec_visible(pid: u32) {
+    let current = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .and_then(|path| path.canonicalize().ok());
+        if exe != current || std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 pub fn instance_is_running(config: &Config, instance: &str) -> bool {
     InstanceStore::new(config.clone())
         .load(instance)
@@ -386,6 +409,10 @@ mod tests {
             .arg("30")
             .spawn()
             .expect("sleep must be available");
+        // `spawn` can return while the child's exec is still being installed;
+        // in that window `/proc/<pid>/exe` transiently reports the parent (the
+        // test binary) and the identity check would wrongly see "hegn running".
+        wait_until_exec_visible(child.id());
         write_private(&owner_path(&config, 4), format!("other\n{}\n", child.id())).unwrap();
 
         let lease = try_claim(&config, 4, "demo")

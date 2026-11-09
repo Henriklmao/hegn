@@ -122,6 +122,28 @@ mod tests {
         (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
     }
 
+    /// Spawn a freshly written script, retrying the transient ETXTBSY window.
+    ///
+    /// A concurrent test thread can `fork` while the script's write fd is still
+    /// open; the forked child inherits that fd until it execs, so `exec` reports
+    /// "text file busy" for a few milliseconds.
+    fn spawn_script(cfg: &VirtiofsConfig) -> VirtiofsProcess {
+        for _ in 0..50 {
+            match cfg.spawn() {
+                Ok(process) => return process,
+                Err(err)
+                    if err
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::ExecutableFileBusy) =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("{err:#}"),
+            }
+        }
+        panic!("spawn kept failing with a busy executable");
+    }
+
     #[test]
     fn args_are_sandboxed_and_scoped_to_one_directory() {
         let (project, run) = setup();
@@ -209,7 +231,7 @@ mod tests {
         fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let cfg = VirtiofsConfig::new(&binary, project.path(), &socket);
-        let mut process = cfg.spawn().unwrap();
+        let mut process = spawn_script(&cfg);
         process
             .wait_for_socket(Duration::from_secs(5))
             .expect("noisy virtiofsd should still create its socket");

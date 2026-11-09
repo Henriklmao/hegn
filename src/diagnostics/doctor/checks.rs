@@ -390,27 +390,21 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
-
     #[test]
     fn check_tool_accepts_a_working_executable() {
-        let dir = tempfile::tempdir().unwrap();
-        let tool = script(dir.path(), "fake-tool", "echo 'fake-tool 1.2.3'");
-
-        let check = check_tool("fake-tool", &tool, &["--version"], true);
+        // `/bin/echo` is stable, unlike a freshly written temp script, which
+        // can hit ETXTBSY ("Text file busy") under a loaded test runner.
+        let check = check_tool(
+            "fake-tool",
+            Path::new("/bin/echo"),
+            &["fake-tool 1.2.3"],
+            true,
+        );
         assert!(check.ok, "{check:?}");
         assert!(check.required);
         assert!(check.detail.contains("fake-tool 1.2.3"), "{check:?}");
         // An explicit path is included so the user knows which binary ran.
-        assert!(
-            check.detail.contains(&tool.display().to_string()),
-            "{check:?}"
-        );
+        assert!(check.detail.contains("/bin/echo"), "{check:?}");
     }
 
     #[test]
@@ -438,10 +432,14 @@ mod tests {
 
     #[test]
     fn check_tool_reports_a_failing_executable_and_its_stderr() {
-        let dir = tempfile::tempdir().unwrap();
-        let tool = script(dir.path(), "failing", "echo 'boom' >&2\nexit 3");
-
-        let check = check_tool("failing", &tool, &["--version"], false);
+        // `/bin/sh -c` is stable, unlike a freshly written temp script, which
+        // can hit ETXTBSY ("Text file busy") under a loaded test runner.
+        let check = check_tool(
+            "failing",
+            Path::new("/bin/sh"),
+            &["-c", "echo 'boom' >&2; exit 3"],
+            false,
+        );
         assert!(!check.ok);
         assert!(!check.required);
         assert_eq!(check.detail, "boom");
