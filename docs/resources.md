@@ -7,6 +7,23 @@ disk, I/O and start-up latency. The numbers below were measured on x86_64 with
 values; [measure on your machine](#measure-on-your-machine) before sizing a
 build box.
 
+## Summary
+
+- **RAM:** a running session uses the configured `memory_mib` (default 2 GiB),
+  plus about 50 MiB for `virtiofsd`, the console relay and VMM bookkeeping.
+  The TUI adds about 26 MiB while it is open. A harness profile that exports files
+  or skills starts a second `virtiofsd`, which adds about 12 MiB.
+- **Scaling:** base instances and clones can run at the same time. The cost
+  scales with each instance.
+- **Disk:** the pinned images take about 2.2 GiB and are shared by all projects.
+  The binary is about 19 MiB. A snapshot is about as large as the guest RAM.
+  Automatic checkpoints keep the newest `snapshot_keep` per instance (2 by
+  default), so budget about 2× guest RAM per running instance. Session logs are
+  pruned by count.
+- **Speed:** computation runs at near-native speed under KVM. Many small file
+  operations are slower, because the workspace is exported through virtio-fs with
+  `--cache=never`.
+
 ## What runs where
 
 hegn never runs project work on the host. A session consists of these host

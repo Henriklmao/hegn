@@ -52,7 +52,7 @@ is the minimum bar.
 - `src/shared/` — dependency-free fs, process, path, text and numeric helpers.
 - `src/cli/` — every TUI action needs a non-interactive CLI counterpart.
 - `src/config/` — config schema; unknown keys are rejected, so update the
-  struct *and* the README example when adding options. `form/` is the TUI
+  struct *and* `docs/configuration.md` when adding options. `form/` is the TUI
   settings editor.
 - `src/security/` — `tirith-core` integration plus hegn-specific guardrails.
 - `src/network/` — guarded TAP pool, nftables rules and privileged setup.
@@ -78,8 +78,8 @@ is the minimum bar.
   terminal event loop and background jobs.
 - `docs/architecture.md` — detailed module, lifecycle, safety and CI documentation.
 
-`README.md` is the user-facing documentation. Keep it in sync when behavior
-changes.
+`README.md` is a short overview. The user documentation lives in `docs/`
+(index: `docs/README.md`). Keep both in sync when behavior changes.
 
 ## Conventions
 

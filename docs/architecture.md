@@ -175,7 +175,7 @@ never the log of the running session.
 | `~/Projects/hegn/` | Projects and import symlinks | user default |
 
 All state paths can be overridden in `config.toml` or by environment variables
-(see the README).
+(see [`configuration.md`](configuration.md)).
 
 ---
 
