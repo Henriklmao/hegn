@@ -130,9 +130,11 @@ special files.
 ## VM images
 
 Images are upstream Cloud Hypervisor artifacts. They are pinned by HTTPS URL and
-SHA-256. `hegn images download` refuses an empty checksum unless you pass
-`--allow-unverified`. It checks the data before the atomic rename. It never
-replaces an existing image without `--force`. See [VM images](vm-images.md).
+SHA-256. Downloads reject non-HTTPS URLs, URLs with embedded credentials and
+HTTPS-to-HTTP redirects, and only install data after the checksum matches.
+`hegn images download` refuses an empty checksum unless you pass
+`--allow-unverified`. It never replaces an existing image without `--force`. See
+[VM images](vm-images.md).
 
 Project import only creates a symlink. It refuses targets that would expose `/`,
 `$HOME`, an ancestor of `projects_root` or hegn's state to the guest.

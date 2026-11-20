@@ -167,6 +167,43 @@ pub fn install_from_reader_with_progress(
     result
 }
 
+/// Replace HTTP basic-auth userinfo with `***`, so error messages and logs
+/// never echo a password that a configured URL might accidentally carry.
+fn redact_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://***@{host}{tail}"),
+        None => url.to_owned(),
+    }
+}
+
+/// Parse a configured download URL and require a plain HTTPS origin.
+///
+/// Every request is built from the returned [`reqwest::Url`], so a scheme
+/// downgrade, embedded credentials or a missing host is rejected before a
+/// connection is attempted. The client is also built with
+/// [`reqwest::ClientBuilder::https_only`], which refuses HTTPS-to-HTTP
+/// redirects, so a trusted server cannot silently downgrade the connection.
+fn https_url(url: &str) -> Result<reqwest::Url> {
+    let shown = redact_userinfo(url);
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("invalid download URL '{shown}'"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("refusing download URL with embedded credentials '{shown}'");
+    }
+    if parsed.scheme() != "https" {
+        bail!("refusing non-HTTPS download URL '{shown}'");
+    }
+    if parsed.host_str().is_none() {
+        bail!("refusing download URL without a host '{shown}'");
+    }
+    Ok(parsed)
+}
+
 /// Download one asset over HTTPS and verify it before installation.
 pub fn download_to(
     url: &str,
@@ -198,16 +235,16 @@ pub fn download_to_with_progress(
     if url.is_empty() {
         bail!("no download URL configured for {}", dest.display());
     }
-    if !url.starts_with("https://") {
-        bail!("refusing non-HTTPS download URL '{url}'");
-    }
+    let url = https_url(url)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
+        // Refuse a plaintext connection or a redirect that downgrades to one.
+        .https_only(true)
         .build()
         .context("failed to build the HTTP client")?;
     let mut response = client
-        .get(url)
+        .get(url.as_str())
         .send()
         .with_context(|| format!("failed to download {url}"))?;
     let status = response.status();
@@ -435,6 +472,42 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("non-HTTPS"), "{err}");
+    }
+
+    #[test]
+    fn download_urls_must_be_plain_https_origins() {
+        assert_eq!(
+            https_url("https://example.com/kernel").unwrap().as_str(),
+            "https://example.com/kernel"
+        );
+
+        for (url, expected) in [
+            ("http://example.com/kernel", "non-HTTPS"),
+            ("ftp://example.com/kernel", "non-HTTPS"),
+            (
+                "https://user:secret@example.com/kernel",
+                "embedded credentials",
+            ),
+            ("https://user@example.com/kernel", "embedded credentials"),
+            ("https://", "invalid download URL"),
+            ("not a url", "invalid download URL"),
+        ] {
+            let err = https_url(url).unwrap_err().to_string();
+            assert!(err.contains(expected), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn url_errors_never_echo_credentials() {
+        for url in [
+            "https://user:s3cret@example.com/kernel",
+            "http://user:s3cret@example.com/kernel",
+            "https://user:s3cret@",
+        ] {
+            let err = https_url(url).unwrap_err().to_string();
+            assert!(!err.contains("s3cret"), "{err}");
+            assert!(err.contains("***@"), "{err}");
+        }
     }
 
     #[test]
