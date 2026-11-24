@@ -28,6 +28,7 @@ the short version.
 | Document | What's in it |
 | --- | --- |
 | [Architecture](architecture.md) | Design goals, modules, lifecycle flows, safety invariants, CI |
+| [Multi-project VMs](design/multi-project-vms.md) | Accepted design for many projects per VM, clones/worktrees, snapshots and migration |
 
 ## Features in detail
 

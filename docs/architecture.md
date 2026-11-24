@@ -11,6 +11,12 @@ terminal, shell and agent session is attached to a real Cloud Hypervisor guest
 serial console. Multiple instances can run at the same time; each one owns its
 configuration, runtime directory, serial log and private root filesystem.
 
+> **Accepted design, not yet implemented.** The
+> [multi-project VM design](design/multi-project-vms.md) replaces the
+> one-project-per-VM model in sections 2–6 with a project-first model where a
+> named VM is a shared tool profile. This document continues to describe the
+> current implementation until that work lands. See ADR-006 … ADR-010.
+
 ---
 
 ## 1. Design goals
@@ -671,8 +677,6 @@ light and dark terminal themes both work. `Color::Reset` is the normal text
 color. Colored backgrounds are limited to small cells: selection bars, footer
 button chips, toast badges and status markers.
 
-
-
 ### 8.2 Attach bar
 
 The CLI attach view is not a full terminal emulator. It reserves the bottom host
@@ -909,6 +913,96 @@ paint, clamps guest DECSTBM sequences so the reserved row stays outside their
 scroll region, and re-reserves the region after RIS/DECSTR. The TUI remains the
 modal, line-intercepted view: `i`/`a` enters insert mode and `Esc` returns to
 normal mode.
+
+### ADR-006: Multiple projects per VM
+
+**Decision:** a VM hosts many projects. Each project is exported by its own
+sandboxed `virtiofsd` and mounted at `/projects/<slug>`; `/workspace` is a
+guest-side symlink to the VM's primary project. Membership changes require a
+restart.
+
+**Why:** toolchains, the harness install and manual package installs are
+expensive to duplicate per project. Multiplicity must not be bought by
+exporting a parent directory: one wide export would give every agent access to
+every sibling project and lose per-project read-only mode.
+
+**Consequence:** a VM can run N `virtiofsd` processes (bounded by
+`max_projects_per_vm`). Cloud-init renders N mounts, the VMM gets N `--fs`
+devices, snapshots must re-spawn all recorded daemons, and guardrails treat
+every `/projects/*` root as workspace. Projects in one VM share a guest user
+and can read each other's files: the VM, not the project, becomes the trust
+boundary. Read-only mode prevents writes, not reads. See
+[`design/multi-project-vms.md`](design/multi-project-vms.md).
+
+### ADR-007: Project-first membership in private state
+
+**Decision:** the project remains the primary user object. A VM is a named
+tool profile and runtime that projects opt into. The project → VM assignment,
+read-only flag and clone lineage live in a private registry under `state_dir`,
+not in the exported project directory. A repo-local `hegn.toml` may only hold
+presentation preferences (`launch`, `integration`, `auto_start`).
+
+**Why:** the registry decides which host directories are exported and whether
+they are writable. A file inside the project is writable by the guest through
+`virtiofsd`; letting it control membership would let an agent widen its own
+export. Keeping membership private is the same principle as host-owned
+nftables rules and TAP reservations.
+
+**Consequence:** the TUI picker stays the home screen and shows a VM badge;
+`hegn vm` and `hegn project assign` become the control surface. The registry
+needs atomic writes and a lock, and unassigned projects need an explicit
+create-or-choose-VM flow.
+
+### ADR-008: Clones by default, worktrees opt-in
+
+**Decision:** parallel workspaces default to self-contained `git clone`
+members of the same VM. A nested git worktree is supported as an explicit
+`--mode worktree` fork only when it lives inside its parent project's exported
+tree.
+
+**Why:** a worktree's `.git` points at `<main>/.git/worktrees/<name>`, outside
+the single exported directory; the guest cannot resolve it, and exporting the
+main repository to fix that lets one agent mutate another's refs, hooks and
+object store. Clones are self-contained and can be read-only, detached or
+deleted independently.
+
+**Consequence:** clones consume a checkout and an object store but no extra
+rootfs or tool install. Worktrees share mutable git state and are documented
+as such; hegn never deletes a worktree implicitly.
+
+### ADR-009: Hard cut to v2
+
+**Decision:** v2 reads a new `vms_dir` and private project registry. Legacy
+`instances_dir` entries and v1 snapshots are ignored, reported by
+`hegn doctor`, and never deleted automatically.
+
+**Why:** the one-project-per-VM fields (`project`, `workspace`, `shared_tag`,
+`guest_mount`, `read_only_workspace`, `ephemeral`) have no faithful v2
+equivalent without inventing a migration policy for clones, snapshots and
+running sessions. Maintaining both execution paths would double the lifecycle,
+snapshot and security surface. No one is using this yet except me 😪
+
+**Consequence:** upgrading is a deliberate recreate. Global `config.toml`
+still accepts `instances_dir`, `shared_tag` and `guest_mount` as deprecated
+aliases with warnings, so startup is not bricked; logs remain readable.
+
+### ADR-010: Snapshot boot fingerprint
+
+**Decision:** every snapshot records the VM name, an ordered membership
+manifest and a `boot_fingerprint` over the VMM-affecting configuration
+(members, tags, mounts, read-only flags, vCPUs, memory, rootfs, network slot,
+profile presence). Automatic resume skips a mismatched checkpoint; manual
+restore refuses one.
+
+**Why:** Cloud Hypervisor restore uses the device tree embedded in the
+snapshot. Adding or removing a virtio-fs share after the snapshot cannot be
+reflected by the restore argv, so a "successful" restore would silently leave
+new projects unmounted or removed projects still exported.
+
+**Consequence:** assigning or detaching a project, or changing VM resources,
+makes older snapshots non-resumable and requires a cold boot or
+`hegn vm apply`. Legacy snapshots without a fingerprint are listed as
+non-restorable.
 
 ---
 
