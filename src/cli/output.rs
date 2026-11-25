@@ -269,7 +269,6 @@ pub(crate) fn prompt_allowed(json: bool, stdin_is_tty: bool) -> bool {
 }
 
 /// Gate a prompt on the effective input mode of this invocation.
-#[allow(dead_code)]
 pub(crate) fn should_prompt(json: bool) -> bool {
     prompt_allowed(json, std::io::stdin().is_terminal())
 }

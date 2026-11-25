@@ -2,7 +2,6 @@
 //! delete and restore projects. Control-plane membership always lives in the
 //! private project registry; a VM is never deleted from here.
 
-use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -18,6 +17,7 @@ use crate::vm::registry::VmRegistry;
 
 use super::vm::{confirm, guest_path_for, prompt_yes, vm_for_entry};
 use crate::cli::args::{ForkModeArg, ProjectCommands};
+use crate::cli::output::should_prompt;
 use crate::cli::resolve::{resolve_project, resolve_project_entry as resolve_picker_entry};
 
 pub(crate) fn project_command(command: ProjectCommands, config: Config, json: bool) -> Result<i32> {
@@ -58,6 +58,7 @@ pub(crate) fn project_command(command: ProjectCommands, config: Config, json: bo
                 vm,
                 solo,
                 "hegn project create",
+                json,
             )?;
             print_new_project(&config, &path, selected.as_ref(), json)?;
             Ok(0)
@@ -81,6 +82,7 @@ pub(crate) fn project_command(command: ProjectCommands, config: Config, json: bo
                 vm,
                 solo,
                 "hegn project import",
+                json,
             )?;
             if json {
                 println!(
@@ -483,6 +485,7 @@ fn select_vm_for_new_project(
     vm: Option<String>,
     solo: bool,
     command: &str,
+    json: bool,
 ) -> Result<Option<VmConfig>> {
     if let Some(vm_name) = vm {
         let (assigned, vm) = assign_project(config, &entry.name, &vm_name, false)?;
@@ -494,7 +497,7 @@ fn select_vm_for_new_project(
             VmRegistry::new(config.clone()).ensure_for_project(&entry.path, harness)?,
         ));
     }
-    if std::io::stdin().is_terminal() {
+    if should_prompt(json) {
         if prompt_yes(&format!(
             "Create a one-member VM named '{}' for this project?",
             entry.name
@@ -690,7 +693,7 @@ fn delete_registered_external(
         true
     } else if keep_files {
         false
-    } else if std::io::stdin().is_terminal() {
+    } else if should_prompt(json) {
         prompt_yes(&format!(
             "Also delete the project files at {}?",
             entry.path.display()
@@ -816,7 +819,7 @@ fn delete_external_picker_entry(
         true
     } else if keep_files {
         false
-    } else if std::io::stdin().is_terminal() {
+    } else if should_prompt(json) {
         prompt_yes(&format!(
             "Also delete the project files at {}?",
             picker.display()
@@ -972,6 +975,30 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("--solo"), "{err}");
+    }
+
+    #[test]
+    fn project_delete_without_a_file_policy_fails_closed_in_json_mode() {
+        // `--json` behaves exactly like a non-TTY stdin, so the second gate
+        // bails before prompting no matter which terminal runs the tests.
+        let (_dir, config) = config();
+        let project = config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("README.md"), b"demo").unwrap();
+        let err = project_command(
+            ProjectCommands::Delete {
+                project: "demo".into(),
+                delete_files: false,
+                keep_files: false,
+                yes: true,
+            },
+            config,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--delete-files"), "{err}");
+        assert!(err.contains("--keep-files"), "{err}");
     }
 
     #[test]
