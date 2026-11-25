@@ -290,7 +290,7 @@ mod tests {
     fn snapshot_text_labels_the_vm_and_drops_the_legacy_instance_label() {
         let meta = SnapshotMeta {
             name: "demo".into(),
-            instance: Some("rust".into()),
+            vm: Some("rust".into()),
             ..SnapshotMeta::default()
         };
         let text = snapshot_text(&meta);

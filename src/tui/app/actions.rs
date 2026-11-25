@@ -391,7 +391,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 vm_state: "Paused".into(),
                 dir: paths.dir,
-                instance: None,
+                vm: None,
                 project: None,
                 size_bytes: 0,
                 note: None,

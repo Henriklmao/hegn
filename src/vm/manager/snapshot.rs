@@ -555,7 +555,7 @@ impl VmManager {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: dir.to_path_buf(),
-            instance: Some(self.vm.name.clone()),
+            vm: Some(self.vm.name.clone()),
             project,
             size_bytes: dir_size(dir),
             note: note.map(str::to_string),
@@ -991,7 +991,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: dir.to_path_buf(),
-            instance: Some(owner.into()),
+            vm: Some(owner.into()),
             project: None,
             size_bytes: 0,
             note: None,
@@ -1009,7 +1009,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: dir.to_path_buf(),
-            instance: Some(manager.vm().name.clone()),
+            vm: Some(manager.vm().name.clone()),
             project: Some(plan.members[0].path.clone()),
             size_bytes: 0,
             note: None,
@@ -1090,7 +1090,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(config_with_assets(dir.path()), dir.path());
         let mut snapshot = matching_snapshot(&manager, &dir.path().join("snap"));
-        snapshot.instance = Some("someone-else".into());
+        snapshot.vm = Some("someone-else".into());
         let err = runtime()
             .block_on(manager.restore_snapshot(&snapshot))
             .unwrap_err()

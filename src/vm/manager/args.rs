@@ -556,7 +556,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             vm_state: "Paused".into(),
             dir: dir.join("snap"),
-            instance: Some("demo".into()),
+            vm: Some("demo".into()),
             project: None,
             size_bytes: 0,
             note: None,

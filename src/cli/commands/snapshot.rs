@@ -186,7 +186,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: paths.final_dir.clone(),
-            instance: vm.map(str::to_owned),
+            vm: vm.map(str::to_owned),
             project: None,
             size_bytes: 0,
             note: None,
@@ -204,7 +204,7 @@ mod tests {
         let meta = SnapshotMeta {
             name: name.into(),
             dir: paths.final_dir.clone(),
-            instance: vm.map(str::to_owned),
+            vm: vm.map(str::to_owned),
             version: 1,
             ..SnapshotMeta::default()
         };

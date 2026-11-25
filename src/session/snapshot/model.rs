@@ -39,11 +39,8 @@ pub struct SnapshotMeta {
     pub dir: PathBuf,
     /// VM that owns this snapshot. Writers emit `vm`; `instance` and
     /// `sandbox` are accepted so files written before the rename still load.
-    ///
-    /// The field keeps the historical Rust name so existing call sites keep
-    /// compiling during the v2 migration; use [`Self::vm`] in new code.
     #[serde(default, rename = "vm", alias = "instance", alias = "sandbox")]
-    pub instance: Option<String>,
+    pub vm: Option<String>,
     /// Primary project directory at snapshot time, for display and scoping.
     pub project: Option<PathBuf>,
     #[serde(default)]
@@ -78,7 +75,7 @@ impl Default for SnapshotMeta {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: PathBuf::new(),
-            instance: None,
+            vm: None,
             project: None,
             size_bytes: 0,
             note: None,
@@ -97,7 +94,7 @@ impl SnapshotMeta {
 
     /// VM that owns this snapshot; `None` only for pre-v2 metadata.
     pub fn vm(&self) -> Option<&str> {
-        self.instance.as_deref()
+        self.vm.as_deref()
     }
 
     /// True for snapshot files written before fingerprinting existed.
@@ -465,7 +462,7 @@ mod tests {
     fn meta() -> SnapshotMeta {
         SnapshotMeta {
             name: "demo".into(),
-            instance: Some("rust".into()),
+            vm: Some("rust".into()),
             boot_fingerprint: Some(compute_fingerprint(&membership(), &boot())),
             membership: membership(),
             boot: Some(boot()),
@@ -489,7 +486,7 @@ mod tests {
         let meta = SnapshotMeta {
             name: "missing".into(),
             dir: dir.path().join("missing"),
-            instance: Some("rust".into()),
+            vm: Some("rust".into()),
             boot_fingerprint: Some("0".repeat(64)),
             boot: Some(boot()),
             ..SnapshotMeta::default()

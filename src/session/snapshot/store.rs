@@ -324,7 +324,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: paths.final_dir.clone(),
-            instance: Some("demo".into()),
+            vm: Some("demo".into()),
             project: Some(PathBuf::from("/workspace/demo")),
             size_bytes: 0,
             note: None,
@@ -342,7 +342,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: paths.final_dir.clone(),
-            instance: Some("demo".into()),
+            vm: Some("demo".into()),
             project: None,
             size_bytes: 0,
             note: Some(AUTOSAVE_NOTE.into()),
@@ -480,7 +480,7 @@ mod tests {
         write_snapshot_files(&foreign);
         let mut foreign_meta = meta("autosave-foreign", &foreign);
         foreign_meta.note = Some(AUTOSAVE_NOTE.into());
-        foreign_meta.instance = Some("other".into());
+        foreign_meta.vm = Some("other".into());
         store.save_meta(&foreign_meta).unwrap();
 
         assert_eq!(
@@ -564,7 +564,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: outside.clone(),
-            instance: Some("demo".into()),
+            vm: Some("demo".into()),
             project: None,
             size_bytes: 0,
             note: None,
@@ -593,7 +593,7 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: store.root().join("a,b"),
-            instance: Some("demo".into()),
+            vm: Some("demo".into()),
             project: None,
             size_bytes: 0,
             note: None,
@@ -710,7 +710,7 @@ mod tests {
         for (name, owner) in [("mine", "demo"), ("other", "rust")] {
             let paths = store.prepare(name).unwrap();
             let mut m = meta(name, &paths);
-            m.instance = Some(owner.into());
+            m.vm = Some(owner.into());
             store.save_meta(&m).unwrap();
         }
 
@@ -747,7 +747,7 @@ mod tests {
             let paths = store.prepare(name).unwrap();
             write_snapshot_files(&paths);
             let mut m = meta(name, &paths);
-            m.instance = Some(owner.into());
+            m.vm = Some(owner.into());
             m.note = Some(AUTOSAVE_NOTE.into());
             m.created_at = Utc::now() + chrono::Duration::seconds(offset);
             store.save_meta(&m).unwrap();
