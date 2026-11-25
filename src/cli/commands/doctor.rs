@@ -95,12 +95,7 @@ pub(crate) fn doctor(config: Config, json: bool, fix: bool) -> Result<i32> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         for check in &report.checks {
-            println!(
-                "{} {:<18} {}",
-                if check.ok { "✓" } else { "✗" },
-                check.name,
-                check.detail
-            );
+            println!("{}", check.line());
         }
         if report.can_download() {
             println!("\nMissing VM images. Download with: hegn images download");
