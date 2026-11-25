@@ -8,11 +8,17 @@
 //! - [`severity`] — UI-facing severity levels
 //! - [`engine`] — command inspection and the resulting decisions
 //! - [`risk`] — hegn's own destructive-workspace guardrails
+//! - [`workspace`] — guest workspace roots for multi-project VMs
 
 mod engine;
 mod risk;
 mod severity;
+mod workspace;
 
 pub use engine::{Decision, Finding, Inspection, SecurityEngine};
-pub use risk::{WorkspaceRisk, detect_workspace_risk};
+pub use risk::{WorkspaceRisk, detect_workspace_risk, detect_workspace_risk_with_policy};
 pub use severity::Severity;
+pub use workspace::{
+    DEFAULT_GUEST_PROJECTS_BASE, GuestWorkspacePolicy, GuestWorkspacePolicyError,
+    WORKSPACE_GUEST_PATH,
+};

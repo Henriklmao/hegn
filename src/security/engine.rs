@@ -10,8 +10,9 @@ use tirith_core::extract::ScanContext;
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::Action as TirithAction;
 
-use super::risk::detect_workspace_risk;
+use super::risk::detect_workspace_risk_with_policy;
 use super::severity::Severity;
+use super::workspace::GuestWorkspacePolicy;
 use crate::config::SecurityMode;
 
 /// One finding shown in the security modal.
@@ -91,6 +92,7 @@ impl Inspection {
 #[derive(Debug, Clone)]
 pub struct SecurityEngine {
     mode: SecurityMode,
+    workspace: GuestWorkspacePolicy,
 }
 
 impl Default for SecurityEngine {
@@ -101,7 +103,28 @@ impl Default for SecurityEngine {
 
 impl SecurityEngine {
     pub fn new(mode: SecurityMode) -> Self {
-        Self { mode }
+        Self {
+            mode,
+            workspace: GuestWorkspacePolicy::default(),
+        }
+    }
+
+    /// Use the given guest workspace roots for destructive-command
+    /// classification. Phase 4b builds this from the VM's config and
+    /// membership; without it only `/workspace` is guarded.
+    pub fn with_workspace_policy(mut self, workspace: GuestWorkspacePolicy) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    /// Replace the guest workspace roots, for callers that reconfigure a live
+    /// engine (for example the TUI after switching VMs).
+    pub fn set_workspace_policy(&mut self, workspace: GuestWorkspacePolicy) {
+        self.workspace = workspace;
+    }
+
+    pub fn workspace_policy(&self) -> &GuestWorkspacePolicy {
+        &self.workspace
     }
 
     pub fn mode(&self) -> SecurityMode {
@@ -110,6 +133,17 @@ impl SecurityEngine {
 
     /// Inspect a shell command before it is sent to the guest.
     pub fn inspect(&self, command: &str, cwd: Option<&std::path::Path>) -> Inspection {
+        self.inspect_with_policy(command, cwd, &self.workspace)
+    }
+
+    /// Inspect a command against an explicit workspace policy without changing
+    /// the engine's configured roots.
+    pub fn inspect_with_policy(
+        &self,
+        command: &str,
+        cwd: Option<&std::path::Path>,
+        workspace: &GuestWorkspacePolicy,
+    ) -> Inspection {
         let command = command.trim();
         if command.is_empty() {
             return Inspection::allowed();
@@ -119,7 +153,7 @@ impl SecurityEngine {
 
         // hegn's own guardrails run even when tirith is disabled, because they
         // encode workspace invariants rather than generic threat signatures.
-        if let Some(risk) = detect_workspace_risk(command) {
+        if let Some(risk) = detect_workspace_risk_with_policy(command, workspace) {
             findings.push(Finding {
                 rule: "workspace_destructive".to_string(),
                 severity: Severity::High,
@@ -549,6 +583,84 @@ mod tests {
         assert_eq!(
             SecurityEngine::new(SecurityMode::Off).mode(),
             SecurityMode::Off
+        );
+    }
+
+    fn multi_project_policy() -> GuestWorkspacePolicy {
+        GuestWorkspacePolicy::with_members("/projects", [("parser", false), ("cli", true)]).unwrap()
+    }
+
+    #[test]
+    fn configured_workspace_policy_guards_every_member_root() {
+        let engine = SecurityEngine::new(SecurityMode::Enforce)
+            .with_workspace_policy(multi_project_policy());
+        for command in [
+            "rm -rf /projects",
+            "rm -rf /projects/*",
+            "rm -rf /projects/parser/target",
+            "rm -rf /projects/cli/.env",
+            "rm -rf /workspace/src",
+        ] {
+            let inspection = engine.inspect(command, None);
+            assert_eq!(inspection.decision, Decision::Block, "{command}");
+            assert!(inspection.destructive, "{command}");
+            assert!(inspection.suggest_checkpoint, "{command}");
+        }
+        assert_eq!(
+            engine.workspace_policy().roots(),
+            vec!["/projects/cli", "/projects/parser", "/workspace"]
+        );
+    }
+
+    #[test]
+    fn configured_workspace_policy_keeps_non_workspace_paths_alone() {
+        // `Off` isolates hegn's guardrail from tirith's generic destructive-rm
+        // rules so the assertion is about policy classification only.
+        let engine =
+            SecurityEngine::new(SecurityMode::Off).with_workspace_policy(multi_project_policy());
+        for command in [
+            "rm -rf /projects/parser-other",
+            "rm -rf /projects/*/src",
+            "rm -rf /projectspace",
+            "rm -rf /tmp/build",
+        ] {
+            let inspection = engine.inspect(command, None);
+            assert!(!inspection.destructive, "{command}");
+        }
+        assert!(engine.inspect("rm -rf /projects/parser", None).destructive);
+        let all_members = engine.inspect("rm -rf /projects/*", None);
+        assert!(all_members.destructive);
+        assert_eq!(
+            all_members.summary(),
+            "HIGH: recursive delete of all workspace projects"
+        );
+    }
+
+    #[test]
+    fn one_off_policy_inspection_does_not_mutate_the_engine() {
+        let engine = SecurityEngine::new(SecurityMode::Off);
+        let policy = multi_project_policy();
+        assert!(!engine.inspect("rm -rf /projects/parser", None).destructive);
+        assert!(
+            engine
+                .inspect_with_policy("rm -rf /projects/parser", None, &policy)
+                .destructive
+        );
+        assert!(
+            !engine.inspect("rm -rf /projects/parser", None).destructive,
+            "inspect_with_policy must not change the configured roots"
+        );
+    }
+
+    #[test]
+    fn workspace_policy_can_be_replaced_on_a_live_engine() {
+        let mut engine = SecurityEngine::new(SecurityMode::Off);
+        assert!(!engine.inspect("rm -rf /projects/parser", None).destructive);
+        engine.set_workspace_policy(multi_project_policy());
+        assert!(engine.inspect("rm -rf /projects/parser", None).destructive);
+        assert_eq!(
+            engine.workspace_policy().roots(),
+            vec!["/projects/cli", "/projects/parser", "/workspace"]
         );
     }
 }
