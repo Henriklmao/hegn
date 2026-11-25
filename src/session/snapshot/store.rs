@@ -491,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn pruning_keeps_the_newest_autosaves_per_instance() {
+    fn pruning_keeps_the_newest_autosaves_per_vm() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(dir.path());
         for (index, offset) in [("auto-old", 0), ("auto-new", 20)] {
