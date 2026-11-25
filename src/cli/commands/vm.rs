@@ -616,10 +616,12 @@ pub(crate) fn confirm(json: bool, question: &str, hint: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         bail!("confirmation required; pass {hint} in non-interactive mode");
     }
-    print!("{question} [y/N] ");
-    std::io::stdout().flush()?;
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
     let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
+    if std::io::stdin().lock().read_line(&mut line)? == 0 {
+        return Ok(false);
+    }
     Ok(matches!(
         line.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
