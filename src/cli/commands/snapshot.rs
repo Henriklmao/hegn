@@ -43,6 +43,25 @@ fn snapshot_owner(meta: &SnapshotMeta, name: &str) -> Result<String> {
         .to_owned())
 }
 
+/// Reject a `--vm` that names a different VM than the snapshot records.
+fn verify_owner(
+    registry: &VmRegistry,
+    requested: Option<String>,
+    owner: &str,
+    name: &str,
+) -> Result<()> {
+    if let Some(requested) = requested {
+        let vm = registry.resolve(&requested)?;
+        if vm.name != owner {
+            bail!(
+                "snapshot '{name}' belongs to VM '{owner}', not '{}'",
+                vm.name
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn snapshot_command(
     command: SnapshotCommands,
     config: Config,
@@ -111,7 +130,17 @@ pub(crate) fn snapshot_command(
             }
             Ok(0)
         }
-        SnapshotCommands::Delete { name } => {
+        SnapshotCommands::Delete { name, vm, instance } => {
+            if let Some(requested) = vm_selector(vm, instance) {
+                let meta = store.load(&name)?;
+                let owner = match (meta.legacy_label(), meta.vm()) {
+                    (None, Some(owner)) => owner.to_owned(),
+                    _ => bail!("snapshot '{name}' has no VM owner; omit --vm to delete it"),
+                };
+                verify_owner(&registry, Some(requested), &owner, &name)?;
+            }
+            // Without `--vm`, delete what the user named. Legacy, ownerless
+            // and corrupt snapshots are still removable.
             store.delete(&name)?;
             if json {
                 println!("{}", serde_json::json!({"deleted": name}));
@@ -120,8 +149,18 @@ pub(crate) fn snapshot_command(
             }
             Ok(0)
         }
-        SnapshotCommands::Show { name } => {
+        SnapshotCommands::Show { name, vm, instance } => {
             let meta = store.load(&name)?;
+            if let Some(requested) = vm_selector(vm, instance) {
+                match (meta.legacy_label(), meta.vm()) {
+                    (None, Some(owner)) => {
+                        verify_owner(&registry, Some(requested), owner, &name)?;
+                    }
+                    _ => eprintln!(
+                        "warning: snapshot '{name}' has no verifiable VM owner; showing it anyway"
+                    ),
+                }
+            }
             print_snapshot(&meta, json)?;
             Ok(0)
         }
@@ -287,5 +326,176 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("belongs to VM 'rust'"), "{message}");
         assert!(message.contains("not 'python'"), "{message}");
+    }
+
+    #[test]
+    fn delete_without_vm_removes_legacy_ownerless_and_corrupt_snapshots() {
+        let (_dir, config) = config();
+        let store = SnapshotStore::new(&config.snapshots_dir);
+        write_legacy_snapshot(&store, "legacy", Some("rust"));
+        write_snapshot(&store, "orphan", None);
+        let corrupt = config.snapshots_dir.join("corrupt");
+        fs::create_dir_all(&corrupt).unwrap();
+        fs::write(corrupt.join("snapshot.json"), b"not json").unwrap();
+
+        for name in ["legacy", "orphan", "corrupt"] {
+            assert_eq!(
+                snapshot_command(
+                    SnapshotCommands::Delete {
+                        name: name.into(),
+                        vm: None,
+                        instance: None,
+                    },
+                    config.clone(),
+                    true,
+                )
+                .unwrap(),
+                0
+            );
+            assert!(
+                !config.snapshots_dir.join(name).exists(),
+                "{name} must be deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_with_vm_refuses_snapshots_without_a_verifiable_owner() {
+        let (_dir, config) = config();
+        let store = SnapshotStore::new(&config.snapshots_dir);
+        write_legacy_snapshot(&store, "legacy", Some("rust"));
+        write_snapshot(&store, "orphan", None);
+
+        for name in ["legacy", "orphan"] {
+            let err = snapshot_command(
+                SnapshotCommands::Delete {
+                    name: name.into(),
+                    vm: Some("rust".into()),
+                    instance: None,
+                },
+                config.clone(),
+                true,
+            )
+            .unwrap_err();
+            assert_eq!(
+                format!("{err:#}"),
+                format!("snapshot '{name}' has no VM owner; omit --vm to delete it")
+            );
+            assert!(
+                config.snapshots_dir.join(name).exists(),
+                "{name} must be preserved"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_with_vm_verifies_ownership() {
+        let (_dir, config) = config();
+        save_vm(&config, "rust");
+        save_vm(&config, "python");
+        let store = SnapshotStore::new(&config.snapshots_dir);
+        write_snapshot(&store, "demo", Some("rust"));
+
+        let err = snapshot_command(
+            SnapshotCommands::Delete {
+                name: "demo".into(),
+                vm: Some("python".into()),
+                instance: None,
+            },
+            config.clone(),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("belongs to VM 'rust'"),
+            "{err:#}"
+        );
+        assert!(config.snapshots_dir.join("demo").exists());
+
+        assert_eq!(
+            snapshot_command(
+                SnapshotCommands::Delete {
+                    name: "demo".into(),
+                    vm: Some("rust".into()),
+                    instance: None,
+                },
+                config,
+                true,
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn show_without_vm_prints_legacy_and_ownerless_snapshots() {
+        let (_dir, config) = config();
+        let store = SnapshotStore::new(&config.snapshots_dir);
+        write_legacy_snapshot(&store, "legacy", Some("rust"));
+        write_snapshot(&store, "orphan", None);
+
+        for name in ["legacy", "orphan"] {
+            assert_eq!(
+                snapshot_command(
+                    SnapshotCommands::Show {
+                        name: name.into(),
+                        vm: None,
+                        instance: None,
+                    },
+                    config.clone(),
+                    true,
+                )
+                .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn show_with_vm_warns_but_still_prints_unverifiable_snapshots() {
+        let (_dir, config) = config();
+        let store = SnapshotStore::new(&config.snapshots_dir);
+        write_legacy_snapshot(&store, "legacy", Some("rust"));
+        write_snapshot(&store, "orphan", None);
+
+        for name in ["legacy", "orphan"] {
+            assert_eq!(
+                snapshot_command(
+                    SnapshotCommands::Show {
+                        name: name.into(),
+                        vm: Some("rust".into()),
+                        instance: None,
+                    },
+                    config.clone(),
+                    true,
+                )
+                .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn show_with_vm_refuses_an_owner_mismatch() {
+        let (_dir, config) = config();
+        save_vm(&config, "rust");
+        save_vm(&config, "python");
+        let store = SnapshotStore::new(&config.snapshots_dir);
+        write_snapshot(&store, "demo", Some("rust"));
+
+        let err = snapshot_command(
+            SnapshotCommands::Show {
+                name: "demo".into(),
+                vm: Some("python".into()),
+                instance: None,
+            },
+            config,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("belongs to VM 'rust'"),
+            "{err:#}"
+        );
     }
 }

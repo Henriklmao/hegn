@@ -462,9 +462,35 @@ pub enum SnapshotCommands {
         instance: Option<String>,
     },
     /// Delete a snapshot directory.
-    Delete { name: String },
+    Delete {
+        name: String,
+        /// Verify the snapshot belongs to this VM before deleting it.
+        #[arg(long, value_name = "VM")]
+        vm: Option<String>,
+        /// Deprecated spelling of `--vm`.
+        #[arg(
+            long = "instance",
+            hide = true,
+            value_name = "VM",
+            conflicts_with = "vm"
+        )]
+        instance: Option<String>,
+    },
     /// Show snapshot metadata.
-    Show { name: String },
+    Show {
+        name: String,
+        /// Verify the snapshot belongs to this VM before showing it.
+        #[arg(long, value_name = "VM")]
+        vm: Option<String>,
+        /// Deprecated spelling of `--vm`.
+        #[arg(
+            long = "instance",
+            hide = true,
+            value_name = "VM",
+            conflicts_with = "vm"
+        )]
+        instance: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1320,6 +1346,61 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_delete_and_show_accept_vm_and_hidden_instance_alias() {
+        let cli =
+            Cli::try_parse_from(["hegn", "snapshot", "delete", "demo", "--vm", "rust"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Snapshot {
+                command: SnapshotCommands::Delete {
+                    ref name,
+                    vm: Some(ref vm),
+                    instance: None
+                }
+            }) if name == "demo" && vm == "rust"
+        ));
+
+        let cli =
+            Cli::try_parse_from(["hegn", "snapshot", "show", "demo", "--vm", "rust"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Snapshot {
+                command: SnapshotCommands::Show {
+                    ref name,
+                    vm: Some(ref vm),
+                    instance: None
+                }
+            }) if name == "demo" && vm == "rust"
+        ));
+
+        let cli = Cli::try_parse_from(["hegn", "snapshot", "delete", "demo", "--instance", "rust"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Snapshot {
+                command: SnapshotCommands::Delete {
+                    ref name,
+                    vm: None,
+                    instance: Some(ref instance)
+                }
+            }) if name == "demo" && instance == "rust"
+        ));
+
+        let cli = Cli::try_parse_from(["hegn", "snapshot", "show", "demo", "--instance", "rust"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Snapshot {
+                command: SnapshotCommands::Show {
+                    ref name,
+                    vm: None,
+                    instance: Some(ref instance)
+                }
+            }) if name == "demo" && instance == "rust"
+        ));
+    }
+
+    #[test]
     fn snapshot_list_and_create_instance_alias_is_hidden_in_help() {
         use clap::CommandFactory;
         let command = Cli::command();
@@ -1327,7 +1408,7 @@ mod tests {
             .get_subcommands()
             .find(|subcommand| subcommand.get_name() == "snapshot")
             .unwrap();
-        for name in ["list", "create", "restore"] {
+        for name in ["list", "create", "restore", "delete", "show"] {
             let subcommand = snapshot
                 .get_subcommands()
                 .find(|subcommand| subcommand.get_name() == name)
