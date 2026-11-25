@@ -78,6 +78,22 @@ impl Config {
         if self.guest_projects_base == "/" {
             bail!("guest_projects_base must not be the filesystem root");
         }
+        // `/workspace` is the primary-project symlink created in every guest.
+        // Mounting member projects at or below it would shadow or collide with
+        // that symlink, so the directory is reserved.
+        let workspace = crate::security::WORKSPACE_GUEST_PATH;
+        if self.guest_projects_base == workspace
+            || self
+                .guest_projects_base
+                .strip_prefix(workspace)
+                .is_some_and(|rest| rest.starts_with('/'))
+        {
+            bail!(
+                "guest_projects_base {} is reserved for the primary /workspace symlink; \
+                 use /projects or another guest path",
+                self.guest_projects_base
+            );
+        }
         if !self.root_device.starts_with("/dev/")
             || !self.root_device.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
@@ -211,7 +227,7 @@ mod tests {
         config.memory_mib = 1024;
         config.guest_projects_base = "workspace".into();
         assert!(config.validate().is_err());
-        config.guest_projects_base = "/workspace".into();
+        config.guest_projects_base = "/projects".into();
         config.root_device = "vda1".into();
         assert!(config.validate().is_err());
         config.root_device = "/dev/vda1".into();
@@ -222,7 +238,7 @@ mod tests {
         config.share_tag_prefix = "workspace".into();
         config.guest_projects_base = "/work space".into();
         assert!(config.validate().is_err());
-        config.guest_projects_base = "/workspace".into();
+        config.guest_projects_base = "/projects".into();
         config.kernel_image = PathBuf::from("/images/vmlinux,broken");
         assert!(config.validate().is_err());
         config.kernel_image = PathBuf::from("/images/vmlinux");
@@ -239,6 +255,26 @@ mod tests {
         assert!(config.validate().is_err());
         config.snapshot_keep = 2;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn guest_projects_base_reserves_the_workspace_symlink() {
+        let mut config = Config::default();
+        for base in ["/workspace", "/workspace/foo", "/workspace/foo/bar"] {
+            config.guest_projects_base = base.into();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("reserved"), "{base}: {err}");
+            assert!(err.contains("/workspace"), "{base}: {err}");
+            assert!(err.contains("primary"), "{base}: {err}");
+        }
+        // safe_mount rejects a trailing slash before the reserved check runs.
+        config.guest_projects_base = "/workspace/".into();
+        assert!(config.validate().is_err());
+
+        for base in ["/projects", "/work", "/workspace2", "/projectsworkspace"] {
+            config.guest_projects_base = base.into();
+            assert!(config.validate().is_ok(), "{base} must remain valid");
+        }
     }
 
     #[test]
