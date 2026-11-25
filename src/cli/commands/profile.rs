@@ -85,15 +85,15 @@ pub(crate) fn profile_command(command: ProfileCommands, config: Config, json: bo
             }
             Ok(0)
         }
-        ProfileCommands::Sync { instance: selector } => {
+        ProfileCommands::Sync { vm } => {
             let registry = VmRegistry::new(config);
-            let vm = registry.resolve(&selector)?;
+            let vm = registry.resolve(&vm)?;
             let plan = crate::agent::profile::prepare_for_start(registry.config(), &vm)?;
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "instance": vm.name,
+                        "vm": vm.name,
                         "packages": plan.packages,
                         "share": plan.share.as_ref().map(|share| &share.bundle_dir),
                         "warnings": plan.warnings,
@@ -114,7 +114,7 @@ pub(crate) fn profile_command(command: ProfileCommands, config: Config, json: bo
                 for warning in &plan.warnings {
                     eprintln!("hegn: {warning}");
                 }
-                println!("Restart the instance to apply configuration files.");
+                println!("Restart the VM to apply configuration files.");
             }
             Ok(0)
         }

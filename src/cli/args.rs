@@ -14,7 +14,7 @@ use crate::session::logs::DEFAULT_KEEP;
 #[command(
     name = "hegn",
     version,
-    about = "Cloud Hypervisor instance manager and TUI for coding agents",
+    about = "Cloud Hypervisor VM manager and TUI for coding agents",
     long_about = "hegn launches hardware-isolated Cloud Hypervisor VMs with a shared \
 workspace, intercepts dangerous commands with tirith-core, and manages VM snapshots. \
 Run without a subcommand to open the TUI."
@@ -112,10 +112,10 @@ pub enum Commands {
     ///
     /// The clap tree is kept so an existing script gets a readable migration
     /// message instead of an "unknown command" usage error.
-    #[command(alias = "sandbox", hide = true)]
-    Instance {
+    #[command(name = "instance", alias = "sandbox", hide = true)]
+    LegacyMapping {
         #[command(subcommand)]
-        command: Option<LegacyInstanceCommands>,
+        command: Option<LegacyMappingCommands>,
     },
     /// List, create, restore and delete VM snapshots.
     Snapshot {
@@ -141,7 +141,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: ProfileCommands,
     },
-    /// Copy host skills into an instance and sync changes back.
+    /// Copy host skills into a VM and sync changes back.
     Skills {
         #[command(subcommand)]
         command: SkillCommands,
@@ -163,7 +163,7 @@ pub enum Commands {
         #[arg(long)]
         fix: bool,
     },
-    /// Measure the host cost of an instance; boots one on demand.
+    /// Measure the host cost of a VM; boots one on demand.
     Benchmark {
         /// Project name or path to boot and measure.
         project: Option<String>,
@@ -342,7 +342,7 @@ pub enum VmCommands {
 /// Every variant only selects the v2 mapping that is printed before exiting
 /// non-zero; no legacy lifecycle behaviour remains.
 #[derive(Debug, Subcommand)]
-pub enum LegacyInstanceCommands {
+pub enum LegacyMappingCommands {
     /// List all instances and their state.
     #[command(visible_alias = "ls")]
     List,
@@ -609,24 +609,27 @@ pub enum ProfileCommands {
     },
     /// Write missing per-harness profile templates.
     Init,
-    /// Refresh an instance's profile payload (files, environment, skills).
+    /// Refresh a VM's profile payload (files, environment, skills).
     Sync {
-        /// Instance name, project name or project path.
-        instance: String,
+        /// VM name, project name or project path.
+        #[arg(value_name = "VM")]
+        vm: String,
     },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum SkillCommands {
-    /// Copy host skill changes into an instance's private copy.
+    /// Copy host skill changes into a VM's private copy.
     Sync {
-        /// Instance name, project name or project path.
-        instance: String,
+        /// VM name, project name or project path.
+        #[arg(value_name = "VM")]
+        vm: String,
     },
-    /// Copy guest skill changes from an instance back to the host.
+    /// Copy guest skill changes from a VM back to the host.
     SyncBack {
-        /// Instance name, project name or project path.
-        instance: String,
+        /// VM name, project name or project path.
+        #[arg(value_name = "VM")]
+        vm: String,
         /// Report what would be copied without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -662,13 +665,40 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_alias_still_parses_as_instance() {
+    fn sandbox_alias_still_parses_as_legacy_mapping() {
         let cli = Cli::try_parse_from(["hegn", "sandbox", "list"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Commands::Instance {
-                command: Some(LegacyInstanceCommands::List)
+            Some(Commands::LegacyMapping {
+                command: Some(LegacyMappingCommands::List)
             })
+        ));
+    }
+
+    #[test]
+    fn sync_commands_take_a_vm_value() {
+        let cli = Cli::try_parse_from(["hegn", "profile", "sync", "demo"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Profile {
+                command: ProfileCommands::Sync { vm }
+            }) if vm == "demo"
+        ));
+
+        let cli = Cli::try_parse_from(["hegn", "skills", "sync", "demo"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Skills {
+                command: SkillCommands::Sync { vm }
+            }) if vm == "demo"
+        ));
+
+        let cli = Cli::try_parse_from(["hegn", "skills", "sync-back", "demo"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Skills {
+                command: SkillCommands::SyncBack { vm, .. }
+            }) if vm == "demo"
         ));
     }
 
@@ -759,14 +789,9 @@ mod tests {
         .unwrap();
         match cli.command {
             Some(Commands::Skills {
-                command:
-                    SkillCommands::SyncBack {
-                        instance,
-                        dry_run,
-                        force,
-                    },
+                command: SkillCommands::SyncBack { vm, dry_run, force },
             }) => {
-                assert_eq!(instance, "demo");
+                assert_eq!(vm, "demo");
                 assert!(dry_run);
                 assert!(force);
             }
@@ -791,8 +816,8 @@ mod tests {
         let cli = Cli::try_parse_from(["hegn", "instance", "ls"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Commands::Instance {
-                command: Some(LegacyInstanceCommands::List)
+            Some(Commands::LegacyMapping {
+                command: Some(LegacyMappingCommands::List)
             })
         ));
 
@@ -898,9 +923,9 @@ mod tests {
     fn optional_arguments_default_to_safe_values() {
         let cli = Cli::try_parse_from(["hegn", "instance", "clone", "demo"]).unwrap();
         match cli.command {
-            Some(Commands::Instance {
+            Some(Commands::LegacyMapping {
                 command:
-                    Some(LegacyInstanceCommands::Clone {
+                    Some(LegacyMappingCommands::Clone {
                         source,
                         name,
                         count,
@@ -1431,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_instance_command_stays_out_of_help() {
+    fn hidden_legacy_mapping_command_stays_out_of_help() {
         use clap::CommandFactory;
         let command = Cli::command();
         let instance = command

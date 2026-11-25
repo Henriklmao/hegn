@@ -21,19 +21,19 @@ use super::vm::{
     guest_cwd_command, guest_path_for, only_running_vm, primary_guest_path, resolve_project_entry,
     vm_for_entry, wait_for_provision,
 };
-use crate::cli::args::LegacyInstanceCommands;
+use crate::cli::args::LegacyMappingCommands;
 
 /// Withdrawn v1 command group. Any invocation exits non-zero after printing
 /// the v2 equivalents so a stale script can be fixed mechanically.
-pub(crate) fn instance_command(
-    _command: Option<LegacyInstanceCommands>,
+pub(crate) fn legacy_mapping_command(
+    _command: Option<LegacyMappingCommands>,
     _config: Config,
     _json: bool,
 ) -> Result<i32> {
-    bail!("{}", instance_migration_message())
+    bail!("{}", legacy_mapping_message())
 }
 
-pub(crate) fn instance_migration_message() -> &'static str {
+pub(crate) fn legacy_mapping_message() -> &'static str {
     "`hegn instance` was replaced by `hegn vm` and `hegn project`:\n\
      \n\
        hegn instance list|status      -> hegn vm list / hegn vm show <vm>\n\
@@ -245,22 +245,22 @@ pub(crate) fn launch_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::args::LegacyInstanceCommands;
+    use crate::cli::args::LegacyMappingCommands;
     use crate::cli::test_support::config;
 
     #[test]
-    fn every_instance_invocation_is_a_migration_error() {
+    fn every_legacy_mapping_invocation_is_a_migration_error() {
         let (_dir, config) = config();
         for command in [
             None,
-            Some(LegacyInstanceCommands::List),
-            Some(LegacyInstanceCommands::Create {
+            Some(LegacyMappingCommands::List),
+            Some(LegacyMappingCommands::Create {
                 project: "demo".into(),
                 name: None,
                 harness: None,
                 clone: false,
             }),
-            Some(LegacyInstanceCommands::Clone {
+            Some(LegacyMappingCommands::Clone {
                 source: "demo".into(),
                 name: None,
                 count: 1,
@@ -268,7 +268,7 @@ mod tests {
                 no_start: true,
             }),
         ] {
-            let err = instance_command(command, config.clone(), true)
+            let err = legacy_mapping_command(command, config.clone(), true)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("hegn vm"), "{err}");
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn migration_message_names_the_project_first_equivalents() {
-        let message = instance_migration_message();
+        let message = legacy_mapping_message();
         assert!(message.contains("hegn vm start"), "{message}");
         assert!(message.contains("hegn project assign"), "{message}");
         assert!(message.contains("hegn project fork"), "{message}");

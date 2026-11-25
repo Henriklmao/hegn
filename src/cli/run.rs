@@ -11,7 +11,7 @@ use super::args::{Cli, Commands, LogCommands};
 use super::commands::config::config_command;
 use super::commands::doctor::{check, doctor};
 use super::commands::image::image_command;
-use super::commands::instance::{attach, instance_command, launch_command, open};
+use super::commands::instance::{attach, launch_command, legacy_mapping_command, open};
 use super::commands::logs::logs_command;
 use super::commands::network::network_command;
 use super::commands::profile::profile_command;
@@ -102,7 +102,7 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
             json,
         ),
         Commands::Vm { command } => vm_command(command, config, json),
-        Commands::Instance { command } => instance_command(command, config, json),
+        Commands::LegacyMapping { command } => legacy_mapping_command(command, config, json),
         Commands::Snapshot { command } => snapshot_command(command, config, json),
         Commands::Check { command, cwd } => check(&command.join(" "), cwd.as_deref(), config, json),
         Commands::Config { command } => config_command(command, config, json),
