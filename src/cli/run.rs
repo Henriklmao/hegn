@@ -18,6 +18,8 @@ use super::commands::profile::profile_command;
 use super::commands::project::project_command;
 use super::commands::skill::skill_command;
 use super::commands::snapshot::snapshot_command;
+use super::commands::vm::vm_command;
+use super::output::{print_projects, project_rows};
 
 /// Run the CLI. Returns the process exit code.
 pub fn run(cli: Cli) -> Result<i32> {
@@ -63,26 +65,15 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
                     .into_iter()
                     .filter(|project| !store.is_hidden(&project.path))
                     .collect::<Vec<_>>();
-            let indices = project::filter_projects(&projects, query.as_deref().unwrap_or(""));
-            let selected: Vec<&project::Project> = indices.iter().map(|&i| &projects[i]).collect();
-            if json {
-                println!("{}", serde_json::to_string_pretty(&selected)?);
-            } else if selected.is_empty() {
+            let rows = project_rows(&config, &projects, query.as_deref().unwrap_or(""))?;
+            if rows.is_empty() && !json {
                 println!(
                     "No projects in {}.\nCreate one with: hegn project create <name>",
                     config.projects_root.display()
                 );
-            } else {
-                println!("{:<28} {:<20} PATH", "NAME", "GIT");
-                for project in selected {
-                    println!(
-                        "{:<28} {:<20} {}",
-                        project.name,
-                        project.git.badge(),
-                        project.display_path()
-                    );
-                }
+                return Ok(0);
             }
+            print_projects(&rows, json)?;
             Ok(0)
         }
         Commands::Project { command } => project_command(command, config, json),
@@ -105,9 +96,12 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
             integration,
             no_bar,
         } => launch_command(selector, command, integration, no_bar, config),
-        Commands::Logs { command } => {
-            logs_command(command.unwrap_or(LogCommands::List), config, json)
-        }
+        Commands::Logs { command } => logs_command(
+            command.unwrap_or(LogCommands::List { vm: None }),
+            config,
+            json,
+        ),
+        Commands::Vm { command } => vm_command(command, config, json),
         Commands::Instance { command } => instance_command(command, config, json),
         Commands::Snapshot { command } => snapshot_command(command, config, json),
         Commands::Check { command, cwd } => check(&command.join(" "), cwd.as_deref(), config, json),

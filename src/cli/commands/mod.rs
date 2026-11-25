@@ -13,3 +13,4 @@ pub(crate) mod profile;
 pub(crate) mod project;
 pub(crate) mod skill;
 pub(crate) mod snapshot;
+pub(crate) mod vm;

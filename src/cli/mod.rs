@@ -12,8 +12,8 @@ mod resolve;
 mod run;
 
 pub use self::args::{
-    Cli, Commands, ConfigCommands, ImageCommands, InstanceCommands, LogCommands, NetworkCommands,
-    ProfileCommands, ProjectCommands, SkillCommands, SnapshotCommands,
+    Cli, Commands, ConfigCommands, ForkModeArg, ImageCommands, InstanceCommands, LogCommands,
+    NetworkCommands, ProfileCommands, ProjectCommands, SkillCommands, SnapshotCommands, VmCommands,
 };
 pub use self::commands::doctor::check_command_for_test;
 pub use self::resolve::{resolve_project, resolve_project_entry};

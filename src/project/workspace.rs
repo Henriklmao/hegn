@@ -350,10 +350,35 @@ impl<'a> WorkspaceService<'a> {
             .with_context(|| format!("clone '{}' has no VM assignment", entry.name))?;
         let target = self.checked_clone_path(&entry, vm)?;
 
-        if !registry.remove(name)? {
-            bail!("project '{name}' disappeared from the registry");
+        // The clone may be the VM primary. Choose its successor while it is
+        // still a registered member, then roll the primary back if the registry
+        // removal itself fails.
+        let primary = super::delete::PrimaryUpdate::prepare(self.config, registry, &entry)?;
+        match registry.remove(name) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Some(primary) = &primary {
+                    let _ = primary.restore(self.config);
+                }
+                bail!("project '{name}' disappeared from the registry");
+            }
+            Err(err) => {
+                if let Some(primary) = &primary {
+                    let _ = primary.restore(self.config);
+                }
+                return Err(err);
+            }
+        }
+        if let Err(err) = registry.validate(self.config, self.vms) {
+            let _ = registry.upsert(entry.clone());
+            if let Some(primary) = &primary {
+                let _ = primary.restore(self.config);
+            }
+            return Err(err);
         }
 
+        // The registry entry stays removed even if the directory deletion
+        // fails: a half-deleted clone must never be registered for a boot.
         match fs::symlink_metadata(&target) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 bail!(
@@ -1388,6 +1413,57 @@ mod tests {
             .unwrap();
         assert_eq!(removed, clone.path);
         assert!(fixture.registry.get("parser-fix").is_none());
+    }
+
+    fn set_primary(fixture: &Fixture, primary: &str) {
+        let mut vm = fixture.vms.load("rust").unwrap();
+        vm.primary = Some(primary.to_string());
+        fixture.vms.save(&vm).unwrap();
+    }
+
+    #[test]
+    fn removing_a_primary_clone_hands_the_flag_to_the_next_member() {
+        let mut fixture = Fixture::new();
+        fixture.parent();
+        let service = WorkspaceService::new(&fixture.config, &fixture.vms);
+        service
+            .fork_clone(&mut fixture.registry, "parser", "parser-fix")
+            .unwrap();
+        set_primary(&fixture, "parser-fix");
+
+        service
+            .remove_clone(&mut fixture.registry, "parser-fix")
+            .unwrap();
+        assert_eq!(
+            fixture.vms.load("rust").unwrap().primary.as_deref(),
+            Some("parser")
+        );
+    }
+
+    #[test]
+    fn a_failed_clone_removal_restores_the_old_primary() {
+        let mut fixture = Fixture::new();
+        fixture.parent();
+        let service = WorkspaceService::new(&fixture.config, &fixture.vms);
+        let clone = service
+            .fork_clone(&mut fixture.registry, "parser", "parser-fix")
+            .unwrap();
+        service
+            .fork_worktree(&mut fixture.registry, "parser-fix", "experiment", None)
+            .unwrap();
+        set_primary(&fixture, "parser-fix");
+
+        let err = service
+            .remove_clone(&mut fixture.registry, "parser-fix")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("worktrees still name it"), "{err}");
+        assert_eq!(
+            fixture.vms.load("rust").unwrap().primary.as_deref(),
+            Some("parser-fix")
+        );
+        assert!(clone.path.is_dir());
+        assert!(fixture.registry.get("parser-fix").is_some());
     }
 
     #[test]

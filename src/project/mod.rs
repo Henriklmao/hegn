@@ -23,7 +23,7 @@ mod registry;
 mod workspace;
 
 pub use create::create_project;
-pub use delete::delete_project;
+pub use delete::{delete_project, delete_registered_project};
 pub use discovery::{discover, discover_protected};
 pub use filter::{filter_projects, fuzzy_score};
 pub use git::{create_checkpoint, create_session_branch, parse_git_status, read_git_summary};

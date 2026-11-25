@@ -53,6 +53,69 @@ pub struct DeleteOutcome {
     pub kept_workspace: Option<PathBuf>,
 }
 
+/// Delete a VM's private rootfs so the next start copies a fresh base image.
+///
+/// Only the per-VM copy below `vms_dir/<name>` is eligible. An explicit
+/// `rootfs_image` is shared state and is always refused. The file must be a
+/// regular, non-symlinked `rootfs.<format>` directly inside the VM directory;
+/// workspaces and every other VM file are left untouched.
+pub fn remove_private_rootfs(config: &Config, vm: &VmConfig) -> Result<Option<PathBuf>> {
+    if let Some(image) = &vm.rootfs_image {
+        bail!(
+            "VM '{}' uses the explicit rootfs_image {}; rebuild only manages a private copy",
+            vm.name,
+            image.display()
+        );
+    }
+    let dir = vm.dir(&config.vms_dir);
+    match fs::symlink_metadata(&dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("refusing symlinked VM directory {}", dir.display());
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            bail!("VM path {} is not a directory", dir.display());
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", dir.display()));
+        }
+    }
+
+    let dest = vm.rootfs_path(config);
+    if dest.parent() != Some(dir.as_path()) {
+        bail!(
+            "refusing to delete rootfs {}: expected it directly inside {}",
+            dest.display(),
+            dir.display()
+        );
+    }
+    let expected = format!("rootfs.{}", config.rootfs_format.as_str());
+    if dest.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        bail!(
+            "refusing to delete rootfs {}: expected the private file name {expected}",
+            dest.display()
+        );
+    }
+
+    match fs::symlink_metadata(&dest) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("refusing to delete symlinked rootfs {}", dest.display());
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            bail!("rootfs {} is not a regular file", dest.display());
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", dest.display()));
+        }
+    }
+    fs::remove_file(&dest)
+        .with_context(|| format!("failed to delete rootfs {}", dest.display()))?;
+    Ok(Some(dest))
+}
+
 /// Multi-VM registry; the global [`Config`] supplies machine-wide settings.
 #[derive(Debug, Clone)]
 pub struct VmRegistry {
@@ -580,5 +643,45 @@ mod tests {
             .ensure_for_project(&project(dir.path(), "demo"), Harness::Shell)
             .unwrap();
         assert_eq!(registry.unique_name("demo").unwrap(), "demo-1");
+    }
+
+    #[test]
+    fn remove_private_rootfs_only_deletes_the_per_vm_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let store = VmStore::new(&config);
+        let vm = VmConfig::from_config(&config, "demo", Some(Harness::Shell));
+        store.save(&vm).unwrap();
+        let rootfs = vm.rootfs_path(&config);
+        std::fs::create_dir_all(rootfs.parent().unwrap()).unwrap();
+        std::fs::write(&rootfs, b"disk").unwrap();
+        std::fs::write(config.vms_dir.join("demo/keep.txt"), b"keep").unwrap();
+
+        let removed = remove_private_rootfs(&config, &vm).unwrap();
+        assert_eq!(removed.as_deref(), Some(rootfs.as_path()));
+        assert!(!rootfs.exists());
+        assert!(config.vms_dir.join("demo/keep.txt").is_file());
+        assert_eq!(remove_private_rootfs(&config, &vm).unwrap(), None);
+    }
+
+    #[test]
+    fn remove_private_rootfs_refuses_explicit_symlinked_and_foreign_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let store = VmStore::new(&config);
+        let mut vm = VmConfig::from_config(&config, "demo", Some(Harness::Shell));
+        vm.rootfs_image = Some(dir.path().join("shared.qcow2"));
+        let err = remove_private_rootfs(&config, &vm).unwrap_err().to_string();
+        assert!(err.contains("explicit rootfs_image"), "{err}");
+
+        vm.rootfs_image = None;
+        store.save(&vm).unwrap();
+        let rootfs = vm.rootfs_path(&config);
+        let target = dir.path().join("outside.img");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &rootfs).unwrap();
+        let err = remove_private_rootfs(&config, &vm).unwrap_err().to_string();
+        assert!(err.contains("symlinked rootfs"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
     }
 }
