@@ -12,9 +12,11 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
 use crate::project::{ProjectKind, ProjectRegistry};
+use crate::security::GuestWorkspacePolicy;
 use crate::vm::cloud_init::{self, MountSpec};
 use crate::vm::config::{VmConfig, VmStore};
 
+use super::core::VmManager;
 use super::paths::VmPaths;
 
 /// Longest guest slug; paths must stay short and readable.
@@ -183,6 +185,125 @@ impl BootPlan {
             .map(|member| member.path.as_path())
             .collect()
     }
+
+    /// Derive the guest workspace roots for this boot plan.
+    ///
+    /// Every exported member becomes `<base>/<slug>` and `/workspace` is
+    /// included automatically. The plan's primary member drives `/workspace`,
+    /// including its read-only flag. The guest projects base is the one the
+    /// plan was built with: it is recovered from the recorded guest paths, so
+    /// cold-boot plans and snapshot-restored plans derive identical policies.
+    ///
+    /// A plan without exported members is rejected rather than silently
+    /// producing a `/workspace`-only policy with no actual mounts behind it.
+    pub fn workspace_policy(&self) -> Result<GuestWorkspacePolicy> {
+        if self.members.is_empty() {
+            bail!(
+                "cannot derive a guest workspace policy for VM '{}': it has no exported members",
+                self.vm
+            );
+        }
+        let base = self.workspace_base()?;
+        let members = self
+            .members
+            .iter()
+            .map(|member| (member.slug.as_str(), member.read_only));
+        let mut policy = GuestWorkspacePolicy::with_members(base, members).with_context(|| {
+            format!(
+                "invalid guest workspace membership for VM '{}' below {base}",
+                self.vm
+            )
+        })?;
+        let roots = policy.roots();
+        for member in &self.members {
+            if !roots.contains(&member.guest_path.as_str()) {
+                bail!(
+                    "plan member '{}' guest path {} does not match slug '{}' below {base}; \
+                     refusing to derive a policy for paths the VM does not mount",
+                    member.name,
+                    member.guest_path,
+                    member.slug
+                );
+            }
+        }
+        policy.set_primary(&self.primary_slug).with_context(|| {
+            format!(
+                "VM '{}' primary project '{}' is not an exported member",
+                self.vm, self.primary
+            )
+        })?;
+        Ok(policy)
+    }
+
+    /// Recover the guest projects base recorded by the plan's member paths.
+    ///
+    /// Every member must agree on the same base, and each guest path must be
+    /// exactly `<base>/<slug>`. A plan assembled from a malformed snapshot or
+    /// by hand is rejected instead of being classified against the wrong
+    /// directory.
+    fn workspace_base(&self) -> Result<&str> {
+        let first = self
+            .members
+            .first()
+            .context("cannot derive a guest workspace policy without a member")?;
+        let (base, _) = first
+            .guest_path
+            .rsplit_once('/')
+            .filter(|(base, _)| !base.is_empty())
+            .with_context(|| {
+                format!(
+                    "plan member '{}' has invalid guest path {}",
+                    first.name, first.guest_path
+                )
+            })?;
+        for member in &self.members {
+            let expected = format!("{base}/{}", member.slug);
+            if member.guest_path != expected {
+                bail!(
+                    "plan member '{}' records guest path {} but slug '{}' implies {expected}",
+                    member.name,
+                    member.guest_path,
+                    member.slug
+                );
+            }
+        }
+        Ok(base)
+    }
+}
+
+impl VmManager {
+    /// Derive the guest workspace roots for this VM.
+    ///
+    /// Prefers the membership record written by the running boot, because that
+    /// is the device tree actually mounted in the guest. When no readable
+    /// manifest exists the current boot plan is built from the registry and
+    /// used instead, so a stopped VM still gets a policy for its next boot.
+    ///
+    /// The TUI should call this single method and hand the result to
+    /// [`crate::security::SecurityEngine::with_workspace_policy`] (or
+    /// `set_workspace_policy` after switching VMs). That keeps the destructive
+    /// and exfiltration guardrails aligned with the VM that is actually
+    /// attached instead of hardcoding `/workspace`.
+    pub fn workspace_policy(&self) -> Result<GuestWorkspacePolicy> {
+        if let Some(manifest) = self.membership() {
+            return manifest
+                .workspace_policy(&self.config.guest_projects_base)
+                .with_context(|| {
+                    format!(
+                        "failed to derive the guest workspace policy for running VM '{}'",
+                        self.vm.name
+                    )
+                });
+        }
+        BootPlan::build(
+            &self.config,
+            &self.vm,
+            &self.store,
+            &self.registry,
+            &self.paths(),
+        )?
+        .workspace_policy()
+    }
 }
 
 /// Sanitize a picker name into a guest slug.
@@ -270,6 +391,7 @@ mod tests {
     use super::*;
     use crate::project::{ProjectEntry, ProjectKind, ProjectRegistry};
     use crate::vm::config::VmConfig;
+    use crate::vm::manager::{MEMBERSHIP_VERSION, MembershipManifest, MembershipMember};
     use chrono::Utc;
     use std::fs;
     use std::path::Path;
@@ -510,5 +632,231 @@ mod tests {
         assert!(spec.read_only);
         assert_eq!(spec.tag, "hegn-prj-0");
         assert_eq!(spec.guest_path, "/projects/ro");
+    }
+
+    #[test]
+    fn workspace_policy_covers_every_member_and_the_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = vm_store(&config, "rust");
+        let mut registry = registry_with(
+            &config,
+            &[
+                ("alpha", "projects/a"),
+                ("beta", "projects/b"),
+                ("gamma", "projects/c"),
+            ],
+        );
+        registry.assign("beta", "rust", true).unwrap();
+        let mut vm = store.load("rust").unwrap();
+        vm.primary = Some("beta".into());
+        let paths = VmPaths::from_vm(&config, &vm);
+        let plan = BootPlan::build(&config, &vm, &store, &registry, &paths).unwrap();
+
+        let policy = plan.workspace_policy().unwrap();
+        assert_eq!(policy.base(), "/projects");
+        assert_eq!(policy.primary(), Some("beta"));
+        assert_eq!(
+            policy.roots(),
+            vec![
+                "/projects/alpha",
+                "/projects/beta",
+                "/projects/gamma",
+                "/workspace"
+            ]
+        );
+        for slug in ["alpha", "beta", "gamma"] {
+            let guest = format!("/projects/{slug}");
+            assert!(policy.contains(&guest), "{guest} must be a workspace root");
+            assert!(policy.contains(&format!("{guest}/src")));
+        }
+        assert!(policy.is_read_only_root("/projects/beta"));
+        assert!(policy.is_read_only_root("/projects/beta/src"));
+        assert!(!policy.is_read_only_root("/projects/alpha"));
+        assert!(
+            policy.is_read_only_root("/workspace"),
+            "workspace follows the read-only primary"
+        );
+        assert!(!policy.contains("/projects/alpha-other"));
+        assert!(!policy.contains("/projects/alpha2"));
+        assert!(!policy.contains("/projects"));
+    }
+
+    #[test]
+    fn workspace_policy_uses_the_configured_guest_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.guest_projects_base = "/legacy-workspace".into();
+        let store = vm_store(&config, "rust");
+        let registry = registry_with(
+            &config,
+            &[
+                ("alpha", "projects/a"),
+                ("beta", "projects/b"),
+                ("gamma", "projects/c"),
+            ],
+        );
+        let vm = store.load("rust").unwrap();
+        let paths = VmPaths::from_vm(&config, &vm);
+        let plan = BootPlan::build(&config, &vm, &store, &registry, &paths).unwrap();
+
+        let policy = plan.workspace_policy().unwrap();
+        assert_eq!(policy.base(), "/legacy-workspace");
+        assert!(policy.contains("/legacy-workspace/alpha/src"));
+        assert!(!policy.contains("/projects/alpha"));
+        assert!(policy.contains("/workspace"));
+    }
+
+    #[test]
+    fn workspace_policy_excludes_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = vm_store(&config, "rust");
+        let parent_path = directory(&config.projects_root, "projects/parser");
+        let mut registry = ProjectRegistry::load(&config.state_dir).unwrap();
+        let mut parent = entry("parser", &parent_path);
+        parent.vm = Some("rust".into());
+        registry.upsert(parent).unwrap();
+
+        let worktree_path = parent_path.join(".worktrees/fix");
+        fs::create_dir_all(&worktree_path).unwrap();
+        let mut worktree = entry("parser-fix", &worktree_path);
+        worktree.kind = ProjectKind::Worktree;
+        worktree.parent = Some("parser".into());
+        worktree.vm = Some("rust".into());
+        registry.upsert(worktree).unwrap();
+
+        let vm = store.load("rust").unwrap();
+        let paths = VmPaths::from_vm(&config, &vm);
+        let plan = BootPlan::build(&config, &vm, &store, &registry, &paths).unwrap();
+        assert_eq!(
+            plan.members
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parser"]
+        );
+
+        let policy = plan.workspace_policy().unwrap();
+        assert_eq!(policy.roots(), vec!["/projects/parser", "/workspace"]);
+        assert!(!policy.contains("/projects/parser-fix"));
+    }
+
+    #[test]
+    fn workspace_policy_rejects_an_empty_plan() {
+        let plan = BootPlan {
+            vm: "rust".into(),
+            members: Vec::new(),
+            primary: "parser".into(),
+            primary_slug: "parser".into(),
+            primary_changed: false,
+        };
+        let err = plan.workspace_policy().unwrap_err().to_string();
+        assert!(err.contains("no exported members"), "{err}");
+    }
+
+    #[test]
+    fn workspace_policy_rejects_a_plan_whose_guest_paths_disagree_with_its_slugs() {
+        let plan = BootPlan {
+            vm: "rust".into(),
+            members: vec![SharedMember {
+                index: 0,
+                name: "parser".into(),
+                path: PathBuf::from("/projects/parser"),
+                tag: "hegn-prj-0".into(),
+                socket: PathBuf::from("/run/virtiofs-0.sock"),
+                pid_file: PathBuf::from("/run/virtiofs-0.pid"),
+                guest_path: "/projects/other".into(),
+                slug: "parser".into(),
+                read_only: false,
+                kind: ProjectKind::External,
+            }],
+            primary: "parser".into(),
+            primary_slug: "parser".into(),
+            primary_changed: false,
+        };
+        let err = plan.workspace_policy().unwrap_err().to_string();
+        assert!(err.contains("implies"), "{err}");
+    }
+
+    #[test]
+    fn manager_prefers_the_running_manifest_and_falls_back_to_the_plan() {
+        use crate::vm::manager::test_support::{config_with_assets, manager};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let manager = manager(config, dir.path());
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        let recorded = MembershipManifest {
+            version: MEMBERSHIP_VERSION,
+            vm: "demo".into(),
+            primary: "recorded".into(),
+            members: vec![MembershipMember {
+                name: "recorded".into(),
+                path: dir.path().join("recorded"),
+                tag: "hegn-prj-0".into(),
+                guest_path: "/projects/recorded".into(),
+                read_only: true,
+                kind: ProjectKind::External,
+            }],
+        };
+        recorded.save(&paths.membership).unwrap();
+
+        let policy = manager.workspace_policy().unwrap();
+        assert_eq!(policy.primary(), Some("recorded"));
+        assert!(policy.contains("/projects/recorded"));
+        assert!(!policy.contains("/projects/demo"));
+        assert!(policy.is_read_only_root("/workspace"));
+
+        fs::remove_file(&paths.membership).unwrap();
+        let policy = manager.workspace_policy().unwrap();
+        assert_eq!(policy.primary(), Some("demo"));
+        assert!(policy.contains("/projects/demo"));
+        assert!(!policy.contains("/projects/recorded"));
+    }
+
+    #[test]
+    fn manager_falls_back_to_the_plan_when_the_manifest_is_unreadable() {
+        use crate::vm::manager::test_support::{config_with_assets, manager};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let manager = manager(config, dir.path());
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        fs::write(&paths.membership, b"{ not json").unwrap();
+
+        let policy = manager.workspace_policy().unwrap();
+        assert_eq!(policy.primary(), Some("demo"));
+        assert!(policy.contains("/projects/demo"));
+    }
+
+    #[test]
+    fn manager_propagates_a_manifest_that_does_not_match_the_configured_base() {
+        use crate::vm::manager::test_support::{config_with_assets, manager};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let manager = manager(config, dir.path());
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+        let recorded = MembershipManifest {
+            version: MEMBERSHIP_VERSION,
+            vm: "demo".into(),
+            primary: "demo".into(),
+            members: vec![MembershipMember {
+                name: "demo".into(),
+                path: dir.path().join("demo"),
+                tag: "hegn-prj-0".into(),
+                guest_path: "/legacy-workspace/demo".into(),
+                read_only: false,
+                kind: ProjectKind::External,
+            }],
+        };
+        recorded.save(&paths.membership).unwrap();
+
+        let err = format!("{:#}", manager.workspace_policy().unwrap_err());
+        assert!(err.contains("not a direct mount"), "{err}");
     }
 }
