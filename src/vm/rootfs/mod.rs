@@ -1,4 +1,4 @@
-//! Growing per-instance root filesystems before the first boot.
+//! Per-VM root filesystems: preparation and growth before the first boot.
 //!
 //! The pinned cloud image is only about 2.2 GiB. That is enough for a bare
 //! Ubuntu cloud image, but not for Node.js, a global npm package and the
@@ -11,8 +11,11 @@
 //! files, snapshots, encryption or external data are handled in-process. For
 //! anything else `qemu-img resize` is used as a fallback when it is installed.
 
+mod prepare;
 mod qcow2;
 mod raw;
+
+pub use prepare::prepare_rootfs;
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;

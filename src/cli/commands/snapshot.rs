@@ -5,9 +5,9 @@ use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::session::snapshot::SnapshotStore;
-use crate::vm::instance::InstanceRegistry;
+use crate::vm::registry::VmRegistry;
 
-use super::instance::snapshot_instance;
+use super::instance::snapshot_vm;
 use crate::cli::args::SnapshotCommands;
 use crate::cli::output::{print_snapshot, runtime};
 
@@ -17,7 +17,7 @@ pub(crate) fn snapshot_command(
     json: bool,
 ) -> Result<i32> {
     let store = SnapshotStore::new(&config.snapshots_dir);
-    let registry = InstanceRegistry::new(config.clone());
+    let registry = VmRegistry::new(config.clone());
     match command {
         SnapshotCommands::List => {
             let snapshots = store.list()?;
@@ -43,22 +43,16 @@ pub(crate) fn snapshot_command(
             Ok(0)
         }
         SnapshotCommands::Create { name, instance } => {
-            let instance = snapshot_instance(&registry, instance)?;
-            let suggested = SnapshotStore::suggested_name(
-                instance
-                    .project
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("snapshot"),
-            );
+            let vm = snapshot_vm(&registry, instance)?;
+            let suggested = SnapshotStore::suggested_name(&vm.name);
             let name = name.unwrap_or(suggested);
-            let meta = runtime()?.block_on(registry.manager(instance).create_snapshot(&name))?;
+            let meta = runtime()?.block_on(registry.manager(vm)?.create_snapshot(&name))?;
             print_snapshot(&meta, json)?;
             Ok(0)
         }
         SnapshotCommands::Restore { name, instance } => {
             let meta = store.load(&name)?;
-            let instance = match instance {
+            let vm = match instance {
                 Some(selector) => registry.resolve(&selector)?,
                 None => match meta.instance.as_deref() {
                     Some(name) => registry.store().load(name)?,
@@ -66,12 +60,12 @@ pub(crate) fn snapshot_command(
                         let project = meta
                             .project
                             .as_deref()
-                            .context("snapshot has no instance/project metadata")?;
+                            .context("snapshot has no VM/project metadata")?;
                         registry.resolve(project.to_string_lossy().as_ref())?
                     }
                 },
             };
-            runtime()?.block_on(registry.manager(instance).restore_snapshot(&meta))?;
+            runtime()?.block_on(registry.manager(vm)?.restore_snapshot(&meta))?;
             if json {
                 println!("{}", serde_json::json!({"restored": meta.name}));
             } else {

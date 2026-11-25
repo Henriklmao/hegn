@@ -137,7 +137,7 @@ impl App {
             }
             KeyCode::Char('S') if self.focus == Focus::Instances => self.stop_selected_instance(),
             KeyCode::F(4) => self.open_global_config(),
-            KeyCode::F(5) if self.focus == Focus::Instances => self.open_instance_config(),
+            KeyCode::F(5) if self.focus == Focus::Instances => self.open_vm_config(),
             KeyCode::Char('t') => {
                 if self.session.is_some() {
                     self.show_session_project();
@@ -262,7 +262,7 @@ impl App {
                 vec![Effect::RefreshProjects, Effect::RefreshInstances]
             }
             KeyCode::F(4) => self.open_global_config(),
-            KeyCode::F(5) if self.focus == Focus::Instances => self.open_instance_config(),
+            KeyCode::F(5) if self.focus == Focus::Instances => self.open_vm_config(),
             KeyCode::Char('?') | KeyCode::F(1) => {
                 self.modal = Some(Modal::Help(HelpState::default()));
                 Vec::new()

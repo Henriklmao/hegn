@@ -58,7 +58,7 @@ pub(crate) fn render_dashboard_preview(frame: &mut Frame, app: &App, area: Rect)
     let instances: Vec<_> = app
         .instances
         .iter()
-        .filter(|instance| crate::vm::instance::same_project(&instance.project, &project.path))
+        .filter(|instance| crate::vm::same_project(&instance.project, &project.path))
         .collect();
     let running = instances
         .iter()

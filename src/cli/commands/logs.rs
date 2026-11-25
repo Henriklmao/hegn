@@ -8,7 +8,7 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::session::logs::{self, LogStore};
 use crate::session::terminal::TerminalBuffer;
-use crate::vm::instance::InstanceRegistry;
+use crate::vm::registry::VmRegistry;
 
 use crate::cli::args::LogCommands;
 use crate::cli::output::human_size;
@@ -74,7 +74,7 @@ pub(crate) fn logs_command(command: LogCommands, config: Config, json: bool) -> 
         }
         LogCommands::Prune { keep } => {
             // Never unlink a log a running instance is still writing to.
-            let registry = InstanceRegistry::new(config.clone());
+            let registry = VmRegistry::new(config.clone());
             let protected: Vec<PathBuf> = registry
                 .summaries()?
                 .into_iter()

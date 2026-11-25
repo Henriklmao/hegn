@@ -1,4 +1,4 @@
-//! Small filesystem and diagnostics helpers shared by the instance manager.
+//! Small filesystem and diagnostics helpers shared by the VM manager.
 //!
 //! Everything here is best-effort or explicitly private (`0600`) and never
 //! follows symlinks when writing runtime metadata.
@@ -12,10 +12,10 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 use crate::config::Config;
-use crate::vm::instance_config::InstanceConfig;
+use crate::vm::config::VmConfig;
 
-pub(super) fn profile_bundle_dir(config: &Config, instance: &InstanceConfig) -> Option<PathBuf> {
-    let bundle = instance.dir(&config.vms_dir).join("profile/bundle");
+pub(super) fn profile_bundle_dir(config: &Config, vm: &VmConfig) -> Option<PathBuf> {
+    let bundle = vm.dir(&config.vms_dir).join("profile/bundle");
     bundle.join("manifest").is_file().then_some(bundle)
 }
 

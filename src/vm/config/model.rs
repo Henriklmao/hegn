@@ -71,6 +71,19 @@ impl Default for VmConfig {
 }
 
 impl VmConfig {
+    /// Directory holding this VM's config, runtime and workspaces.
+    pub fn dir(&self, root: &std::path::Path) -> PathBuf {
+        root.join(&self.name)
+    }
+
+    /// Root filesystem used by this VM without creating it.
+    pub fn rootfs_path(&self, config: &Config) -> PathBuf {
+        self.rootfs_image.clone().unwrap_or_else(|| {
+            self.dir(&config.vms_dir)
+                .join(format!("rootfs.{}", config.rootfs_format.as_str()))
+        })
+    }
+
     /// Build a v2 VM config seeded from the global defaults.
     ///
     /// The share tag is intentionally absent: v2 derives one tag per exported

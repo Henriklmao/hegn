@@ -9,7 +9,7 @@ use crate::security::SecurityEngine;
 use crate::session::snapshot::SnapshotStore;
 use crate::session::state::StateStore;
 use crate::session::terminal::TerminalBuffer;
-use crate::vm::instance::InstanceSummary;
+use crate::vm::registry::VmSummary;
 
 use super::util::clamp_index;
 use super::*;
@@ -20,7 +20,7 @@ impl App {
         let snapshots = SnapshotStore::new(&config.snapshots_dir)
             .list()
             .unwrap_or_default();
-        let instances = crate::vm::instance::InstanceRegistry::new(config.clone())
+        let instances = crate::vm::registry::VmRegistry::new(config.clone())
             .summaries()
             .unwrap_or_default();
         let instance = InstanceStatus::from_config(&config);
@@ -183,8 +183,8 @@ impl App {
                     .instances
                     .iter()
                     .find(|instance| {
-                        crate::vm::instance::same_project(&instance.workspace, path)
-                            || crate::vm::instance::same_project(&instance.project, path)
+                        crate::vm::same_project(&instance.workspace, path)
+                            || crate::vm::same_project(&instance.project, path)
                     })
                     .map(|instance| instance.project.clone())?;
                 self.projects
@@ -195,7 +195,7 @@ impl App {
         }
     }
 
-    pub fn selected_instance(&self) -> Option<&InstanceSummary> {
+    pub fn selected_instance(&self) -> Option<&VmSummary> {
         self.instance_visible
             .get(self.instance_selected)
             .and_then(|&index| self.instances.get(index))
@@ -230,9 +230,7 @@ impl App {
                 .instances
                 .iter()
                 .enumerate()
-                .filter(|(_, instance)| {
-                    crate::vm::instance::same_project(&instance.project, &project)
-                })
+                .filter(|(_, instance)| crate::vm::same_project(&instance.project, &project))
                 .map(|(index, _)| index)
                 .collect(),
             None => Vec::new(),
@@ -267,7 +265,7 @@ impl App {
         let selected = self
             .selected_instance()
             .map(|instance| instance.name.clone());
-        let registry = crate::vm::instance::InstanceRegistry::new(self.config.clone());
+        let registry = crate::vm::registry::VmRegistry::new(self.config.clone());
         if let Ok(instances) = registry.summaries() {
             self.instances = instances;
         }
@@ -278,15 +276,15 @@ impl App {
             self.instance.memory_mib = summary.memory_mib;
             // Do not overwrite the optimistic Starting state while the attach
             // thread is still booting; it would re-enable double starts.
-            if self.instance.state != InstanceState::Starting {
+            if self.instance.state != VmUiState::Starting {
                 self.instance.state = match summary.state.as_str() {
-                    "running" => InstanceState::Running,
-                    "paused" => InstanceState::Paused,
-                    _ => InstanceState::Stopped,
+                    "running" => VmUiState::Running,
+                    "paused" => VmUiState::Paused,
+                    _ => VmUiState::Stopped,
                 };
             }
-        } else if self.session.is_none() && self.instance.state != InstanceState::Starting {
-            self.instance.state = InstanceState::Stopped;
+        } else if self.session.is_none() && self.instance.state != VmUiState::Starting {
+            self.instance.state = VmUiState::Stopped;
             self.instance.started_at = None;
             self.instance.note = None;
             self.instance.socket = None;
@@ -385,7 +383,7 @@ impl App {
         }
         if closed && !self.session_closed_reported {
             self.session_closed_reported = true;
-            self.instance.state = InstanceState::Stopped;
+            self.instance.state = VmUiState::Stopped;
             self.instance.started_at = None;
             self.toast("session exited", ToastLevel::Info);
         }
@@ -469,8 +467,6 @@ mod tests {
         base.project = demo.clone();
         let mut clone = fake_instance(&app, "demo-1", demo.join("clone-1"));
         clone.project = demo.clone();
-        clone.ephemeral = true;
-        clone.source_instance = Some("demo".into());
         let mut other_instance = fake_instance(&app, "other", other.join("workspace"));
         other_instance.project = other.clone();
 
@@ -501,12 +497,6 @@ mod tests {
             .map(|&index| app.instances[index].name.as_str())
             .collect();
         assert_eq!(names, ["demo", "demo-1"]);
-        assert!(
-            app.instance_visible
-                .iter()
-                .any(|&index| app.instances[index].ephemeral),
-            "multi-agent clones must be attachable from the list"
-        );
 
         app.selected = app
             .visible
@@ -603,8 +593,6 @@ mod tests {
         base.project = demo.clone();
         let mut clone = fake_instance(&app, "demo-1", demo.join("clone-1"));
         clone.project = demo.clone();
-        clone.ephemeral = true;
-        clone.source_instance = Some("demo".into());
 
         app.set_projects(vec![Project {
             name: "demo".into(),
@@ -715,7 +703,7 @@ mod tests {
         log.set_exited(true);
 
         app.poll();
-        assert_eq!(app.instance.state, InstanceState::Stopped);
+        assert_eq!(app.instance.state, VmUiState::Stopped);
         assert!(app.terminal.len() >= 2);
         assert!(
             app.toast
@@ -734,15 +722,15 @@ mod tests {
     #[test]
     fn refresh_does_not_clear_the_starting_state() {
         let (_dir, mut app) = test_app();
-        app.instance.state = InstanceState::Starting;
+        app.instance.state = VmUiState::Starting;
         app.refresh_instances();
-        assert_eq!(app.instance.state, InstanceState::Starting);
+        assert_eq!(app.instance.state, VmUiState::Starting);
     }
 
     #[test]
     fn instance_status_reflects_config() {
         let (_dir, app) = test_app();
-        assert_eq!(app.instance.state, InstanceState::Stopped);
+        assert_eq!(app.instance.state, VmUiState::Stopped);
         assert_eq!(app.instance.backend, "cloud-hypervisor");
         assert_eq!(app.instance.vcpus, app.config.vcpus);
     }

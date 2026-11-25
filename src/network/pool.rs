@@ -14,13 +14,14 @@ use super::privilege::ensure_ready;
 use super::{DNS, NETWORK_DIR, TAP_POOL};
 use crate::config::Config;
 use crate::shared::fs::write_private;
-use crate::vm::instance::InstanceManager;
-use crate::vm::instance_config::{InstanceConfig, InstanceStore};
+use crate::vm::config::{VmConfig, VmStore};
+use crate::vm::manager::VmManager;
 
-/// A reserved TAP device for one instance.
+/// A reserved TAP device for one VM.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Lease {
     pub index: u8,
+    /// Owner VM name (the on-disk owner file format is unchanged).
     pub instance: String,
     pub tap: String,
     pub mac: String,
@@ -92,12 +93,12 @@ pub fn status(config: &Config) -> Vec<TapStatus> {
         .collect()
 }
 
-/// Reserve a TAP slice for an instance.
+/// Reserve a TAP slice for a VM.
 ///
-/// The instance's recorded index is preferred so a snapshot restored later sees
-/// the same device name. If the recorded owner is another running instance, or
-/// the pool is exhausted, the start fails instead of silently sharing a TAP.
-pub fn acquire(config: &Config, instance: &InstanceConfig) -> Result<Lease> {
+/// The VM's recorded index is preferred so a snapshot restored later sees the
+/// same device name. If the recorded owner is another running VM, or the pool is
+/// exhausted, the start fails instead of silently sharing a TAP.
+pub fn acquire(config: &Config, vm: &VmConfig) -> Result<Lease> {
     ensure_ready(config)?;
     fs::create_dir_all(network_dir(config))
         .with_context(|| format!("failed to create {}", network_dir(config).display()))?;
@@ -107,12 +108,12 @@ pub fn acquire(config: &Config, instance: &InstanceConfig) -> Result<Lease> {
         fs::set_permissions(network_dir(config), fs::Permissions::from_mode(0o700))?;
     }
 
-    let preferred = instance.network_index;
+    let preferred = vm.network_index;
     if let Some(index) = preferred {
         if index >= TAP_POOL {
             bail!(
-                "instance '{}' records network index {index}, but the TAP pool has {TAP_POOL} slots",
-                instance.name
+                "VM '{}' records network index {index}, but the TAP pool has {TAP_POOL} slots",
+                vm.name
             );
         }
         if !tap_exists(index) {
@@ -121,9 +122,9 @@ pub fn acquire(config: &Config, instance: &InstanceConfig) -> Result<Lease> {
                 tap_name(index)
             );
         }
-        return try_claim(config, index, &instance.name)?.with_context(|| {
+        return try_claim(config, index, &vm.name)?.with_context(|| {
             format!(
-                "guarded TAP {} is reserved by another running instance",
+                "guarded TAP {} is reserved by another running VM",
                 tap_name(index)
             )
         });
@@ -133,14 +134,14 @@ pub fn acquire(config: &Config, instance: &InstanceConfig) -> Result<Lease> {
         if !tap_exists(index) {
             continue;
         }
-        if let Some(lease) = try_claim(config, index, &instance.name)? {
+        if let Some(lease) = try_claim(config, index, &vm.name)? {
             return Ok(lease);
         }
     }
     bail!(
-        "no free guarded-network TAP is available for instance '{}'; increase the pool or stop \
-         another instance",
-        instance.name
+        "no free guarded-network TAP is available for VM '{}'; increase the pool or stop \
+         another VM",
+        vm.name
     )
 }
 
@@ -157,7 +158,7 @@ fn try_claim(config: &Config, index: u8, instance: &str) -> Result<Option<Lease>
         // session record exists. A live VM is equally authoritative. The pid
         // alone is not proof: it may have been recycled by an unrelated
         // process, so require it to still execute the hegn binary.
-        if owner_process_alive(pid) || instance_is_running(config, &owner) {
+        if owner_process_alive(pid) || vm_is_running(config, &owner) {
             return Ok(None);
         }
         // A crashed hegn process and a stopped VM left the reservation behind.
@@ -176,8 +177,8 @@ fn try_claim(config: &Config, index: u8, instance: &str) -> Result<Option<Lease>
     Ok(Some(lease))
 }
 
-/// Release every reservation held by an instance, including stale ones.
-pub fn release(config: &Config, instance: &str) {
+/// Release every reservation held by a VM, including stale ones.
+pub fn release(config: &Config, vm: &str) {
     // Hold the per-TAP lock while checking the owner: another hegn process may
     // be claiming the same slice concurrently, and removing its fresh owner
     // file would let a third instance share the TAP.
@@ -189,7 +190,7 @@ pub fn release(config: &Config, instance: &str) {
         let Ok(_guard) = FileLock::acquire(&lock_path(config, index)) else {
             continue;
         };
-        if read_owner(&path).is_some_and(|(owner, _)| owner == instance) {
+        if read_owner(&path).is_some_and(|(owner, _)| owner == vm) {
             let _ = fs::remove_file(&path);
         }
     }
@@ -201,7 +202,7 @@ fn owner_process_alive(pid: u32) -> bool {
     let Ok(binary) = std::env::current_exe() else {
         return false;
     };
-    crate::vm::instance::process_matches(pid, &binary)
+    crate::vm::process_matches(pid, &binary)
 }
 
 /// Wait (bounded) until `pid` has completed its `exec`.
@@ -227,11 +228,11 @@ fn wait_until_exec_visible(pid: u32) {
     }
 }
 
-pub fn instance_is_running(config: &Config, instance: &str) -> bool {
-    InstanceStore::new(config.clone())
-        .load(instance)
-        .map(|instance_config| InstanceManager::new(config.clone(), instance_config).is_running())
-        .unwrap_or(false)
+pub fn vm_is_running(config: &Config, vm: &str) -> bool {
+    let Ok(loaded) = VmStore::new(config).load(vm) else {
+        return false;
+    };
+    VmManager::new(config.clone(), loaded).is_ok_and(|manager| manager.is_running())
 }
 
 /// Owner files contain `instance\npid\n`. The pid covers the window between
@@ -303,11 +304,11 @@ mod tests {
         (dir, config)
     }
 
-    fn instance(name: &str, network_index: Option<u8>) -> InstanceConfig {
-        InstanceConfig {
+    fn vm(name: &str, network_index: Option<u8>) -> VmConfig {
+        VmConfig {
             name: name.to_string(),
             network_index,
-            ..InstanceConfig::default()
+            ..VmConfig::default()
         }
     }
 
@@ -489,7 +490,7 @@ mod tests {
     fn acquire_rejects_a_recorded_index_outside_the_pool() {
         let (_dir, config) = test_config();
         for index in [TAP_POOL, TAP_POOL + 1, u8::MAX] {
-            let err = acquire(&config, &instance("demo", Some(index)))
+            let err = acquire(&config, &vm("demo", Some(index)))
                 .expect_err("out-of-range index must be rejected");
             let message = format!("{err:#}");
             assert!(
@@ -519,7 +520,7 @@ mod tests {
             .unwrap();
         }
 
-        let err = acquire(&config, &instance("demo", None))
+        let err = acquire(&config, &vm("demo", None))
             .expect_err("an exhausted pool must not hand out a shared lease");
         let message = format!("{err:#}");
         assert!(
@@ -617,8 +618,8 @@ mod tests {
     }
 
     #[test]
-    fn instance_is_running_is_false_for_an_unknown_instance() {
+    fn vm_is_running_is_false_for_an_unknown_vm() {
         let (_dir, config) = test_config();
-        assert!(!instance_is_running(&config, "demo"));
+        assert!(!vm_is_running(&config, "demo"));
     }
 }

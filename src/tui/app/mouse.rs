@@ -325,7 +325,7 @@ mod tests {
             effects.as_slice(),
             [Effect::AttachInstance { instance }] if instance == "demo"
         ));
-        assert_eq!(app.instance.state, InstanceState::Starting);
+        assert_eq!(app.instance.state, VmUiState::Starting);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 
 use crate::config::VirtiofsSandbox;
-use crate::vm::instance::InstanceManager;
+use crate::vm::manager::VmManager;
 
 use super::process::VirtiofsProcess;
 
@@ -92,7 +92,7 @@ impl VirtiofsConfig {
         // The socket may be left over from a crashed session. Refuse to
         // replace anything that is not a socket instead of deleting it or
         // letting virtiofsd follow a symlink.
-        InstanceManager::remove_stale_socket(&self.socket_path)?;
+        VmManager::remove_stale_socket(&self.socket_path)?;
         let child = Command::new(&self.binary)
             .args(&args)
             .stdin(Stdio::null())

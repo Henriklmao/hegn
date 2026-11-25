@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::parse::{
     expand_path, parse_local_endpoints, parse_number, parse_packages, set_global_path,
-    validate_guest_mount, validate_share_tag_prefix, validate_shared_tag,
+    validate_guest_mount, validate_share_tag_prefix,
 };
 use super::rows::{ConfigField, FieldKind};
 use super::state::{ConfigForm, Draft, EditState, FormOutcome};
@@ -22,7 +22,7 @@ impl ConfigForm {
             buffer: match field {
                 ConfigField::ExtraPackages => match &self.draft {
                     Draft::Global(config) => config.extra_packages.join(", "),
-                    Draft::Instance(instance) => instance.extra_packages.join(", "),
+                    Draft::Vm(vm) => vm.extra_packages.join(", "),
                 },
                 ConfigField::LocalEndpoints => match &self.draft {
                     Draft::Global(config) => config
@@ -31,7 +31,7 @@ impl ConfigForm {
                         .map(|endpoint| format!("{}={}", endpoint.name, endpoint.port))
                         .collect::<Vec<_>>()
                         .join(", "),
-                    Draft::Instance(_) => String::new(),
+                    Draft::Vm(_) => String::new(),
                 },
                 _ => self.value(field),
             },
@@ -147,22 +147,14 @@ impl ConfigForm {
             (Draft::Global(config), _) if field.is_path() => {
                 set_global_path(config, field, expand_path(text))?;
             }
-            (Draft::Instance(instance), ConfigField::Vcpus) => {
-                instance.vcpus = parse_number(text, 1, 32)? as u8;
+            (Draft::Vm(vm), ConfigField::Vcpus) => {
+                vm.vcpus = parse_number(text, 1, 32)? as u8;
             }
-            (Draft::Instance(instance), ConfigField::Memory) => {
-                instance.memory_mib = parse_number(text, 128, 262_144)? as u32;
+            (Draft::Vm(vm), ConfigField::Memory) => {
+                vm.memory_mib = parse_number(text, 128, 262_144)? as u32;
             }
-            (Draft::Instance(instance), ConfigField::SharedTag) => {
-                validate_shared_tag(text)?;
-                instance.shared_tag = text.to_string();
-            }
-            (Draft::Instance(instance), ConfigField::GuestMount) => {
-                validate_guest_mount(text)?;
-                instance.guest_mount = text.to_string();
-            }
-            (Draft::Instance(instance), ConfigField::ExtraPackages) => {
-                instance.extra_packages = parse_packages(text)?;
+            (Draft::Vm(vm), ConfigField::ExtraPackages) => {
+                vm.extra_packages = parse_packages(text)?;
             }
             _ => bail!("{} cannot be edited", field.label()),
         }

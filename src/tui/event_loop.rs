@@ -123,9 +123,13 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 app.refresh_instances();
                 app.toast(note, level);
             }
-            Ok(ScanMessage::InstanceError(err)) => {
-                app.refresh_instances();
-                app.toast(err, ToastLevel::Error);
+            Ok(ScanMessage::Error(err)) => {
+                if app.loading {
+                    app.loading = false;
+                    app.toast(format!("project scan failed: {err}"), ToastLevel::Error);
+                } else {
+                    app.toast(err, ToastLevel::Error);
+                }
             }
             Ok(ScanMessage::Doctor { report, note }) => {
                 app.clear_download_progress();
@@ -138,10 +142,6 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
             }
             Ok(ScanMessage::ProvisionReady) => app.provision_ready(),
             Ok(ScanMessage::ProvisionFailed(err)) => app.provision_failed(err),
-            Ok(ScanMessage::Error(err)) => {
-                app.loading = false;
-                app.toast(format!("project scan failed: {err}"), ToastLevel::Error);
-            }
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
         }
     }
@@ -159,7 +159,7 @@ mod tests {
     use crate::config::Harness;
     use crate::project::{GitSummary, Project};
     use crate::session::console::TerminalConsole;
-    use crate::tui::app::{InstanceState, Modal, Screen, ToastLevel};
+    use crate::tui::app::{Modal, Screen, ToastLevel, VmUiState};
     use crate::vm::images::DownloadProgress;
     use std::path::{Path, PathBuf};
 
@@ -282,7 +282,7 @@ mod tests {
         drain_scan(&mut app, &rx);
         assert_eq!(toast(&app), ("instance list refreshed", ToastLevel::Warn));
 
-        tx.send(ScanMessage::InstanceError("state file unreadable".into()))
+        tx.send(ScanMessage::Error("state file unreadable".into()))
             .unwrap();
         drain_scan(&mut app, &rx);
         assert_eq!(toast(&app), ("state file unreadable", ToastLevel::Error));
@@ -360,7 +360,7 @@ mod tests {
             .unwrap();
         drain_scan(&mut app, &rx);
         assert!(app.session.is_none());
-        assert_eq!(app.instance.state, InstanceState::Failed);
+        assert_eq!(app.instance.state, VmUiState::Failed);
         assert_eq!(
             toast(&app),
             ("VM start failed: missing kernel image", ToastLevel::Error)

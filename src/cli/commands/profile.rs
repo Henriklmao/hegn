@@ -3,7 +3,7 @@
 use anyhow::Result;
 
 use crate::config::{Config, Harness};
-use crate::vm::instance::InstanceRegistry;
+use crate::vm::registry::VmRegistry;
 
 use super::config::run_editor;
 use crate::cli::args::ProfileCommands;
@@ -86,7 +86,7 @@ pub(crate) fn profile_command(command: ProfileCommands, config: Config, json: bo
             Ok(0)
         }
         ProfileCommands::Sync { instance } => {
-            let registry = InstanceRegistry::new(config);
+            let registry = VmRegistry::new(config);
             let instance = registry.resolve(&instance)?;
             let plan = crate::agent::profile::prepare_for_start(registry.config(), &instance)?;
             if json {

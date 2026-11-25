@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::app::{App, InstanceState, Screen};
+use crate::tui::app::{App, Screen, VmUiState};
 
 use super::theme::{ACCENT, BORDER, CYAN, GREEN, MUTED, ON_ACCENT, RED, YELLOW, spinner};
 
@@ -71,11 +71,11 @@ pub(crate) fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(left).style(Style::default()), inner);
 
     let status = match app.instance.state {
-        InstanceState::Running => ("● running".to_string(), GREEN),
-        InstanceState::Starting => (format!("{} starting", spinner(app.tick())), YELLOW),
-        InstanceState::Paused => ("Ⅱ paused".to_string(), YELLOW),
-        InstanceState::Failed => ("✕ failed".to_string(), RED),
-        InstanceState::Stopped => {
+        VmUiState::Running => ("● running".to_string(), GREEN),
+        VmUiState::Starting => (format!("{} starting", spinner(app.tick())), YELLOW),
+        VmUiState::Paused => ("Ⅱ paused".to_string(), YELLOW),
+        VmUiState::Failed => ("✕ failed".to_string(), RED),
+        VmUiState::Stopped => {
             if app.active_project().is_some() {
                 ("○ no instance".to_string(), MUTED)
             } else {

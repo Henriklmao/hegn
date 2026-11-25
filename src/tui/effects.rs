@@ -162,7 +162,7 @@ pub(super) fn handle_effects(
                 spawn_attach(app.config.clone(), instance, scan_tx.clone());
             }
             Effect::AttachConsole { instance } => {
-                let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
+                let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
                 // Release the embedded client first. Otherwise the external
                 // attach replaces it in the relay and the TUI keeps a dead
                 // socket when the user comes back.
@@ -170,13 +170,13 @@ pub(super) fn handle_effects(
                 app.detach_console();
                 let result = with_suspended_terminal(terminal, || {
                     let config = registry.resolve(&instance)?;
-                    let console = registry.manager(config).ensure_console()?;
+                    let console = registry.manager(config)?.ensure_console()?;
                     crate::session::console::run_interactive(console, true)
                 });
                 let reattached = registry
                     .resolve(&instance)
                     .ok()
-                    .and_then(|config| registry.manager(config).attach_console().ok());
+                    .and_then(|config| registry.manager(config).ok()?.attach_console().ok());
                 if let Some(console) = reattached {
                     app.attach_console(Box::new(console));
                     app.project_view = crate::tui::app::ProjectView::Split;
@@ -193,7 +193,7 @@ pub(super) fn handle_effects(
                 }
             }
             Effect::StopInstance { instance } => {
-                let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
+                let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
                 app.pending_launch = None;
                 match registry.stop(&instance) {
                     Ok(()) => {
@@ -207,7 +207,7 @@ pub(super) fn handle_effects(
                 instance,
                 delete_files,
             } => {
-                let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
+                let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
                 match registry.delete(&instance, delete_files) {
                     Ok(outcome) => {
                         let message = match outcome.kept_workspace {
@@ -269,7 +269,7 @@ pub(super) fn handle_effects(
             }
             Effect::RefreshInstances => app.refresh_instances(),
             Effect::RestoreSnapshot(snapshot) => {
-                let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
+                let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
                 let instance = snapshot
                     .instance
                     .as_deref()
@@ -287,7 +287,7 @@ pub(super) fn handle_effects(
                     );
                     continue;
                 };
-                let manager = registry.manager(instance);
+                let manager = registry.manager(instance)?;
                 match runtime.block_on(manager.restore_snapshot(&snapshot)) {
                     Ok(()) => match manager.attach_console() {
                         Ok(console) => {

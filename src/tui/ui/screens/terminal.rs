@@ -182,7 +182,7 @@ mod tests {
     use crate::session::console::TerminalConsole;
     use crate::tui::app::{ProjectView, Screen};
     use crate::tui::ui::test_support::*;
-    use crate::vm::instance::InstanceSummary;
+    use crate::vm::registry::VmSummary;
     use std::path::{Path, PathBuf};
 
     struct FakeConsole {
@@ -215,14 +215,14 @@ mod tests {
         }
     }
 
-    fn instance(app: &App, name: &str, state: &str) -> InstanceSummary {
-        InstanceSummary {
+    fn instance(app: &App, name: &str, state: &str) -> VmSummary {
+        VmSummary {
             name: name.into(),
+            harness: Harness::Shell,
+            primary: Some("demo".into()),
+            members: 1,
             project: PathBuf::from("/projects/demo"),
             workspace: PathBuf::from(format!("/workspaces/{name}")),
-            harness: Harness::Shell,
-            ephemeral: false,
-            source_instance: None,
             created_at: chrono::Utc::now(),
             state: state.into(),
             vm_pid: None,

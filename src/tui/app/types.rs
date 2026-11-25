@@ -20,7 +20,7 @@ use crate::session::console::TerminalConsole;
 use crate::session::snapshot::SnapshotMeta;
 use crate::session::state::StateStore;
 use crate::session::terminal::TerminalBuffer;
-use crate::vm::instance::InstanceSummary;
+use crate::vm::registry::VmSummary;
 
 const TOAST_TTL: Duration = Duration::from_secs(6);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,7 +205,7 @@ pub struct PendingLaunch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstanceState {
+pub enum VmUiState {
     Stopped,
     Starting,
     Running,
@@ -213,7 +213,7 @@ pub enum InstanceState {
     Failed,
 }
 
-impl InstanceState {
+impl VmUiState {
     pub fn label(self) -> &'static str {
         match self {
             Self::Stopped => "stopped",
@@ -227,7 +227,7 @@ impl InstanceState {
 
 #[derive(Debug, Clone)]
 pub struct InstanceStatus {
-    pub state: InstanceState,
+    pub state: VmUiState,
     pub backend: &'static str,
     pub vcpus: u8,
     pub memory_mib: u32,
@@ -292,7 +292,7 @@ impl InstanceStatus {
             "missing VM"
         };
         Self {
-            state: InstanceState::Stopped,
+            state: VmUiState::Stopped,
             backend,
             vcpus: config.vcpus,
             memory_mib: config.memory_mib,
@@ -342,7 +342,7 @@ pub enum ActionId {
     DeleteInstance,
     DeleteProject,
     DeleteProjectFiles,
-    InstanceConfig,
+    VmConfig,
     GlobalConfig,
     ProjectConfig,
     ProjectConfigSave,
@@ -599,7 +599,7 @@ pub enum DeleteInstanceStage {
 
 #[derive(Debug, Clone)]
 pub struct DeleteInstanceModal {
-    pub instance: InstanceSummary,
+    pub instance: VmSummary,
     pub stage: DeleteInstanceStage,
     pub error: Option<String>,
     pub scroll: usize,
@@ -747,7 +747,7 @@ pub struct App {
     pub project_snapshots: Vec<usize>,
     pub project_snapshot_selected: usize,
     pub snapshot_rows: Vec<RowHit>,
-    pub instances: Vec<InstanceSummary>,
+    pub instances: Vec<VmSummary>,
     /// Indices into [`App::instances`] for the selected project.
     pub instance_visible: Vec<usize>,
     pub instance_selected: usize,

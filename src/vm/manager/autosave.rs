@@ -2,7 +2,7 @@
 //!
 //! A running VM is checkpointed every `snapshot_interval_secs` so a later
 //! `start` can restore the newest checkpoint instead of cold booting. The
-//! worker is a small `hegn __autosnapshot --instance <name>` process: like the
+//! worker is a small `hegn __autosnapshot --vm <name>` process: like the
 //! console relay it outlives the CLI/TUI that spawned it and stops as soon as
 //! the VM is gone.
 //!
@@ -24,12 +24,12 @@ use anyhow::{Context, Result, bail};
 use crate::config::Config;
 use crate::session::snapshot::{AUTOSAVE_NOTE, SnapshotStore};
 use crate::shared::process::executable_matches;
+use crate::vm::config::VmConfig;
 use crate::vm::hypervisor::VmState;
-use crate::vm::instance_config::InstanceConfig;
+use crate::vm::registry::VmRegistry;
 
-use super::paths::InstancePaths;
+use super::paths::VmPaths;
 use super::process::read_pid;
-use super::registry::InstanceRegistry;
 use super::util::{append_event_log, write_private};
 
 /// Hidden first argument used to start the worker from [`spawn`].
@@ -47,33 +47,35 @@ pub fn requested() -> bool {
 
 /// Entry point for the detached worker, called from `main`.
 pub fn run_from_current_args() -> Result<()> {
-    let instance =
+    let vm =
         parse_args(std::env::args_os().skip(2)).context("invalid automatic snapshot arguments")?;
     let config = Config::load()?;
-    run_worker(&config, &instance)
+    run_worker(&config, &vm)
 }
 
 fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<String> {
-    let mut instance = None;
+    let mut vm = None;
     let mut args = args.peekable();
     while let Some(flag) = args.next() {
         match flag.to_str() {
-            Some("--instance") => {
-                instance = Some(
+            // `--instance` is the pre-v2 spelling; keep reading it so a worker
+            // spawned by an older hegn survives an upgrade.
+            Some("--vm") | Some("--instance") => {
+                vm = Some(
                     args.next()
-                        .context("missing value for --instance")?
+                        .context("missing value for --vm")?
                         .into_string()
-                        .map_err(|_| anyhow::anyhow!("instance name is not valid UTF-8"))?,
+                        .map_err(|_| anyhow::anyhow!("VM name is not valid UTF-8"))?,
                 );
             }
             _ => bail!("unknown autosnapshot argument {flag:?}"),
         }
     }
-    let instance = instance.context("missing --instance")?;
-    if instance.is_empty() {
-        bail!("instance name must not be empty");
+    let vm = vm.context("missing --vm")?;
+    if vm.is_empty() {
+        bail!("VM name must not be empty");
     }
-    Ok(instance)
+    Ok(vm)
 }
 
 /// Does `pid` still run the automatic snapshot worker?
@@ -94,11 +96,7 @@ pub fn process_matches(pid: u32, binary: &Path) -> bool {
 /// Returns the existing pid when a matching worker is still alive. A stale pid
 /// file is replaced. The child is left detached; a reaper thread avoids a
 /// zombie while the parent (usually the TUI) is alive.
-pub(crate) fn spawn(
-    config: &Config,
-    instance: &InstanceConfig,
-    paths: &InstancePaths,
-) -> Result<u32> {
+pub(crate) fn spawn(config: &Config, vm: &VmConfig, paths: &VmPaths) -> Result<u32> {
     if !config.periodic_snapshots {
         return Ok(0);
     }
@@ -118,8 +116,8 @@ pub(crate) fn spawn(
         .with_context(|| format!("failed to open {}", paths.autosave_log.display()))?;
     let mut child = Command::new(&exe)
         .arg(INTERNAL_ARG)
-        .arg("--instance")
-        .arg(&instance.name)
+        .arg("--vm")
+        .arg(&vm.name)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr))
@@ -146,10 +144,10 @@ fn reaper(mut child: Child) {
 }
 
 /// Loop until the VM disappears, checkpointing it every interval.
-fn run_worker(config: &Config, instance: &str) -> Result<()> {
+fn run_worker(config: &Config, name: &str) -> Result<()> {
     let interval = Duration::from_secs(config.snapshot_interval_secs.max(30));
     let keep = config.snapshot_keep.max(1);
-    let registry = InstanceRegistry::new(config.clone());
+    let registry = VmRegistry::new(config.clone());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -157,9 +155,9 @@ fn run_worker(config: &Config, instance: &str) -> Result<()> {
 
     loop {
         std::thread::sleep(interval);
-        let manager = match registry.manager_by_name(instance) {
+        let manager = match registry.manager_by_name(name) {
             Ok(manager) => manager,
-            // The instance was deleted while the VM was running.
+            // The VM was deleted while it was running.
             Err(_) => return Ok(()),
         };
         if !manager.is_running() {
@@ -167,16 +165,17 @@ fn run_worker(config: &Config, instance: &str) -> Result<()> {
         }
         // Never turn a deliberate pause into a resume. Only a running guest is
         // a suitable checkpoint.
-        match runtime.block_on(manager.instance_info()) {
+        match runtime.block_on(manager.vm_info()) {
             Ok(info) if info.state == VmState::Running => {}
             Ok(_) => continue,
             Err(_) => return Ok(()),
         }
-        let name = suggested_name();
-        match runtime.block_on(manager.create_snapshot_tagged(&name, Some(AUTOSAVE_NOTE))) {
+        let snapshot_name = suggested_name();
+        match runtime.block_on(manager.create_snapshot_tagged(&snapshot_name, Some(AUTOSAVE_NOTE)))
+        {
             Ok(_) => {
                 if let Err(err) =
-                    SnapshotStore::new(&config.snapshots_dir).prune_autosaves(instance, keep)
+                    SnapshotStore::new(&config.snapshots_dir).prune_autosaves(name, keep)
                 {
                     append_event_log(
                         &manager.paths().event_log,
@@ -213,11 +212,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_instance_argument() {
+    fn parses_the_vm_argument_and_the_legacy_instance_alias() {
+        assert_eq!(args_from(&["--vm", "demo"]).unwrap(), "demo");
         assert_eq!(args_from(&["--instance", "demo"]).unwrap(), "demo");
         assert!(args_from(&[]).is_err());
-        assert!(args_from(&["--instance"]).is_err());
-        assert!(args_from(&["--instance", ""]).is_err());
+        assert!(args_from(&["--vm"]).is_err());
+        assert!(args_from(&["--vm", ""]).is_err());
         assert!(args_from(&["--unknown", "demo"]).is_err());
     }
 
@@ -237,14 +237,14 @@ mod tests {
 
     #[test]
     fn disabled_periodic_snapshots_do_not_spawn_a_worker() {
-        use super::super::test_support::{config_with_assets, instance_for};
+        use crate::vm::manager::test_support::{config_with_assets, manager};
 
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
         config.periodic_snapshots = false;
-        let instance = instance_for(&dir.path().join("project"));
-        let paths = InstancePaths::from_instance(&config, &instance);
-        assert_eq!(spawn(&config, &instance, &paths).unwrap(), 0);
+        let manager = manager(config, dir.path());
+        let paths = manager.paths();
+        assert_eq!(spawn(manager.config(), manager.vm(), &paths).unwrap(), 0);
         assert!(!paths.autosave_pid.exists());
     }
 }

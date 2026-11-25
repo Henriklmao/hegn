@@ -1,5 +1,9 @@
-//! Project removal: instance cleanup, deleting a real directory or unlinking an
-//! imported symlink, with paths always constrained to the projects root.
+//! Project removal: unassigning the project from its VM, deleting a real
+//! directory or unlinking an imported symlink, with paths always constrained to
+//! the projects root.
+//!
+//! Removing a project never deletes a VM or a sibling project. A running VM
+//! keeps its current shares until `hegn vm apply` restarts it.
 
 use std::fs;
 use std::path::Path;
@@ -20,7 +24,7 @@ enum EntryRemoval {
 
 /// Remove a project from the picker.
 ///
-/// Every instance belonging to the project is stopped and deleted. When
+/// The project is first unassigned from its VM in the private registry. When
 /// `delete_files` is true the project directory is removed; an imported symlink
 /// only loses the link and its target always stays. When files are kept for a
 /// real directory, the entry is recorded as hidden so the next scan does not
@@ -31,21 +35,21 @@ pub fn delete_project(
     delete_files: bool,
 ) -> Result<ProjectDeleteOutcome> {
     // Validate containment before any destructive work. A caller passing an
-    // outside/nested path must not lose that project's instances first.
+    // outside/nested path must not lose that project's registry entry first.
     direct_child_root(&config.projects_root, entry)?;
 
-    let registry = crate::vm::instance::InstanceRegistry::new(config.clone());
-    let instances: Vec<String> = registry
-        .summaries()?
-        .into_iter()
-        .filter(|instance| {
-            crate::vm::instance::same_project(&instance.project, entry)
-                || crate::vm::instance::same_project(&instance.workspace, entry)
-        })
-        .map(|instance| instance.name)
-        .collect();
-    for name in &instances {
-        registry.delete(name, true)?;
+    let canonical = entry
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", entry.display()))?;
+    let mut registry = crate::project::ProjectRegistry::load(&config.state_dir)?;
+    if let Some(project) = registry.find_by_path(&canonical).cloned() {
+        // Worktrees inherit membership; unassign refuses them individually.
+        if project.kind != crate::project::ProjectKind::Worktree && project.vm.is_some() {
+            registry.unassign(&project.name)?;
+        }
+        // The picker entry is gone, so a stale registry entry would make the
+        // next boot fail validation. Worktrees are removed as their own entry.
+        registry.remove(&project.name)?;
     }
 
     let removal = remove_entry(&config.projects_root, entry, delete_files)?;
@@ -56,14 +60,15 @@ pub fn delete_project(
     store.set_project_hidden(entry, kept)?;
     Ok(ProjectDeleteOutcome {
         files_deleted,
-        instances,
+        // Removing a project never removes a VM.
+        instances: Vec::new(),
     })
 }
 
 /// Resolve `root` and verify that `entry` is a direct child of it.
 ///
 /// This is a pure containment check with no filesystem mutation, so callers
-/// can run it before stopping or deleting any related instance.
+/// can run it before touching the registry or any files.
 fn direct_child_root(root: &Path, entry: &Path) -> Result<std::path::PathBuf> {
     let root = root
         .canonicalize()
@@ -287,7 +292,7 @@ mod tests {
         config.projects_root = dir.join("projects");
         config.state_dir = dir.join("state");
         config.snapshots_dir = dir.join("snapshots");
-        config.vms_dir = dir.join("instances");
+        config.vms_dir = dir.join("vms");
         config.templates_dir = dir.join("templates");
         config.profiles_dir = dir.join("profiles");
         config
@@ -317,30 +322,60 @@ mod tests {
     }
 
     #[test]
-    fn delete_project_removes_matching_instances_and_leaves_unrelated_ones() {
+    fn delete_project_unassigns_without_touching_the_vm_or_siblings() {
+        use crate::project::{ProjectEntry, ProjectKind, ProjectRegistry};
+        use crate::vm::config::{VmConfig, VmStore};
+        use chrono::Utc;
+
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let project = config.projects_root.join("demo");
         let other = config.projects_root.join("other");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        let instances = crate::vm::instance_config::InstanceStore::new(config.clone());
-        instances
-            .create_from_project(&project, Some("demo-vm"), None, false)
+        let project = project.canonicalize().unwrap();
+        let other = other.canonicalize().unwrap();
+
+        let store = VmStore::new(&config);
+        store
+            .save(&VmConfig::from_config(&config, "shared", None))
             .unwrap();
-        instances
-            .create_from_project(&other, Some("other-vm"), None, false)
-            .unwrap();
-        let instance_dir = config.vms_dir.join("demo-vm");
-        assert!(instance_dir.is_dir());
+        let mut registry = ProjectRegistry::load(&config.state_dir).unwrap();
+        for (name, path) in [("demo", &project), ("other", &other)] {
+            registry
+                .upsert(ProjectEntry {
+                    name: name.into(),
+                    path: path.clone(),
+                    vm: None,
+                    read_only: false,
+                    kind: ProjectKind::External,
+                    parent: None,
+                    managed: false,
+                    hidden: false,
+                    created_at: Utc::now(),
+                })
+                .unwrap();
+            registry.assign(name, "shared", false).unwrap();
+        }
 
         let outcome = delete_project(&config, &project, true).unwrap();
-        assert_eq!(outcome.instances, vec!["demo-vm".to_string()]);
+        assert!(
+            outcome.instances.is_empty(),
+            "deleting a project never deletes a VM"
+        );
         assert!(outcome.files_deleted);
-        assert!(!instance_dir.exists());
         assert!(!project.exists());
-        assert!(config.vms_dir.join("other-vm").is_dir());
-        assert!(other.is_dir());
+        assert!(other.is_dir(), "sibling projects must survive");
+        assert!(
+            config.vms_dir.join("shared").is_dir(),
+            "the VM must survive"
+        );
+        let registry = ProjectRegistry::load(&config.state_dir).unwrap();
+        assert!(registry.find_by_path(&project).is_none());
+        assert_eq!(
+            registry.find_by_path(&other).unwrap().vm.as_deref(),
+            Some("shared")
+        );
     }
 
     #[test]
@@ -372,12 +407,6 @@ mod tests {
         std::fs::create_dir_all(&config.projects_root).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("keep.txt"), "keep").unwrap();
-        let instances = crate::vm::instance_config::InstanceStore::new(config.clone());
-        instances
-            .create_from_project(&outside, Some("outside-vm"), None, false)
-            .unwrap();
-        let instance_dir = config.vms_dir.join("outside-vm");
-        assert!(instance_dir.is_dir());
 
         let err = delete_project(&config, &outside, true)
             .unwrap_err()
@@ -386,10 +415,6 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(outside.join("keep.txt")).unwrap(),
             "keep"
-        );
-        assert!(
-            instance_dir.is_dir(),
-            "an invalid entry must not destroy its instances first"
         );
     }
 }

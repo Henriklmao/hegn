@@ -24,9 +24,20 @@ use super::user_data::{meta_data, user_data};
 /// 4 MiB is enough for the seed and keeps it cheap.
 const SEED_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Increment when the seed's user-data changes so existing instances re-run
-/// cloud-init on their next boot.
-pub const SEED_VERSION: u32 = 11;
+/// Increment when the seed's user-data changes so existing VMs re-run
+/// cloud-init on their next boot. Version 12 introduced multiple mounts and
+/// the `/workspace` symlink.
+pub const SEED_VERSION: u32 = 12;
+
+/// One exported project mounted by cloud-init.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountSpec {
+    /// virtio-fs device tag (`hegn-prj-<index>`).
+    pub tag: String,
+    /// Absolute guest path below `guest_projects_base`.
+    pub guest_path: String,
+    pub read_only: bool,
+}
 
 /// Reject values that could break out of the cloud-init shell command.
 pub(crate) fn safe_token(value: &str) -> bool {
@@ -53,25 +64,42 @@ pub(crate) fn safe_mount(value: &str) -> bool {
 /// Write (or replace) the NoCloud seed at `path`.
 ///
 /// The image is created with mode `0600` and `O_NOFOLLOW`; a planted symlink
-/// cannot redirect the write.
+/// cannot redirect the write. Every mount is validated before the file is
+/// touched.
 #[allow(clippy::too_many_arguments)]
 pub fn write_seed(
     path: &Path,
-    shared_tag: &str,
-    guest_mount: &str,
+    mounts: &[MountSpec],
+    primary_guest: &str,
     instance_id: &str,
     provision: &ProvisionPlan,
     profile: Option<&ProfileShare>,
     network: Option<&Lease>,
     endpoints: &[LocalEndpoint],
     credential_hardening: bool,
-    read_only_workspace: bool,
 ) -> Result<()> {
-    if !safe_token(shared_tag) {
-        anyhow::bail!("unsafe virtio-fs tag for the cloud-init seed: {shared_tag:?}");
+    if mounts.is_empty() {
+        anyhow::bail!("cloud-init seed needs at least one project mount");
     }
-    if !safe_mount(guest_mount) {
-        anyhow::bail!("unsafe guest mount path for the cloud-init seed: {guest_mount:?}");
+    for mount in mounts {
+        if !safe_token(&mount.tag) {
+            anyhow::bail!(
+                "unsafe virtio-fs tag for the cloud-init seed: {tag:?}",
+                tag = mount.tag
+            );
+        }
+        if !safe_mount(&mount.guest_path) {
+            anyhow::bail!(
+                "unsafe guest mount path for the cloud-init seed: {path:?}",
+                path = mount.guest_path
+            );
+        }
+    }
+    if !safe_mount(primary_guest) {
+        anyhow::bail!("unsafe primary guest path for the cloud-init seed: {primary_guest:?}");
+    }
+    if !mounts.iter().any(|mount| mount.guest_path == primary_guest) {
+        anyhow::bail!("primary guest path {primary_guest:?} is not one of the mounted projects");
     }
     if !safe_token(instance_id) {
         anyhow::bail!("unsafe cloud-init instance id: {instance_id:?}");
@@ -80,15 +108,13 @@ pub fn write_seed(
         .filter(|_| !endpoints.is_empty())
         .map(|lease| endpoint_env(lease, endpoints));
     let user_data = user_data(
-        shared_tag,
-        guest_mount,
+        mounts,
+        primary_guest,
         provision,
         profile,
         endpoint_env.as_deref(),
         credential_hardening,
-        read_only_workspace,
     );
-    let meta_data = meta_data(instance_id);
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -117,7 +143,7 @@ pub fn write_seed(
             .with_context(|| format!("failed to open cloud-init seed {}", path.display()))?;
         let root = fs.root_dir();
         write_file(&root, "user-data", &user_data)?;
-        write_file(&root, "meta-data", &meta_data)?;
+        write_file(&root, "meta-data", &meta_data(instance_id))?;
         if let Some(network) = network {
             write_file(&root, "network-config", &network.guest_network_config())?;
         }
@@ -140,23 +166,32 @@ fn write_file<IO: std::io::Read + std::io::Write + std::io::Seek>(
     Ok(())
 }
 
-/// Stable id for this seed. It changes when the seed version, preset or
-/// network configuration changes, which makes cloud-init re-apply the new
-/// user-data/network-config even when the rootfs is reused.
+/// Stable id for this seed. It changes when the seed version, membership,
+/// preset or network configuration changes, which makes cloud-init re-apply
+/// the new user-data/network-config even when the rootfs is reused.
+#[allow(clippy::too_many_arguments)]
 pub fn instance_id(
-    instance: &str,
+    vm: &str,
+    mounts: &[MountSpec],
+    primary_guest: &str,
     provision: &ProvisionPlan,
     profile: Option<&ProfileShare>,
     network: Option<&Lease>,
     endpoints: &[LocalEndpoint],
     credential_hardening: bool,
-    read_only_workspace: bool,
 ) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
     hasher.update(SEED_VERSION.to_le_bytes());
-    hasher.update([credential_hardening as u8, read_only_workspace as u8]);
+    hasher.update([credential_hardening as u8]);
+    hasher.update(vm.as_bytes());
+    hasher.update(primary_guest.as_bytes());
+    for mount in mounts {
+        hasher.update(mount.tag.as_bytes());
+        hasher.update(mount.guest_path.as_bytes());
+        hasher.update([mount.read_only as u8]);
+    }
     hasher.update(provision.harness.label().as_bytes());
     hasher.update(provision.script().as_bytes());
     if let Some(profile) = profile {
@@ -167,7 +202,7 @@ pub fn instance_id(
         hasher.update(endpoint_env(lease, endpoints).as_bytes());
     }
     let digest = hex::encode(hasher.finalize());
-    format!("hegn-{instance}-v{SEED_VERSION}-{}", &digest[..12])
+    format!("hegn-{vm}-v{SEED_VERSION}-{}", &digest[..12])
 }
 
 /// The exact `--disk` value for the seed.
@@ -192,6 +227,21 @@ mod tests {
             host_ip: host_ip(0),
             guest_ip: guest_ip(0),
         }
+    }
+
+    fn mounts() -> Vec<MountSpec> {
+        vec![
+            MountSpec {
+                tag: "hegn-prj-0".into(),
+                guest_path: "/projects/parser".into(),
+                read_only: false,
+            },
+            MountSpec {
+                tag: "hegn-prj-1".into(),
+                guest_path: "/projects/cli".into(),
+                read_only: true,
+            },
+        ]
     }
 
     fn read_seed(path: &Path) -> (String, String, Option<String>) {
@@ -225,14 +275,13 @@ mod tests {
         let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
         write_seed(
             &path,
-            "workspace",
-            "/workspace",
+            &mounts(),
+            "/projects/parser",
             "hegn-demo",
             &plan,
             None,
             Some(&lease()),
             &[],
-            false,
             false,
         )
         .unwrap();
@@ -245,16 +294,92 @@ mod tests {
         let (user_data, meta_data, network) = read_seed(&path);
         assert!(user_data.contains("autologin root"), "{user_data}");
         assert!(
-            user_data.contains("mount -t virtiofs 'workspace' '/workspace'"),
+            user_data.contains("mount -t virtiofs 'hegn-prj-0' '/projects/parser'"),
+            "{user_data}"
+        );
+        assert!(
+            user_data.contains("mount -t virtiofs -o ro 'hegn-prj-1' '/projects/cli'"),
+            "{user_data}"
+        );
+        assert!(
+            user_data.contains("ln -sfn '/projects/parser' '/workspace'"),
+            "{user_data}"
+        );
+        assert!(
+            user_data.contains("directory = /projects/parser"),
+            "{user_data}"
+        );
+        assert!(
+            user_data.contains("directory = /projects/cli"),
             "{user_data}"
         );
         assert!(user_data.contains("directory = /workspace"), "{user_data}");
+        assert!(user_data.contains("hegn-health v3"), "{user_data}");
+        assert!(
+            user_data.contains("mounts=$mounts_ok/$mounts_total"),
+            "{user_data}"
+        );
         assert!(user_data.contains("/usr/local/sbin/hegn-provision"));
         assert!(user_data.contains("hegn-provision.service"));
         assert!(meta_data.contains("instance-id: hegn-demo"), "{meta_data}");
         let network = network.expect("network-config must be present");
         assert!(network.contains("10.213.0.2/30"), "{network}");
         assert!(network.contains("via: 10.213.0.1"), "{network}");
+    }
+
+    #[test]
+    fn login_shell_starts_in_the_primary_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud-init.img");
+        let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
+        write_seed(
+            &path,
+            &mounts(),
+            "/projects/parser",
+            "hegn-demo",
+            &plan,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let (user_data, _, _) = read_seed(&path);
+        assert!(
+            user_data.contains("  - path: /etc/profile.d/hegn-workspace.sh"),
+            "{user_data}"
+        );
+        assert!(user_data.contains("cd '/workspace'"), "{user_data}");
+    }
+
+    #[test]
+    fn health_counts_every_expected_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud-init.img");
+        let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
+        write_seed(
+            &path,
+            &mounts(),
+            "/projects/parser",
+            "hegn-demo",
+            &plan,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let (user_data, _, _) = read_seed(&path);
+        assert!(user_data.contains("mounts_total=2"), "{user_data}");
+        assert!(
+            user_data.contains("for target in '/projects/parser' '/projects/cli'"),
+            "{user_data}"
+        );
+        assert!(
+            user_data.contains("mounts=$mounts_ok/$mounts_total"),
+            "{user_data}"
+        );
+        assert!(!user_data.contains("hegn-health v2"), "{user_data}");
     }
 
     #[test]
@@ -274,14 +399,13 @@ mod tests {
         ];
         write_seed(
             &path,
-            "workspace",
-            "/workspace",
+            &mounts(),
+            "/projects/parser",
             "hegn-demo",
             &plan,
             None,
             Some(&lease()),
             &endpoints,
-            false,
             false,
         )
         .unwrap();
@@ -306,8 +430,6 @@ mod tests {
 
     #[test]
     fn profile_share_mounts_and_applies_on_every_boot() {
-        use std::path::PathBuf;
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cloud-init.img");
         let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
@@ -317,14 +439,13 @@ mod tests {
         };
         write_seed(
             &path,
-            "workspace",
-            "/workspace",
+            &mounts(),
+            "/projects/parser",
             "hegn-demo",
             &plan,
             Some(&profile),
             None,
             &[],
-            false,
             false,
         )
         .unwrap();
@@ -348,26 +469,88 @@ mod tests {
     }
 
     #[test]
-    fn instance_id_changes_with_preset_and_network() {
+    fn instance_id_changes_with_membership_preset_and_network() {
         let shell = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
         let opencode = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
-        let a = instance_id("demo", &shell, None, None, &[], false, false);
+        let one = mounts();
+        let a = instance_id(
+            "demo",
+            &one,
+            "/projects/parser",
+            &shell,
+            None,
+            None,
+            &[],
+            false,
+        );
         assert_eq!(
             a,
-            instance_id("demo", &shell, None, None, &[], false, false)
+            instance_id(
+                "demo",
+                &one,
+                "/projects/parser",
+                &shell,
+                None,
+                None,
+                &[],
+                false
+            )
         );
         assert_ne!(
             a,
-            instance_id("demo", &opencode, None, None, &[], false, false)
+            instance_id(
+                "demo",
+                &one,
+                "/projects/parser",
+                &opencode,
+                None,
+                None,
+                &[],
+                false
+            )
         );
         assert_ne!(
             a,
-            instance_id("demo", &shell, None, Some(&lease()), &[], false, false)
+            instance_id(
+                "demo",
+                &one,
+                "/projects/parser",
+                &shell,
+                None,
+                Some(&lease()),
+                &[],
+                false
+            )
         );
         assert_ne!(
             a,
-            instance_id("demo", &shell, None, None, &[], true, false),
+            instance_id(
+                "demo",
+                &one,
+                "/projects/parser",
+                &shell,
+                None,
+                None,
+                &[],
+                true
+            ),
             "toggling credential hardening must re-run cloud-init"
+        );
+        let mut two = one.clone();
+        two.pop();
+        assert_ne!(
+            a,
+            instance_id(
+                "demo",
+                &two,
+                "/projects/parser",
+                &shell,
+                None,
+                None,
+                &[],
+                false
+            ),
+            "membership changes must re-run cloud-init"
         );
         assert!(a.starts_with("hegn-demo-v"));
     }
@@ -379,14 +562,13 @@ mod tests {
         let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
         write_seed(
             &path,
-            "workspace",
-            "/workspace",
+            &mounts(),
+            "/projects/parser",
             "hegn-demo",
             &plan,
             None,
             None,
             &[],
-            false,
             false,
         )
         .unwrap();
@@ -407,14 +589,13 @@ mod tests {
         assert!(
             write_seed(
                 &link,
-                "workspace",
-                "/workspace",
+                &mounts(),
+                "/projects/parser",
                 "hegn-demo",
                 &plan,
                 None,
                 None,
                 &[],
-                false,
                 false
             )
             .is_err()
@@ -427,17 +608,67 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cloud-init.img");
         let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
+        for bad in ["bad tag", "workspace;reboot"] {
+            let mounts = vec![MountSpec {
+                tag: bad.into(),
+                guest_path: "/projects/demo".into(),
+                read_only: false,
+            }];
+            assert!(
+                write_seed(
+                    &path,
+                    &mounts,
+                    "/projects/demo",
+                    "hegn-demo",
+                    &plan,
+                    None,
+                    None,
+                    &[],
+                    false
+                )
+                .is_err(),
+                "{bad:?}"
+            );
+        }
+        for bad in ["/work space", "/workspace;reboot", "/workspace/../etc"] {
+            let mounts = vec![MountSpec {
+                tag: "hegn-prj-0".into(),
+                guest_path: bad.into(),
+                read_only: false,
+            }];
+            assert!(
+                write_seed(
+                    &path,
+                    &mounts,
+                    bad,
+                    "hegn-demo",
+                    &plan,
+                    None,
+                    None,
+                    &[],
+                    false
+                )
+                .is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_empty_or_unmounted_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud-init.img");
+        let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
         assert!(
             write_seed(
                 &path,
-                "bad tag",
-                "/workspace",
+                &[],
+                "/projects/demo",
                 "hegn-demo",
                 &plan,
                 None,
                 None,
                 &[],
-                false,
                 false
             )
             .is_err()
@@ -445,44 +676,13 @@ mod tests {
         assert!(
             write_seed(
                 &path,
-                "workspace",
-                "/work space",
+                &mounts(),
+                "/projects/elsewhere",
                 "hegn-demo",
                 &plan,
                 None,
                 None,
                 &[],
-                false,
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            write_seed(
-                &path,
-                "workspace;reboot",
-                "/workspace",
-                "hegn-demo",
-                &plan,
-                None,
-                None,
-                &[],
-                false,
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            write_seed(
-                &path,
-                "workspace",
-                "/workspace;reboot",
-                "hegn-demo",
-                &plan,
-                None,
-                None,
-                &[],
-                false,
                 false
             )
             .is_err()
@@ -498,14 +698,13 @@ mod tests {
         let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
         write_seed(
             &path,
-            "workspace",
-            "/workspace",
+            &mounts(),
+            "/projects/parser",
             "hegn-demo",
             &plan,
             None,
             None,
             &[],
-            false,
             false,
         )
         .unwrap();
@@ -593,14 +792,13 @@ mod tests {
             assert!(
                 write_seed(
                     &path,
-                    "workspace",
-                    "/workspace",
+                    &mounts(),
+                    "/projects/parser",
                     bad,
                     &plan,
                     None,
                     None,
                     &[],
-                    false,
                     false,
                 )
                 .is_err(),
@@ -613,10 +811,29 @@ mod tests {
     #[test]
     fn instance_id_is_stable_and_tracks_profile_and_endpoints() {
         let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
-        let plain = instance_id("demo", &plan, None, None, &[], false, false);
+        let mounts = mounts();
+        let plain = instance_id(
+            "demo",
+            &mounts,
+            "/projects/parser",
+            &plan,
+            None,
+            None,
+            &[],
+            false,
+        );
         assert_eq!(
             plain,
-            instance_id("demo", &plan, None, None, &[], false, false)
+            instance_id(
+                "demo",
+                &mounts,
+                "/projects/parser",
+                &plan,
+                None,
+                None,
+                &[],
+                false
+            )
         );
         assert_eq!(
             plain,
@@ -627,17 +844,43 @@ mod tests {
             bundle_dir: PathBuf::from("/tmp/bundle"),
             manifest_id: "b".repeat(64),
         };
-        let with_profile = instance_id("demo", &plan, Some(&profile), None, &[], false, false);
+        let with_profile = instance_id(
+            "demo",
+            &mounts,
+            "/projects/parser",
+            &plan,
+            Some(&profile),
+            None,
+            &[],
+            false,
+        );
         assert_ne!(plain, with_profile);
 
         let lease = lease();
-        let no_endpoints = instance_id("demo", &plan, None, Some(&lease), &[], false, false);
+        let no_endpoints = instance_id(
+            "demo",
+            &mounts,
+            "/projects/parser",
+            &plan,
+            None,
+            Some(&lease),
+            &[],
+            false,
+        );
         let endpoint = LocalEndpoint {
             name: "ollama".into(),
             port: 11434,
         };
-        let with_endpoint =
-            instance_id("demo", &plan, None, Some(&lease), &[endpoint], false, false);
+        let with_endpoint = instance_id(
+            "demo",
+            &mounts,
+            "/projects/parser",
+            &plan,
+            None,
+            Some(&lease),
+            &[endpoint],
+            false,
+        );
         assert_ne!(no_endpoints, with_endpoint);
     }
 

@@ -25,7 +25,6 @@ pub(super) enum ScanMessage {
         note: String,
         level: ToastLevel,
     },
-    InstanceError(String),
     Doctor {
         report: DoctorReport,
         note: Option<String>,
@@ -98,7 +97,7 @@ mod tests {
                 note: "instances refreshed".into(),
                 level: ToastLevel::Warn,
             },
-            ScanMessage::InstanceError("unreadable state".into()),
+            ScanMessage::Error("unreadable state".into()),
             ScanMessage::Doctor {
                 report: DoctorReport {
                     ok: true,
@@ -141,7 +140,7 @@ mod tests {
             matches!(&messages[1], ScanMessage::Started { .. }),
             matches!(&messages[2], ScanMessage::StartFailed(_)),
             matches!(&messages[3], ScanMessage::InstancesChanged { .. }),
-            matches!(&messages[4], ScanMessage::InstanceError(_)),
+            matches!(&messages[4], ScanMessage::Error(_)),
             matches!(&messages[5], ScanMessage::Doctor { .. }),
             matches!(&messages[6], ScanMessage::DownloadProgress(_)),
             matches!(&messages[7], ScanMessage::Provision(_)),

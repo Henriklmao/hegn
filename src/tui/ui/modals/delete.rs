@@ -186,22 +186,22 @@ mod tests {
     use crate::project::GitSummary;
     use crate::tui::app::Modal;
     use crate::tui::ui::test_support::*;
-    use crate::vm::instance::InstanceSummary;
+    use crate::vm::registry::VmSummary;
     use std::path::PathBuf;
 
-    fn instance(app: &App, name: &str, state: &str) -> InstanceSummary {
-        InstanceSummary {
+    fn instance(app: &App, name: &str, state: &str) -> VmSummary {
+        VmSummary {
             name: name.into(),
+            harness: Harness::Opencode,
+            primary: Some("demo".into()),
+            members: 1,
             project: PathBuf::from("/projects/demo"),
             workspace: PathBuf::from(format!("/workspaces/{name}")),
-            harness: Harness::Opencode,
-            ephemeral: false,
-            source_instance: None,
             created_at: chrono::Utc::now(),
             state: state.into(),
             vm_pid: None,
             serial_log: None,
-            config_path: app.config.vms_dir.join(name).join("hegn.toml"),
+            config_path: app.config.vms_dir.join(name).join("vm.toml"),
             vcpus: 2,
             memory_mib: 2048,
             error: None,

@@ -460,7 +460,7 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                     FooterDef {
                         key: "F5",
                         label: "Instance config",
-                        action: ActionId::InstanceConfig,
+                        action: ActionId::VmConfig,
                     },
                 ],
                 Focus::Snapshots => vec![
@@ -580,7 +580,7 @@ mod tests {
         DeleteInstanceStage::Files, DeleteProjectModal, MultiAgentForm,
     };
     use crate::tui::ui::test_support::*;
-    use crate::vm::instance::InstanceSummary;
+    use crate::vm::registry::VmSummary;
     use std::path::PathBuf;
 
     fn actions(app: &App) -> Vec<ActionId> {
@@ -597,14 +597,14 @@ mod tests {
             .collect()
     }
 
-    fn instance(app: &App, name: &str, state: &str) -> InstanceSummary {
-        InstanceSummary {
+    fn instance(app: &App, name: &str, state: &str) -> VmSummary {
+        VmSummary {
             name: name.into(),
+            harness: Harness::Shell,
+            primary: Some("demo".into()),
+            members: 1,
             project: PathBuf::from("/projects/demo"),
             workspace: PathBuf::from(format!("/workspaces/{name}")),
-            harness: Harness::Shell,
-            ephemeral: false,
-            source_instance: None,
             created_at: chrono::Utc::now(),
             state: state.into(),
             vm_pid: None,
@@ -642,7 +642,7 @@ mod tests {
             ActionId::StartInstance,
             ActionId::StopInstance,
             ActionId::DeleteInstance,
-            ActionId::InstanceConfig,
+            ActionId::VmConfig,
         ] {
             assert!(buttons.contains(&action), "missing {action:?}");
         }

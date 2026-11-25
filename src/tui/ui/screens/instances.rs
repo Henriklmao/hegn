@@ -78,7 +78,6 @@ pub(crate) fn render_instances(
         } else {
             "○"
         };
-        let badge = if instance.ephemeral { " clone" } else { "" };
         lines.push(Line::from(vec![
             Span::styled(
                 format!(" {marker} "),
@@ -90,7 +89,11 @@ pub(crate) fn render_instances(
             ),
             Span::styled(truncate(&instance.name, 18), base),
             Span::styled(
-                badge,
+                if instance.members > 1 {
+                    format!(" {}p", instance.members)
+                } else {
+                    String::new()
+                },
                 if selected {
                     Style::default().fg(ON_ACCENT).bg(CYAN)
                 } else {
@@ -129,17 +132,17 @@ mod tests {
     use crate::config::Harness;
     use crate::tui::app::Screen;
     use crate::tui::ui::test_support::*;
-    use crate::vm::instance::InstanceSummary;
+    use crate::vm::registry::VmSummary;
     use std::path::PathBuf;
 
-    fn instance(app: &App, name: &str, state: &str, harness: Harness) -> InstanceSummary {
-        InstanceSummary {
+    fn instance(app: &App, name: &str, state: &str, harness: Harness) -> VmSummary {
+        VmSummary {
             name: name.into(),
+            harness,
+            primary: Some("demo".into()),
+            members: 1,
             project: PathBuf::from("/projects/demo"),
             workspace: PathBuf::from(format!("/workspaces/{name}")),
-            harness,
-            ephemeral: false,
-            source_instance: None,
             created_at: chrono::Utc::now(),
             state: state.into(),
             vm_pid: None,
@@ -167,7 +170,6 @@ mod tests {
             instance(&app, "broken", "failed", Harness::Shell),
             instance(&app, "idle", "stopped", Harness::Shell),
         ];
-        app.instances[3].ephemeral = true;
         app.refresh_instance_filter();
 
         let (text, hits, buffer) = render_buffer(&app, 120, 42);
@@ -175,7 +177,6 @@ mod tests {
         assert_eq!(hits.instances.len(), 4);
         assert!(text.contains("●"), "{text}");
         assert!(text.contains("○"), "{text}");
-        assert!(text.contains("clone"), "{text}");
         assert!(text.contains("OpenCode"), "{text}");
         assert!(text.contains("Claude Code"), "{text}");
 

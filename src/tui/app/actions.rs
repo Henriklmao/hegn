@@ -179,7 +179,7 @@ impl App {
                     Vec::new()
                 }
             }
-            ActionId::InstanceConfig => self.open_instance_config(),
+            ActionId::VmConfig => self.open_vm_config(),
             ActionId::GlobalConfig => self.open_global_config(),
             ActionId::ProjectConfig => self.open_project_config(),
             ActionId::ProjectConfigSave => match self.modal.take() {

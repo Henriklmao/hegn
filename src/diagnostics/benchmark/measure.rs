@@ -1,4 +1,4 @@
-//! Measurement modes: running instances, one project, or a throwaway project.
+//! Measurement modes: running VMs, one project, or a throwaway project.
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::config::{Config, Harness};
 use crate::project;
-use crate::vm::instance::{InstanceRegistry, same_project};
+use crate::vm::registry::{VmRegistry, same_project};
 
 use super::cleanup::remove_temp_project;
 use super::report::{
@@ -32,8 +32,8 @@ struct SessionFile {
     project: Option<PathBuf>,
     #[serde(default)]
     workspace: Option<PathBuf>,
-    #[serde(default, alias = "sandbox")]
-    instance: Option<String>,
+    #[serde(default, alias = "instance", alias = "sandbox")]
+    vm: Option<String>,
     #[serde(default)]
     harness: Option<String>,
     #[serde(default)]
@@ -42,6 +42,9 @@ struct SessionFile {
     vm_pid: u32,
     #[serde(default)]
     relay_pid: u32,
+    #[serde(default)]
+    virtiofs_pids: Vec<u32>,
+    /// Pre-v2 single-share session.
     #[serde(default)]
     virtiofs_pid: u32,
 }
@@ -119,8 +122,8 @@ fn measure_project(config: &Config, project: &str, json: bool) -> Result<i32> {
             .is_some_and(|running| same_project(running, &path))
     }) {
         // Prefer the recorded instance name; legacy records predate it.
-        let mut report = match session.instance.as_deref().filter(|name| !name.is_empty()) {
-            Some(name) => collect_for_instance(config, name),
+        let mut report = match session.vm.as_deref().filter(|name| !name.is_empty()) {
+            Some(name) => collect_for_vm(config, name),
             None => collect_for_project(config, &path),
         };
         report
@@ -130,19 +133,19 @@ fn measure_project(config: &Config, project: &str, json: bool) -> Result<i32> {
     }
 
     let harness = project::read_meta(&path).harness.unwrap_or(config.harness);
-    let registry = InstanceRegistry::new(config.clone());
-    let instance = registry.ensure_for_project(&path, harness)?;
-    registry.manager(instance.clone()).start()?;
+    let registry = VmRegistry::new(config.clone());
+    let vm = registry.ensure_for_project(&path, harness)?;
+    registry.manager(vm.clone())?.start()?;
 
-    let mut report = collect_for_instance(config, &instance.name);
+    let mut report = collect_for_vm(config, &vm.name);
     report.started = true;
     report.notes.push(format!(
-        "instance '{}' started; measured right after the VMM socket came up, so guest RSS \
+        "VM '{}' started; measured right after the VMM socket came up, so guest RSS \
          grows while the guest boots (attach with `hegn attach {}`, stop it with \
          `hegn instance stop {}`)",
-        instance.name, instance.name, instance.name
+        vm.name, vm.name, vm.name
     ));
-    note_other_instances(config, &instance.name, &mut report.notes);
+    note_other_instances(config, &vm.name, &mut report.notes);
     emit(report, json)
 }
 
@@ -172,32 +175,36 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
         );
     }
 
-    let registry = InstanceRegistry::new(config.clone());
-    let mut instance = None;
+    let registry = VmRegistry::new(config.clone());
+    let mut vm = None;
     let started = (|| -> Result<BenchmarkReport> {
         let created = registry.ensure_for_project(&path, config.harness)?;
-        // Record the instance before booting: if the start fails, the cleanup
-        // below still has to unregister it.
-        instance = Some(created.clone());
-        registry.manager(created).start()?;
-        let mut report = collect_for_instance(config, &instance.as_ref().unwrap().name);
+        // Record the VM before booting: if the start fails, the cleanup below
+        // still has to unregister it.
+        vm = Some(created.clone());
+        registry.manager(created)?.start()?;
+        let mut report = collect_for_vm(config, &vm.as_ref().unwrap().name);
         report.started = true;
         report.notes.push(
             "measured right after the VMM socket came up, so guest RSS grows while the guest \
              boots; the instance was stopped and removed after this snapshot"
                 .to_string(),
         );
-        note_other_instances(config, &instance.as_ref().unwrap().name, &mut report.notes);
+        note_other_instances(config, &vm.as_ref().unwrap().name, &mut report.notes);
         Ok(report)
     })();
 
-    let stopped = instance
+    let stopped = vm
         .as_ref()
-        .map(|instance| registry.manager(instance.clone()).stop().is_ok())
+        .map(|vm| {
+            registry
+                .manager(vm.clone())
+                .is_ok_and(|manager| manager.stop().is_ok())
+        })
         .unwrap_or(false);
-    let instance_removed = instance
+    let instance_removed = vm
         .as_ref()
-        .map(|instance| registry.delete(&instance.name, true).is_ok())
+        .map(|vm| registry.delete(&vm.name, true).is_ok())
         .unwrap_or(false);
     let removed = match remove_temp_project(config, &path) {
         Ok(()) => true,
@@ -211,22 +218,19 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
         Ok(mut report) => {
             report.cleanup = Some(Cleanup {
                 project: path.clone(),
-                instance: instance
-                    .as_ref()
-                    .map(|instance| instance.name.clone())
-                    .unwrap_or_default(),
+                instance: vm.as_ref().map(|vm| vm.name.clone()).unwrap_or_default(),
                 instance_stopped: stopped,
                 removed,
             });
             if !stopped {
                 report
                     .notes
-                    .push("the temporary instance could not be stopped".to_string());
+                    .push("the temporary VM could not be stopped".to_string());
             }
             if !instance_removed {
                 report
                     .notes
-                    .push("the temporary instance could not be removed".to_string());
+                    .push("the temporary VM could not be removed".to_string());
             }
             if !removed {
                 report.notes.push(format!(
@@ -258,10 +262,8 @@ pub fn collect(config: &Config) -> BenchmarkReport {
     collect_with(config, |_, _| true)
 }
 
-fn collect_for_instance(config: &Config, name: &str) -> BenchmarkReport {
-    collect_with(config, |session, _| {
-        session.instance.as_deref() == Some(name)
-    })
+fn collect_for_vm(config: &Config, name: &str) -> BenchmarkReport {
+    collect_with(config, |session, _| session.vm.as_deref() == Some(name))
 }
 
 fn collect_for_project(config: &Config, project: &Path) -> BenchmarkReport {
@@ -290,13 +292,13 @@ fn collect_with(config: &Config, keep: impl Fn(&SessionFile, &Path) -> bool) -> 
 
     if sessions.is_empty() {
         notes.push(
-            "no running instance session found; disk usage and the configured guest cost are \
+            "no running VM session found; disk usage and the configured guest cost are \
              reported instead"
                 .to_string(),
         );
     } else {
         notes.push(format!(
-            "guest RAM is populated on demand: {} in total across {} instance(es)",
+            "guest RAM is populated on demand: {} in total across {} VM(s)",
             human_bytes(guest_memory_bytes),
             sessions.len()
         ));
@@ -363,7 +365,7 @@ fn running_sessions(config: &Config) -> Vec<(SessionFile, PathBuf)> {
 fn note_other_instances(config: &Config, measured: &str, notes: &mut Vec<String>) {
     let others = running_sessions(config)
         .into_iter()
-        .filter(|(session, _)| session.instance.as_deref() != Some(measured))
+        .filter(|(session, _)| session.vm.as_deref() != Some(measured))
         .count();
     if others > 0 {
         notes.push(format!(
@@ -433,12 +435,6 @@ fn build_session(
             Some(&vm),
             "cloud-hypervisor",
         ),
-        (
-            "virtiofsd",
-            session.virtiofs_pid,
-            Some(virtiofsd),
-            "virtiofsd",
-        ),
         ("console-relay", session.relay_pid, None, "__console-relay"),
     ] {
         if pid == 0 {
@@ -465,13 +461,39 @@ fn build_session(
         }
     }
 
+    let mut member_pids = session.virtiofs_pids.clone();
+    if session.virtiofs_pid != 0 {
+        member_pids.push(session.virtiofs_pid);
+    }
+    for (index, pid) in member_pids.into_iter().enumerate() {
+        if pid == 0 {
+            continue;
+        }
+        let role = format!("virtiofsd-{index}");
+        if !matches_binary(pid, virtiofsd, "virtiofsd") {
+            notes.push(format!(
+                "pid {pid} recorded as {role} no longer belongs to that process"
+            ));
+            continue;
+        }
+        match process_tree_usage(pid) {
+            Some((rss_bytes, virtual_bytes)) => processes.push(ProcessCost {
+                role,
+                pid,
+                rss_bytes,
+                virtual_bytes,
+            }),
+            None => notes.push(format!("{role} pid {pid} is not running")),
+        }
+    }
+
     let uptime_secs = session
         .started_at
         .map(|started| (Utc::now() - started).num_seconds().max(0) as u64);
 
     SessionCost {
         instance: session
-            .instance
+            .vm
             .clone()
             .or_else(|| {
                 session
@@ -524,7 +546,7 @@ fn instance_limits(session: &Path, config: &Config) -> (u8, u32) {
     let config_file = session
         .parent()
         .and_then(Path::parent)
-        .map(|dir| dir.join(crate::vm::instance_config::CONFIG_FILE));
+        .map(|dir| dir.join(crate::vm::config::VM_CONFIG_FILE));
     let limits = config_file
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|raw| toml::from_str::<Limits>(&raw).ok())
@@ -625,7 +647,7 @@ mod tests {
             report
                 .notes
                 .iter()
-                .any(|note| note.contains("no running instance"))
+                .any(|note| note.contains("no running VM"))
         );
         assert!(report.disk.iter().any(|cost| cost.name == "images"));
     }
@@ -676,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_limits_prefer_the_instance_config() {
+    fn instance_limits_prefer_the_vm_config() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             vcpus: 2,
@@ -684,10 +706,10 @@ mod tests {
             ..Config::default()
         };
 
-        let run = dir.path().join("instance/run");
+        let run = dir.path().join("vm/run");
         fs::create_dir_all(&run).unwrap();
         fs::write(
-            dir.path().join("instance/hegn.toml"),
+            dir.path().join("vm/vm.toml"),
             b"vcpus = 8\nmemory_mib = 8192\n",
         )
         .unwrap();
@@ -704,16 +726,16 @@ mod tests {
             memory_mib: 2048,
             ..Config::default()
         };
-        let run = dir.path().join("instance/run");
+        let run = dir.path().join("vm/run");
         fs::create_dir_all(&run).unwrap();
         let session = run.join("session.json");
 
         assert_eq!(instance_limits(&session, &config), (2, 2048));
 
-        fs::write(dir.path().join("instance/hegn.toml"), b"not = [valid").unwrap();
+        fs::write(dir.path().join("vm/vm.toml"), b"not = [valid").unwrap();
         assert_eq!(instance_limits(&session, &config), (2, 2048));
 
-        fs::write(dir.path().join("instance/hegn.toml"), b"vcpus = 4\n").unwrap();
+        fs::write(dir.path().join("vm/vm.toml"), b"vcpus = 4\n").unwrap();
         assert_eq!(instance_limits(&session, &config), (4, 2048));
     }
 
@@ -818,11 +840,12 @@ mod tests {
         let session = SessionFile {
             project: Some(dir.path().join("demo")),
             workspace: None,
-            instance: None,
+            vm: None,
             harness: None,
             started_at: Some(Utc::now() + chrono::Duration::seconds(60)),
             vm_pid: 0,
             relay_pid: 0,
+            virtiofs_pids: Vec::new(),
             virtiofs_pid: 0,
         };
 

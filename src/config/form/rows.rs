@@ -283,14 +283,13 @@ const INSTANCE_ROWS: &[ConfigRow] = &[
     ConfigRow::Field(ConfigField::Harness),
     ConfigRow::Field(ConfigField::Vcpus),
     ConfigRow::Field(ConfigField::Memory),
-    ConfigRow::Field(ConfigField::AutoBranch),
+    ConfigRow::Field(ConfigField::Security),
     ConfigRow::Group("Guest sharing"),
-    ConfigRow::Field(ConfigField::SharedTag),
-    ConfigRow::Field(ConfigField::GuestMount),
-    ConfigRow::Field(ConfigField::ReadOnlyWorkspace),
+    ConfigRow::Note("share tags come from the global share_tag_prefix"),
+    ConfigRow::Note("membership is managed by `hegn project assign`"),
     ConfigRow::Group("Packages"),
     ConfigRow::Field(ConfigField::ExtraPackages),
-    ConfigRow::Group("Instance (read-only)"),
+    ConfigRow::Group("VM (read-only)"),
     ConfigRow::Field(ConfigField::Project),
     ConfigRow::Field(ConfigField::Workspace),
     ConfigRow::Field(ConfigField::RootfsPath),
@@ -370,19 +369,16 @@ pub(super) fn endpoints_value(endpoints: &[LocalEndpoint]) -> String {
 mod tests {
     use crate::config::form::ConfigForm;
     use crate::config::form::test_support::global_config;
-    use crate::vm::instance_config::InstanceStore;
+    use crate::vm::config::{VmConfig, VmStore};
 
     #[test]
     fn instance_form_has_no_endpoint_page() {
         let dir = tempfile::tempdir().unwrap();
         let config = global_config(dir.path());
-        let store = InstanceStore::new(config.clone());
-        let project = dir.path().join("projects/demo");
-        std::fs::create_dir_all(&project).unwrap();
-        let instance = store
-            .create_from_project(&project, Some("demo"), None, false)
-            .unwrap();
-        let form = ConfigForm::instance(instance, config);
+        let store = VmStore::new(&config);
+        let vm = VmConfig::from_config(&config, "demo", None);
+        store.save(&vm).unwrap();
+        let form = ConfigForm::vm(vm, config);
         assert_eq!(form.pages(), &[super::ConfigPage::General]);
         assert_eq!(form.value(super::ConfigField::LocalEndpoints), "—");
     }

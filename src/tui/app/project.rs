@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::project::{self};
 use crate::security::Decision;
 use crate::session::state::StateStore;
-use crate::vm::instance::InstanceSummary;
+use crate::vm::registry::VmSummary;
 
 use super::*;
 
@@ -169,7 +169,7 @@ impl App {
         self.store = StateStore::load(self.config.state_dir.join("state.json"));
     }
 
-    pub(super) fn workspace_is_inside_instance(&self, instance: &InstanceSummary) -> bool {
+    pub(super) fn workspace_is_inside_instance(&self, instance: &VmSummary) -> bool {
         let dir = self.config.vms_dir.join(&instance.name);
         let dir = dir.canonicalize().unwrap_or(dir);
         let workspace = instance
@@ -360,7 +360,7 @@ mod tests {
         );
         assert_eq!(app.screen, Screen::Project);
         assert_eq!(app.project_view, ProjectView::Compact);
-        assert_eq!(app.instance.state, InstanceState::Stopped);
+        assert_eq!(app.instance.state, VmUiState::Stopped);
         assert_eq!(app.open_project.as_deref(), Some(project.path.as_path()));
     }
 

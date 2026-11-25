@@ -4,12 +4,12 @@
 use anyhow::{Result, bail};
 
 use crate::config::Config;
-use crate::vm::instance::InstanceRegistry;
+use crate::vm::registry::VmRegistry;
 
 use crate::cli::args::SkillCommands;
 
 pub(crate) fn skill_command(command: SkillCommands, config: Config, json: bool) -> Result<i32> {
-    let registry = InstanceRegistry::new(config);
+    let registry = VmRegistry::new(config);
     match command {
         SkillCommands::Sync { instance } => {
             let instance = registry.resolve(&instance)?;
@@ -33,7 +33,7 @@ pub(crate) fn skill_command(command: SkillCommands, config: Config, json: bool) 
             force,
         } => {
             let instance = registry.resolve(&instance)?;
-            let manager = registry.manager(instance.clone());
+            let manager = registry.manager(instance.clone())?;
             if manager.is_running() && !force && !dry_run {
                 bail!(
                     "instance '{}' is running; stop it first or pass --force to copy live files",

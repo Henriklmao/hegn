@@ -59,11 +59,11 @@ pub(super) fn launch_agent(
             command,
             bar,
         } => {
-            let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
+            let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
             app.detach_console();
             let result = with_suspended_terminal(terminal, || {
                 let config = registry.resolve(&instance)?;
-                let console = registry.manager(config).attach_console()?;
+                let console = registry.manager(config)?.attach_console()?;
                 crate::session::console::run_interactive_with_command(
                     console,
                     bar,
@@ -75,7 +75,7 @@ pub(super) fn launch_agent(
             let reattached = registry
                 .resolve(&instance)
                 .ok()
-                .and_then(|config| registry.manager(config).attach_console().ok());
+                .and_then(|config| registry.manager(config).ok()?.attach_console().ok());
             if let Some(console) = reattached {
                 app.attach_console(Box::new(console));
                 app.project_view = crate::tui::app::ProjectView::Split;

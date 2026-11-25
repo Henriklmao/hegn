@@ -64,7 +64,7 @@ pub(crate) fn render_project_panel(frame: &mut Frame, app: &App, area: Rect) {
                 format!(
                     "{} inside {}",
                     app.config.harness.label(),
-                    crate::vm::instance_config::InstanceConfig::default().guest_mount
+                    app.config.guest_projects_base.clone()
                 ),
                 Style::default().fg(TEXT),
             ),

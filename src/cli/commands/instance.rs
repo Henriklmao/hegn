@@ -1,6 +1,10 @@
 //! `hegn instance`, `open`, `attach` and `launch` handlers, plus the helpers
-//! they share for picking the only running instance and drawing provisioning
+//! they share for picking the only running VM and drawing provisioning
 //! progress.
+//!
+//! Phase 2 keeps the legacy `instance` command as a mechanical adapter over
+//! [`VmRegistry`]. The project-first `hegn vm`/`hegn project` surface lands in
+//! Phase 5.
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -13,11 +17,12 @@ use crate::agent::launch::{self, Integration, LaunchAction};
 use crate::agent::provision::{ProvisionPlan, ProvisionProgress, ProvisionWatcher};
 use crate::config::Config;
 use crate::project;
-use crate::vm::instance::InstanceRegistry;
+use crate::vm::config::VmConfig;
+use crate::vm::registry::VmRegistry;
 
 use super::config::run_editor;
 use crate::cli::args::InstanceCommands;
-use crate::cli::output::{print_instance, print_instances, print_report, runtime};
+use crate::cli::output::{print_instances, print_report, runtime};
 use crate::cli::resolve::resolve_project;
 
 pub(crate) fn instance_command(
@@ -25,122 +30,63 @@ pub(crate) fn instance_command(
     config: Config,
     json: bool,
 ) -> Result<i32> {
-    let registry = InstanceRegistry::new(config.clone());
+    let registry = VmRegistry::new(config.clone());
     match command {
         InstanceCommands::List => {
             print_instances(&registry.summaries()?, json)?;
             Ok(0)
         }
-        InstanceCommands::Create {
-            project,
-            name,
-            harness,
-            clone,
-        } => {
-            let path = resolve_project(&config, &project)?;
-            let harness = harness.or_else(|| project::read_meta(&path).harness);
-            let instance = if clone {
-                let outcome =
-                    registry.create_with_warnings(&path, name.as_deref(), harness, true)?;
-                for warning in &outcome.warnings {
-                    eprintln!("warning: {warning}");
-                }
-                outcome.instance
-            } else {
-                registry.create(&path, name.as_deref(), harness, false)?
-            };
-            print_instance(&registry.summary(&instance), json)?;
-            Ok(0)
-        }
-        InstanceCommands::Clone {
-            source,
-            name,
-            count,
-            harness,
-            no_start,
-        } => {
-            if count == 0 || count > 64 {
-                bail!("--count must be between 1 and 64");
-            }
-            let source = registry.resolve(&source)?;
-            let base = name.unwrap_or_else(|| format!("{}-agent", source.name));
-            let mut created = Vec::new();
-            for index in 1..=count {
-                let clone_name = if count == 1 {
-                    registry.unique_name(&base)?
-                } else {
-                    registry.unique_name(&format!("{base}-{index}"))?
-                };
-                let outcome = registry.clone_from(&source, &clone_name, harness)?;
-                for warning in &outcome.warnings {
-                    eprintln!("warning: {warning}");
-                }
-                if !no_start {
-                    registry.manager(outcome.instance.clone()).start()?;
-                }
-                created.push(registry.summary(&outcome.instance));
-            }
-            print_instances(&created, json)?;
-            Ok(0)
-        }
+        InstanceCommands::Create { .. } => bail!(
+            "`hegn instance create` was replaced by `hegn vm create <name>` plus \
+             `hegn project assign <project> --vm <name>`"
+        ),
+        InstanceCommands::Clone { .. } => bail!(
+            "`hegn instance clone` was replaced by `hegn project fork <project>` \
+             (workspaces land in Phase 7; use a second VM until then)"
+        ),
         InstanceCommands::Start {
             name,
             harness,
             clone,
         } => {
-            let instance = match registry.resolve(&name) {
-                Ok(instance) => {
-                    if clone {
-                        let clone_name =
-                            registry.unique_name(&format!("{}-agent", instance.name))?;
-                        let outcome = registry.clone_from(&instance, &clone_name, harness)?;
-                        for warning in &outcome.warnings {
-                            eprintln!("warning: {warning}");
-                        }
-                        outcome.instance
-                    } else {
-                        instance
-                    }
-                }
+            if clone {
+                bail!(
+                    "`--clone` was replaced by `hegn project fork` and is not available yet; \
+                     start the VM without it"
+                );
+            }
+            let vm = match registry.resolve(&name) {
+                Ok(vm) => vm,
                 Err(_) => {
                     let path = resolve_project(&config, &name)?;
                     let meta = project::read_meta(&path);
                     let harness = harness.or(meta.harness).unwrap_or(config.harness);
-                    if clone {
-                        let outcome =
-                            registry.create_with_warnings(&path, None, Some(harness), true)?;
-                        for warning in &outcome.warnings {
-                            eprintln!("warning: {warning}");
-                        }
-                        outcome.instance
-                    } else {
-                        registry.ensure_for_project(&path, harness)?
-                    }
+                    registry.ensure_for_project(&path, harness)?
                 }
             };
-            let manager = registry.manager(instance);
+            let manager = registry.manager(vm)?;
             let report = manager.start()?;
             print_report(&report, json)?;
             Ok(0)
         }
         InstanceCommands::Stop { name } => {
-            let instance = match name {
+            let vm = match name {
                 Some(selector) => registry.resolve(&selector)?,
-                None => only_running_instance(&registry)?,
+                None => only_running_vm(&registry)?,
             };
-            registry.manager(instance.clone()).stop()?;
+            registry.manager(vm.clone())?.stop()?;
             if json {
-                println!("{}", serde_json::json!({"stopped": instance.name}));
+                println!("{}", serde_json::json!({"stopped": vm.name}));
             } else {
-                println!("Instance '{}' stopped.", instance.name);
+                println!("VM '{}' stopped.", vm.name);
             }
             Ok(0)
         }
         InstanceCommands::Status { name } => {
             match name {
                 Some(selector) => {
-                    let instance = registry.resolve(&selector)?;
-                    let report = registry.manager(instance).status()?;
+                    let vm = registry.resolve(&selector)?;
+                    let report = registry.manager(vm)?.status()?;
                     print_report(&report, json)?;
                 }
                 None => print_instances(&registry.summaries()?, json)?,
@@ -148,38 +94,38 @@ pub(crate) fn instance_command(
             Ok(0)
         }
         InstanceCommands::Pause { name } => {
-            let instance = registry.resolve(&name)?;
-            let instance_name = instance.name.clone();
-            runtime()?.block_on(registry.manager(instance).pause())?;
+            let vm = registry.resolve(&name)?;
+            let vm_name = vm.name.clone();
+            runtime()?.block_on(registry.manager(vm)?.pause())?;
             if json {
-                println!("{}", serde_json::json!({"paused": instance_name}));
+                println!("{}", serde_json::json!({"paused": vm_name}));
             } else {
-                println!("Instance '{instance_name}' paused.");
+                println!("VM '{vm_name}' paused.");
             }
             Ok(0)
         }
         InstanceCommands::Resume { name } => {
-            let instance = registry.resolve(&name)?;
-            let instance_name = instance.name.clone();
-            runtime()?.block_on(registry.manager(instance).resume())?;
+            let vm = registry.resolve(&name)?;
+            let vm_name = vm.name.clone();
+            runtime()?.block_on(registry.manager(vm)?.resume())?;
             if json {
-                println!("{}", serde_json::json!({"resumed": instance_name}));
+                println!("{}", serde_json::json!({"resumed": vm_name}));
             } else {
-                println!("Instance '{instance_name}' resumed.");
+                println!("VM '{vm_name}' resumed.");
             }
             Ok(0)
         }
         InstanceCommands::Config { name, edit, path } => {
-            let instance = registry.store().load(&name)?;
+            let vm = registry.store().load(&name)?;
             let config_path = registry.store().config_path(&name)?;
             if path {
                 println!("{}", config_path.display());
             } else if edit {
                 run_editor(&config_path)?;
             } else if json {
-                println!("{}", serde_json::to_string_pretty(&instance)?);
+                println!("{}", serde_json::to_string_pretty(&vm)?);
             } else {
-                println!("{}", toml::to_string_pretty(&instance)?);
+                println!("{}", toml::to_string_pretty(&vm)?);
             }
             Ok(0)
         }
@@ -189,81 +135,59 @@ pub(crate) fn instance_command(
             keep_files,
             yes,
         } => {
-            let instance = registry.store().load(&name)?;
-            let workspace_inside = instance
-                .workspace
-                .canonicalize()
-                .map(|workspace| {
-                    instance
-                        .dir(registry.store().root())
-                        .canonicalize()
-                        .map(|dir| workspace.starts_with(&dir))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if !yes && !prompt_yes(&format!("Delete instance '{}'?", instance.name))? {
+            let vm = registry.store().load(&name)?;
+            if !yes && !prompt_yes(&format!("Delete VM '{}'?", vm.name))? {
                 println!("Cancelled.");
                 return Ok(0);
             }
-            let delete_files = if workspace_inside {
-                if delete_files {
-                    true
-                } else if keep_files {
-                    false
-                } else {
-                    if !std::io::stdin().is_terminal() {
-                        bail!("workspace files require an explicit --delete-files or --keep-files");
-                    }
-                    prompt_yes("Also delete the cloned workspace files?")?
-                }
-            } else {
+            let delete_files = if delete_files {
+                true
+            } else if keep_files {
                 false
+            } else if std::io::stdin().is_terminal() {
+                prompt_yes("Also delete hegn-managed workspace files?")?
+            } else {
+                bail!("choose --delete-files or --keep-files in non-interactive mode");
             };
-            let outcome = registry.delete(&instance.name, delete_files)?;
+            let outcome = registry.delete(&vm.name, delete_files)?;
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "deleted": instance.name,
+                        "deleted": vm.name,
                         "delete_files": delete_files,
                         "kept_workspace": outcome.kept_workspace,
                     })
                 );
             } else if let Some(kept) = outcome.kept_workspace {
                 println!(
-                    "Instance '{}' removed. Workspace kept at {}",
-                    instance.name,
+                    "VM '{}' removed. Workspaces kept at {}",
+                    vm.name,
                     kept.display()
                 );
-            } else if workspace_inside && delete_files {
-                println!("Instance '{}' and its workspace deleted.", instance.name);
+            } else if delete_files {
+                println!("VM '{}' and its managed workspaces deleted.", vm.name);
             } else {
-                println!(
-                    "Instance '{}' removed. Source project {} was not touched.",
-                    instance.name,
-                    instance.project.display()
-                );
+                println!("VM '{}' removed. Project files were not touched.", vm.name);
             }
             Ok(0)
         }
     }
 }
 
-pub(crate) fn only_running_instance(
-    registry: &InstanceRegistry,
-) -> Result<crate::vm::instance_config::InstanceConfig> {
+pub(crate) fn only_running_vm(registry: &VmRegistry) -> Result<VmConfig> {
     let mut running: Vec<_> = registry
         .summaries()?
         .into_iter()
-        .filter(|instance| instance.state == "running")
+        .filter(|vm| vm.state == "running")
         .collect();
     match running.len() {
-        0 => bail!("no running instance; start one with `hegn instance start <name>`"),
+        0 => bail!("no running VM; start one with `hegn instance start <name>`"),
         1 => registry.store().load(&running.remove(0).name),
         _ => {
-            let names: Vec<String> = running.into_iter().map(|instance| instance.name).collect();
+            let names: Vec<String> = running.into_iter().map(|vm| vm.name).collect();
             bail!(
-                "multiple instances are running ({}); pass an instance name",
+                "multiple VMs are running ({}); pass a VM name",
                 names.join(", ")
             )
         }
@@ -286,13 +210,10 @@ pub(crate) fn prompt_yes(question: &str) -> Result<bool> {
     ))
 }
 
-pub(crate) fn snapshot_instance(
-    registry: &InstanceRegistry,
-    requested: Option<String>,
-) -> Result<crate::vm::instance_config::InstanceConfig> {
+pub(crate) fn snapshot_vm(registry: &VmRegistry, requested: Option<String>) -> Result<VmConfig> {
     match requested {
         Some(selector) => registry.resolve(&selector),
-        None => only_running_instance(registry),
+        None => only_running_vm(registry),
     }
 }
 
@@ -319,10 +240,10 @@ pub(crate) fn open(
 
     let meta = project::read_meta(&path);
     let harness = meta.harness.unwrap_or(config.harness);
-    let registry = InstanceRegistry::new(config.clone());
-    let instance = registry.ensure_for_project(&path, harness)?;
-    let plan = ProvisionPlan::new(instance.harness, &instance.extra_packages).ok();
-    let manager = registry.manager(instance.clone());
+    let registry = VmRegistry::new(config.clone());
+    let vm = registry.ensure_for_project(&path, harness)?;
+    let plan = ProvisionPlan::new(vm.harness, &vm.extra_packages).ok();
+    let manager = registry.manager(vm.clone())?;
     let report = if manager.is_running() {
         manager.status().ok()
     } else {
@@ -333,20 +254,36 @@ pub(crate) fn open(
     {
         wait_for_provision(report.serial_log.as_deref(), &plan);
     }
+    if let Some(warning) = manager.membership_warning() {
+        eprintln!("warning: {warning}");
+    }
     let console = manager.attach_console()?;
 
     // Only mutate the workspace repository once a VM is actually available.
-    let workspace = instance.workspace.clone();
-    let git = project::read_git_summary(&workspace);
-    if instance.auto_branch && git.is_repo && !no_branch {
-        match project::create_session_branch(&workspace) {
-            Ok(branch) => println!("Session branch: {branch}"),
-            Err(err) => eprintln!("warning: could not create session branch: {err}"),
+    let workspace = primary_path(&registry, &vm);
+    if !no_branch && let Some(workspace) = workspace {
+        let git = project::read_git_summary(&workspace);
+        if git.is_repo {
+            match project::create_session_branch(&workspace) {
+                Ok(branch) => println!("Session branch: {branch}"),
+                Err(err) => eprintln!("warning: could not create session branch: {err}"),
+            }
         }
     }
 
     crate::session::console::run_interactive_with_command(console, !no_bar, command.as_deref())?;
     Ok(0)
+}
+
+/// Primary (or first) exported project of a VM.
+fn primary_path(registry: &VmRegistry, vm: &VmConfig) -> Option<std::path::PathBuf> {
+    let projects = crate::project::ProjectRegistry::load(&registry.config().state_dir).ok()?;
+    let members = projects.exported_members(&vm.name);
+    members
+        .iter()
+        .find(|entry| vm.primary.as_deref() == Some(entry.name.as_str()))
+        .or_else(|| members.first())
+        .map(|entry| entry.path.clone())
 }
 
 /// Wait for the guest provisioner while showing a rough progress bar.
@@ -426,13 +363,17 @@ pub(crate) fn attach(
     command: Option<String>,
     config: Config,
 ) -> Result<i32> {
-    let registry = InstanceRegistry::new(config.clone());
-    let instance = match project {
+    let registry = VmRegistry::new(config.clone());
+    let vm = match project {
         Some(selector) => registry.resolve(&selector)?,
-        None => only_running_instance(&registry)?,
+        None => only_running_vm(&registry)?,
     };
     // VmConsole::attach re-verifies the recorded pid, VM binary and relay.
-    let console = registry.manager(instance).attach_console()?;
+    let manager = registry.manager(vm)?;
+    if let Some(warning) = manager.membership_warning() {
+        eprintln!("warning: {warning}");
+    }
+    let console = manager.attach_console()?;
     crate::session::console::run_interactive_with_command(console, !no_bar, command.as_deref())?;
     Ok(0)
 }
@@ -444,10 +385,10 @@ pub(crate) fn launch_command(
     no_bar: bool,
     config: Config,
 ) -> Result<i32> {
-    let registry = InstanceRegistry::new(config.clone());
-    let instance = match selector {
+    let registry = VmRegistry::new(config.clone());
+    let vm = match selector {
         Some(selector) => match registry.resolve(&selector) {
-            Ok(instance) => instance,
+            Ok(vm) => vm,
             Err(_) => {
                 let path = resolve_project(&config, &selector)?;
                 let meta = project::read_meta(&path);
@@ -455,10 +396,10 @@ pub(crate) fn launch_command(
                 registry.ensure_for_project(&path, harness)?
             }
         },
-        None => only_running_instance(&registry)?,
+        None => only_running_vm(&registry)?,
     };
 
-    let manager = registry.manager(instance.clone());
+    let manager = registry.manager(vm.clone())?;
     let started_now = !manager.is_running();
     let report = if started_now {
         Some(manager.start()?)
@@ -466,16 +407,20 @@ pub(crate) fn launch_command(
         manager.status().ok()
     };
     if config.cloud_init {
-        let plan = ProvisionPlan::new(instance.harness, &instance.extra_packages).ok();
+        let plan = ProvisionPlan::new(vm.harness, &vm.extra_packages).ok();
         if let (Some(report), Some(plan)) = (&report, plan) {
             wait_for_provision(report.serial_log.as_deref(), &plan);
         }
     }
 
-    let meta = project::read_meta(&instance.project);
+    let workspace = primary_path(&registry, &vm);
+    let meta = workspace
+        .as_deref()
+        .map(project::read_meta)
+        .unwrap_or_default();
     let mut spec = launch::resolve(
         &config,
-        instance.harness,
+        vm.harness,
         command.as_deref().or(meta.launch.as_deref()),
         integration.or(meta.integration),
     )?;
@@ -483,7 +428,8 @@ pub(crate) fn launch_command(
         spec.bar = false;
     }
     let hegn = std::env::current_exe().context("failed to locate the hegn executable")?;
-    match launch::action(&spec, &instance.name, &instance.workspace, &hegn)? {
+    let workspace = workspace.unwrap_or_default();
+    match launch::action(&spec, &vm.name, &workspace, &hegn)? {
         LaunchAction::Embedded { command } => {
             let console = manager.attach_console()?;
             crate::session::console::run_interactive_with_command(
@@ -527,48 +473,58 @@ mod tests {
     use crate::config::Harness;
 
     #[test]
-    fn instance_status_json_works_without_vm() {
+    fn instance_status_json_works_without_a_vm() {
         let (_dir, config) = config();
         let code = instance_command(InstanceCommands::Status { name: None }, config, true).unwrap();
         assert_eq!(code, 0);
     }
 
     #[test]
-    fn instance_create_clone_list_config_and_delete() {
+    fn legacy_create_and_clone_point_at_the_new_commands() {
         let (_dir, config) = config();
-        let project = config.projects_root.join("demo");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("README.md"), b"demo").unwrap();
-
-        let code = instance_command(
+        let err = instance_command(
             InstanceCommands::Create {
-                project: project.display().to_string(),
-                name: Some("base".into()),
-                harness: Some(Harness::Codex),
+                project: "demo".into(),
+                name: None,
+                harness: None,
                 clone: false,
             },
             config.clone(),
             true,
         )
-        .unwrap();
-        assert_eq!(code, 0);
-        assert!(config.vms_dir.join("base/hegn.toml").is_file());
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("hegn vm create"), "{err}");
 
-        let code = instance_command(
+        let err = instance_command(
             InstanceCommands::Clone {
-                source: "base".into(),
-                name: Some("agent1".into()),
+                source: "demo".into(),
+                name: None,
                 count: 1,
                 harness: None,
                 no_start: true,
             },
-            config.clone(),
+            config,
             true,
         )
-        .unwrap();
-        assert_eq!(code, 0);
-        assert!(config.vms_dir.join("agent1/hegn.toml").is_file());
-        assert!(config.vms_dir.join("agent1/workspace/README.md").is_file());
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("hegn project fork"), "{err}");
+    }
+
+    #[test]
+    fn start_status_config_and_delete_use_the_vm_manager() {
+        let (_dir, config) = config();
+        let project = config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("README.md"), b"demo").unwrap();
+
+        // Create the transitional solo VM the way `open` does.
+        let registry = VmRegistry::new(config.clone());
+        let vm = registry
+            .ensure_for_project(&project, Harness::Codex)
+            .unwrap();
+        assert!(config.vms_dir.join("demo/vm.toml").is_file());
 
         assert_eq!(
             instance_command(InstanceCommands::List, config.clone(), true).unwrap(),
@@ -577,7 +533,7 @@ mod tests {
         assert_eq!(
             instance_command(
                 InstanceCommands::Config {
-                    name: "base".into(),
+                    name: "demo".into(),
                     edit: false,
                     path: true,
                 },
@@ -587,12 +543,30 @@ mod tests {
             .unwrap(),
             0
         );
+        // A VM with no assets cannot start, but the command must reach the
+        // manager rather than the deleted instance store.
+        let err = instance_command(
+            InstanceCommands::Start {
+                name: "demo".into(),
+                harness: None,
+                clone: false,
+            },
+            config.clone(),
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("VM log:") || err.contains("missing VM assets"),
+            "{err}"
+        );
+
         assert_eq!(
             instance_command(
                 InstanceCommands::Delete {
-                    name: "agent1".into(),
-                    delete_files: true,
-                    keep_files: false,
+                    name: vm.name,
+                    delete_files: false,
+                    keep_files: true,
                     yes: true,
                 },
                 config.clone(),
@@ -601,14 +575,15 @@ mod tests {
             .unwrap(),
             0
         );
-        assert!(!config.vms_dir.join("agent1").exists());
+        assert!(!config.vms_dir.join("demo").exists());
         assert!(project.join("README.md").is_file());
+        let _ = crate::vm::same_project(&project, &project);
     }
 
     #[test]
     fn attach_without_a_session_is_a_hard_error() {
         let (_dir, config) = config();
         let err = attach(None, false, None, config).unwrap_err().to_string();
-        assert!(err.contains("no running instance"), "{err}");
+        assert!(err.contains("no running VM"), "{err}");
     }
 }

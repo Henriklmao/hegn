@@ -105,7 +105,7 @@ pub(super) fn ensure_socket(path: &Path) -> Result<()> {
             path.display()
         ),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => bail!(
-            "no Cloud Hypervisor API socket at {} — start an instance first",
+            "no Cloud Hypervisor API socket at {} — start a VM first",
             path.display()
         ),
         Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),

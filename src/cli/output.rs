@@ -1,90 +1,51 @@
-//! Rendering helpers shared by the CLI handlers: instance, report and
-//! snapshot output plus the small JSON/text utilities they need.
+//! Rendering helpers shared by the CLI handlers: VM, report and snapshot output
+//! plus the small JSON/text utilities they need.
 
 use anyhow::Result;
 
 pub(crate) use crate::shared::text::human_bytes as human_size;
 
 use crate::session::snapshot::SnapshotMeta;
-use crate::vm::instance::{InstanceReport, InstanceSummary, process_alive};
+use crate::vm::{VmReport, VmSummary, process_alive};
 
-pub(crate) fn print_instances(instances: &[InstanceSummary], json: bool) -> Result<()> {
+pub(crate) fn print_instances(instances: &[VmSummary], json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(instances)?);
         return Ok(());
     }
     if instances.is_empty() {
-        println!("No instances. Create one with: hegn instance create <project>");
+        println!("No VMs. Create one with: hegn vm create <name>");
         return Ok(());
     }
     println!(
-        "{:<24} {:<12} {:<10} {:<12} PROJECT",
-        "INSTANCE", "STATE", "MODE", "HARNESS"
+        "{:<24} {:<12} {:<8} {:<12} PRIMARY",
+        "VM", "STATE", "MEMBERS", "HARNESS"
     );
-    for instance in instances {
+    for vm in instances {
         println!(
-            "{:<24} {:<12} {:<10} {:<12} {}",
-            instance.name,
-            instance.state,
-            if instance.ephemeral {
-                "clone"
-            } else {
-                "project"
-            },
-            instance.harness.label(),
-            instance.project.display()
+            "{:<24} {:<12} {:<8} {:<12} {}",
+            vm.name,
+            vm.state,
+            vm.members,
+            vm.harness.label(),
+            vm.project.display()
         );
     }
     Ok(())
 }
 
-pub(crate) fn print_instance(instance: &InstanceSummary, json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(instance)?);
-        return Ok(());
-    }
-    println!("instance      {}", instance.name);
-    println!("state        {}", instance.state);
-    println!(
-        "mode         {}",
-        if instance.ephemeral {
-            "clone"
-        } else {
-            "project"
-        }
-    );
-    println!("project      {}", instance.project.display());
-    println!("workspace    {}", instance.workspace.display());
-    println!("harness      {}", instance.harness.label());
-    println!(
-        "resources    {} vCPU · {} MiB",
-        instance.vcpus, instance.memory_mib
-    );
-    println!("config       {}", instance.config_path.display());
-    if let Some(source) = &instance.source_instance {
-        println!("source       {source}");
-    }
-    if let Some(pid) = instance.vm_pid {
-        println!("vm           pid {pid}");
-    }
-    if let Some(log) = &instance.serial_log {
-        println!("serial log   {}", log.display());
-    }
-    if let Some(error) = &instance.error {
-        println!("error        {error}");
-    }
-    Ok(())
-}
-
-pub(crate) fn print_report(report: &InstanceReport, json: bool) -> Result<()> {
+pub(crate) fn print_report(report: &VmReport, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
-    println!("instance      {}", report.instance);
+    println!("vm           {}", report.vm);
     println!("state        {}", report.state);
     println!("backend      {}", report.backend);
-    println!("workspace    {}", report.workspace.display());
+    println!("members      {}", report.members);
+    if let Some(primary) = &report.primary {
+        println!("primary      {primary}");
+    }
     if let Some(project) = &report.project {
         println!("project      {}", project.display());
     }
@@ -96,13 +57,13 @@ pub(crate) fn print_report(report: &InstanceReport, json: bool) -> Result<()> {
     println!("serial       {}", report.serial_socket.display());
     println!("console      {}", report.console_socket.display());
     println!(
-        "virtiofs     {} ({})",
+        "virtiofs     {} ({} member daemon(s))",
         if report.virtiofs_running {
             "running"
         } else {
             "stopped"
         },
-        report.virtiofs_socket.display()
+        report.virtiofs_pids.len()
     );
     if let Some(pid) = report.vm_pid {
         println!(
@@ -116,10 +77,10 @@ pub(crate) fn print_report(report: &InstanceReport, json: bool) -> Result<()> {
             if process_alive(pid) { "alive" } else { "dead" }
         );
     }
-    if let Some(pid) = report.virtiofs_pid {
+    for pid in &report.virtiofs_pids {
         println!(
             "virtiofsd    pid {pid} ({})",
-            if process_alive(pid) { "alive" } else { "dead" }
+            if process_alive(*pid) { "alive" } else { "dead" }
         );
     }
     if let Some(log) = &report.serial_log {

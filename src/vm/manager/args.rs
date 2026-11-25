@@ -19,11 +19,12 @@ use crate::network;
 use crate::session::relay::{self, RelayArgs};
 use crate::session::snapshot::{SnapshotMeta, SnapshotStore};
 use crate::vm::cloud_init;
+use crate::vm::config::VmConfig;
 use crate::vm::hypervisor::CloudHypervisorClient;
-use crate::vm::instance_config::InstanceConfig;
 use crate::vm::virtiofs::{VirtiofsConfig, VirtiofsProcess};
 
-use super::paths::InstancePaths;
+use super::BootPlan;
+use super::paths::VmPaths;
 use super::process::{hegn_binary, is_socket, process_alive, remove_socket, terminate_relay};
 use super::util::log_tail;
 
@@ -37,15 +38,6 @@ const SERIAL_CONSOLE: &str = "ttyAMA0";
 
 pub(super) fn boot_args(root_device: &str) -> String {
     format!("console={SERIAL_CONSOLE} reboot=k panic=1 root={root_device} rw")
-}
-
-#[cfg(test)]
-fn virtiofs_config(
-    config: &Config,
-    paths: &InstancePaths,
-    project: &Path,
-) -> Result<VirtiofsConfig> {
-    virtiofs_config_at(config, project, &paths.virtiofs_socket, false)
 }
 
 pub(super) fn virtiofs_config_at(
@@ -70,15 +62,7 @@ pub(super) fn virtiofs_config_at(
     Ok(virtiofs)
 }
 
-pub(super) fn spawn_virtiofsd(
-    config: &Config,
-    paths: &InstancePaths,
-    project: &Path,
-    read_only: bool,
-) -> Result<VirtiofsProcess> {
-    spawn_virtiofsd_at(config, project, &paths.virtiofs_socket, read_only)
-}
-
+/// Spawn one sandboxed virtiofsd for an exported directory.
 pub(super) fn spawn_virtiofsd_at(
     config: &Config,
     shared_dir: &Path,
@@ -95,10 +79,15 @@ pub(super) fn spawn_virtiofsd_at(
 }
 
 /// Build the hardened command line for a normal boot.
+///
+/// One `--fs` device per exported member in plan order, then the optional
+/// profile share. The tags and sockets belong to the plan, so the VMM device
+/// tree always matches the membership manifest.
 pub(super) fn cloud_hypervisor_args(
     config: &Config,
-    instance: &InstanceConfig,
-    paths: &InstancePaths,
+    vm: &VmConfig,
+    plan: &BootPlan,
+    paths: &VmPaths,
     rootfs: &Path,
     network: Option<&network::Lease>,
     profile_socket: Option<&Path>,
@@ -123,23 +112,25 @@ pub(super) fn cloud_hypervisor_args(
     }
 
     args.push("--cpus".into());
-    args.push(format!("boot={},max={}", instance.vcpus, instance.vcpus).into());
+    args.push(format!("boot={},max={}", vm.vcpus, vm.vcpus).into());
     args.push("--memory".into());
-    args.push(format!("size={}M,shared=on", instance.memory_mib).into());
+    args.push(format!("size={}M,shared=on", vm.memory_mib).into());
     // The host is the entropy source. A restored guest keeps its virtio-rng
     // device and receives fresh bytes from /dev/urandom instead of reusing the
     // CRNG state captured in the snapshot.
     args.push("--rng".into());
     args.push("src=/dev/urandom".into());
-    args.push("--fs".into());
-    args.push(
-        format!(
-            "tag={},socket={},num_queues=1,queue_size=1024",
-            instance.shared_tag,
-            paths.virtiofs_socket.display()
-        )
-        .into(),
-    );
+    for member in &plan.members {
+        args.push("--fs".into());
+        args.push(
+            format!(
+                "tag={},socket={},num_queues=1,queue_size=1024",
+                member.tag,
+                member.socket.display()
+            )
+            .into(),
+        );
+    }
     if let Some(socket) = profile_socket {
         args.push("--fs".into());
         args.push(
@@ -158,9 +149,9 @@ pub(super) fn cloud_hypervisor_args(
         // reading `/sys/class/net/<tap>/tun_flags`, which sysfs resolves to
         // `/sys/devices/virtual/net/<tap>/tun_flags`. Its own Landlock ruleset
         // only grants `/dev/net/tun`, so that read fails with EACCES and the VM
-        // dies while creating the virtio-net device. Grant exactly this
-        // instance's TAP directory, read-only: other interfaces and the rest of
-        // /sys stay invisible to the VMM.
+        // dies while creating the virtio-net device. Grant exactly this VM's
+        // TAP directory, read-only: other interfaces and the rest of /sys stay
+        // invisible to the VMM.
         args.push("--landlock-rules".into());
         args.push(format!("path=/sys/devices/virtual/net/{},access=r", lease.tap).into());
     }
@@ -176,7 +167,7 @@ pub(super) fn cloud_hypervisor_args(
 /// requested again — otherwise a restored VM would run unsandboxed.
 pub(super) fn restore_args(
     config: &Config,
-    paths: &InstancePaths,
+    paths: &VmPaths,
     snapshot: &SnapshotMeta,
     network: Option<&network::Lease>,
 ) -> Vec<OsString> {
@@ -192,7 +183,7 @@ pub(super) fn restore_args(
     args
 }
 
-pub(super) fn common_args(config: &Config, paths: &InstancePaths) -> Vec<OsString> {
+pub(super) fn common_args(config: &Config, paths: &VmPaths) -> Vec<OsString> {
     let args: Vec<OsString> = vec![
         "--api-socket".into(),
         paths.api_socket.clone().into_os_string(),
@@ -219,15 +210,35 @@ pub(super) fn common_args(config: &Config, paths: &InstancePaths) -> Vec<OsStrin
     args
 }
 
+/// Spawn Cloud Hypervisor for a cold boot.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_cloud_hypervisor(
     config: &Config,
-    instance: &InstanceConfig,
-    paths: &InstancePaths,
+    vm: &VmConfig,
+    plan: &BootPlan,
+    paths: &VmPaths,
+    rootfs: &Path,
     binary: &Path,
-    restore: Option<&SnapshotMeta>,
     network: Option<&network::Lease>,
     profile_socket: Option<&Path>,
 ) -> Result<Child> {
+    let args = cloud_hypervisor_args(config, vm, plan, paths, rootfs, network, profile_socket);
+    spawn_vmm(binary, paths, args)
+}
+
+/// Spawn Cloud Hypervisor with `--restore`; the snapshot owns the device tree.
+pub(super) fn spawn_restore(
+    config: &Config,
+    paths: &VmPaths,
+    snapshot: &SnapshotMeta,
+    binary: &Path,
+    network: Option<&network::Lease>,
+) -> Result<Child> {
+    let args = restore_args(config, paths, snapshot, network);
+    spawn_vmm(binary, paths, args)
+}
+
+fn spawn_vmm(binary: &Path, paths: &VmPaths, args: Vec<OsString>) -> Result<Child> {
     // Cloud Hypervisor must create the API and serial listeners itself.
     remove_socket(&paths.api_socket)?;
     remove_socket(&paths.serial_socket)?;
@@ -239,13 +250,6 @@ pub(super) fn spawn_cloud_hypervisor(
         .open(&paths.log)
         .with_context(|| format!("failed to open {}", paths.log.display()))?;
     let stderr = log.try_clone()?;
-    let args = match restore {
-        Some(snapshot) => restore_args(config, paths, snapshot, network),
-        None => {
-            let rootfs = instance.prepare_rootfs(config)?;
-            cloud_hypervisor_args(config, instance, paths, &rootfs, network, profile_socket)
-        }
-    };
     Command::new(binary)
         .args(args)
         .stdin(Stdio::null())
@@ -260,7 +264,7 @@ pub(super) fn spawn_cloud_hypervisor(
         })
 }
 
-pub(super) fn start_relay(paths: &InstancePaths, serial_log: &Path, vm: &mut Child) -> Result<u32> {
+pub(super) fn start_relay(paths: &VmPaths, serial_log: &Path, vm: &mut Child) -> Result<u32> {
     remove_socket(&paths.console_socket)?;
     let args = RelayArgs {
         backend: paths.serial_socket.clone(),
@@ -349,7 +353,24 @@ fn status_reports_seccomp(status: &str) -> bool {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
-    use crate::vm::instance::test_support::{config_with_assets, instance_for, strings};
+    use crate::vm::manager::test_support::{config_with_assets, manager, plan_for, strings};
+
+    fn plan_and_paths(
+        dir: &Path,
+    ) -> (
+        Config,
+        VmConfig,
+        BootPlan,
+        VmPaths,
+        crate::vm::manager::VmManager,
+    ) {
+        let config = config_with_assets(dir);
+        let manager = manager(config.clone(), dir);
+        let plan = plan_for(&manager);
+        let paths = manager.paths();
+        let vm = manager.vm().clone();
+        (config, vm, plan, paths, manager)
+    }
 
     #[test]
     fn virtiofsd_honours_the_configured_sandbox() {
@@ -357,14 +378,18 @@ mod tests {
         let mut config = config_with_assets(dir.path());
         config.virtiofsd_bin = std::env::current_exe().unwrap();
         config.virtiofs_sandbox = crate::config::VirtiofsSandbox::Chroot;
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
-        let virtiofs = virtiofs_config(&config, &paths, dir.path()).unwrap();
+        let virtiofs = virtiofs_config_at(
+            &config,
+            dir.path(),
+            &dir.path().join("virtiofs.sock"),
+            false,
+        )
+        .unwrap();
         assert_eq!(virtiofs.sandbox, crate::config::VirtiofsSandbox::Chroot);
     }
 
     #[test]
-    fn read_only_workspace_sets_virtiofsd_readonly() {
+    fn read_only_member_sets_virtiofsd_readonly() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
         config.virtiofsd_bin = std::env::current_exe().unwrap();
@@ -390,16 +415,10 @@ mod tests {
     #[test]
     fn cloud_hypervisor_args_are_hardened_and_use_native_virtiofs() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_with_assets(dir.path());
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
+        let (config, vm, plan, paths, manager) = plan_and_paths(dir.path());
+        let rootfs = vm.rootfs_path(&config);
         let args = strings(&cloud_hypervisor_args(
-            &config,
-            &instance,
-            &paths,
-            &instance.rootfs_path(&config),
-            None,
-            None,
+            &config, &vm, &plan, &paths, &rootfs, None, None,
         ));
         let joined = args.join(" ");
         assert!(joined.contains("--kernel"), "{joined}");
@@ -407,7 +426,7 @@ mod tests {
         assert!(joined.contains("image_type=qcow2"), "{joined}");
         assert!(joined.contains("--memory size=128M,shared=on"), "{joined}");
         assert!(joined.contains("--rng src=/dev/urandom"), "{joined}");
-        assert!(joined.contains("--fs tag=workspace"), "{joined}");
+        assert!(joined.contains("--fs tag=hegn-prj-0"), "{joined}");
         assert!(joined.contains("--serial socket="), "{joined}");
         assert!(joined.contains("--console off"), "{joined}");
         assert!(joined.contains("--seccomp true"), "{joined}");
@@ -427,27 +446,28 @@ mod tests {
             joined.contains(&format!("root={}", config.root_device)),
             "{joined}"
         );
+        let _ = manager;
     }
 
     #[test]
     fn guarded_network_adds_only_a_tap_and_mac() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_with_assets(dir.path());
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
+        let (config, vm, plan, paths, _manager) = plan_and_paths(dir.path());
         let lease = crate::network::Lease {
             index: 2,
-            instance: instance.name.clone(),
+            instance: vm.name.clone(),
             tap: crate::network::tap_name(2),
             mac: crate::network::mac(2),
             host_ip: crate::network::host_ip(2),
             guest_ip: crate::network::guest_ip(2),
         };
+        let rootfs = vm.rootfs_path(&config);
         let joined = strings(&cloud_hypervisor_args(
             &config,
-            &instance,
+            &vm,
+            &plan,
             &paths,
-            &instance.rootfs_path(&config),
+            &rootfs,
             Some(&lease),
             None,
         ))
@@ -472,22 +492,22 @@ mod tests {
     }
 
     #[test]
-    fn profile_share_is_a_second_sandboxed_device() {
+    fn profile_share_is_a_second_sandboxed_device_after_every_member() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_with_assets(dir.path());
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
+        let (config, vm, plan, paths, _manager) = plan_and_paths(dir.path());
         let socket = dir.path().join("profile.sock");
+        let rootfs = vm.rootfs_path(&config);
         let args = strings(&cloud_hypervisor_args(
             &config,
-            &instance,
+            &vm,
+            &plan,
             &paths,
-            &instance.rootfs_path(&config),
+            &rootfs,
             None,
             Some(&socket),
         ));
         let joined = args.join(" ");
-        assert!(joined.contains("--fs tag=workspace"), "{joined}");
+        assert!(joined.contains("--fs tag=hegn-prj-0"), "{joined}");
         assert!(
             joined.contains(&format!(
                 "--fs tag=hegn-profile,socket={}",
@@ -495,21 +515,24 @@ mod tests {
             )),
             "{joined}"
         );
+        let member = args
+            .iter()
+            .position(|arg| arg.starts_with("tag=hegn-prj-0"))
+            .expect("member fs");
+        let profile = args
+            .iter()
+            .position(|arg| arg.starts_with("tag=hegn-profile,socket="))
+            .expect("profile fs");
+        assert!(profile > member, "the profile device comes last: {args:?}");
     }
 
     #[test]
     fn sysfs_tap_rule_is_absent_without_a_network_device() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_with_assets(dir.path());
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
+        let (config, vm, plan, paths, _manager) = plan_and_paths(dir.path());
+        let rootfs = vm.rootfs_path(&config);
         let joined = strings(&cloud_hypervisor_args(
-            &config,
-            &instance,
-            &paths,
-            &instance.rootfs_path(&config),
-            None,
-            None,
+            &config, &vm, &plan, &paths, &rootfs, None, None,
         ))
         .join(" ");
         assert!(!joined.contains("/sys/devices/virtual/net"), "{joined}");
@@ -518,43 +541,38 @@ mod tests {
     #[test]
     fn air_gapped_boot_has_no_network_device() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_with_assets(dir.path());
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
+        let (config, vm, plan, paths, _manager) = plan_and_paths(dir.path());
+        let rootfs = vm.rootfs_path(&config);
         let joined = strings(&cloud_hypervisor_args(
-            &config,
-            &instance,
-            &paths,
-            &instance.rootfs_path(&config),
-            None,
-            None,
+            &config, &vm, &plan, &paths, &rootfs, None, None,
         ))
         .join(" ");
         assert!(!joined.contains("--net"), "{joined}");
     }
 
-    #[test]
-    fn restore_args_come_from_the_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = config_with_assets(dir.path());
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
-        let snap_dir = dir.path().join("snap");
-        let snapshot = SnapshotMeta {
+    fn snapshot(dir: &Path) -> SnapshotMeta {
+        SnapshotMeta {
             name: "demo".into(),
             created_at: chrono::Utc::now(),
             vm_state: "Paused".into(),
-            dir: snap_dir.clone(),
+            dir: dir.join("snap"),
             instance: Some("demo".into()),
             project: None,
             size_bytes: 0,
             note: None,
-        };
+        }
+    }
+
+    #[test]
+    fn restore_args_come_from_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _vm, _plan, paths, _manager) = plan_and_paths(dir.path());
+        let snapshot = snapshot(dir.path());
         let joined = strings(&restore_args(&config, &paths, &snapshot, None)).join(" ");
         assert!(
             joined.contains(&format!(
                 "source_url=file://{},resume=true",
-                snap_dir.display()
+                snapshot.dir.display()
             )),
             "{joined}"
         );
@@ -586,13 +604,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
         config.cloud_init = false;
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
+        let manager = manager(config.clone(), dir.path());
+        let plan = plan_for(&manager);
+        let vm = manager.vm().clone();
+        let paths = manager.paths();
         let args = strings(&cloud_hypervisor_args(
             &config,
-            &instance,
+            &vm,
+            &plan,
             &paths,
-            &instance.rootfs_path(&config),
+            &vm.rootfs_path(&config),
             None,
             None,
         ));
@@ -605,16 +626,10 @@ mod tests {
     #[test]
     fn boot_command_pins_the_kernel_rootfs_and_seed_disks() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_with_assets(dir.path());
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
+        let (config, vm, plan, paths, _manager) = plan_and_paths(dir.path());
+        let rootfs = vm.rootfs_path(&config);
         let args = strings(&cloud_hypervisor_args(
-            &config,
-            &instance,
-            &paths,
-            &instance.rootfs_path(&config),
-            None,
-            None,
+            &config, &vm, &plan, &paths, &rootfs, None, None,
         ));
         let index = |flag: &str| {
             args.iter()
@@ -630,10 +645,7 @@ mod tests {
         let disk = index("--disk");
         assert_eq!(
             args[disk + 1],
-            format!(
-                "path={},image_type=qcow2",
-                instance.rootfs_path(&config).display()
-            )
+            format!("path={},image_type=qcow2", rootfs.display())
         );
         assert_eq!(args[disk + 2], cloud_init::disk_arg(&paths.cloud_init));
 
@@ -642,8 +654,8 @@ mod tests {
         assert_eq!(
             args[index("--fs") + 1],
             format!(
-                "tag=workspace,socket={},num_queues=1,queue_size=1024",
-                paths.virtiofs_socket.display()
+                "tag=hegn-prj-0,socket={},num_queues=1,queue_size=1024",
+                paths.virtiofs_socket(0).display()
             )
         );
         assert_eq!(
@@ -656,19 +668,8 @@ mod tests {
     #[test]
     fn restore_args_keep_seccomp_and_drop_boot_devices() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_with_assets(dir.path());
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
-        let snapshot = SnapshotMeta {
-            name: "demo".into(),
-            created_at: chrono::Utc::now(),
-            vm_state: "Paused".into(),
-            dir: dir.path().join("snap"),
-            instance: Some("demo".into()),
-            project: None,
-            size_bytes: 0,
-            note: None,
-        };
+        let (config, _vm, _plan, paths, _manager) = plan_and_paths(dir.path());
+        let snapshot = snapshot(dir.path());
         let args = restore_args(&config, &paths, &snapshot, None);
         let joined = strings(&args).join(" ");
         assert!(joined.contains("--seccomp true"), "{joined}");
@@ -696,22 +697,11 @@ mod tests {
     #[test]
     fn restore_args_keep_landlock_and_add_the_tap_rule() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_with_assets(dir.path());
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
-        let snapshot = SnapshotMeta {
-            name: "demo".into(),
-            created_at: chrono::Utc::now(),
-            vm_state: "Paused".into(),
-            dir: dir.path().join("snap"),
-            instance: Some("demo".into()),
-            project: None,
-            size_bytes: 0,
-            note: None,
-        };
+        let (config, vm, _plan, paths, _manager) = plan_and_paths(dir.path());
+        let snapshot = snapshot(dir.path());
         let lease = crate::network::Lease {
             index: 4,
-            instance: instance.name.clone(),
+            instance: vm.name.clone(),
             tap: crate::network::tap_name(4),
             mac: crate::network::mac(4),
             host_ip: crate::network::host_ip(4),
@@ -729,9 +719,7 @@ mod tests {
     #[test]
     fn common_args_always_enable_the_sandbox() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_with_assets(dir.path());
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
+        let (config, _vm, _plan, paths, _manager) = plan_and_paths(dir.path());
 
         let boot = strings(&common_args(&config, &paths)).join(" ");
         assert!(boot.contains("--seccomp true"), "{boot}");
@@ -751,31 +739,29 @@ mod tests {
     fn missing_virtiofsd_is_reported_before_anything_is_spawned() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
+        let paths_manager = manager(config.clone(), dir.path());
+        let paths = paths_manager.paths();
 
-        let err = virtiofs_config(&config, &paths, dir.path())
+        let err = virtiofs_config_at(&config, dir.path(), &paths.virtiofs_socket(0), false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("virtiofsd"), "{err}");
         assert!(err.contains("install virtiofsd"), "{err}");
         assert!(
-            !paths.virtiofs_socket.exists(),
+            !paths.virtiofs_socket(0).exists(),
             "a failed preflight must not create a socket"
         );
-        assert!(!paths.virtiofs_pid.exists());
+        assert!(!paths.virtiofs_pid(0).exists());
     }
 
     #[test]
     fn tap_pool_boundary_maps_to_the_last_slice_without_overflow() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_with_assets(dir.path());
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
+        let (config, vm, plan, paths, _manager) = plan_and_paths(dir.path());
         let last = crate::network::TAP_POOL - 1;
         let lease = crate::network::Lease {
             index: last,
-            instance: instance.name.clone(),
+            instance: vm.name.clone(),
             tap: crate::network::tap_name(last),
             mac: crate::network::mac(last),
             host_ip: crate::network::host_ip(last),
@@ -783,9 +769,10 @@ mod tests {
         };
         let joined = strings(&cloud_hypervisor_args(
             &config,
-            &instance,
+            &vm,
+            &plan,
             &paths,
-            &instance.rootfs_path(&config),
+            &vm.rootfs_path(&config),
             Some(&lease),
             None,
         ))
@@ -798,24 +785,85 @@ mod tests {
             joined.contains("--landlock-rules path=/sys/devices/virtual/net/hegn15,access=r"),
             "{joined}"
         );
-        // The host TAP configuration belongs to `hegn network setup`, never the
-        // VMM command line.
         for forbidden in ["ip=", "mask=", "gateway=", "dns="] {
             assert!(!joined.contains(forbidden), "{forbidden} in {joined}");
         }
     }
 
     #[test]
-    fn hardened_args_never_name_a_host_process_backend() {
+    fn every_member_gets_an_fs_device_in_plan_order() {
+        use crate::project::{ProjectEntry, ProjectKind, ProjectRegistry};
+        use chrono::Utc;
+
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
-        let instance = instance_for(dir.path());
-        let paths = InstancePaths::from_instance(&config, &instance);
+        let manager = manager(config.clone(), dir.path());
+        let second = dir.path().join("project-two");
+        std::fs::create_dir_all(&second).unwrap();
+        let mut registry = ProjectRegistry::load(&config.state_dir).unwrap();
+        registry
+            .upsert(ProjectEntry {
+                name: "second".into(),
+                path: second.canonicalize().unwrap(),
+                vm: None,
+                read_only: false,
+                kind: ProjectKind::External,
+                parent: None,
+                managed: false,
+                hidden: false,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        registry.assign("second", "demo", false).unwrap();
+        let manager =
+            crate::vm::manager::VmManager::new(config.clone(), manager.vm().clone()).unwrap();
+        let plan = plan_for(&manager);
+        assert_eq!(plan.members.len(), 2);
+
+        let profile_socket = dir.path().join("profile.sock");
+        let args = strings(&cloud_hypervisor_args(
+            &config,
+            manager.vm(),
+            &plan,
+            &manager.paths(),
+            &manager.vm().rootfs_path(&config),
+            None,
+            Some(&profile_socket),
+        ));
+        let devices: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(index, arg)| arg.as_str() == "--fs" && *index + 1 < args.len())
+            .map(|(index, _)| &args[index + 1])
+            .collect();
+        assert_eq!(devices.len(), 3, "two members plus the profile: {args:?}");
+        assert!(
+            devices[0].starts_with("tag=hegn-prj-0,"),
+            "{:?}",
+            devices[0]
+        );
+        assert!(
+            devices[1].starts_with("tag=hegn-prj-1,"),
+            "{:?}",
+            devices[1]
+        );
+        assert!(
+            devices[2].starts_with("tag=hegn-profile,"),
+            "the profile share must come last: {:?}",
+            devices[2]
+        );
+    }
+
+    #[test]
+    fn hardened_args_never_name_a_host_process_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, vm, plan, paths, _manager) = plan_and_paths(dir.path());
         let joined = strings(&cloud_hypervisor_args(
             &config,
-            &instance,
+            &vm,
+            &plan,
             &paths,
-            &instance.rootfs_path(&config),
+            &vm.rootfs_path(&config),
             None,
             None,
         ))

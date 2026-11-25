@@ -28,9 +28,7 @@ impl App {
             .map(|project| {
                 self.instances
                     .iter()
-                    .filter(|instance| {
-                        crate::vm::instance::same_project(&instance.project, project)
-                    })
+                    .filter(|instance| crate::vm::same_project(&instance.project, project))
                     .map(|instance| instance.name.as_str())
                     .collect()
             })

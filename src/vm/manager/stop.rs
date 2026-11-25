@@ -1,25 +1,27 @@
-//! Instance shutdown: terminate the VMM, relay and virtiofsd, release runtime
-//! state and the guarded-network reservation.
+//! VM shutdown: terminate the VMM, relay, every member virtiofsd, the profile
+//! daemon and the autosave worker, release runtime state and the guarded
+//! network reservation.
 //!
-//! Termination only happens after `super::super::process::process_matches`
-//! confirms that the recorded PID still belongs to the expected executable.
+//! Termination only happens after `process_matches` confirms that the recorded
+//! PID still belongs to the expected executable. Workspaces are never removed.
+
+use std::collections::BTreeSet;
 
 use anyhow::{Result, bail};
 
 use crate::network;
 
-use super::super::process::{
-    hegn_binary, read_pid, terminate, terminate_autosave, terminate_relay,
-};
-use super::InstanceManager;
-use super::cleanup::cleanup_files;
+use super::VmManager;
+use super::cleanup::{cleanup_files, indexed_pids};
+use super::process::{hegn_binary, read_pid, terminate, terminate_autosave, terminate_relay};
 
-impl InstanceManager {
-    /// Stop Cloud Hypervisor, the console relay and virtiofsd.
+impl VmManager {
+    /// Stop Cloud Hypervisor, the console relay, every member virtiofsd, the
+    /// profile daemon and the autosave worker.
     pub fn stop(&self) -> Result<()> {
         let paths = self.paths();
         if !paths.run_dir.is_dir() {
-            bail!("no instance session found in {}", paths.run_dir.display());
+            bail!("no VM session found in {}", paths.run_dir.display());
         }
         let _lock = self.lock(&paths)?;
         let hegn = hegn_binary()?;
@@ -33,31 +35,42 @@ impl InstanceManager {
         let session = self.session();
         let vm_pid = session
             .as_ref()
-            .map(|s| s.vm_pid)
+            .map(|session| session.vm_pid)
             .or_else(|| read_pid(&paths.vm_pid));
         let relay_pid = session
             .as_ref()
-            .map(|s| s.relay_pid)
+            .map(|session| session.relay_pid)
             .filter(|pid| *pid != 0)
             .or_else(|| read_pid(&paths.relay_pid));
-        let virtiofs_pid = session
-            .as_ref()
-            .map(|s| s.virtiofs_pid)
-            .or_else(|| read_pid(&paths.virtiofs_pid));
         let profile_virtiofs_pid = session
             .as_ref()
-            .map(|s| s.profile_virtiofs_pid)
+            .map(|session| session.profile_virtiofs_pid)
             .filter(|pid| *pid != 0)
             .or_else(|| read_pid(&paths.profile_virtiofs_pid));
         let autosave_pid = read_pid(&paths.autosave_pid);
 
+        // Members are recorded in both the session and the run directory. The
+        // union covers a crash between spawning a daemon and writing the
+        // session record; deduplication prevents double signals.
+        let mut member_pids = BTreeSet::new();
+        if let Some(session) = &session {
+            member_pids.extend(
+                session
+                    .virtiofs_pids
+                    .iter()
+                    .copied()
+                    .filter(|pid| *pid != 0),
+            );
+        }
+        member_pids.extend(indexed_pids(&paths).into_iter().map(|(_, pid)| pid));
+
         if vm_pid.is_none()
             && relay_pid.is_none()
-            && virtiofs_pid.is_none()
+            && member_pids.is_empty()
             && profile_virtiofs_pid.is_none()
             && autosave_pid.is_none()
         {
-            bail!("no instance session found in {}", paths.run_dir.display());
+            bail!("no VM session found in {}", paths.run_dir.display());
         }
         let vm_binary = self.trusted_vm_binary(session.as_ref().and_then(|s| s.vm_binary.as_ref()));
 
@@ -67,7 +80,7 @@ impl InstanceManager {
         if let Some(pid) = relay_pid {
             terminate_relay(pid, &hegn);
         }
-        if let Some(pid) = virtiofs_pid {
+        for pid in member_pids {
             terminate(pid, &self.config.virtiofsd_bin);
         }
         if let Some(pid) = profile_virtiofs_pid {
@@ -77,14 +90,14 @@ impl InstanceManager {
             terminate_autosave(pid, &hegn);
         }
         cleanup_files(&paths);
-        network::release(&self.config, &self.instance.name);
+        network::release(&self.config, &self.vm.name);
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::vm::instance::test_support::{config_with_assets, manager};
+    use crate::vm::manager::test_support::{config_with_assets, manager};
 
     #[test]
     fn stop_refuses_an_unreadable_session() {
@@ -116,17 +129,17 @@ mod tests {
         let manager = manager(config_with_assets(dir.path()), dir.path());
         let paths = manager.paths();
         let err = manager.stop().unwrap_err().to_string();
-        assert!(err.contains("no instance session found"), "{err}");
+        assert!(err.contains("no VM session found"), "{err}");
         assert!(err.contains(&paths.run_dir.display().to_string()), "{err}");
         assert!(!paths.run_dir.exists(), "stop must not create state");
     }
 
     #[test]
-    fn stop_removes_runtime_state_but_keeps_the_project() {
+    fn stop_removes_runtime_state_but_keeps_the_workspace() {
         use chrono::Utc;
 
         use crate::config::Harness;
-        use crate::vm::instance::SessionRecord;
+        use crate::vm::manager::SessionRecord;
 
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
@@ -139,27 +152,32 @@ mod tests {
         let record = SessionRecord {
             project: project.clone(),
             workspace: project.clone(),
-            instance: "demo".into(),
+            vm: "demo".into(),
             harness: Harness::Shell,
             started_at: Utc::now(),
             // Zero disables termination; this test exercises cleanup only.
             vm_pid: 0,
             vm_binary: None,
             relay_pid: 0,
-            virtiofs_pid: 0,
+            virtiofs_pids: vec![0, 0],
             profile_virtiofs_pid: 0,
             boot_args: String::new(),
             serial_log: None,
+            membership: Vec::new(),
         };
         std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
         std::fs::write(&paths.vm_pid, b"0").unwrap();
         std::fs::write(&paths.cloud_init, b"seed").unwrap();
+        std::fs::write(&paths.membership, b"{}").unwrap();
+        std::fs::write(paths.virtiofs_pid(0), b"0").unwrap();
 
         manager.stop().unwrap();
 
         assert!(!paths.session.exists());
         assert!(!paths.vm_pid.exists());
         assert!(!paths.cloud_init.exists());
+        assert!(!paths.membership.exists());
+        assert!(!paths.virtiofs_pid(0).exists());
         assert!(project.join("README.md").is_file());
     }
 
@@ -175,5 +193,40 @@ mod tests {
 
         manager.stop().unwrap();
         assert!(!paths.vm_pid.exists());
+    }
+
+    #[test]
+    fn stop_kills_every_indexed_member_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        // Use a real host process as the "virtiofsd" and point the trusted
+        // binary at the same executable; the identity check then permits the
+        // signal instead of refusing an unrelated process.
+        config.virtiofsd_bin = std::path::PathBuf::from("/bin/sleep");
+        let manager = manager(config, dir.path());
+        let paths = manager.paths();
+        paths.ensure().unwrap();
+
+        let mut children: Vec<std::process::Child> = (0..3)
+            .map(|_| {
+                std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("sleep must be available")
+            })
+            .collect();
+        for (index, child) in children.iter().enumerate() {
+            std::fs::write(paths.virtiofs_pid(index), child.id().to_string()).unwrap();
+        }
+
+        manager.stop().unwrap();
+        for (index, child) in children.iter_mut().enumerate() {
+            let status = child.wait().unwrap();
+            assert!(
+                !status.success(),
+                "member {index} should have been terminated: {status}"
+            );
+            assert!(!paths.virtiofs_pid(index).exists());
+        }
     }
 }

@@ -14,7 +14,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
-use crate::vm::instance_config::InstanceConfig;
+use crate::vm::config::VmConfig;
 
 use super::PROFILE_VERSION;
 use super::fs::{
@@ -34,8 +34,8 @@ enum Refresh {
 }
 
 /// Build the profile payload for an instance start.
-pub fn prepare_for_start(config: &Config, instance: &InstanceConfig) -> Result<ProfilePlan> {
-    materialize(config, instance, Refresh::Start)
+pub fn prepare_for_start(config: &Config, vm: &VmConfig) -> Result<ProfilePlan> {
+    materialize(config, vm, Refresh::Start)
 }
 
 /// Copy host skill changes into an existing per-instance bundle.
@@ -43,23 +43,23 @@ pub fn prepare_for_start(config: &Config, instance: &InstanceConfig) -> Result<P
 /// Host files win for files they contain; guest-only files are preserved. The
 /// guest target is a link to this bundle, so a running VM sees the new files
 /// immediately.
-pub fn sync_skills(config: &Config, instance: &InstanceConfig) -> Result<SyncReport> {
+pub fn sync_skills(config: &Config, vm: &VmConfig) -> Result<SyncReport> {
     let store = ProfileStore::new(config);
-    let profile = store.load(instance.harness)?;
+    let profile = store.load(vm.harness)?;
     let mut report = SyncReport {
-        instance: instance.name.clone(),
-        harness: instance.harness,
+        instance: vm.name.clone(),
+        harness: vm.harness,
         sources: 0,
         copied_files: 0,
         warnings: Vec::new(),
     };
-    let layout = ProfileLayout::new(config, instance)?;
+    let layout = ProfileLayout::new(config, vm)?;
     let mut state = layout
         .load_state()
-        .filter(|state| state.harness == instance.harness)
+        .filter(|state| state.harness == vm.harness)
         .unwrap_or_else(|| ProfileState {
             version: PROFILE_VERSION,
-            harness: instance.harness,
+            harness: vm.harness,
             files: Vec::new(),
             skills: Vec::new(),
         });
@@ -96,29 +96,25 @@ pub fn sync_skills(config: &Config, instance: &InstanceConfig) -> Result<SyncRep
 /// Only regular files are copied. Symlinks and special files are skipped, so a
 /// poisoned guest cannot redirect a host write outside the configured skill
 /// directory.
-pub fn sync_skills_back(
-    config: &Config,
-    instance: &InstanceConfig,
-    dry_run: bool,
-) -> Result<SyncBackReport> {
-    let layout = ProfileLayout::new(config, instance)?;
+pub fn sync_skills_back(config: &Config, vm: &VmConfig, dry_run: bool) -> Result<SyncBackReport> {
+    let layout = ProfileLayout::new(config, vm)?;
     let state = layout.load_state().with_context(|| {
         format!(
             "instance '{}' has no profile copy yet; start it once or run `hegn skills sync {}`",
-            instance.name, instance.name
+            vm.name, vm.name
         )
     })?;
-    if state.harness != instance.harness {
+    if state.harness != vm.harness {
         bail!(
             "instance '{}' has a profile copy for harness '{}' but is configured for '{}'; \
              start it once to rebuild the profile",
-            instance.name,
+            vm.name,
             state.harness.label(),
-            instance.harness.label()
+            vm.harness.label()
         );
     }
     let mut report = SyncBackReport {
-        instance: instance.name.clone(),
+        instance: vm.name.clone(),
         harness: state.harness,
         copied_files: 0,
         skipped_files: 0,
@@ -344,17 +340,13 @@ fn temporary_name() -> String {
     format!(".hegn-sync-{}-{nonce}", std::process::id())
 }
 
-fn materialize(
-    config: &Config,
-    instance: &InstanceConfig,
-    refresh: Refresh,
-) -> Result<ProfilePlan> {
+fn materialize(config: &Config, vm: &VmConfig, refresh: Refresh) -> Result<ProfilePlan> {
     let store = ProfileStore::new(config);
-    let profile = store.load(instance.harness)?;
-    let layout = ProfileLayout::new(config, instance)?;
+    let profile = store.load(vm.harness)?;
+    let layout = ProfileLayout::new(config, vm)?;
     let previous = layout
         .load_state()
-        .filter(|state| state.harness == instance.harness);
+        .filter(|state| state.harness == vm.harness);
     let mut state = if refresh == Refresh::Skills {
         previous.clone()
     } else {
@@ -362,7 +354,7 @@ fn materialize(
     }
     .unwrap_or_else(|| ProfileState {
         version: PROFILE_VERSION,
-        harness: instance.harness,
+        harness: vm.harness,
         files: Vec::new(),
         skills: Vec::new(),
     });
@@ -623,18 +615,14 @@ mod tests {
         config
     }
 
-    fn instance(config: &Config, harness: Harness) -> InstanceConfig {
-        let project = config.projects_root.join("demo");
-        fs::create_dir_all(&project).unwrap();
-        let instance = InstanceConfig {
+    fn vm(_config: &Config, harness: Harness) -> VmConfig {
+        let vm = VmConfig {
             name: "demo".into(),
-            project: project.clone(),
-            workspace: project,
             harness,
-            ..InstanceConfig::default()
+            ..VmConfig::default()
         };
-        instance.validate().unwrap();
-        instance
+        vm.validate().unwrap();
+        vm
     }
 
     fn first_skill_dir(share: &ProfileShare) -> PathBuf {
@@ -650,7 +638,7 @@ mod tests {
     fn prepare_copies_files_skills_and_environment() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let instance = instance(&config, Harness::Opencode);
+        let vm = vm(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         store.write_templates().unwrap();
         let profile = format!(
@@ -675,7 +663,7 @@ OPENAI_API_KEY = "sk-test"
         fs::create_dir_all(dir.path().join("host-skills/demo")).unwrap();
         fs::write(dir.path().join("host-skills/demo/SKILL.md"), b"# demo").unwrap();
 
-        let plan = prepare_for_start(&config, &instance).unwrap();
+        let plan = prepare_for_start(&config, &vm).unwrap();
         assert_eq!(plan.packages, vec!["jq"]);
         let share = plan.share.expect("profile share");
         assert!(share.bundle_dir.join("manifest").is_file());
@@ -691,7 +679,7 @@ OPENAI_API_KEY = "sk-test"
         let guest_skill = skills.join("guest/SKILL.md");
         fs::create_dir_all(guest_skill.parent().unwrap()).unwrap();
         fs::write(&guest_skill, b"# guest").unwrap();
-        prepare_for_start(&config, &instance).unwrap();
+        prepare_for_start(&config, &vm).unwrap();
         assert!(guest_skill.is_file());
     }
 
@@ -699,7 +687,7 @@ OPENAI_API_KEY = "sk-test"
     fn skill_sync_and_sync_back_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let instance = instance(&config, Harness::Opencode);
+        let vm = vm(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         store.write_templates().unwrap();
         let host_skills = dir.path().join("host-skills");
@@ -710,7 +698,7 @@ OPENAI_API_KEY = "sk-test"
             source = host_skills.to_string_lossy(),
         );
         fs::write(store.path(Harness::Opencode), profile).unwrap();
-        let plan = prepare_for_start(&config, &instance).unwrap();
+        let plan = prepare_for_start(&config, &vm).unwrap();
         let share = plan.share.unwrap();
         let skills = first_skill_dir(&share);
 
@@ -719,7 +707,7 @@ OPENAI_API_KEY = "sk-test"
         fs::create_dir_all(guest.parent().unwrap()).unwrap();
         fs::write(&guest, b"# guest").unwrap();
 
-        let report = sync_skills_back(&config, &instance, false).unwrap();
+        let report = sync_skills_back(&config, &vm, false).unwrap();
         assert_eq!(report.copied_files, 1);
         assert_eq!(
             fs::read(host_skills.join("guest/SKILL.md")).unwrap(),
@@ -729,7 +717,7 @@ OPENAI_API_KEY = "sk-test"
         // Host change is merged into the instance copy without deleting the
         // guest-created skill.
         fs::write(host_skills.join("demo/SKILL.md"), b"# host-v2").unwrap();
-        let report = sync_skills(&config, &instance).unwrap();
+        let report = sync_skills(&config, &vm).unwrap();
         assert!(report.copied_files >= 1);
         assert_eq!(
             fs::read(skills.join("demo/SKILL.md")).unwrap(),
@@ -742,7 +730,7 @@ OPENAI_API_KEY = "sk-test"
     fn symlinks_are_never_copied_into_the_guest() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let instance = instance(&config, Harness::Opencode);
+        let vm = vm(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         let host_skills = dir.path().join("host-skills");
         fs::create_dir_all(&host_skills).unwrap();
@@ -753,7 +741,7 @@ OPENAI_API_KEY = "sk-test"
             source = host_skills.to_string_lossy(),
         );
         fs::write(store.path(Harness::Opencode), profile).unwrap();
-        let plan = prepare_for_start(&config, &instance).unwrap();
+        let plan = prepare_for_start(&config, &vm).unwrap();
         assert!(plan.warnings.iter().any(|w| w.contains("symlink")));
     }
 
@@ -761,7 +749,7 @@ OPENAI_API_KEY = "sk-test"
     fn sync_back_skips_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let instance = instance(&config, Harness::Opencode);
+        let vm = vm(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         let host_skills = dir.path().join("host-skills");
         fs::create_dir_all(&host_skills).unwrap();
@@ -770,11 +758,11 @@ OPENAI_API_KEY = "sk-test"
             source = host_skills.to_string_lossy(),
         );
         fs::write(store.path(Harness::Opencode), profile).unwrap();
-        let plan = prepare_for_start(&config, &instance).unwrap();
+        let plan = prepare_for_start(&config, &vm).unwrap();
         let share = plan.share.unwrap();
         let skills = first_skill_dir(&share);
         std::os::unix::fs::symlink("/etc/passwd", skills.join("evil")).unwrap();
-        let report = sync_skills_back(&config, &instance, false).unwrap();
+        let report = sync_skills_back(&config, &vm, false).unwrap();
         assert_eq!(report.copied_files, 0);
         assert!(report.warnings.iter().any(|w| w.contains("symlink")));
         assert!(!host_skills.join("evil").exists());
@@ -784,7 +772,7 @@ OPENAI_API_KEY = "sk-test"
     fn planted_bundle_symlinks_cannot_redirect_host_writes() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let instance = instance(&config, Harness::Opencode);
+        let vm = vm(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         let host_skills = dir.path().join("host-skills");
         fs::create_dir_all(host_skills.join("demo")).unwrap();
@@ -794,7 +782,7 @@ OPENAI_API_KEY = "sk-test"
             source = host_skills.to_string_lossy(),
         );
         fs::write(store.path(Harness::Opencode), profile).unwrap();
-        let plan = prepare_for_start(&config, &instance).unwrap();
+        let plan = prepare_for_start(&config, &vm).unwrap();
         let share = plan.share.unwrap();
 
         // A compromised guest replaces its skill copy with a symlink to a
@@ -806,7 +794,7 @@ OPENAI_API_KEY = "sk-test"
         fs::remove_dir_all(&skill_copy).unwrap();
         std::os::unix::fs::symlink(&trap, &skill_copy).unwrap();
 
-        sync_skills(&config, &instance).unwrap();
+        sync_skills(&config, &vm).unwrap();
         let metadata = fs::symlink_metadata(&skill_copy).unwrap();
         assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
         assert_eq!(fs::read(trap.join("do-not-touch")).unwrap(), b"host");
@@ -814,7 +802,7 @@ OPENAI_API_KEY = "sk-test"
         // The sync-back path also refuses the planted link.
         fs::remove_dir_all(&skill_copy).unwrap();
         std::os::unix::fs::symlink(&trap, &skill_copy).unwrap();
-        let report = sync_skills_back(&config, &instance, false).unwrap();
+        let report = sync_skills_back(&config, &vm, false).unwrap();
         assert_eq!(report.copied_files, 0);
         assert!(report.warnings.iter().any(|w| w.contains("real directory")));
         assert_eq!(fs::read(trap.join("do-not-touch")).unwrap(), b"host");
@@ -824,11 +812,11 @@ OPENAI_API_KEY = "sk-test"
     fn missing_sources_are_warnings_not_errors() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let instance = instance(&config, Harness::Opencode);
+        let vm = vm(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         let profile = "version = 1\n[[files]]\nsource = \"/definitely/missing\"\ntarget = \"/root/.config/opencode/x\"\n";
         fs::write(store.path(Harness::Opencode), profile).unwrap();
-        let plan = prepare_for_start(&config, &instance).unwrap();
+        let plan = prepare_for_start(&config, &vm).unwrap();
         assert!(plan.warnings.iter().any(|w| w.contains("missing")));
         assert!(plan.share.is_none());
     }
@@ -854,7 +842,7 @@ OPENAI_API_KEY = "sk-test"
     fn copying_skips_symlinks_and_special_files() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let instance = instance(&config, Harness::Opencode);
+        let vm = vm(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         let host_skills = dir.path().join("host-skills");
         fs::create_dir_all(host_skills.join("demo")).unwrap();
@@ -864,7 +852,7 @@ OPENAI_API_KEY = "sk-test"
         make_fifo(&host_skills.join("pipe"));
         fs::write(store.path(Harness::Opencode), skill_profile(&host_skills)).unwrap();
 
-        let plan = prepare_for_start(&config, &instance).unwrap();
+        let plan = prepare_for_start(&config, &vm).unwrap();
         let share = plan.share.expect("profile share");
         let skills = first_skill_dir(&share);
         assert!(skills.join("demo/SKILL.md").is_file());
@@ -886,17 +874,17 @@ OPENAI_API_KEY = "sk-test"
     fn sync_back_skips_special_files() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let instance = instance(&config, Harness::Opencode);
+        let vm = vm(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         let host_skills = dir.path().join("host-skills");
         fs::create_dir_all(host_skills.join("demo")).unwrap();
         fs::write(host_skills.join("demo/SKILL.md"), b"# host").unwrap();
         fs::write(store.path(Harness::Opencode), skill_profile(&host_skills)).unwrap();
-        let plan = prepare_for_start(&config, &instance).unwrap();
+        let plan = prepare_for_start(&config, &vm).unwrap();
         let skills = first_skill_dir(&plan.share.unwrap());
         make_fifo(&skills.join("pipe"));
 
-        let report = sync_skills_back(&config, &instance, false).unwrap();
+        let report = sync_skills_back(&config, &vm, false).unwrap();
         assert_eq!(report.copied_files, 0);
         assert!(report.skipped_files >= 1);
         assert!(
@@ -911,17 +899,17 @@ OPENAI_API_KEY = "sk-test"
     fn sync_back_dry_run_reports_changes_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let instance = instance(&config, Harness::Opencode);
+        let vm = vm(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         let host_skills = dir.path().join("host-skills");
         fs::create_dir_all(host_skills.join("demo")).unwrap();
         fs::write(host_skills.join("demo/SKILL.md"), b"# host").unwrap();
         fs::write(store.path(Harness::Opencode), skill_profile(&host_skills)).unwrap();
-        let plan = prepare_for_start(&config, &instance).unwrap();
+        let plan = prepare_for_start(&config, &vm).unwrap();
         let skills = first_skill_dir(&plan.share.unwrap());
         fs::write(skills.join("demo/SKILL.md"), b"# guest").unwrap();
 
-        let dry = sync_skills_back(&config, &instance, true).unwrap();
+        let dry = sync_skills_back(&config, &vm, true).unwrap();
         assert!(dry.dry_run);
         assert_eq!(dry.copied_files, 1);
         assert_eq!(
@@ -929,7 +917,7 @@ OPENAI_API_KEY = "sk-test"
             b"# host"
         );
 
-        let real = sync_skills_back(&config, &instance, false).unwrap();
+        let real = sync_skills_back(&config, &vm, false).unwrap();
         assert!(!real.dry_run);
         assert_eq!(
             fs::read(host_skills.join("demo/SKILL.md")).unwrap(),
@@ -941,13 +929,13 @@ OPENAI_API_KEY = "sk-test"
     fn sync_back_refuses_symlinked_destination_directories() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let instance = instance(&config, Harness::Opencode);
+        let vm = vm(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         let host_skills = dir.path().join("host-skills");
         fs::create_dir_all(host_skills.join("seed")).unwrap();
         fs::write(host_skills.join("seed/SKILL.md"), b"# host").unwrap();
         fs::write(store.path(Harness::Opencode), skill_profile(&host_skills)).unwrap();
-        let plan = prepare_for_start(&config, &instance).unwrap();
+        let plan = prepare_for_start(&config, &vm).unwrap();
         let skills = first_skill_dir(&plan.share.unwrap());
         fs::create_dir_all(skills.join("sub")).unwrap();
         fs::write(skills.join("sub/SKILL.md"), b"# guest").unwrap();
@@ -957,7 +945,7 @@ OPENAI_API_KEY = "sk-test"
         fs::write(trap.join("do-not-touch"), b"host").unwrap();
         std::os::unix::fs::symlink(&trap, host_skills.join("sub")).unwrap();
 
-        let err = sync_skills_back(&config, &instance, false).unwrap_err();
+        let err = sync_skills_back(&config, &vm, false).unwrap_err();
         assert!(
             format!("{err:#}").contains("refusing symlinked profile directory"),
             "{err:#}"
@@ -972,7 +960,7 @@ OPENAI_API_KEY = "sk-test"
 
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
-        let instance = instance(&config, Harness::Opencode);
+        let vm = vm(&config, Harness::Opencode);
         let store = ProfileStore::new(&config);
         let source = dir.path().join("opencode.json");
         fs::write(&source, b"{}").unwrap();
@@ -982,7 +970,7 @@ OPENAI_API_KEY = "sk-test"
         );
         fs::write(store.path(Harness::Opencode), profile).unwrap();
 
-        let plan = prepare_for_start(&config, &instance).unwrap();
+        let plan = prepare_for_start(&config, &vm).unwrap();
         let share = plan.share.expect("profile share");
         let root = share.bundle_dir.parent().unwrap();
         for path in [

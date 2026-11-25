@@ -76,12 +76,22 @@ pub(super) fn spawn_attach(config: Config, instance: String, tx: mpsc::Sender<Sc
     let spawned = std::thread::Builder::new()
         .name("hegn-attach-vm".into())
         .spawn(move || {
-            let registry = crate::vm::instance::InstanceRegistry::new(config);
+            let registry = crate::vm::registry::VmRegistry::new(config);
             let harness = registry
                 .store()
                 .load(&instance)
                 .map(|config| config.harness)
                 .unwrap_or_default();
+            let warning = registry
+                .manager_by_name(&instance)
+                .ok()
+                .and_then(|manager| manager.membership_warning());
+            if let Some(warning) = warning {
+                let _ = thread_tx.send(ScanMessage::InstancesChanged {
+                    note: warning,
+                    level: ToastLevel::Warn,
+                });
+            }
             let result = registry
                 .manager_by_name(&instance)
                 .and_then(|manager| manager.ensure_console());
@@ -107,82 +117,24 @@ pub(super) fn spawn_attach(config: Config, instance: String, tx: mpsc::Sender<Sc
 }
 
 pub(super) fn spawn_clones(
-    config: Config,
-    source: String,
-    count: usize,
-    harness: Harness,
-    start: bool,
+    _config: Config,
+    _source: String,
+    _count: usize,
+    _harness: Harness,
+    _start: bool,
     tx: mpsc::Sender<ScanMessage>,
 ) {
-    let thread_tx = tx.clone();
     let spawned = std::thread::Builder::new()
         .name("hegn-clone-agents".into())
         .spawn(move || {
-            let registry = crate::vm::instance::InstanceRegistry::new(config.clone());
-            let source = match registry.resolve(&source) {
-                Ok(source) => source,
-                Err(err) => {
-                    // Clone failures must not tear down the attached VM.
-                    let _ = thread_tx.send(ScanMessage::InstanceError(format!(
-                        "could not create clones: {err}"
-                    )));
-                    return;
-                }
-            };
-            let mut created = 0;
-            let mut failures = Vec::new();
-            let mut warnings = Vec::new();
-            for index in 1..=count {
-                let base = format!("{}-agent", source.name);
-                let name = match registry.unique_name(&format!("{base}-{index}")) {
-                    Ok(name) => name,
-                    Err(err) => {
-                        failures.push(err.to_string());
-                        continue;
-                    }
-                };
-                match registry.clone_from(&source, &name, Some(harness)) {
-                    Ok(outcome) => {
-                        for warning in &outcome.warnings {
-                            if !warnings.iter().any(|existing| existing == warning) {
-                                warnings.push(warning.clone());
-                            }
-                        }
-                        if start
-                            && let Err(err) = registry.manager(outcome.instance.clone()).start()
-                        {
-                            failures.push(format!("{name}: {err}"));
-                        }
-                        created += 1;
-                    }
-                    Err(err) => failures.push(format!("{name}: {err}")),
-                }
-            }
-            let mut note = if failures.is_empty() {
-                format!("created {created} clone(s) for parallel agents")
-            } else {
-                format!(
-                    "created {created} clone(s); {} failed: {}",
-                    failures.len(),
-                    failures.join("; ")
-                )
-            };
-            if !warnings.is_empty() {
-                note.push_str("; warning: ");
-                note.push_str(&warnings.join("; "));
-            }
-            let level = if failures.is_empty() && warnings.is_empty() {
-                ToastLevel::Info
-            } else {
-                ToastLevel::Warn
-            };
-            let _ = thread_tx.send(ScanMessage::InstancesChanged { note, level });
+            let _ = tx.send(ScanMessage::InstancesChanged {
+                note: "clone workspaces are not available yet; use `hegn project fork` once \
+                       Phase 7 lands, or run a second VM"
+                    .into(),
+                level: ToastLevel::Warn,
+            });
         });
-    if let Err(err) = spawned {
-        let _ = tx.send(ScanMessage::InstanceError(format!(
-            "could not start the clone thread: {err}"
-        )));
-    }
+    let _ = spawned;
 }
 
 pub(super) fn spawn_start(
@@ -195,19 +147,25 @@ pub(super) fn spawn_start(
     let spawned = std::thread::Builder::new()
         .name("hegn-start-vm".into())
         .spawn(move || {
-            let registry = crate::vm::instance::InstanceRegistry::new(config.clone());
-            let instance = match registry.ensure_for_project(&project, harness) {
-                Ok(instance) => instance,
+            let registry = crate::vm::registry::VmRegistry::new(config.clone());
+            let vm = match registry.ensure_for_project(&project, harness) {
+                Ok(vm) => vm,
                 Err(err) => {
                     let _ = thread_tx.send(ScanMessage::StartFailed(err.to_string()));
                     return;
                 }
             };
-            let workspace = instance.workspace.clone();
-            let auto_branch = instance.auto_branch;
-            let harness = instance.harness;
-            let plan = ProvisionPlan::new(instance.harness, &instance.extra_packages).ok();
-            let manager = registry.manager(instance);
+            let workspace = project.clone();
+            let auto_branch = config.auto_branch;
+            let harness = vm.harness;
+            let plan = ProvisionPlan::new(vm.harness, &vm.extra_packages).ok();
+            let manager = match registry.manager(vm) {
+                Ok(manager) => manager,
+                Err(err) => {
+                    let _ = thread_tx.send(ScanMessage::StartFailed(err.to_string()));
+                    return;
+                }
+            };
             let was_running = manager.is_running();
             let started = if was_running {
                 manager.status().ok()

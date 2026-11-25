@@ -35,7 +35,7 @@ impl App {
         }
     }
 
-    pub(super) fn open_instance_config(&mut self) -> Vec<Effect> {
+    pub(super) fn open_vm_config(&mut self) -> Vec<Effect> {
         let Some(instance) = self
             .selected_instance()
             .map(|instance| instance.name.clone())
@@ -43,15 +43,15 @@ impl App {
             self.toast("select an instance first", ToastLevel::Warn);
             return Vec::new();
         };
-        self.show_instance_config_form(&instance, None);
+        self.show_vm_config_form(&instance, None);
         Vec::new()
     }
 
-    pub(super) fn show_instance_config_form(&mut self, name: &str, status: Option<String>) {
-        let store = crate::vm::instance_config::InstanceStore::new(self.config.clone());
+    pub(super) fn show_vm_config_form(&mut self, name: &str, status: Option<String>) {
+        let store = crate::vm::config::VmStore::new(&self.config);
         match store.load(name) {
-            Ok(instance) => {
-                let mut form = ConfigForm::instance(instance, self.config.clone());
+            Ok(vm) => {
+                let mut form = ConfigForm::vm(vm, self.config.clone());
                 form.status = status;
                 self.config_hover = None;
                 self.modal = Some(Modal::Config(form));
@@ -87,7 +87,7 @@ impl App {
                 }
                 effects
             }
-            Some(Applied::Instance) => {
+            Some(Applied::Vm) => {
                 self.refresh_instances();
                 self.modal = Some(Modal::Config(form));
                 self.toast("instance settings saved", ToastLevel::Info);
@@ -121,11 +121,10 @@ impl App {
                 }
             },
             ConfigKind::Instance => {
-                match form.instance_name().map(str::to_string) {
-                    Some(name) => self.show_instance_config_form(
-                        &name,
-                        Some("reverted to the file on disk".into()),
-                    ),
+                match form.vm_name().map(str::to_string) {
+                    Some(name) => {
+                        self.show_vm_config_form(&name, Some("reverted to the file on disk".into()))
+                    }
                     None => {
                         form.error = Some("instance name is missing".into());
                         self.modal = Some(Modal::Config(form));
@@ -410,14 +409,13 @@ mod tests {
         let inside = app.config.vms_dir.join("demo").join("workspace");
         app.focus = Focus::Instances;
         let instance = fake_instance(&app, "demo", inside.clone());
-        let stored = crate::vm::instance_config::InstanceConfig {
+        let stored = crate::vm::config::VmConfig {
             name: "demo".into(),
-            project: instance.project.clone(),
-            workspace: inside,
             harness: Harness::Shell,
-            ..crate::vm::instance_config::InstanceConfig::default()
+            primary: Some("demo".into()),
+            ..crate::vm::config::VmConfig::default()
         };
-        crate::vm::instance_config::InstanceStore::new(app.config.clone())
+        crate::vm::config::VmStore::new(&app.config)
             .save(&stored)
             .unwrap();
         install_instances(&mut app, vec![instance]);
@@ -506,15 +504,14 @@ mod tests {
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
         let inside = app.config.vms_dir.join("demo").join("workspace");
-        crate::vm::instance_config::InstanceStore::new(app.config.clone())
-            .save(&crate::vm::instance_config::InstanceConfig {
+        crate::vm::config::VmStore::new(&app.config)
+            .save(&crate::vm::config::VmConfig {
                 name: "demo".into(),
-                project: project.clone(),
-                workspace: inside.clone(),
                 harness: Harness::Shell,
                 vcpus: 2,
                 memory_mib: 2048,
-                ..crate::vm::instance_config::InstanceConfig::default()
+                primary: Some("demo".into()),
+                ..crate::vm::config::VmConfig::default()
             })
             .unwrap();
         let instance = fake_instance(&app, "demo", inside);

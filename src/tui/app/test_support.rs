@@ -20,7 +20,7 @@ pub(super) use crate::config::{Config, Harness};
 pub(super) use crate::project::{GitSummary, Project};
 pub(super) use crate::session::console::TerminalConsole;
 pub(super) use crate::session::snapshot::{SnapshotMeta, SnapshotStore};
-pub(super) use crate::vm::instance::InstanceSummary;
+pub(super) use crate::vm::registry::VmSummary;
 
 use super::App;
 
@@ -175,19 +175,19 @@ pub(super) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-pub(super) fn fake_instance(app: &App, name: &str, workspace: PathBuf) -> InstanceSummary {
-    InstanceSummary {
+pub(super) fn fake_instance(app: &App, name: &str, workspace: PathBuf) -> VmSummary {
+    VmSummary {
         name: name.into(),
+        harness: Harness::Shell,
+        primary: Some("demo".into()),
+        members: 1,
         project: app.config.projects_root.join("demo"),
         workspace,
-        harness: Harness::Shell,
-        ephemeral: false,
-        source_instance: None,
         created_at: chrono::Utc::now(),
         state: "stopped".into(),
         vm_pid: None,
         serial_log: None,
-        config_path: app.config.vms_dir.join(name).join("hegn.toml"),
+        config_path: app.config.vms_dir.join(name).join("vm.toml"),
         vcpus: 2,
         memory_mib: 2048,
         error: None,
@@ -196,7 +196,7 @@ pub(super) fn fake_instance(app: &App, name: &str, workspace: PathBuf) -> Instan
 
 /// Install an instance list and select the matching fake project, so the
 /// project-scoped instance filter has something to work with.
-pub(super) fn install_instances(app: &mut App, instances: Vec<InstanceSummary>) {
+pub(super) fn install_instances(app: &mut App, instances: Vec<VmSummary>) {
     if let Some(project) = instances.first().map(|instance| instance.project.clone()) {
         let name = project
             .file_name()
