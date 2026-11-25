@@ -1060,6 +1060,11 @@ mod tests {
                 .starts_with(fixture.config.projects_root.canonicalize().unwrap())
         );
 
+        // A clone does not inherit the parent repository's local identity; set
+        // one explicitly so this works on a host with no global git identity.
+        git_ok(&entry.path, &["config", "user.email", "test@example.com"]);
+        git_ok(&entry.path, &["config", "user.name", "Test"]);
+
         // The clone commits independently and the parent is untouched.
         fs::write(entry.path.join("fix.txt"), "fix\n").unwrap();
         git_ok(&entry.path, &["add", "."]);
