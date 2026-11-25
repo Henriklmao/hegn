@@ -30,6 +30,19 @@ fn selected_snapshots(store: &SnapshotStore, vm: Option<&str>) -> Result<Vec<Sna
     }
 }
 
+/// VM that owns a snapshot, or an error when the metadata is legacy or has no
+/// owner. The historical messages are kept so scripts and users see the same
+/// remediation.
+fn snapshot_owner(meta: &SnapshotMeta, name: &str) -> Result<String> {
+    if let Some(label) = meta.legacy_label() {
+        bail!("snapshot '{name}' is {label}; take a new snapshot with `hegn snapshot create`");
+    }
+    Ok(meta
+        .vm()
+        .context("snapshot has no VM/project metadata")?
+        .to_owned())
+}
+
 pub(crate) fn snapshot_command(
     command: SnapshotCommands,
     config: Config,
@@ -74,25 +87,21 @@ pub(crate) fn snapshot_command(
             print_snapshot(&meta, json)?;
             Ok(0)
         }
-        SnapshotCommands::Restore { name, instance } => {
+        SnapshotCommands::Restore { name, vm, instance } => {
             let meta = store.load(&name)?;
-            if let Some(label) = meta.legacy_label() {
-                anyhow::bail!(
-                    "snapshot '{name}' is {label}; take a new snapshot with `hegn snapshot create`"
-                );
-            }
-            let vm = match instance {
-                Some(selector) => registry.resolve(&selector)?,
-                None => match meta.vm() {
-                    Some(name) => registry.store().load(name)?,
-                    None => {
-                        let project = meta
-                            .project
-                            .as_deref()
-                            .context("snapshot has no VM/project metadata")?;
-                        registry.resolve(project.to_string_lossy().as_ref())?
+            let owner = snapshot_owner(&meta, &name)?;
+            let vm = match vm_selector(vm, instance) {
+                Some(selector) => {
+                    let vm = registry.resolve(&selector)?;
+                    if vm.name != owner {
+                        bail!(
+                            "snapshot '{name}' belongs to VM '{owner}', not '{}'",
+                            vm.name
+                        );
                     }
-                },
+                    vm
+                }
+                None => registry.store().load(&owner)?,
             };
             runtime()?.block_on(registry.manager(vm)?.restore_snapshot(&meta))?;
             if json {
@@ -149,6 +158,26 @@ mod tests {
         };
         store.save_meta(&meta).unwrap();
         meta
+    }
+
+    fn write_legacy_snapshot(store: &SnapshotStore, name: &str, vm: Option<&str>) {
+        let paths = store.prepare(name).unwrap();
+        let meta = SnapshotMeta {
+            name: name.into(),
+            dir: paths.final_dir.clone(),
+            instance: vm.map(str::to_owned),
+            version: 1,
+            ..SnapshotMeta::default()
+        };
+        store.save_meta(&meta).unwrap();
+    }
+
+    fn save_vm(config: &Config, name: &str) {
+        use crate::config::Harness;
+        use crate::vm::config::{VmConfig, VmStore};
+
+        let vm = VmConfig::from_config(config, name, Some(Harness::Shell));
+        VmStore::new(config).save(&vm).unwrap();
     }
 
     #[test]
@@ -216,5 +245,47 @@ mod tests {
             vm_selector(Some("rust".into()), None),
             Some("rust".to_owned())
         );
+    }
+
+    #[test]
+    fn restore_refuses_legacy_snapshots() {
+        let (_dir, config) = config();
+        let store = SnapshotStore::new(&config.snapshots_dir);
+        write_legacy_snapshot(&store, "legacy", Some("rust"));
+
+        let err = snapshot_command(
+            SnapshotCommands::Restore {
+                name: "legacy".into(),
+                vm: None,
+                instance: None,
+            },
+            config,
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("legacy"), "{err:#}");
+    }
+
+    #[test]
+    fn restore_refuses_an_owner_mismatch() {
+        let (_dir, config) = config();
+        save_vm(&config, "rust");
+        save_vm(&config, "python");
+        let store = SnapshotStore::new(&config.snapshots_dir);
+        write_snapshot(&store, "demo", Some("rust"));
+
+        let err = snapshot_command(
+            SnapshotCommands::Restore {
+                name: "demo".into(),
+                vm: Some("python".into()),
+                instance: None,
+            },
+            config,
+            true,
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("belongs to VM 'rust'"), "{message}");
+        assert!(message.contains("not 'python'"), "{message}");
     }
 }

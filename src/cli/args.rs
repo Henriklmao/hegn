@@ -449,8 +449,16 @@ pub enum SnapshotCommands {
     /// Load a snapshot (boots a fresh Cloud Hypervisor process).
     Restore {
         name: String,
-        /// Instance to restore into (defaults to the snapshot metadata).
-        #[arg(long)]
+        /// VM to restore into (defaults to the snapshot metadata).
+        #[arg(long, value_name = "VM")]
+        vm: Option<String>,
+        /// Deprecated spelling of `--vm`.
+        #[arg(
+            long = "instance",
+            hide = true,
+            value_name = "VM",
+            conflicts_with = "vm"
+        )]
         instance: Option<String>,
     },
     /// Delete a snapshot directory.
@@ -1282,6 +1290,36 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_restore_accepts_vm_and_hidden_instance_alias() {
+        let cli =
+            Cli::try_parse_from(["hegn", "snapshot", "restore", "demo", "--vm", "rust"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Snapshot {
+                command: SnapshotCommands::Restore {
+                    ref name,
+                    vm: Some(ref vm),
+                    instance: None
+                }
+            }) if name == "demo" && vm == "rust"
+        ));
+
+        let cli =
+            Cli::try_parse_from(["hegn", "snapshot", "restore", "demo", "--instance", "rust"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Snapshot {
+                command: SnapshotCommands::Restore {
+                    ref name,
+                    vm: None,
+                    instance: Some(ref instance)
+                }
+            }) if name == "demo" && instance == "rust"
+        ));
+    }
+
+    #[test]
     fn snapshot_list_and_create_instance_alias_is_hidden_in_help() {
         use clap::CommandFactory;
         let command = Cli::command();
@@ -1289,7 +1327,7 @@ mod tests {
             .get_subcommands()
             .find(|subcommand| subcommand.get_name() == "snapshot")
             .unwrap();
-        for name in ["list", "create"] {
+        for name in ["list", "create", "restore"] {
             let subcommand = snapshot
                 .get_subcommands()
                 .find(|subcommand| subcommand.get_name() == name)
