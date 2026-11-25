@@ -33,6 +33,7 @@ pub(crate) fn render_project_panel(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
+    let vm = app.project_vm_name(&project.path).unwrap_or("unassigned");
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
@@ -40,6 +41,13 @@ pub(crate) fn render_project_panel(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(project.display_path(), Style::default().fg(MUTED)),
+        ]),
+        Line::from(vec![
+            Span::styled(" vm   ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("⬢ {vm}"),
+                Style::default().fg(if vm == "unassigned" { YELLOW } else { TEXT }),
+            ),
         ]),
         Line::from(vec![
             Span::styled(" git  ", Style::default().fg(MUTED)),
@@ -55,17 +63,6 @@ pub(crate) fn render_project_panel(frame: &mut Frame, app: &App, area: Rect) {
                     .last_opened
                     .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
                     .unwrap_or_else(|| "never opened".into()),
-                Style::default().fg(TEXT),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" runs ", Style::default().fg(MUTED)),
-            Span::styled(
-                format!(
-                    "{} inside {}",
-                    app.config.harness.label(),
-                    app.config.guest_projects_base.clone()
-                ),
                 Style::default().fg(TEXT),
             ),
         ]),

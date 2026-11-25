@@ -1,14 +1,16 @@
 //! Dashboard and instance state: loading project lists, filters, selection and
 //! the periodic poll.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::config::Config;
-use crate::project::{self, GitSummary, Project, ProjectMeta};
+use crate::project::{self, GitSummary, Project, ProjectEntry, ProjectMeta, ProjectRegistry};
 use crate::security::SecurityEngine;
 use crate::session::snapshot::SnapshotStore;
 use crate::session::state::StateStore;
 use crate::session::terminal::TerminalBuffer;
+use crate::vm::VmPaths;
 use crate::vm::registry::VmSummary;
 
 use super::util::clamp_index;
@@ -22,6 +24,9 @@ impl App {
             .unwrap_or_default();
         let instances = crate::vm::registry::VmRegistry::new(config.clone())
             .summaries()
+            .unwrap_or_default();
+        let project_entries = ProjectRegistry::load(&config.state_dir)
+            .map(|registry| registry.entries().to_vec())
             .unwrap_or_default();
         let vm = VmStatus::from_config(&config);
         let security_engine = SecurityEngine::new(config.security);
@@ -46,6 +51,7 @@ impl App {
             health: None,
             snapshots,
             selected_snapshot: 0,
+            project_entries,
             project_snapshots: Vec::new(),
             project_snapshot_selected: 0,
             snapshot_rows: Vec::new(),
@@ -97,6 +103,7 @@ impl App {
         self.projects = projects;
         self.loading = false;
         self.refresh_filter();
+        self.refresh_project_entries();
         let preferred = previous.or_else(|| self.store.state().last_project.clone());
         if let Some(path) = preferred
             && let Some(index) = self
@@ -133,7 +140,119 @@ impl App {
         {
             self.selected = index;
         }
+        self.refresh_project_entries();
         self.refresh_instance_filter();
+    }
+
+    /// Reload the private project registry (assignment and membership).
+    pub fn refresh_project_entries(&mut self) {
+        self.project_entries = ProjectRegistry::load(&self.config.state_dir)
+            .map(|registry| registry.entries().to_vec())
+            .unwrap_or_default();
+    }
+
+    /// Registry entry for a project path, tolerating a symlinked projects root.
+    pub fn project_entry(&self, path: &std::path::Path) -> Option<&ProjectEntry> {
+        self.project_entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .or_else(|| {
+                self.project_entries
+                    .iter()
+                    .find(|entry| crate::vm::same_project(&entry.path, path))
+            })
+    }
+
+    /// Name of the VM a project is assigned to.
+    pub fn project_vm_name(&self, path: &std::path::Path) -> Option<&str> {
+        self.project_entry(path)
+            .and_then(|entry| entry.vm.as_deref())
+    }
+
+    /// Summary of the VM a project is assigned to.
+    pub fn project_vm(&self, path: &std::path::Path) -> Option<&VmSummary> {
+        let name = self.project_vm_name(path)?;
+        self.instances.iter().find(|summary| summary.name == name)
+    }
+
+    /// VM badge shown next to a dashboard project row.
+    pub fn project_vm_badge(&self, path: &std::path::Path) -> String {
+        match self.project_vm_name(path) {
+            Some(name) => {
+                let members = self
+                    .instances
+                    .iter()
+                    .find(|summary| summary.name == name)
+                    .map(|summary| summary.members)
+                    .unwrap_or(0);
+                if members > 1 {
+                    format!("⬢ {name} · {members}p")
+                } else {
+                    format!("⬢ {name}")
+                }
+            }
+            None => "unassigned".to_string(),
+        }
+    }
+
+    /// Guest paths of every exported member of a VM.
+    ///
+    /// Uses the boot plan when the registry is valid; otherwise falls back to
+    /// the deterministic `<guest_projects_base>/<slug>` mapping so the TUI can
+    /// still show a path for a broken membership.
+    pub fn vm_guest_paths(&self, vm: &str) -> HashMap<String, String> {
+        let store = crate::vm::config::VmStore::new(&self.config);
+        let Ok(registry) = ProjectRegistry::load(&self.config.state_dir) else {
+            return HashMap::new();
+        };
+        if let Ok(config) = store.load(vm) {
+            let paths = VmPaths::from_vm(&self.config, &config);
+            if let Ok(plan) = crate::vm::manager::BootPlan::build(
+                &self.config,
+                &config,
+                &store,
+                &registry,
+                &paths,
+            ) {
+                return plan
+                    .members
+                    .into_iter()
+                    .map(|member| (member.name, member.guest_path))
+                    .collect();
+            }
+        }
+        registry
+            .exported_members(vm)
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    format!(
+                        "{}/{}",
+                        self.config.guest_projects_base,
+                        crate::vm::manager::slugify(&entry.name)
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// Guest path of one project, when it is an exported member.
+    pub fn project_guest_path(&self, path: &std::path::Path) -> Option<String> {
+        let entry = self.project_entry(path)?;
+        let vm = entry.vm.as_deref()?;
+        self.vm_guest_paths(vm).remove(&entry.name)
+    }
+
+    /// Newest snapshot owned by `vm`.
+    pub fn newest_snapshot_for_vm(
+        &self,
+        vm: &str,
+    ) -> Option<&crate::session::snapshot::SnapshotMeta> {
+        self.snapshots
+            .iter()
+            .filter(|snapshot| snapshot.vm() == Some(vm))
+            .max_by_key(|snapshot| snapshot.created_at)
     }
 
     /// Read the last `hegn-health` line from the selected instance's log.
@@ -269,6 +388,7 @@ impl App {
         if let Ok(instances) = registry.summaries() {
             self.instances = instances;
         }
+        self.refresh_project_entries();
         self.refresh_instance_filter_named(selected);
         let selected = self.selected_instance().cloned();
         if let Some(summary) = selected {

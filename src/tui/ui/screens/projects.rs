@@ -114,15 +114,26 @@ pub(crate) fn render_projects(frame: &mut Frame, app: &App, area: Rect) -> Vec<R
             Span::styled(project.name.clone(), base),
         ]);
         lines.push(name_line);
-        let detail = Line::from(Span::styled(
-            format!("   {}", project.git.badge()),
-            if selected {
-                Style::default().fg(ON_ACCENT).bg(ACCENT)
-            } else {
-                Style::default().fg(MUTED)
-            },
-        ));
-        lines.push(detail);
+        let vm_badge = app.project_vm_badge(&project.path);
+        let detail_style = if selected {
+            Style::default().fg(ON_ACCENT).bg(ACCENT)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("   {}", project.git.badge()), detail_style),
+            Span::styled("  ", detail_style),
+            Span::styled(
+                vm_badge,
+                if selected {
+                    detail_style
+                } else if app.project_vm_name(&project.path).is_some() {
+                    Style::default().fg(ACCENT)
+                } else {
+                    Style::default().fg(YELLOW)
+                },
+            ),
+        ]));
         hits.push(RowHit {
             rect: Rect {
                 x: list_area.x,
@@ -153,6 +164,37 @@ pub(crate) fn branch_color(git: &crate::project::GitSummary) -> Color {
 #[cfg(test)]
 mod tests {
     use crate::tui::ui::test_support::*;
+
+    #[test]
+    fn project_rows_show_a_vm_badge_or_unassigned() {
+        let (_dir, mut app) = app();
+        let (text, _) = render(&app);
+        assert!(text.contains("unassigned"), "{text}");
+
+        let path = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&path).unwrap();
+        app.projects[0].path = path.clone();
+        app.instances = vec![crate::vm::registry::VmSummary {
+            name: "rust".into(),
+            harness: crate::config::Harness::Shell,
+            primary: Some("demo".into()),
+            members: 2,
+            project: path.clone(),
+            workspace: path,
+            created_at: chrono::Utc::now(),
+            state: "running".into(),
+            vm_pid: None,
+            serial_log: None,
+            config_path: app.config.vms_dir.join("rust/vm.toml"),
+            vcpus: 2,
+            memory_mib: 2048,
+            error: None,
+        }];
+        crate::tui::ui::test_support::assign_project(&mut app, "demo", "rust");
+        let (text, _) = render(&app);
+        assert!(text.contains("⬢ rust"), "{text}");
+        assert!(!text.contains("unassigned"), "{text}");
+    }
 
     #[test]
     fn empty_project_list_has_guidance() {

@@ -38,6 +38,31 @@ pub(crate) fn app() -> (tempfile::TempDir, App) {
     (dir, app)
 }
 
+/// Register `name` under the app's projects root and assign it to `vm`.
+pub(crate) fn assign_project(app: &mut App, name: &str, vm: &str) {
+    use crate::project::{ProjectEntry, ProjectKind, ProjectRegistry};
+
+    let path = app.config.projects_root.join(name);
+    std::fs::create_dir_all(&path).unwrap();
+    let canonical = path.canonicalize().unwrap();
+    let mut registry = ProjectRegistry::load(&app.config.state_dir).unwrap();
+    registry
+        .upsert(ProjectEntry {
+            name: name.into(),
+            path: canonical,
+            vm: None,
+            read_only: false,
+            kind: ProjectKind::External,
+            parent: None,
+            managed: false,
+            hidden: false,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+    registry.assign(name, vm, false).unwrap();
+    app.refresh_project_entries();
+}
+
 pub(crate) fn render(app: &App) -> (String, UiHits) {
     render_sized(app, 120, 42)
 }

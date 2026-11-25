@@ -14,7 +14,7 @@ use crate::config::form::{ConfigField, ConfigPage};
 pub use crate::config::form::{ConfigForm, ConfigKind};
 use crate::config::{Config, Harness};
 use crate::diagnostics::doctor::DoctorReport;
-use crate::project::{GitSummary, Project, ProjectMeta};
+use crate::project::{GitSummary, Project, ProjectEntry, ProjectMeta};
 use crate::security::{Inspection, SecurityEngine};
 use crate::session::console::TerminalConsole;
 use crate::session::snapshot::SnapshotMeta;
@@ -743,6 +743,8 @@ pub struct App {
     pub health: Option<VmHealth>,
     pub snapshots: Vec<SnapshotMeta>,
     pub selected_snapshot: usize,
+    /// Private project registry entries, refreshed with the project scan.
+    pub project_entries: Vec<ProjectEntry>,
     /// Indices into [`App::snapshots`] for the open project.
     pub project_snapshots: Vec<usize>,
     pub project_snapshot_selected: usize,
