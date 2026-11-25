@@ -55,6 +55,15 @@ pub(crate) fn snapshot_vm(registry: &VmRegistry, requested: Option<String>) -> R
     }
 }
 
+/// Decide whether `hegn open` creates a session branch.
+///
+/// `auto_branch` comes from the configuration; `--no-branch` is the only
+/// force-off flag. There is no `--branch` flag, so a VM configured with
+/// `auto_branch = false` never creates one.
+fn should_create_session_branch(auto_branch: bool, no_branch: bool) -> bool {
+    auto_branch && !no_branch
+}
+
 pub(crate) fn open(
     project: String,
     editor: bool,
@@ -96,7 +105,7 @@ pub(crate) fn open(
     }
 
     // Only mutate the workspace repository once a VM is actually available.
-    if !no_branch {
+    if should_create_session_branch(config.auto_branch, no_branch) {
         let git = project::read_git_summary(&entry.path);
         if git.is_repo {
             match project::create_session_branch(&entry.path) {
@@ -284,5 +293,19 @@ mod tests {
         let (_dir, config) = config();
         let err = attach(None, false, None, config).unwrap_err().to_string();
         assert!(err.contains("no running VM"), "{err}");
+    }
+
+    #[test]
+    fn auto_branch_and_no_branch_decide_the_session_branch() {
+        assert!(should_create_session_branch(true, false));
+        assert!(
+            !should_create_session_branch(false, false),
+            "auto_branch = false disables the branch"
+        );
+        assert!(
+            !should_create_session_branch(true, true),
+            "--no-branch always forces off"
+        );
+        assert!(!should_create_session_branch(false, true));
     }
 }

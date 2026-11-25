@@ -115,7 +115,8 @@ pub struct Config {
     pub local_endpoints: Vec<LocalEndpoint>,
     /// Extra packages installed while creating a VM template.
     pub extra_packages: Vec<String>,
-    /// Create `agent/hegn-session-<timestamp>` before launching.
+    /// Create `agent/hegn-session-<timestamp>` when `hegn open` attaches.
+    /// `--no-branch` is the only force-off flag.
     pub auto_branch: bool,
     /// Keep a rolling automatic snapshot of a running VM so it can be resumed
     /// instead of cold booted.
