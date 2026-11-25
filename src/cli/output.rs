@@ -2,6 +2,7 @@
 //! plus the small JSON/text utilities they need.
 
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -259,6 +260,20 @@ pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
+/// Whether a CLI action may ask the user a question.
+///
+/// `--json` promises machine-readable stdout, so a `[y/N]` prompt would corrupt
+/// the stream; a non-TTY stdin cannot answer at all.
+pub(crate) fn prompt_allowed(json: bool, stdin_is_tty: bool) -> bool {
+    !json && stdin_is_tty
+}
+
+/// Gate a prompt on the effective input mode of this invocation.
+#[allow(dead_code)]
+pub(crate) fn should_prompt(json: bool) -> bool {
+    prompt_allowed(json, std::io::stdin().is_terminal())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +299,14 @@ mod tests {
     fn human_size_uses_tebibytes_for_larger_values() {
         assert_eq!(human_size(1024_u64.pow(4)), "1.0 TiB");
         assert_eq!(human_size(u64::MAX), "16777216.0 TiB");
+    }
+
+    #[test]
+    fn prompt_allowed_requires_a_terminal_and_text_output() {
+        assert!(prompt_allowed(false, true));
+        assert!(!prompt_allowed(false, false));
+        assert!(!prompt_allowed(true, true));
+        assert!(!prompt_allowed(true, false));
     }
 
     #[test]
