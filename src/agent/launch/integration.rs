@@ -90,7 +90,7 @@ pub enum LaunchAction {
     Embedded { command: String },
     /// Suspend the TUI and attach the current terminal.
     External {
-        instance: String,
+        vm: String,
         command: Option<String>,
         bar: bool,
     },
@@ -101,12 +101,7 @@ pub enum LaunchAction {
 }
 
 /// Translate a resolved spec into the action the TUI/CLI should perform.
-pub fn action(
-    spec: &LaunchSpec,
-    instance: &str,
-    project: &Path,
-    hegn: &Path,
-) -> Result<LaunchAction> {
+pub fn action(spec: &LaunchSpec, vm: &str, project: &Path, hegn: &Path) -> Result<LaunchAction> {
     let integration = spec.integration.resolve();
     let command = (!spec.is_shell()).then(|| spec.command.clone());
     match integration {
@@ -114,7 +109,7 @@ pub fn action(
             command: spec.command.clone(),
         }),
         Integration::External => Ok(LaunchAction::External {
-            instance: instance.to_string(),
+            vm: vm.to_string(),
             command,
             bar: spec.bar,
         }),
@@ -122,13 +117,13 @@ pub fn action(
             if env::var_os("TMUX").is_none() {
                 bail!("tmux launch integration requires running hegn inside tmux");
             }
-            let pane_command = attach_shell_command(hegn, instance, command.as_deref(), spec.bar);
+            let pane_command = attach_shell_command(hegn, vm, command.as_deref(), spec.bar);
             Ok(LaunchAction::Spawn {
                 program: "tmux".into(),
                 args: vec![
                     "new-window".into(),
                     "-n".into(),
-                    format!("hegn-{instance}"),
+                    format!("hegn-{vm}"),
                     "-c".into(),
                     project.display().to_string(),
                     pane_command,
@@ -140,7 +135,7 @@ pub fn action(
                 bail!("herdr launch integration requires running hegn inside herdr");
             }
             Ok(LaunchAction::Herdr {
-                pane_command: attach_shell_command(hegn, instance, command.as_deref(), spec.bar),
+                pane_command: attach_shell_command(hegn, vm, command.as_deref(), spec.bar),
                 cwd: project.to_path_buf(),
             })
         }
@@ -149,12 +144,7 @@ pub fn action(
 }
 
 /// Build the `hegn attach` command used inside tmux/herdr panes.
-pub fn attach_shell_command(
-    hegn: &Path,
-    instance: &str,
-    command: Option<&str>,
-    bar: bool,
-) -> String {
+pub fn attach_shell_command(hegn: &Path, vm: &str, command: Option<&str>, bar: bool) -> String {
     let mut argv = vec![hegn.to_string_lossy().into_owned()];
     // tmux/herdr panes start from their own server environment, so pass the
     // config explicitly instead of relying on environment inheritance.
@@ -163,7 +153,7 @@ pub fn attach_shell_command(
         argv.push(config.to_string_lossy().into_owned());
     }
     argv.push("attach".into());
-    argv.push(instance.to_string());
+    argv.push(vm.to_string());
     if let Some(command) = command {
         argv.push("--command".into());
         argv.push(command.to_string());
@@ -251,7 +241,7 @@ mod tests {
         assert_eq!(
             action,
             LaunchAction::External {
-                instance: "demo".into(),
+                vm: "demo".into(),
                 command: Some("opencode".into()),
                 bar: false
             }
@@ -291,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_commands_quote_instance_and_command_arguments() {
+    fn attach_commands_quote_vm_and_command_arguments() {
         let command = attach_shell_command(
             Path::new("/usr/bin/hegn"),
             "demo;reboot",
@@ -321,7 +311,7 @@ mod tests {
         assert_eq!(
             action,
             LaunchAction::External {
-                instance: "demo".into(),
+                vm: "demo".into(),
                 command: None,
                 bar: true
             }

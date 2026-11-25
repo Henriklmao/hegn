@@ -54,11 +54,7 @@ pub(super) fn launch_agent(
                 Err(err) => app.toast(format!("launch failed: {err}"), ToastLevel::Error),
             }
         }
-        LaunchAction::External {
-            instance: vm,
-            command,
-            bar,
-        } => {
+        LaunchAction::External { vm, command, bar } => {
             let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
             app.detach_console();
             let result = with_suspended_terminal(terminal, || {

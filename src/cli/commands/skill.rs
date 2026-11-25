@@ -19,7 +19,7 @@ pub(crate) fn skill_command(command: SkillCommands, config: Config, json: bool) 
             } else {
                 println!(
                     "Copied {} file(s) from {} host source(s) into instance '{}'",
-                    report.copied_files, report.sources, report.instance
+                    report.copied_files, report.sources, report.vm
                 );
                 for warning in &report.warnings {
                     eprintln!("hegn: {warning}");
@@ -47,7 +47,7 @@ pub(crate) fn skill_command(command: SkillCommands, config: Config, json: bool) 
                 let action = if dry_run { "Would copy" } else { "Copied" };
                 println!(
                     "{} {} file(s) from instance '{}' back to the host ({} unchanged)",
-                    action, report.copied_files, report.instance, report.skipped_files
+                    action, report.copied_files, report.vm, report.skipped_files
                 );
                 for warning in &report.warnings {
                     eprintln!("hegn: {warning}");

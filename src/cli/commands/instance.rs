@@ -218,11 +218,7 @@ pub(crate) fn launch_command(
                 Some(&command),
             )?;
         }
-        LaunchAction::External {
-            instance: vm,
-            command,
-            bar,
-        } => {
+        LaunchAction::External { vm, command, bar } => {
             let console = registry.manager_by_name(&vm)?.attach_console()?;
             crate::session::console::run_interactive_with_command(
                 console,

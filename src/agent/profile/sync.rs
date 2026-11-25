@@ -47,7 +47,7 @@ pub fn sync_skills(config: &Config, vm: &VmConfig) -> Result<SyncReport> {
     let store = ProfileStore::new(config);
     let profile = store.load(vm.harness)?;
     let mut report = SyncReport {
-        instance: vm.name.clone(),
+        vm: vm.name.clone(),
         harness: vm.harness,
         sources: 0,
         copied_files: 0,
@@ -114,7 +114,7 @@ pub fn sync_skills_back(config: &Config, vm: &VmConfig, dry_run: bool) -> Result
         );
     }
     let mut report = SyncBackReport {
-        instance: vm.name.clone(),
+        vm: vm.name.clone(),
         harness: state.harness,
         copied_files: 0,
         skipped_files: 0,
