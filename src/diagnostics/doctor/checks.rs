@@ -280,21 +280,52 @@ fn legacy_checks(config: &Config, data_root: Option<&Path>, config_path: &Path) 
 ///
 /// v1 stored instances next to the snapshot root as `instances` and later
 /// `sandboxes`. The default data directory is checked too, so a custom
-/// `vms_dir` cannot hide the old default directories.
+/// `vms_dir` cannot hide the old default directories. A reused `vms_dir` may
+/// also contain v1 instances directly; a v2 VM has `vm.toml`, a v1 instance
+/// has `hegn.toml` instead.
 fn legacy_instance_dirs(config: &Config, data_root: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    let mut siblings = Vec::new();
     if let Some(parent) = config.vms_dir.parent() {
-        candidates.push(parent.join("instances"));
-        candidates.push(parent.join("sandboxes"));
+        siblings.push(parent.join("instances"));
+        siblings.push(parent.join("sandboxes"));
     }
     if let Some(root) = data_root {
-        candidates.push(root.join("instances"));
-        candidates.push(root.join("sandboxes"));
+        siblings.push(root.join("instances"));
+        siblings.push(root.join("sandboxes"));
     }
+    candidates.extend(siblings.into_iter().filter(|path| {
+        path != &config.vms_dir
+            && !path.starts_with(&config.vms_dir)
+            && !config.vms_dir.starts_with(path)
+    }));
+
+    if let Ok(entries) = fs::read_dir(&config.vms_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_real_dir(&path)
+                && is_regular_file(&path.join(crate::project::PROJECT_META_FILE))
+                && !is_regular_file(&path.join(crate::vm::config::VM_CONFIG_FILE))
+            {
+                candidates.push(path);
+            }
+        }
+    }
+
+    candidates.retain(|path| is_real_dir(path));
     candidates.sort();
     candidates.dedup();
-    candidates.retain(|path| path.is_dir() && !path.starts_with(&config.vms_dir));
     candidates
+}
+
+/// A real directory; symlinks are never legacy state or VMs.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// A regular file; a symlinked marker does not make a directory a v1 instance.
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
 fn legacy_instance_check(config: &Config, data_root: Option<&Path>) -> Check {
@@ -819,6 +850,58 @@ mod tests {
         assert_eq!(
             legacy_instance_dirs(&config, Some(&data_root)),
             vec![data_root.join("instances"), data_root.join("sandboxes")]
+        );
+    }
+
+    #[test]
+    fn legacy_instance_dirs_finds_v1_children_inside_a_reused_vms_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let data_root = dir.path().join("data");
+
+        let active = config.vms_dir.join("active");
+        fs::create_dir_all(&active).unwrap();
+        fs::write(active.join("vm.toml"), "version = 2\n").unwrap();
+        let legacy = config.vms_dir.join("old");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("hegn.toml"), "harness = \"opencode\"\n").unwrap();
+        // A stray directory with neither marker is not a v1 instance.
+        fs::create_dir_all(config.vms_dir.join("stray")).unwrap();
+
+        assert_eq!(
+            legacy_instance_dirs(&config, Some(&data_root)),
+            vec![legacy]
+        );
+    }
+
+    #[test]
+    fn legacy_instance_dirs_skips_sibling_candidates_that_are_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = isolated_config(dir.path());
+        let data_root = dir.path().join("data");
+        config.vms_dir = data_root.join("instances/vms");
+        fs::create_dir_all(&config.vms_dir).unwrap();
+        fs::create_dir_all(data_root.join("instances")).unwrap();
+
+        assert!(
+            legacy_instance_dirs(&config, Some(&data_root)).is_empty(),
+            "an ancestor of vms_dir is not a legacy instance directory"
+        );
+    }
+
+    #[test]
+    fn legacy_instance_dirs_skips_symlinked_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let data_root = dir.path().join("data");
+        fs::create_dir_all(&config.vms_dir).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("hegn.toml"), "harness = \"opencode\"\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), config.vms_dir.join("linked")).unwrap();
+
+        assert!(
+            legacy_instance_dirs(&config, Some(&data_root)).is_empty(),
+            "a symlinked v1 instance is not scanned or reported"
         );
     }
 
