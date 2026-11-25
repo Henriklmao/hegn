@@ -210,7 +210,7 @@ impl VmManager {
 
     /// Take the exclusive VM lifecycle lock.
     ///
-    /// A second `hegn open`/`instance start` must not recreate the API or serial
+    /// A second `hegn open`/`hegn vm start` must not recreate the API or serial
     /// socket underneath a VM that is already booting.
     pub(super) fn lock(&self, paths: &VmPaths) -> Result<RunLock> {
         paths.ensure()?;

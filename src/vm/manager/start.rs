@@ -115,7 +115,7 @@ impl VmManager {
         }
         if self.is_running() {
             bail!(
-                "VM '{}' is already running (use `hegn instance stop {}` first)",
+                "VM '{}' is already running (use `hegn vm stop {}` first)",
                 self.vm.name,
                 self.vm.name
             );

@@ -1,8 +1,8 @@
 //! Persistent, private serial-console logs.
 //!
 //! The detached console relay appends the guest UART to a log in
-//! `<state>/logs/`, so the full boot and session output survives `hegn instance
-//! stop` even while no terminal is attached.
+//! `<state>/logs/`, so the full boot and session output survives `hegn vm stop`
+//! even while no terminal is attached.
 //!
 //! Log files can contain whatever an agent printed, including secrets or
 //! terminal escape sequences. They are therefore created with mode `0600`

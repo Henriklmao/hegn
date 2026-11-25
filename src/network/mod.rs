@@ -16,7 +16,7 @@
 //! the packet.
 //!
 //! TAP creation and nftables need `CAP_NET_ADMIN`. `hegn network setup` is the
-//! explicit, one-time privileged step; `hegn instance start` is fail-closed and
+//! explicit, one-time privileged step; `hegn vm start` is fail-closed and
 //! refuses to boot a guarded VM unless the host marker shows that the firewall
 //! is active.
 

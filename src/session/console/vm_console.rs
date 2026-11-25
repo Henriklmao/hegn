@@ -43,7 +43,7 @@ impl VmConsole {
                 paths.run_dir.display()
             ),
             None => bail!(
-                "no VM session in {}; start one with `hegn instance start <name>`",
+                "no VM session in {}; start one with `hegn vm start <name>`",
                 paths.run_dir.display()
             ),
         };
@@ -59,13 +59,13 @@ impl VmConsole {
         }
         let hegn = std::env::current_exe().context("failed to locate the hegn executable")?;
         if session.relay_pid != 0 && !relay::process_matches_relay(session.relay_pid, &hegn) {
-            bail!("the console relay is not running; restart the VM with `hegn instance start`");
+            bail!("the console relay is not running; restart the VM with `hegn vm start`");
         }
         let socket_ok = std::fs::symlink_metadata(&paths.console_socket)
             .map(|meta| meta.file_type().is_socket())
             .unwrap_or(false);
         if !socket_ok {
-            bail!("the console relay socket is missing; restart the VM with `hegn instance start`");
+            bail!("the console relay socket is missing; restart the VM with `hegn vm start`");
         }
         let stream = UnixStream::connect(&paths.console_socket).with_context(|| {
             format!(
