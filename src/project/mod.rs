@@ -11,6 +11,7 @@
 //! - [`delete`] — removing projects and their instances
 //! - [`workspace`] — clone and worktree forks of a project
 
+mod assign;
 mod create;
 mod delete;
 mod discovery;
@@ -22,6 +23,7 @@ mod model;
 mod registry;
 mod workspace;
 
+pub use assign::{UnassignOutcome, assign_project, registered_entry, unassign_project};
 pub use create::create_project;
 pub use delete::{delete_project, delete_registered_project};
 pub use discovery::{discover, discover_protected};
