@@ -221,7 +221,7 @@ mod tests {
     fn lease() -> Lease {
         Lease {
             index: 0,
-            instance: "demo".into(),
+            vm: "demo".into(),
             tap: tap_name(0),
             mac: mac(0),
             host_ip: host_ip(0),

@@ -7,7 +7,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::addressing::{guest_ip, host_ip, mac, tap_name};
 use super::privilege::ensure_ready;
@@ -18,11 +18,12 @@ use crate::vm::config::{VmConfig, VmStore};
 use crate::vm::manager::VmManager;
 
 /// A reserved TAP device for one VM.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
     pub index: u8,
     /// Owner VM name (the on-disk owner file format is unchanged).
-    pub instance: String,
+    #[serde(alias = "instance")]
+    pub vm: String,
     pub tap: String,
     pub mac: String,
     pub host_ip: Ipv4Addr,
@@ -87,7 +88,7 @@ pub fn status(config: &Config) -> Vec<TapStatus> {
             host_ip: host_ip(index),
             exists: tap_exists(index),
             owner: read_owner(&owner_path(config, index))
-                .map(|(instance, _pid)| instance)
+                .map(|(vm, _pid)| vm)
                 .filter(|owner| !owner.is_empty()),
         })
         .collect()
@@ -145,14 +146,14 @@ pub fn acquire(config: &Config, vm: &VmConfig) -> Result<Lease> {
     )
 }
 
-fn try_claim(config: &Config, index: u8, instance: &str) -> Result<Option<Lease>> {
+fn try_claim(config: &Config, index: u8, vm: &str) -> Result<Option<Lease>> {
     let path = owner_path(config, index);
     let lock = lock_path(config, index);
     let _guard = FileLock::acquire(&lock)?;
 
     if let Some((owner, pid)) = read_owner(&path)
         && !owner.is_empty()
-        && owner != instance
+        && owner != vm
     {
         // A live hegn process may still be booting the owner VM, before its
         // session record exists. A live VM is equally authoritative. The pid
@@ -167,13 +168,13 @@ fn try_claim(config: &Config, index: u8, instance: &str) -> Result<Option<Lease>
 
     let lease = Lease {
         index,
-        instance: instance.to_string(),
+        vm: vm.to_string(),
         tap: tap_name(index),
         mac: mac(index),
         host_ip: host_ip(index),
         guest_ip: guest_ip(index),
     };
-    write_private(&path, format!("{instance}\n{}\n", std::process::id()))?;
+    write_private(&path, format!("{vm}\n{}\n", std::process::id()))?;
     Ok(Some(lease))
 }
 
@@ -181,7 +182,7 @@ fn try_claim(config: &Config, index: u8, instance: &str) -> Result<Option<Lease>
 pub fn release(config: &Config, vm: &str) {
     // Hold the per-TAP lock while checking the owner: another hegn process may
     // be claiming the same slice concurrently, and removing its fresh owner
-    // file would let a third instance share the TAP.
+    // file would let a third VM share the TAP.
     for index in 0..TAP_POOL {
         let path = owner_path(config, index);
         if !path.exists() {
@@ -235,17 +236,17 @@ pub fn vm_is_running(config: &Config, vm: &str) -> bool {
     VmManager::new(config.clone(), loaded).is_ok_and(|manager| manager.is_running())
 }
 
-/// Owner files contain `instance\npid\n`. The pid covers the window between
+/// Owner files contain `vm\npid\n`. The pid covers the window between
 /// reservation and the session record becoming visible.
 fn read_owner(path: &Path) -> Option<(String, u32)> {
     let raw = fs::read_to_string(path).ok()?;
     let mut lines = raw.lines();
-    let instance = lines.next()?.trim().to_string();
+    let vm = lines.next()?.trim().to_string();
     let pid = lines
         .next()
         .and_then(|line| line.trim().parse().ok())
         .unwrap_or(0);
-    Some((instance, pid))
+    Some((vm, pid))
 }
 
 fn tap_exists(index: u8) -> bool {
@@ -289,7 +290,7 @@ mod tests {
     use crate::config::NetworkMode;
     use std::os::unix::fs::PermissionsExt;
 
-    /// A config whose state and instance roots live in a throwaway directory, so
+    /// A config whose state and VM roots live in a throwaway directory, so
     /// no test can read or write the host's real hegn state.
     fn test_config() -> (tempfile::TempDir, Config) {
         let dir = tempfile::tempdir().unwrap();
@@ -324,7 +325,7 @@ mod tests {
     fn guest_config_matches_the_reserved_slice() {
         let lease = Lease {
             index: 3,
-            instance: "demo".into(),
+            vm: "demo".into(),
             tap: tap_name(3),
             mac: mac(3),
             host_ip: host_ip(3),
@@ -342,12 +343,23 @@ mod tests {
     }
 
     #[test]
+    fn lease_serializes_vm_and_reads_the_legacy_instance_alias() {
+        let legacy = r#"{"index":3,"instance":"demo","tap":"hegn3","mac":"52:54:00:00:00:04","host_ip":"10.213.0.13","guest_ip":"10.213.0.14"}"#;
+        let lease: Lease = serde_json::from_str(legacy).unwrap();
+        assert_eq!(lease.vm, "demo");
+
+        let json = serde_json::to_value(&lease).unwrap();
+        assert_eq!(json["vm"], "demo");
+        assert!(json.get("instance").is_none());
+    }
+
+    #[test]
     fn try_claim_records_a_private_owner_file_and_lease() {
         let (_dir, config) = test_config();
         let lease = try_claim(&config, 3, "demo").unwrap().unwrap();
 
         assert_eq!(lease.index, 3);
-        assert_eq!(lease.instance, "demo");
+        assert_eq!(lease.vm, "demo");
         assert_eq!(lease.tap, "hegn3");
         assert_eq!(lease.mac, "52:54:00:00:00:04");
         assert_eq!(lease.host_ip, Ipv4Addr::new(10, 213, 0, 13));
@@ -370,11 +382,11 @@ mod tests {
     }
 
     #[test]
-    fn try_claim_reuses_the_slice_for_the_same_instance() {
+    fn try_claim_reuses_the_slice_for_the_same_vm() {
         let (_dir, config) = test_config();
         fs::create_dir_all(network_dir(&config)).unwrap();
-        // A stale, dead pid recorded for the *same* instance is not a conflict:
-        // the instance owns its stable pool slot.
+        // A stale, dead pid recorded for the *same* VM is not a conflict:
+        // the VM owns its stable pool slot.
         write_private(&owner_path(&config, 5), "demo\n4294967295\n").unwrap();
 
         let lease = try_claim(&config, 5, "demo").unwrap().unwrap();
@@ -457,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn release_removes_only_the_instances_own_reservations() {
+    fn release_removes_only_the_vms_own_reservations() {
         let (_dir, config) = test_config();
         try_claim(&config, 0, "demo").unwrap().unwrap();
         try_claim(&config, 1, "other").unwrap().unwrap();
@@ -467,10 +479,10 @@ mod tests {
         assert!(!owner_path(&config, 0).exists());
         assert!(
             owner_path(&config, 1).exists(),
-            "release must not touch another instance's slice"
+            "release must not touch another VM's slice"
         );
 
-        // Releasing an instance that holds nothing is a no-op, not an error.
+        // Releasing a VM that holds nothing is a no-op, not an error.
         release(&config, "demo");
         release(&config, "never-existed");
     }

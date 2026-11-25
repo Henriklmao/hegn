@@ -455,7 +455,7 @@ mod tests {
         let (config, vm, plan, paths, _manager) = plan_and_paths(dir.path());
         let lease = crate::network::Lease {
             index: 2,
-            instance: vm.name.clone(),
+            vm: vm.name.clone(),
             tap: crate::network::tap_name(2),
             mac: crate::network::mac(2),
             host_ip: crate::network::host_ip(2),
@@ -702,7 +702,7 @@ mod tests {
         let snapshot = snapshot(dir.path());
         let lease = crate::network::Lease {
             index: 4,
-            instance: vm.name.clone(),
+            vm: vm.name.clone(),
             tap: crate::network::tap_name(4),
             mac: crate::network::mac(4),
             host_ip: crate::network::host_ip(4),
@@ -762,7 +762,7 @@ mod tests {
         let last = crate::network::TAP_POOL - 1;
         let lease = crate::network::Lease {
             index: last,
-            instance: vm.name.clone(),
+            vm: vm.name.clone(),
             tap: crate::network::tap_name(last),
             mac: crate::network::mac(last),
             host_ip: crate::network::host_ip(last),
