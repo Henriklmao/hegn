@@ -21,7 +21,7 @@ one-project-per-VM model.
 | Project `hegn.toml` | Only `launch`, `integration`, `auto_start` |
 | `instances_dir` in `config.toml` | Deprecated alias for `vms_dir`; warning |
 | `shared_tag` in `config.toml` | Deprecated alias for `share_tag_prefix`; warning |
-| `guest_mount` in `config.toml` | Deprecated alias for `guest_projects_base`; warning |
+| `guest_mount` in `config.toml` | Deprecated alias; `/workspace` migrates to `/projects` with a specific warning |
 | v1 instance directories | Ignored, reported by `hegn doctor`, never deleted |
 | v1 snapshots without a fingerprint | Listed as legacy; never restored or deleted |
 | v1 session logs | Still readable with `hegn logs` |
@@ -29,6 +29,22 @@ one-project-per-VM model.
 A v1 `config.toml` keeps working for the renamed global keys, so startup is not
 bricked. The old values are read; rewrite them to the new names when convenient.
 Unknown keys are still rejected.
+
+The old v1 default `guest_mount = "/workspace"` is migrated to
+`/projects` with this exact warning:
+
+```text
+warning: legacy guest_mount = "/workspace" is reserved for the primary /workspace symlink; using guest_projects_base = "/projects" instead. Set guest_projects_base explicitly to silence this warning.
+```
+
+Set `guest_projects_base` explicitly to remove the warning. A new
+`guest_projects_base = "/workspace"` is rejected because `/workspace` and paths
+under it are reserved for the primary-project symlink.
+
+Per-VM `security`, `periodic_snapshots`, `snapshot_interval_secs`,
+`snapshot_keep` and `auto_resume` in `vm.toml` are effective and are seeded from
+the global values when the VM is created. Change them in `vm.toml`; use
+`hegn vm apply <vm>` to restart a running VM with the new settings.
 
 A v1 project `hegn.toml` may contain `harness`, `packages` or `template`. Those
 keys are ignored for control in v2. Harness and packages belong to `vm.toml`.

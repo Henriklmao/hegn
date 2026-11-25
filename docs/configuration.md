@@ -115,6 +115,17 @@ hegn prints a warning to stderr for each deprecated key found in `config.toml`.
 (marked `!`). Read the values correctly, but rewrite the file with the new
 names. `vms_dir` must be an absolute path and must not contain a comma.
 
+The old v1 default `guest_mount = "/workspace"` is migrated to `/projects` with
+this exact warning:
+
+```text
+warning: legacy guest_mount = "/workspace" is reserved for the primary /workspace symlink; using guest_projects_base = "/projects" instead. Set guest_projects_base explicitly to silence this warning.
+```
+
+The migration only applies to the legacy key with the old `/workspace` value.
+An explicit `guest_projects_base = "/workspace"` is rejected: `/workspace` and
+paths under it are reserved for the primary symlink.
+
 `share_tag_prefix` must leave room for `-<index>` within the 36-byte virtio-fs
 tag limit and must not be the reserved profile tag `hegn-profile`.
 
@@ -160,6 +171,8 @@ created_at = "2026-11-24T10:00:00Z"
 
 These are VM settings: `security` and the snapshot policy fields are stored per
 VM in `vm.toml` and copied from the global defaults when the VM is created.
+They are effective at runtime: changing them in `vm.toml` takes effect on the
+next start, and `hegn vm apply <vm>` restarts a running VM to apply them.
 `vm.toml` deliberately does **not** list projects. Boot resolves the VM name to
 members by scanning the private registry, so membership has one source of truth.
 
