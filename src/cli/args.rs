@@ -417,13 +417,33 @@ pub enum InstanceCommands {
 pub enum SnapshotCommands {
     /// List snapshots (newest first).
     #[command(visible_alias = "ls")]
-    List,
+    List {
+        /// Only list snapshots owned by this VM.
+        #[arg(long, value_name = "VM")]
+        vm: Option<String>,
+        /// Deprecated spelling of `--vm`.
+        #[arg(
+            long = "instance",
+            hide = true,
+            value_name = "VM",
+            conflicts_with = "vm"
+        )]
+        instance: Option<String>,
+    },
     /// Pause the VM, snapshot RAM+CPU, resume.
     Create {
         /// Name for the snapshot (defaults to a timestamp).
         name: Option<String>,
-        /// Instance to snapshot (defaults to the only running instance).
-        #[arg(long)]
+        /// VM or project selector to snapshot.
+        #[arg(long, value_name = "VM")]
+        vm: Option<String>,
+        /// Deprecated spelling of `--vm`.
+        #[arg(
+            long = "instance",
+            hide = true,
+            value_name = "VM",
+            conflicts_with = "vm"
+        )]
         instance: Option<String>,
     },
     /// Load a snapshot (boots a fresh Cloud Hypervisor process).
@@ -742,7 +762,10 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Snapshot {
-                command: SnapshotCommands::List
+                command: SnapshotCommands::List {
+                    vm: None,
+                    instance: None
+                }
             })
         ));
 
@@ -878,9 +901,10 @@ mod tests {
         let cli = Cli::try_parse_from(["hegn", "snapshot", "create"]).unwrap();
         match cli.command {
             Some(Commands::Snapshot {
-                command: SnapshotCommands::Create { name, instance },
+                command: SnapshotCommands::Create { name, vm, instance },
             }) => {
                 assert!(name.is_none());
+                assert!(vm.is_none());
                 assert!(instance.is_none());
             }
             other => panic!("unexpected {other:?}"),
@@ -1188,6 +1212,98 @@ mod tests {
                 );
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_list_and_create_accept_vm_and_hidden_instance_alias() {
+        let cli = Cli::try_parse_from(["hegn", "snapshot", "list", "--vm", "rust"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Snapshot {
+                command: SnapshotCommands::List {
+                    vm: Some(ref vm),
+                    instance: None
+                }
+            }) if vm == "rust"
+        ));
+
+        let cli =
+            Cli::try_parse_from(["hegn", "snapshot", "create", "demo", "--vm", "rust"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Snapshot {
+                command: SnapshotCommands::Create {
+                    name: Some(ref name),
+                    vm: Some(ref vm),
+                    instance: None
+                }
+            }) if name == "demo" && vm == "rust"
+        ));
+
+        // The deprecated spelling still parses on both subcommands.
+        let cli = Cli::try_parse_from(["hegn", "snapshot", "list", "--instance", "rust"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Snapshot {
+                command: SnapshotCommands::List {
+                    vm: None,
+                    instance: Some(ref instance)
+                }
+            }) if instance == "rust"
+        ));
+
+        let cli =
+            Cli::try_parse_from(["hegn", "snapshot", "create", "--instance", "rust"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Snapshot {
+                command: SnapshotCommands::Create {
+                    name: None,
+                    vm: None,
+                    instance: Some(ref instance)
+                }
+            }) if instance == "rust"
+        ));
+
+        // `--vm` and `--instance` name the same VM, so passing both is an error.
+        assert!(
+            Cli::try_parse_from([
+                "hegn",
+                "snapshot",
+                "list",
+                "--vm",
+                "rust",
+                "--instance",
+                "demo",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn snapshot_list_and_create_instance_alias_is_hidden_in_help() {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let snapshot = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "snapshot")
+            .unwrap();
+        for name in ["list", "create"] {
+            let subcommand = snapshot
+                .get_subcommands()
+                .find(|subcommand| subcommand.get_name() == name)
+                .unwrap();
+            let vm = subcommand
+                .get_arguments()
+                .find(|arg| arg.get_id() == "vm")
+                .unwrap();
+            assert!(!vm.is_hide_set(), "{name} --vm must be visible");
+            let instance = subcommand
+                .get_arguments()
+                .find(|arg| arg.get_id() == "instance")
+                .unwrap();
+            assert!(instance.is_hide_set(), "{name} --instance must stay hidden");
         }
     }
 
