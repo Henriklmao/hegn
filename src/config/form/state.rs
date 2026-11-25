@@ -79,7 +79,7 @@ impl ConfigForm {
 
     /// Open the editor for an existing instance.
     pub fn instance(instance: InstanceConfig, base: Config) -> Self {
-        let path = base.instances_dir.join(&instance.name).join(CONFIG_FILE);
+        let path = base.vms_dir.join(&instance.name).join(CONFIG_FILE);
         let title = format!("instance '{}' settings", instance.name);
         Self::build(
             ConfigKind::Instance,
@@ -203,8 +203,8 @@ impl ConfigForm {
                 ConfigField::GuestHardening => on_off(config.guest_credential_hardening),
                 ConfigField::KernelImage => config.kernel_image.display().to_string(),
                 ConfigField::RootfsImage => config.rootfs_image.display().to_string(),
-                ConfigField::SharedTag => config.shared_tag.clone(),
-                ConfigField::GuestMount => config.guest_mount.clone(),
+                ConfigField::SharedTag => config.share_tag_prefix.clone(),
+                ConfigField::GuestMount => config.guest_projects_base.clone(),
                 ConfigField::Network => config.network.label().to_string(),
                 ConfigField::Security => config.security.label().to_string(),
                 ConfigField::Backend => config.backend.label().to_string(),
@@ -215,7 +215,7 @@ impl ConfigForm {
                 ConfigField::ProjectsRoot => config.projects_root.display().to_string(),
                 ConfigField::StateDir => config.state_dir.display().to_string(),
                 ConfigField::SnapshotsDir => config.snapshots_dir.display().to_string(),
-                ConfigField::InstancesDir => config.instances_dir.display().to_string(),
+                ConfigField::VmsDir => config.vms_dir.display().to_string(),
                 ConfigField::TemplatesDir => config.templates_dir.display().to_string(),
                 ConfigField::ProfilesDir => config.profiles_dir.display().to_string(),
                 ConfigField::ExtraPackages => list_value(&config.extra_packages),

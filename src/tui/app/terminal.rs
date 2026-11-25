@@ -240,7 +240,7 @@ impl App {
         self.instance.started_at = Some(Instant::now());
         self.instance.socket = Some(
             self.config
-                .instances_dir
+                .vms_dir
                 .join(console.instance_name())
                 .join("run/cloud-hypervisor.sock"),
         );
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn f2_requests_the_real_attach_client() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let inside = app.config.vms_dir.join("demo").join("workspace");
         let instance = fake_instance(&app, "demo", inside);
         install_instances(&mut app, vec![instance]);
         app.screen = Screen::Project;
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn attaching_is_rejected_while_another_vm_is_booting() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let inside = app.config.vms_dir.join("demo").join("workspace");
         let instance = fake_instance(&app, "demo", inside);
         install_instances(&mut app, vec![instance]);
         app.instance.state = InstanceState::Starting;

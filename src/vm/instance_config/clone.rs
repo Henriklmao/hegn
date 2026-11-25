@@ -157,8 +157,6 @@ impl InstanceStore {
             harness: self.defaults.harness,
             vcpus: self.defaults.vcpus,
             memory_mib: self.defaults.memory_mib,
-            shared_tag: self.defaults.shared_tag.clone(),
-            guest_mount: self.defaults.guest_mount.clone(),
             auto_branch: self.defaults.auto_branch,
             security: self.defaults.security,
             extra_packages: self.defaults.extra_packages.clone(),
@@ -464,6 +462,18 @@ mod tests {
 
     fn cfg_default_vcpus() -> u8 {
         crate::config::Config::default().vcpus
+    }
+
+    #[test]
+    fn legacy_instances_keep_the_v1_share_tag_and_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(config(dir.path()));
+        let project = project(dir.path(), "demo");
+        let instance = store
+            .create_from_project(&project, None, None, false)
+            .unwrap();
+        assert_eq!(instance.shared_tag, "workspace");
+        assert_eq!(instance.guest_mount, "/workspace");
     }
 
     #[test]

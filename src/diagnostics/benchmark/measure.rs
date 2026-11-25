@@ -501,7 +501,7 @@ fn session_candidates(config: &Config) -> Vec<PathBuf> {
     if legacy.is_file() {
         paths.push(legacy);
     }
-    if let Ok(entries) = fs::read_dir(&config.instances_dir) {
+    if let Ok(entries) = fs::read_dir(&config.vms_dir) {
         for entry in entries.flatten() {
             let candidate = entry.path().join("run").join("session.json");
             if candidate.is_file() {
@@ -558,7 +558,7 @@ fn disk_costs(config: &Config) -> Vec<DiskCost> {
         dirs.push(("images".to_string(), dir.to_path_buf(), None));
     }
     dirs.push(("snapshots".to_string(), config.snapshots_dir.clone(), None));
-    dirs.push(("instances".to_string(), config.instances_dir.clone(), None));
+    dirs.push(("instances".to_string(), config.vms_dir.clone(), None));
     dirs.push(("logs".to_string(), logs.clone(), None));
     // Session logs live inside the state directory; do not count them twice.
     dirs.push(("state".to_string(), config.state_dir.clone(), Some(logs)));
@@ -592,12 +592,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            instances_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("instances"),
             ..Config::default()
         };
 
-        fs::create_dir_all(config.instances_dir.join("a/run")).unwrap();
-        fs::write(config.instances_dir.join("a/run/session.json"), b"{}").unwrap();
+        fs::create_dir_all(config.vms_dir.join("a/run")).unwrap();
+        fs::write(config.vms_dir.join("a/run/session.json"), b"{}").unwrap();
 
         let candidates = session_candidates(&config);
         assert_eq!(candidates.len(), 1);
@@ -610,7 +610,7 @@ mod tests {
         let config = Config {
             state_dir: dir.path().join("state"),
             snapshots_dir: dir.path().join("data/snapshots"),
-            instances_dir: dir.path().join("data/instances"),
+            vms_dir: dir.path().join("data/instances"),
             kernel_image: dir.path().join("data/images/kernel"),
             vcpus: 4,
             memory_mib: 1024,
@@ -722,13 +722,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            instances_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("instances"),
             ..Config::default()
         };
         for instance in ["b", "a"] {
-            fs::create_dir_all(config.instances_dir.join(instance).join("run")).unwrap();
+            fs::create_dir_all(config.vms_dir.join(instance).join("run")).unwrap();
             fs::write(
-                config.instances_dir.join(instance).join("run/session.json"),
+                config.vms_dir.join(instance).join("run/session.json"),
                 b"{}",
             )
             .unwrap();
@@ -753,15 +753,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            instances_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("instances"),
             ..Config::default()
         };
-        fs::create_dir_all(config.instances_dir.join("a/run")).unwrap();
-        fs::write(
-            config.instances_dir.join("a/run/session.json"),
-            b"{not json",
-        )
-        .unwrap();
+        fs::create_dir_all(config.vms_dir.join("a/run")).unwrap();
+        fs::write(config.vms_dir.join("a/run/session.json"), b"{not json").unwrap();
 
         let mut notes = Vec::new();
         let costs = session_costs(&config, &mut notes, |_, _| true);
@@ -793,7 +789,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            instances_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("instances"),
             snapshots_dir: dir.path().join("snapshots"),
             kernel_image: dir.path().join("images/kernel"),
             ..Config::default()
@@ -844,7 +840,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            instances_dir: dir.path().join("data/instances"),
+            vms_dir: dir.path().join("data/instances"),
             ..Config::default()
         };
         fs::create_dir_all(config.state_dir.join("run")).unwrap();

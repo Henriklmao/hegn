@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn enter_never_confirms_a_deletion() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let inside = app.config.vms_dir.join("demo").join("workspace");
         app.focus = Focus::Instances;
         let instance = fake_instance(&app, "demo", inside);
         install_instances(&mut app, vec![instance]);
@@ -1150,7 +1150,7 @@ mod tests {
     #[test]
     fn instance_focus_and_delete_double_confirmation() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let inside = app.config.vms_dir.join("demo").join("workspace");
         app.focus = Focus::Instances;
         let instance = fake_instance(&app, "demo", inside);
         install_instances(&mut app, vec![instance]);
@@ -1189,7 +1189,7 @@ mod tests {
     #[test]
     fn projects_focus_delete_opens_the_project_delete_modal() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let inside = app.config.vms_dir.join("demo").join("workspace");
         let instance = fake_instance(&app, "demo", inside);
         install_instances(&mut app, vec![instance]);
         app.projects = vec![Project {
@@ -1328,7 +1328,7 @@ mod tests {
     #[test]
     fn keeping_files_emits_a_keep_effect() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let inside = app.config.vms_dir.join("demo").join("workspace");
         app.focus = Focus::Instances;
         let instance = fake_instance(&app, "demo", inside);
         install_instances(&mut app, vec![instance]);
@@ -1347,7 +1347,7 @@ mod tests {
     #[test]
     fn stop_shortcut_only_works_with_instance_focus() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let inside = app.config.vms_dir.join("demo").join("workspace");
         let instance = fake_instance(&app, "demo", inside);
         install_instances(&mut app, vec![instance]);
         app.focus = Focus::Projects;
@@ -1432,7 +1432,7 @@ mod tests {
     #[test]
     fn delete_instance_cancel_keys_emit_nothing() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let inside = app.config.vms_dir.join("demo").join("workspace");
         app.focus = Focus::Instances;
         let instance = fake_instance(&app, "demo", inside);
         install_instances(&mut app, vec![instance]);
@@ -1451,7 +1451,7 @@ mod tests {
     #[test]
     fn delete_instance_escape_at_the_files_question_keeps_the_instance() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let inside = app.config.vms_dir.join("demo").join("workspace");
         app.focus = Focus::Instances;
         let instance = fake_instance(&app, "demo", inside);
         install_instances(&mut app, vec![instance]);
@@ -1493,7 +1493,7 @@ mod tests {
     fn delete_instance_files_stage_k_and_n_keep_the_files() {
         for cancel in ['k', 'n'] {
             let (_dir, mut app) = test_app();
-            let inside = app.config.instances_dir.join("demo").join("workspace");
+            let inside = app.config.vms_dir.join("demo").join("workspace");
             app.focus = Focus::Instances;
             let instance = fake_instance(&app, "demo", inside);
             install_instances(&mut app, vec![instance]);

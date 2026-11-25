@@ -301,7 +301,7 @@ mod tests {
     fn summaries_are_empty_when_no_instances_exist() {
         let dir = tempfile::tempdir().unwrap();
         let registry = InstanceRegistry::new(config_with_assets(dir.path()));
-        assert!(!registry.config().instances_dir.exists());
+        assert!(!registry.config().vms_dir.exists());
         assert!(registry.list().unwrap().is_empty());
         assert!(registry.summaries().unwrap().is_empty());
     }

@@ -1,6 +1,6 @@
 //! Runtime paths for one instance's sockets, pid files and metadata.
 //!
-//! All paths live under `<instances_dir>/<name>/run/`, which is created with
+//! All paths live under `<vms_dir>/<name>/run/`, which is created with
 //! private (`0700`) permissions.
 
 use std::fs;
@@ -46,7 +46,7 @@ pub struct InstancePaths {
 
 impl InstancePaths {
     pub fn from_instance(config: &Config, instance: &InstanceConfig) -> Self {
-        let run_dir = instance.dir(&config.instances_dir).join("run");
+        let run_dir = instance.dir(&config.vms_dir).join("run");
         Self {
             api_socket: run_dir.join("cloud-hypervisor.sock"),
             serial_socket: run_dir.join("serial.sock"),
@@ -115,7 +115,7 @@ mod tests {
         let config = config_with_assets(dir.path());
         let instance = instance_for(&dir.path().join("project"));
         let paths = InstancePaths::from_instance(&config, &instance);
-        assert_eq!(paths.run_dir, config.instances_dir.join("demo").join("run"));
+        assert_eq!(paths.run_dir, config.vms_dir.join("demo").join("run"));
         assert_eq!(
             paths.api_socket.file_name().unwrap(),
             "cloud-hypervisor.sock"
@@ -218,6 +218,6 @@ mod tests {
                 path.display()
             );
         }
-        assert!(paths.run_dir.starts_with(config.instances_dir.join("demo")));
+        assert!(paths.run_dir.starts_with(config.vms_dir.join("demo")));
     }
 }

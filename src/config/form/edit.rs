@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::parse::{
     expand_path, parse_local_endpoints, parse_number, parse_packages, set_global_path,
-    validate_guest_mount, validate_shared_tag,
+    validate_guest_mount, validate_share_tag_prefix, validate_shared_tag,
 };
 use super::rows::{ConfigField, FieldKind};
 use super::state::{ConfigForm, Draft, EditState, FormOutcome};
@@ -131,12 +131,12 @@ impl ConfigForm {
                 config.root_device = text.to_string();
             }
             (Draft::Global(config), ConfigField::SharedTag) => {
-                validate_shared_tag(text)?;
-                config.shared_tag = text.to_string();
+                validate_share_tag_prefix(text, config.max_projects_per_vm)?;
+                config.share_tag_prefix = text.to_string();
             }
             (Draft::Global(config), ConfigField::GuestMount) => {
                 validate_guest_mount(text)?;
-                config.guest_mount = text.to_string();
+                config.guest_projects_base = text.to_string();
             }
             (Draft::Global(config), ConfigField::ExtraPackages) => {
                 config.extra_packages = parse_packages(text)?;
@@ -189,7 +189,7 @@ mod tests {
         form.handle_key(key(KeyCode::Enter));
         assert!(form.is_editing());
         assert!(form.error.is_some());
-        assert_eq!(form.value(ConfigField::SharedTag), "workspace");
+        assert_eq!(form.value(ConfigField::SharedTag), "hegn-prj");
 
         form.cancel_edit();
         assert!(!form.is_editing());
@@ -213,8 +213,8 @@ mod tests {
         );
         assert!(form.save().is_some());
         assert_eq!(
-            Config::load_from(&path).unwrap().shared_tag,
-            "workspacagent"
+            Config::load_from(&path).unwrap().share_tag_prefix,
+            "hegn-pragent"
         );
     }
 }

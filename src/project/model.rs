@@ -81,11 +81,19 @@ impl Project {
 }
 
 /// Optional per-project hegn settings stored in `hegn.toml`.
+///
+/// The control plane (membership, read-only status, resources) lives in the
+/// private project registry. Of these keys, only `launch`, `integration` and
+/// `auto_start` remain presentation preferences; `harness`, `packages` and
+/// `template` are deprecated v1 leftovers that v2 ignores with a warning.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectMeta {
+    /// Deprecated, presentation-only leftover from v1.
     pub harness: Option<crate::config::Harness>,
+    /// Deprecated, presentation-only leftover from v1.
     pub packages: Vec<String>,
+    /// Deprecated, presentation-only leftover from v1.
     pub template: Option<String>,
     /// Launch command override for this project (`harness`, `shell`, or a
     /// command name from the global `[launch]` table).

@@ -347,7 +347,7 @@ mod tests {
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
         config.templates_dir = dir.path().join("templates");
-        config.instances_dir = dir.path().join("instances");
+        config.vms_dir = dir.path().join("instances");
         config.profiles_dir = dir.path().join("profiles");
         config.kernel_image = dir.path().join("missing-kernel");
         config.rootfs_image = dir.path().join("missing-rootfs");

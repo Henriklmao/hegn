@@ -91,7 +91,7 @@ mod tests {
     fn cleanup_files_removes_only_runtime_state() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
-        let instance_dir = config.instances_dir.join("demo");
+        let instance_dir = config.vms_dir.join("demo");
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("README.md"), b"hello\n").unwrap();

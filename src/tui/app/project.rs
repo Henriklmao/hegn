@@ -170,7 +170,7 @@ impl App {
     }
 
     pub(super) fn workspace_is_inside_instance(&self, instance: &InstanceSummary) -> bool {
-        let dir = self.config.instances_dir.join(&instance.name);
+        let dir = self.config.vms_dir.join(&instance.name);
         let dir = dir.canonicalize().unwrap_or(dir);
         let workspace = instance
             .workspace

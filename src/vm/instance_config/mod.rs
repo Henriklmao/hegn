@@ -1,9 +1,9 @@
 //! Per-instance configuration and workspace cloning.
 //!
-//! Every instance lives in its own directory under `instances_dir`:
+//! Every instance lives in its own directory under `vms_dir`:
 //!
 //! ```text
-//! <instances_dir>/<name>/
+//! <vms_dir>/<name>/
 //!   hegn.toml     per-instance settings (private, 0600)
 //!   workspace/    clone for multi-agent instances
 //!   run/          runtime sockets/pids/lock (created on start)
@@ -36,7 +36,7 @@ pub(crate) mod test_support {
     #[allow(clippy::field_reassign_with_default)]
     pub(crate) fn config(dir: &Path) -> Config {
         let mut config = Config::default();
-        config.instances_dir = dir.join("instances");
+        config.vms_dir = dir.join("instances");
         config.projects_root = dir.join("projects");
         config.harness = Harness::Shell;
         config

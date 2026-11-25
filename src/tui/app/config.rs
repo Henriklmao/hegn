@@ -407,7 +407,7 @@ mod tests {
             other => panic!("expected global settings, got {other:?}"),
         }
         app.modal = None;
-        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let inside = app.config.vms_dir.join("demo").join("workspace");
         app.focus = Focus::Instances;
         let instance = fake_instance(&app, "demo", inside.clone());
         let stored = crate::vm::instance_config::InstanceConfig {
@@ -444,7 +444,7 @@ mod tests {
         ));
 
         // Replace the valid tag with an invalid one, then try to switch tabs.
-        for _ in 0.."workspace".len() {
+        for _ in 0.."hegn-prj".len() {
             app.handle_key(key(KeyCode::Backspace));
         }
         for c in "bad tag".chars() {
@@ -466,7 +466,7 @@ mod tests {
                 assert_eq!(form.page(), ConfigPage::General, "the page must not change");
                 assert!(form.is_editing(), "the invalid text stays editable");
                 assert!(form.error.is_some());
-                assert_eq!(form.value(ConfigField::SharedTag), "workspace");
+                assert_eq!(form.value(ConfigField::SharedTag), "hegn-prj");
             }
             other => panic!("expected settings modal, got {other:?}"),
         }
@@ -505,7 +505,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let inside = app.config.vms_dir.join("demo").join("workspace");
         crate::vm::instance_config::InstanceStore::new(app.config.clone())
             .save(&crate::vm::instance_config::InstanceConfig {
                 name: "demo".into(),

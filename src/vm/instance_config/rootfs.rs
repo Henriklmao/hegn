@@ -18,7 +18,7 @@ impl InstanceConfig {
     /// Root filesystem used by this instance, without creating it.
     pub fn rootfs_path(&self, config: &Config) -> PathBuf {
         self.rootfs_image.clone().unwrap_or_else(|| {
-            self.dir(&config.instances_dir)
+            self.dir(&config.vms_dir)
                 .join(format!("rootfs.{}", config.rootfs_format.as_str()))
         })
     }
@@ -139,12 +139,12 @@ mod tests {
         };
         assert_eq!(
             instance.rootfs_path(&cfg),
-            cfg.instances_dir.join("demo/rootfs.raw")
+            cfg.vms_dir.join("demo/rootfs.raw")
         );
         cfg.rootfs_format = crate::config::RootfsFormat::Qcow2;
         assert_eq!(
             instance.rootfs_path(&cfg),
-            cfg.instances_dir.join("demo/rootfs.qcow2")
+            cfg.vms_dir.join("demo/rootfs.qcow2")
         );
         // An explicit per-instance image always wins.
         let mut instance = instance;

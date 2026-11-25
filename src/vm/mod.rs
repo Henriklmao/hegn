@@ -8,10 +8,12 @@
 //! - [`rootfs`] — sparse per-instance root filesystem growth
 //! - [`images`] — pinned upstream assets, download and checksum verification
 //! - [`cloud_init`] — NoCloud seed generation
+//! - [`config`] — per-VM `vm.toml` and its store
 //! - [`instance_config`] — per-instance `hegn.toml`, clones and rootfs copies
 //! - [`instance`] — VM lifecycle, registry and session records
 
 pub mod cloud_init;
+pub mod config;
 pub mod hypervisor;
 pub mod images;
 pub mod instance;

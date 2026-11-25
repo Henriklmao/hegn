@@ -124,8 +124,7 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
         true,
         config.projects_root.display().to_string(),
     ));
-    let usage =
-        filesystem_usage(&config.instances_dir).or_else(|| filesystem_usage(&config.state_dir));
+    let usage = filesystem_usage(&config.vms_dir).or_else(|| filesystem_usage(&config.state_dir));
     let (disk_ok, disk_detail) = match usage {
         Some((used, total)) if total > 0 => {
             let percent = used.saturating_mul(100) / total;

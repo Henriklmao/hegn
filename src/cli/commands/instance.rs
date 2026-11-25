@@ -552,7 +552,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(code, 0);
-        assert!(config.instances_dir.join("base/hegn.toml").is_file());
+        assert!(config.vms_dir.join("base/hegn.toml").is_file());
 
         let code = instance_command(
             InstanceCommands::Clone {
@@ -567,13 +567,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(code, 0);
-        assert!(config.instances_dir.join("agent1/hegn.toml").is_file());
-        assert!(
-            config
-                .instances_dir
-                .join("agent1/workspace/README.md")
-                .is_file()
-        );
+        assert!(config.vms_dir.join("agent1/hegn.toml").is_file());
+        assert!(config.vms_dir.join("agent1/workspace/README.md").is_file());
 
         assert_eq!(
             instance_command(InstanceCommands::List, config.clone(), true).unwrap(),
@@ -606,7 +601,7 @@ mod tests {
             .unwrap(),
             0
         );
-        assert!(!config.instances_dir.join("agent1").exists());
+        assert!(!config.vms_dir.join("agent1").exists());
         assert!(project.join("README.md").is_file());
     }
 

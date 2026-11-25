@@ -110,7 +110,7 @@ pub(super) struct ProfileLayout {
 
 impl ProfileLayout {
     pub(super) fn new(config: &Config, instance: &InstanceConfig) -> Result<Self> {
-        let root = instance.dir(&config.instances_dir).join("profile");
+        let root = instance.dir(&config.vms_dir).join("profile");
         let bundle_dir = root.join(BUNDLE_DIR);
         secure_dir(&root)?;
         secure_dir(&bundle_dir)?;
@@ -224,7 +224,7 @@ mod tests {
     fn config(dir: &Path) -> Config {
         let mut config = Config::default();
         config.profiles_dir = dir.join("profiles");
-        config.instances_dir = dir.join("instances");
+        config.vms_dir = dir.join("instances");
         config.projects_root = dir.join("projects");
         fs::create_dir_all(&config.profiles_dir).unwrap();
         config

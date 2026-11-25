@@ -287,7 +287,7 @@ mod tests {
         config.projects_root = dir.join("projects");
         config.state_dir = dir.join("state");
         config.snapshots_dir = dir.join("snapshots");
-        config.instances_dir = dir.join("instances");
+        config.vms_dir = dir.join("instances");
         config.templates_dir = dir.join("templates");
         config.profiles_dir = dir.join("profiles");
         config
@@ -331,7 +331,7 @@ mod tests {
         instances
             .create_from_project(&other, Some("other-vm"), None, false)
             .unwrap();
-        let instance_dir = config.instances_dir.join("demo-vm");
+        let instance_dir = config.vms_dir.join("demo-vm");
         assert!(instance_dir.is_dir());
 
         let outcome = delete_project(&config, &project, true).unwrap();
@@ -339,7 +339,7 @@ mod tests {
         assert!(outcome.files_deleted);
         assert!(!instance_dir.exists());
         assert!(!project.exists());
-        assert!(config.instances_dir.join("other-vm").is_dir());
+        assert!(config.vms_dir.join("other-vm").is_dir());
         assert!(other.is_dir());
     }
 
@@ -376,7 +376,7 @@ mod tests {
         instances
             .create_from_project(&outside, Some("outside-vm"), None, false)
             .unwrap();
-        let instance_dir = config.instances_dir.join("outside-vm");
+        let instance_dir = config.vms_dir.join("outside-vm");
         assert!(instance_dir.is_dir());
 
         let err = delete_project(&config, &outside, true)

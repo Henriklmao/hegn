@@ -10,6 +10,7 @@
 pub mod form;
 
 mod defaults;
+mod deprecated;
 mod env;
 mod paths;
 mod tools;
@@ -17,6 +18,7 @@ mod types;
 mod validate;
 
 pub use self::defaults::DEFAULT_AGENTS_MD;
+pub use self::deprecated::deprecated_keys;
 pub use self::tools::{CLOUD_HYPERVISOR_FALLBACKS, CLOUD_HYPERVISOR_STATIC, VIRTIOFSD_FALLBACKS};
 pub use self::types::{
     BackendKind, Harness, LocalEndpoint, NetworkMode, RootfsFormat, SecurityMode, VirtiofsSandbox,
@@ -46,10 +48,10 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Snapshot metadata and memory files. Defaults to `~/.local/share/hegn/snapshots`.
     pub snapshots_dir: PathBuf,
-    /// Per-instance configuration, runtime and cloned workspaces.
-    /// Defaults to `~/.local/share/hegn/instances`.
-    #[serde(alias = "sandboxes_dir")]
-    pub instances_dir: PathBuf,
+    /// Per-VM configuration, runtime and cloned workspaces.
+    /// Defaults to `~/.local/share/hegn/vms`.
+    #[serde(alias = "instances_dir", alias = "sandboxes_dir")]
+    pub vms_dir: PathBuf,
     /// Directory containing project templates (`agents.md`, language skeletons).
     pub templates_dir: PathBuf,
     /// Directory containing per-harness profile templates
@@ -89,9 +91,17 @@ pub struct Config {
     /// Warn in `hegn doctor` when the filesystem holding the instances is
     /// fuller than this percentage.
     pub disk_usage_warn_percent: u8,
-    /// virtiofs tag; mounted at `guest_mount` inside the guest.
-    pub shared_tag: String,
-    pub guest_mount: String,
+    /// Prefix for the per-project virtio-fs tags. Each exported project gets
+    /// `<share_tag_prefix>-<index>`, so the prefix must leave room for the
+    /// suffix within the 36-byte virtio-fs tag limit.
+    #[serde(alias = "shared_tag")]
+    pub share_tag_prefix: String,
+    /// Guest directory below which project shares are mounted.
+    #[serde(alias = "guest_mount")]
+    pub guest_projects_base: String,
+    /// Hard ceiling for exported projects per VM. Each member is one
+    /// virtio-fs device and one `virtiofsd` process.
+    pub max_projects_per_vm: u32,
     pub virtiofs_sandbox: VirtiofsSandbox,
     pub backend: BackendKind,
     /// Harness launched when a project is opened.
@@ -126,13 +136,22 @@ impl Config {
     /// Selected environment variables override the file so `hegn` can be
     /// exercised in CI without touching the user's real directories:
     /// `HEGN_PROJECTS_ROOT`, `HEGN_STATE_DIR`, `HEGN_SNAPSHOTS_DIR`,
-    /// `HEGN_INSTANCES_DIR`,
+    /// `HEGN_VMS_DIR` (with the deprecated `HEGN_INSTANCES_DIR` fallback),
     /// `HEGN_TEMPLATES_DIR`, `HEGN_CLOUD_HYPERVISOR_BIN`, `HEGN_VIRTIOFSD_BIN`,
     /// `HEGN_KERNEL_IMAGE` and `HEGN_ROOTFS_IMAGE`.
+    ///
+    /// Deprecated keys (`instances_dir`, `shared_tag`, `guest_mount`) still
+    /// parse, but each one used in the file prints a warning to stderr.
     pub fn load() -> Result<Self> {
         let path = Self::config_path();
         let mut config = if path.exists() {
-            Self::load_from(&path)?
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read config {}", path.display()))?;
+            for key in deprecated_keys(&raw) {
+                let replacement = self::deprecated::replacement(key);
+                eprintln!("warning: config key `{key}` is deprecated; use `{replacement}` instead");
+            }
+            Self::parse_at(&path, &raw)?
         } else {
             Self::default()
         };
@@ -145,9 +164,11 @@ impl Config {
     pub fn load_from(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        let config: Self = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config {}", path.display()))?;
-        Ok(config)
+        Self::parse_at(path, &raw)
+    }
+
+    fn parse_at(path: &Path, raw: &str) -> Result<Self> {
+        toml::from_str(raw).with_context(|| format!("failed to parse config {}", path.display()))
     }
 
     /// Create runtime and config directories. Safe to call repeatedly.
@@ -155,7 +176,7 @@ impl Config {
         for dir in [
             &self.state_dir,
             &self.snapshots_dir,
-            &self.instances_dir,
+            &self.vms_dir,
             &self.profiles_dir,
         ] {
             if let Ok(metadata) = fs::symlink_metadata(dir)
@@ -356,7 +377,7 @@ root_device = "/dev/vda"
         let mut config = Config::default();
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
-        config.instances_dir = dir.path().join("instances");
+        config.vms_dir = dir.path().join("vms");
         config.templates_dir = dir.path().join("templates");
         config.profiles_dir = dir.path().join("profiles");
         config.projects_root = dir.path().join("projects");
@@ -437,6 +458,7 @@ root_device = "/dev/vda"
         let mut config = Config::default();
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
+        config.vms_dir = dir.path().join("vms");
         config.templates_dir = dir.path().join("templates");
         config.profiles_dir = dir.path().join("profiles");
         config.projects_root = dir.path().join("projects");
@@ -462,6 +484,7 @@ root_device = "/dev/vda"
         let mut config = Config::default();
         config.state_dir = link;
         config.snapshots_dir = dir.path().join("snapshots");
+        config.vms_dir = dir.path().join("vms");
         config.templates_dir = dir.path().join("templates");
         config.profiles_dir = dir.path().join("profiles");
         config.projects_root = dir.path().join("projects");
@@ -497,6 +520,42 @@ root_device = "/dev/vda"
         config.vcpus = 0;
         assert!(config.save_to(&path).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"vcpus = 4\n");
+    }
+
+    #[test]
+    fn legacy_keys_still_parse_through_aliases() {
+        let (_dir, path) = temp_config(
+            r#"
+instances_dir = "/data/legacy-instances"
+shared_tag = "legacy-tag"
+guest_mount = "/legacy-workspace"
+"#,
+        );
+        let raw = fs::read_to_string(&path).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.vms_dir, PathBuf::from("/data/legacy-instances"));
+        assert_eq!(config.share_tag_prefix, "legacy-tag");
+        assert_eq!(config.guest_projects_base, "/legacy-workspace");
+        assert_eq!(
+            deprecated_keys(&raw),
+            vec!["instances_dir", "shared_tag", "guest_mount"]
+        );
+    }
+
+    #[test]
+    fn new_keys_parse_without_deprecation_warnings() {
+        let (_dir, path) = temp_config(
+            r#"
+vms_dir = "/data/vms"
+share_tag_prefix = "hegn-prj"
+guest_projects_base = "/projects"
+max_projects_per_vm = 4
+"#,
+        );
+        let raw = fs::read_to_string(&path).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.max_projects_per_vm, 4);
+        assert!(deprecated_keys(&raw).is_empty());
     }
 
     #[test]

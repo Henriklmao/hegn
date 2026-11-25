@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::vm::instance_config::InstanceConfig;
 
 pub(super) fn profile_bundle_dir(config: &Config, instance: &InstanceConfig) -> Option<PathBuf> {
-    let bundle = instance.dir(&config.instances_dir).join("profile/bundle");
+    let bundle = instance.dir(&config.vms_dir).join("profile/bundle");
     bundle.join("manifest").is_file().then_some(bundle)
 }
 

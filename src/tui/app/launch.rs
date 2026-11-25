@@ -274,7 +274,7 @@ mod tests {
                 .is_some_and(|toast| toast.text.contains("no instance selected"))
         );
 
-        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let inside = app.config.vms_dir.join("demo").join("workspace");
         let mut instance = fake_instance(&app, "demo", inside.clone());
         instance.harness = Harness::Opencode;
         install_instances(&mut app, vec![instance]);

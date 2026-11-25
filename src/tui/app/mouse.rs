@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn double_clicking_an_instance_asks_to_attach() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
+        let inside = app.config.vms_dir.join("demo").join("workspace");
         let instance = fake_instance(&app, "demo", inside);
         install_instances(&mut app, vec![instance]);
         app.screen = Screen::Project;

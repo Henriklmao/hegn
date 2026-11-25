@@ -27,7 +27,7 @@ update both the schema and this page.
 projects_root   = "~/Projects/hegn"
 state_dir       = "~/.local/state/hegn"
 snapshots_dir   = "~/.local/share/hegn/snapshots"
-instances_dir   = "~/.local/share/hegn/instances"
+vms_dir         = "~/.local/share/hegn/vms"
 templates_dir   = "~/.config/hegn/templates"
 profiles_dir    = "~/.config/hegn/profiles"
 cloud_hypervisor_bin = "cloud-hypervisor"
@@ -48,8 +48,9 @@ vcpus           = 2          # 1–32
 memory_mib      = 2048       # 128–262144 (256 GiB)
 max_rootfs_gib  = 64         # 16–1024; rootfs growth ceiling
 disk_usage_warn_percent = 80 # doctor warns above this usage
-shared_tag      = "workspace" # virtio-fs tag, <= 36 bytes, no whitespace
-guest_mount     = "/workspace" # absolute guest path
+share_tag_prefix = "hegn-prj" # tags are <prefix>-<index>, <= 36 bytes total
+guest_projects_base = "/projects" # guest directory for project mounts
+max_projects_per_vm = 16      # 1–32 exported projects per VM
 virtiofs_sandbox = "namespace" # "namespace" (recommended) or "chroot"
 backend         = "auto"      # "auto" or "cloud-hypervisor"; both need a VM
 cloud_init      = true        # NoCloud seed for the official cloud image
@@ -88,6 +89,11 @@ bar             = false      # full-screen commands should own every row
 # port = 11434
 ```
 
+The old keys `instances_dir`, `shared_tag` and `guest_mount` still parse as
+deprecated aliases (`vms_dir`, `share_tag_prefix`, `guest_projects_base`) and
+print a warning. v1 instance configuration keeps using the `workspace` tag and
+the `/workspace` mount; the new prefix and base apply to v2 multi-project VMs.
+
 Some key groups have their own pages:
 
 - Images and checksums: [VM images](vm-images.md)
@@ -106,14 +112,19 @@ Every instance has a `hegn.toml` in its directory (see
 [Instance layout](projects-and-instances.md#instance-layout-on-disk)). Set
 `read_only_workspace = true` there to mount the project read-only.
 
-Every project has a `hegn.toml` in its folder. It is written by
-`hegn project create` and records the harness, the packages and the template:
+Every project may have a `hegn.toml` in its folder for presentation
+preferences. It cannot change membership or resources:
 
 ```toml
 launch = "review"
 integration = "herdr"
 auto_start = true
 ```
+
+The old `harness`, `packages` and `template` keys still parse for v1, but are
+deprecated presentation-only leftovers. Membership, read-only status and
+resources are controlled by hegn's private project registry, never by a file
+inside the project.
 
 ---
 
@@ -177,7 +188,8 @@ These variables override the matching config values:
 | `HEGN_SNAPSHOTS_DIR` | `snapshots_dir` |
 | `HEGN_TEMPLATES_DIR` | `templates_dir` |
 | `HEGN_PROFILES_DIR` | `profiles_dir` |
-| `HEGN_INSTANCES_DIR` | `instances_dir` |
+| `HEGN_VMS_DIR` | `vms_dir` |
+| `HEGN_INSTANCES_DIR` | `vms_dir` (deprecated fallback) |
 | `HEGN_CLOUD_HYPERVISOR_BIN` | `cloud_hypervisor_bin` |
 | `HEGN_VIRTIOFSD_BIN` | `virtiofsd_bin` |
 | `HEGN_KERNEL_IMAGE`, `HEGN_ROOTFS_IMAGE` | `kernel_image`, `rootfs_image` |

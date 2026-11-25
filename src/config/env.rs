@@ -22,8 +22,11 @@ impl Config {
         if let Some(value) = path_var("HEGN_SNAPSHOTS_DIR") {
             self.snapshots_dir = value;
         }
-        if let Some(value) = path_var("HEGN_INSTANCES_DIR") {
-            self.instances_dir = value;
+        if let Some(value) = path_var("HEGN_VMS_DIR") {
+            self.vms_dir = value;
+        } else if let Some(value) = path_var("HEGN_INSTANCES_DIR") {
+            // Deprecated fallback: HEGN_VMS_DIR wins when both are set.
+            self.vms_dir = value;
         }
         if let Some(value) = path_var("HEGN_TEMPLATES_DIR") {
             self.templates_dir = value;
@@ -89,6 +92,7 @@ pub(super) const HEGN_ENV_VARS: &[&str] = &[
     "HEGN_PROJECTS_ROOT",
     "HEGN_STATE_DIR",
     "HEGN_SNAPSHOTS_DIR",
+    "HEGN_VMS_DIR",
     "HEGN_INSTANCES_DIR",
     "HEGN_TEMPLATES_DIR",
     "HEGN_PROFILES_DIR",
@@ -173,7 +177,7 @@ mod tests {
                 ("HEGN_PROJECTS_ROOT", "/tmp/hegn-env/projects"),
                 ("HEGN_STATE_DIR", "/tmp/hegn-env/state"),
                 ("HEGN_SNAPSHOTS_DIR", "/tmp/hegn-env/snapshots"),
-                ("HEGN_INSTANCES_DIR", "/tmp/hegn-env/instances"),
+                ("HEGN_VMS_DIR", "/tmp/hegn-env/vms"),
                 ("HEGN_TEMPLATES_DIR", "/tmp/hegn-env/templates"),
                 ("HEGN_PROFILES_DIR", "/tmp/hegn-env/profiles"),
                 (
@@ -205,10 +209,7 @@ mod tests {
             config.snapshots_dir,
             PathBuf::from("/tmp/hegn-env/snapshots")
         );
-        assert_eq!(
-            config.instances_dir,
-            PathBuf::from("/tmp/hegn-env/instances")
-        );
+        assert_eq!(config.vms_dir, PathBuf::from("/tmp/hegn-env/vms"));
         assert_eq!(
             config.templates_dir,
             PathBuf::from("/tmp/hegn-env/templates")
@@ -237,6 +238,36 @@ mod tests {
         assert_eq!(config.rootfs_url, "https://example.test/rootfs");
         assert_eq!(config.rootfs_sha256, "rootfs-digest");
         assert_eq!(config.network, NetworkMode::Off);
+    }
+
+    #[test]
+    fn legacy_instances_dir_is_a_fallback_for_vms_dir() {
+        let _lock = env_lock();
+        let _guard = EnvVarGuard::set(
+            HEGN_ENV_VARS,
+            &[("HEGN_INSTANCES_DIR", "/tmp/hegn-env/legacy-instances")],
+        );
+        let mut config = Config::default();
+        config.apply_env_overrides();
+        assert_eq!(
+            config.vms_dir,
+            PathBuf::from("/tmp/hegn-env/legacy-instances")
+        );
+    }
+
+    #[test]
+    fn vms_dir_wins_over_the_legacy_instances_dir() {
+        let _lock = env_lock();
+        let _guard = EnvVarGuard::set(
+            HEGN_ENV_VARS,
+            &[
+                ("HEGN_VMS_DIR", "/tmp/hegn-env/vms"),
+                ("HEGN_INSTANCES_DIR", "/tmp/hegn-env/legacy-instances"),
+            ],
+        );
+        let mut config = Config::default();
+        config.apply_env_overrides();
+        assert_eq!(config.vms_dir, PathBuf::from("/tmp/hegn-env/vms"));
     }
 
     #[test]

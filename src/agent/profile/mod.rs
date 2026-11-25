@@ -12,7 +12,7 @@
 //! `hegn skills sync-back`.
 //!
 //! ```text
-//! <instances_dir>/<instance>/profile/
+//! <vms_dir>/<instance>/profile/
 //!   local.json          host-side mapping (never exported)
 //!   bundle/             exported to the guest at /run/hegn/profile
 //!     manifest          tab-separated copy plan

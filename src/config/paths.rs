@@ -39,14 +39,19 @@ impl Config {
         let mut protected = vec![
             self.state_dir.clone(),
             self.snapshots_dir.clone(),
-            self.instances_dir.clone(),
+            self.vms_dir.clone(),
             self.templates_dir.clone(),
             self.profiles_dir.clone(),
         ];
-        if let Some(parent) = self.instances_dir.parent() {
-            let legacy = parent.join("sandboxes");
-            if legacy != self.instances_dir && legacy.exists() {
-                protected.push(legacy);
+        // v1 stored instances next to the snapshots directory. They are no
+        // longer active state, but importing them would still expose stale
+        // sockets, logs or memory images to a guest.
+        if let Some(parent) = self.vms_dir.parent() {
+            for legacy_name in ["instances", "sandboxes"] {
+                let legacy = parent.join(legacy_name);
+                if legacy != self.vms_dir && legacy.exists() {
+                    protected.push(legacy);
+                }
             }
         }
         if let Some(parent) = Self::config_path().parent() {
@@ -76,7 +81,7 @@ mod tests {
         config.projects_root = dir.join("projects");
         config.state_dir = dir.join("state");
         config.snapshots_dir = dir.join("snapshots");
-        config.instances_dir = dir.join("instances");
+        config.vms_dir = dir.join("vms");
         config.templates_dir = dir.join("templates");
         config.profiles_dir = dir.join("profiles");
         config
@@ -133,7 +138,7 @@ mod tests {
         for path in [
             &config.state_dir,
             &config.snapshots_dir,
-            &config.instances_dir,
+            &config.vms_dir,
             &config.templates_dir,
             &config.profiles_dir,
         ] {
@@ -151,12 +156,21 @@ mod tests {
             !protected.contains(&dir.path().join("sandboxes")),
             "a missing legacy directory is not reported"
         );
+        assert!(
+            !protected.contains(&dir.path().join("instances")),
+            "a missing legacy instances directory is not reported"
+        );
 
         std::fs::create_dir(dir.path().join("sandboxes")).unwrap();
+        std::fs::create_dir(dir.path().join("instances")).unwrap();
         let protected = config.protected_paths();
         assert!(
             protected.contains(&dir.path().join("sandboxes")),
             "an existing legacy directory is protected"
+        );
+        assert!(
+            protected.contains(&dir.path().join("instances")),
+            "an existing legacy instances directory is protected"
         );
     }
 

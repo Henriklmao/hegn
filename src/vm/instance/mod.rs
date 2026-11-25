@@ -69,7 +69,7 @@ pub(crate) mod test_support {
         config.state_dir = dir.join("state");
         config.projects_root = dir.join("projects");
         config.snapshots_dir = dir.join("snapshots");
-        config.instances_dir = dir.join("instances");
+        config.vms_dir = dir.join("instances");
         config.profiles_dir = dir.join("profiles");
         config.templates_dir = dir.join("templates");
         config.kernel_image = dir.join("vmlinux");

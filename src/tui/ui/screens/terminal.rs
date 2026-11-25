@@ -227,7 +227,7 @@ mod tests {
             state: state.into(),
             vm_pid: None,
             serial_log: None,
-            config_path: app.config.instances_dir.join(name).join("hegn.toml"),
+            config_path: app.config.vms_dir.join(name).join("hegn.toml"),
             vcpus: 2,
             memory_mib: 2048,
             error: None,

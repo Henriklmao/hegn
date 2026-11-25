@@ -1,6 +1,6 @@
 //! Filesystem-only store for instance configuration files.
 //!
-//! The store owns the `instances_dir` root. Every operation re-validates the
+//! The store owns the `vms_dir` root. Every operation re-validates the
 //! instance name before it becomes a path component, and configuration files
 //! are written privately (`0600`, no symlink following).
 
@@ -27,7 +27,7 @@ pub struct InstanceStore {
 impl InstanceStore {
     pub fn new(config: Config) -> Self {
         Self {
-            root: config.instances_dir.clone(),
+            root: config.vms_dir.clone(),
             defaults: config,
         }
     }

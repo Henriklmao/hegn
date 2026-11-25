@@ -52,6 +52,16 @@ pub(super) fn validate_shared_tag(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// A tag prefix needs room for `-<index>` inside the 36-byte virtio-fs limit.
+pub(super) fn validate_share_tag_prefix(text: &str, max_projects: u32) -> Result<()> {
+    validate_shared_tag(text)?;
+    let widest_index = max_projects.saturating_sub(1);
+    if text.len() + 1 + widest_index.to_string().len() > 36 {
+        bail!("share tag prefix must leave room for '-{widest_index}' within 36 bytes");
+    }
+    Ok(())
+}
+
 pub(super) fn validate_guest_mount(text: &str) -> Result<()> {
     if !crate::vm::cloud_init::safe_mount(text) {
         bail!("guest mount must be an absolute path with simple components");
@@ -103,7 +113,7 @@ pub(super) fn set_global_path(
         ConfigField::ProjectsRoot => config.projects_root = path,
         ConfigField::StateDir => config.state_dir = path,
         ConfigField::SnapshotsDir => config.snapshots_dir = path,
-        ConfigField::InstancesDir => config.instances_dir = path,
+        ConfigField::VmsDir => config.vms_dir = path,
         ConfigField::TemplatesDir => config.templates_dir = path,
         ConfigField::ProfilesDir => config.profiles_dir = path,
         _ => bail!("{} is not a path", field.label()),
@@ -278,7 +288,7 @@ mod tests {
             ConfigField::ProjectsRoot,
             ConfigField::StateDir,
             ConfigField::SnapshotsDir,
-            ConfigField::InstancesDir,
+            ConfigField::VmsDir,
             ConfigField::TemplatesDir,
             ConfigField::ProfilesDir,
         ] {
@@ -291,7 +301,7 @@ mod tests {
         assert_eq!(config.projects_root, path);
         assert_eq!(config.state_dir, path);
         assert_eq!(config.snapshots_dir, path);
-        assert_eq!(config.instances_dir, path);
+        assert_eq!(config.vms_dir, path);
         assert_eq!(config.templates_dir, path);
         assert_eq!(config.profiles_dir, path);
 

@@ -62,7 +62,7 @@ pub enum ConfigField {
     ProjectsRoot,
     StateDir,
     SnapshotsDir,
-    InstancesDir,
+    VmsDir,
     TemplatesDir,
     ProfilesDir,
     ExtraPackages,
@@ -113,8 +113,8 @@ impl ConfigField {
             Self::GuestHardening => "Guest hardening",
             Self::KernelImage => "Kernel image",
             Self::RootfsImage => "Rootfs image",
-            Self::SharedTag => "Shared tag",
-            Self::GuestMount => "Guest mount",
+            Self::SharedTag => "Share tag prefix",
+            Self::GuestMount => "Guest projects base",
             Self::ReadOnlyWorkspace => "Read-only workspace",
             Self::Network => "Network",
             Self::Security => "Security",
@@ -124,7 +124,7 @@ impl ConfigField {
             Self::ProjectsRoot => "Projects root",
             Self::StateDir => "State dir",
             Self::SnapshotsDir => "Snapshots dir",
-            Self::InstancesDir => "Instances dir",
+            Self::VmsDir => "VMs dir",
             Self::TemplatesDir => "Templates dir",
             Self::ProfilesDir => "Profiles dir",
             Self::ExtraPackages => "Extra packages",
@@ -196,7 +196,7 @@ impl ConfigField {
                 | Self::ProjectsRoot
                 | Self::StateDir
                 | Self::SnapshotsDir
-                | Self::InstancesDir
+                | Self::VmsDir
                 | Self::TemplatesDir
                 | Self::ProfilesDir
         )
@@ -248,7 +248,7 @@ const GENERAL_ROWS: &[ConfigRow] = &[
     ConfigRow::Field(ConfigField::ProjectsRoot),
     ConfigRow::Field(ConfigField::StateDir),
     ConfigRow::Field(ConfigField::SnapshotsDir),
-    ConfigRow::Field(ConfigField::InstancesDir),
+    ConfigRow::Field(ConfigField::VmsDir),
     ConfigRow::Field(ConfigField::TemplatesDir),
     ConfigRow::Field(ConfigField::ProfilesDir),
     ConfigRow::Group("Packages"),

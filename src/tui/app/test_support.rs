@@ -31,7 +31,7 @@ pub(super) fn test_app() -> (tempfile::TempDir, App) {
     config.state_dir = dir.path().join("state");
     config.snapshots_dir = dir.path().join("snapshots");
     config.templates_dir = dir.path().join("templates");
-    config.instances_dir = dir.path().join("instances");
+    config.vms_dir = dir.path().join("instances");
     config.profiles_dir = dir.path().join("profiles");
     config.backend = crate::config::BackendKind::Auto;
     config.auto_branch = false;
@@ -187,7 +187,7 @@ pub(super) fn fake_instance(app: &App, name: &str, workspace: PathBuf) -> Instan
         state: "stopped".into(),
         vm_pid: None,
         serial_log: None,
-        config_path: app.config.instances_dir.join(name).join("hegn.toml"),
+        config_path: app.config.vms_dir.join(name).join("hegn.toml"),
         vcpus: 2,
         memory_mib: 2048,
         error: None,
