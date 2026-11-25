@@ -302,10 +302,10 @@ fn collect_with(
         .unwrap_or(config.memory_mib);
     let (snapshots, snapshot_estimate_bytes) = snapshot_estimate(config, memory_mib);
 
-    let disk = disk_costs(config);
-    let disk_allocated_bytes = disk.iter().map(|cost| cost.allocated_bytes).sum();
     let vm_disk = vm_disk_costs(config);
     let vm_disk_allocated_bytes = vm_disk.iter().map(|vm| vm.allocated_bytes).sum();
+    let disk = disk_costs(config, &vm_disk);
+    let disk_allocated_bytes = disk.iter().map(|cost| cost.allocated_bytes).sum();
     let legacy_instances = legacy_instance_disk(config, data_root);
 
     if sessions.is_empty() {
@@ -605,7 +605,7 @@ fn snapshot_estimate(config: &Config, memory_mib: u32) -> (u64, u64) {
     (count, count * u64::from(memory_mib) * MIB)
 }
 
-fn disk_costs(config: &Config) -> Vec<DiskCost> {
+fn disk_costs(config: &Config, vm_disk: &[VmDisk]) -> Vec<DiskCost> {
     let logs = config.logs_dir();
     let mut dirs: Vec<(String, PathBuf, Option<PathBuf>)> = Vec::new();
     if let Some(dir) = config.kernel_image.parent() {
@@ -620,7 +620,15 @@ fn disk_costs(config: &Config) -> Vec<DiskCost> {
     dirs.into_iter()
         .map(|(name, path, exclude)| {
             let exists = path.is_dir();
-            let usage = if exists {
+            // The VMs row includes only valid v2 VM directories. Legacy v1
+            // children inside vms_dir are reported in their own row instead.
+            let usage = if name == "VMs" {
+                Usage {
+                    allocated: vm_disk.iter().map(|vm| vm.allocated_bytes).sum(),
+                    apparent: vm_disk.iter().map(|vm| vm.apparent_bytes).sum(),
+                    files: vm_disk.iter().map(|vm| vm.files).sum(),
+                }
+            } else if exists {
                 usage_excluding(&path, exclude.as_deref())
             } else {
                 Usage::default()
@@ -987,7 +995,7 @@ mod tests {
         fs::write(config.logs_dir().join("session-1.log"), vec![0u8; 100]).unwrap();
         fs::write(config.state_dir.join("state.json"), vec![0u8; 10]).unwrap();
 
-        let disk = disk_costs(&config);
+        let disk = disk_costs(&config, &vm_disk_costs(&config));
         let logs = disk.iter().find(|cost| cost.name == "logs").unwrap();
         let state = disk.iter().find(|cost| cost.name == "state").unwrap();
         assert_eq!(logs.files, 1);
@@ -1157,6 +1165,19 @@ mod tests {
                 .sum::<u64>()
         );
         assert_eq!(report.vm_disk.len(), 1);
+        let vm_disk_total = report
+            .disk
+            .iter()
+            .find(|cost| cost.name == "VMs")
+            .expect("overall VMs row");
+        assert_eq!(
+            vm_disk_total.allocated_bytes, report.vm_disk_allocated_bytes,
+            "the overall VMs row excludes legacy children"
+        );
+        assert_eq!(
+            vm_disk_total.files,
+            report.vm_disk.iter().map(|vm| vm.files).sum::<u64>()
+        );
         assert!(
             report
                 .legacy_instances
