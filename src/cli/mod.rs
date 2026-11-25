@@ -12,7 +12,7 @@ mod resolve;
 mod run;
 
 pub use self::args::{
-    Cli, Commands, ConfigCommands, ForkModeArg, ImageCommands, InstanceCommands, LogCommands,
+    Cli, Commands, ConfigCommands, ForkModeArg, ImageCommands, LegacyInstanceCommands, LogCommands,
     NetworkCommands, ProfileCommands, ProjectCommands, SkillCommands, SnapshotCommands, VmCommands,
 };
 pub use self::commands::doctor::check_command_for_test;

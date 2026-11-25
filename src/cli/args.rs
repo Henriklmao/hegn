@@ -115,7 +115,7 @@ pub enum Commands {
     #[command(alias = "sandbox", hide = true)]
     Instance {
         #[command(subcommand)]
-        command: Option<InstanceCommands>,
+        command: Option<LegacyInstanceCommands>,
     },
     /// List, create, restore and delete VM snapshots.
     Snapshot {
@@ -337,8 +337,12 @@ pub enum VmCommands {
     },
 }
 
+/// Subcommands accepted by the hidden legacy `hegn instance` command.
+///
+/// Every variant only selects the v2 mapping that is printed before exiting
+/// non-zero; no legacy lifecycle behaviour remains.
 #[derive(Debug, Subcommand)]
-pub enum InstanceCommands {
+pub enum LegacyInstanceCommands {
     /// List all instances and their state.
     #[command(visible_alias = "ls")]
     List,
@@ -663,7 +667,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Instance {
-                command: Some(InstanceCommands::List)
+                command: Some(LegacyInstanceCommands::List)
             })
         ));
     }
@@ -788,7 +792,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Instance {
-                command: Some(InstanceCommands::List)
+                command: Some(LegacyInstanceCommands::List)
             })
         ));
 
@@ -896,7 +900,7 @@ mod tests {
         match cli.command {
             Some(Commands::Instance {
                 command:
-                    Some(InstanceCommands::Clone {
+                    Some(LegacyInstanceCommands::Clone {
                         source,
                         name,
                         count,

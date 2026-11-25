@@ -131,12 +131,12 @@ pub(crate) fn print_projects(rows: &[ProjectRow], json: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn print_instances(instances: &[VmSummary], json: bool) -> Result<()> {
+pub(crate) fn print_vms(vms: &[VmSummary], json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(instances)?);
+        println!("{}", serde_json::to_string_pretty(vms)?);
         return Ok(());
     }
-    if instances.is_empty() {
+    if vms.is_empty() {
         println!("No VMs. Create one with: hegn vm create <name>");
         return Ok(());
     }
@@ -144,7 +144,7 @@ pub(crate) fn print_instances(instances: &[VmSummary], json: bool) -> Result<()>
         "{:<24} {:<12} {:<8} {:<12} PRIMARY",
         "VM", "STATE", "MEMBERS", "HARNESS"
     );
-    for vm in instances {
+    for vm in vms {
         println!(
             "{:<24} {:<12} {:<8} {:<12} {}",
             vm.name,

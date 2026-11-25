@@ -23,7 +23,7 @@ use crate::vm::manager::{BootPlan, VmPaths};
 use crate::vm::registry::{VmRegistry, remove_private_rootfs};
 
 use crate::cli::args::VmCommands;
-use crate::cli::output::{print_instances, print_report};
+use crate::cli::output::{print_report, print_vms};
 
 /// One member of a VM as shown by `vm show`/`vm projects`.
 #[derive(Debug, Clone, Serialize)]
@@ -53,7 +53,7 @@ pub(crate) fn vm_command(command: VmCommands, config: Config, json: bool) -> Res
     let registry = VmRegistry::new(config.clone());
     match command {
         VmCommands::List => {
-            print_instances(&registry.summaries()?, json)?;
+            print_vms(&registry.summaries()?, json)?;
             Ok(0)
         }
         VmCommands::Create {

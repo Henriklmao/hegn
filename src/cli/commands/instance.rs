@@ -21,12 +21,12 @@ use super::vm::{
     guest_cwd_command, guest_path_for, only_running_vm, primary_guest_path, resolve_project_entry,
     vm_for_entry, wait_for_provision,
 };
-use crate::cli::args::InstanceCommands;
+use crate::cli::args::LegacyInstanceCommands;
 
 /// Withdrawn v1 command group. Any invocation exits non-zero after printing
 /// the v2 equivalents so a stale script can be fixed mechanically.
 pub(crate) fn instance_command(
-    _command: Option<InstanceCommands>,
+    _command: Option<LegacyInstanceCommands>,
     _config: Config,
     _json: bool,
 ) -> Result<i32> {
@@ -249,7 +249,7 @@ pub(crate) fn launch_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::args::InstanceCommands;
+    use crate::cli::args::LegacyInstanceCommands;
     use crate::cli::test_support::config;
 
     #[test]
@@ -257,14 +257,14 @@ mod tests {
         let (_dir, config) = config();
         for command in [
             None,
-            Some(InstanceCommands::List),
-            Some(InstanceCommands::Create {
+            Some(LegacyInstanceCommands::List),
+            Some(LegacyInstanceCommands::Create {
                 project: "demo".into(),
                 name: None,
                 harness: None,
                 clone: false,
             }),
-            Some(InstanceCommands::Clone {
+            Some(LegacyInstanceCommands::Clone {
                 source: "demo".into(),
                 name: None,
                 count: 1,
