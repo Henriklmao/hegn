@@ -247,7 +247,19 @@ impl App {
             .as_ref()
             .map(|s| s.project().to_path_buf())
             .or_else(|| self.selected_project().map(|p| p.path.clone()));
-        let inspection = self.security_engine.inspect(&command, cwd.as_deref());
+        let policy = match self.workspace_policy_for(cwd.as_deref()) {
+            Ok(policy) => policy,
+            Err(err) => {
+                self.toast(
+                    format!("workspace guard unavailable: {err:#}"),
+                    ToastLevel::Error,
+                );
+                return Vec::new();
+            }
+        };
+        let inspection =
+            self.security_engine
+                .inspect_with_policy(&command, cwd.as_deref(), &policy);
         match inspection.decision {
             Decision::Allow => {
                 self.write_line(&command);
@@ -406,6 +418,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         let log = ConsoleLog::default();
         app.attach_console(log.console("/projects/demo"));
+        app.attached_vm = None;
 
         app.handle_key(key(KeyCode::Char('i')));
         for c in "echo hi".chars() {
