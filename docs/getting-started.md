@@ -114,7 +114,7 @@ hegn vm shell dev --project my-app       # shell in one project's guest director
 hegn project fork my-app --name my-app-fix-tests
                                          # isolated clone, same VM, one more member
 hegn project info my-app                 # membership, kind and guest path
-hegn snapshot create before-refactor     # save the full VM state
+hegn snapshot create before-refactor --vm dev  # save the full VM state
 hegn logs list --vm dev                  # serial logs for this VM's projects
 hegn project import /path/to/repo --vm dev
 hegn images status                       # check the VM images

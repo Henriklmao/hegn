@@ -25,16 +25,20 @@ member of that VM.
 
 ```bash
 hegn snapshot list
-hegn snapshot create before-refactor --instance dev
-hegn snapshot restore before-refactor --instance dev
+hegn snapshot create before-refactor --vm dev
+hegn snapshot restore before-refactor --vm dev
 hegn snapshot delete before-refactor
 hegn snapshot show before-refactor
 ```
 
-Without an owner flag, `hegn snapshot create` uses the only running VM.
+`hegn snapshot create` requires `--vm <vm>` (or a project assigned to a VM);
+without it the command fails with `snapshot create needs a VM: pass --vm <vm>`.
 `hegn snapshot restore` defaults to the VM recorded in the snapshot metadata.
 `hegn snapshot list` shows the owning VM and whether the snapshot is `v2` or
 `legacy`.
+
+The old `--instance` spelling is accepted as a hidden deprecated alias and
+prints a warning. Use `--vm`.
 
 `hegn snapshot create` pauses the VM. Cloud Hypervisor writes `config.json`,
 `state.json` and `memory-ranges` into a private directory. Then the VM resumes.

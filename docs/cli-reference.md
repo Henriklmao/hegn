@@ -69,8 +69,8 @@ Run `hegn <command> --help` for the full options of each command.
                                    and exits non-zero (hidden from --help)
 
   snapshot list                    List snapshots with VM and format (alias: ls)
-  snapshot create [NAME] [--instance VM]
-  snapshot restore NAME [--instance VM] | delete NAME | show NAME
+  snapshot create [NAME] --vm VM
+  snapshot restore NAME [--vm VM] | delete NAME | show NAME
   check [--cwd PATH] CMD...        Inspect a command with tirith-core
   config show | path | init
   profile list | show HARNESS | path HARNESS [--edit] | init
@@ -99,6 +99,9 @@ Notes:
   directory and its managed clone workspaces.
 - `profile sync` and `skills sync` accept a VM name, a project name or a project
   path and operate on that VM's private profile copy.
+- `snapshot create` requires `--vm <vm>` (or a project assigned to a VM).
+  `--instance` remains a hidden deprecated alias for `--vm` and prints a
+  warning.
 
 ---
 
