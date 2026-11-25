@@ -27,22 +27,22 @@ use crate::config::RootfsFormat;
 
 /// Comfortable floor for a VM root filesystem. Sparse files mean this
 /// costs almost no host disk space until the guest actually writes to it.
-pub const MIN_INSTANCE_ROOTFS_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const MIN_VM_ROOTFS_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-/// Give `path` at least [`MIN_INSTANCE_ROOTFS_BYTES`] of virtual space, without
+/// Give `path` at least [`MIN_VM_ROOTFS_BYTES`] of virtual space, without
 /// exceeding `max_bytes`.
 ///
 /// Returns `true` when the file was extended.
 pub fn grow_to_minimum(path: &Path, format: RootfsFormat, max_bytes: u64) -> Result<bool> {
-    if max_bytes < MIN_INSTANCE_ROOTFS_BYTES {
+    if max_bytes < MIN_VM_ROOTFS_BYTES {
         bail!(
             "rootfs ceiling is {} bytes, below the {} byte minimum needed for the harness \
              preset",
             max_bytes,
-            MIN_INSTANCE_ROOTFS_BYTES
+            MIN_VM_ROOTFS_BYTES
         );
     }
-    grow(path, format, MIN_INSTANCE_ROOTFS_BYTES, max_bytes)
+    grow(path, format, MIN_VM_ROOTFS_BYTES, max_bytes)
 }
 
 /// Extend `path` to `target` bytes, refusing to exceed `max_bytes`. A larger
@@ -104,8 +104,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("disk.raw");
         fs::write(&path, b"disk").unwrap();
-        let err =
-            grow_to_minimum(&path, RootfsFormat::Raw, MIN_INSTANCE_ROOTFS_BYTES - 1).unwrap_err();
+        let err = grow_to_minimum(&path, RootfsFormat::Raw, MIN_VM_ROOTFS_BYTES - 1).unwrap_err();
         assert!(format!("{err:#}").contains("below"), "{err:#}");
     }
 }
