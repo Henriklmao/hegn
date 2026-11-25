@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::agent::provision::{ProvisionEvent, ProvisionPlan, ProvisionWatcher};
 use crate::config::{Config, Harness};
-use crate::project::{self, ProjectEntry, ProjectKind, ProjectRegistry};
+use crate::project::{self, ProjectKind, ProjectRegistry, assign_project, unassign_project};
 use crate::project::{ForkMode, WorkspaceService};
 use crate::tui::app::ToastLevel;
 use crate::tui::messages::ScanMessage;
@@ -321,32 +321,19 @@ pub(super) fn spawn_assign_project(
         .name("hegn-assign-project".into())
         .spawn(move || {
             let result = (|| -> anyhow::Result<()> {
-                let mut registry = ProjectRegistry::load(&config.state_dir)?;
-                if registry.get(&project).is_none() {
-                    let canonical = path.canonicalize().map_err(|err| {
-                        anyhow::anyhow!("project path {} is not usable: {err}", path.display())
-                    })?;
-                    registry.upsert(ProjectEntry {
-                        name: project.clone(),
-                        path: canonical,
-                        vm: None,
-                        read_only: false,
-                        kind: ProjectKind::External,
-                        parent: None,
-                        managed: false,
-                        hidden: false,
-                        created_at: chrono::Utc::now(),
-                    })?;
-                }
-                VmStore::new(&config)
-                    .load(&vm)
-                    .map_err(|err| anyhow::anyhow!("unknown VM '{vm}': {err}"))?;
-                registry.assign(&project, &vm, read_only)?;
-                if let Err(err) = registry.validate(&config, &VmStore::new(&config)) {
-                    // Never leave a validated-away assignment behind.
-                    let _ = registry.unassign(&project);
-                    return Err(err);
-                }
+                // Prefer the picker name so an imported symlink keeps its
+                // registered name; fall back to the path for outside-root
+                // projects that are not under the projects root.
+                let registered = ProjectRegistry::load(&config.state_dir)?
+                    .get(&project)
+                    .is_some();
+                let under_root = config.projects_root.join(&project).is_dir();
+                let selector = if registered || under_root {
+                    project.clone()
+                } else {
+                    path.display().to_string()
+                };
+                assign_project(&config, &selector, &vm, read_only)?;
                 Ok(())
             })();
             let (note, level) = match result {
@@ -372,16 +359,31 @@ pub(super) fn spawn_unassign_project(
     let spawned = std::thread::Builder::new()
         .name("hegn-unassign-project".into())
         .spawn(move || {
-            let result = (|| -> anyhow::Result<()> {
-                let mut registry = ProjectRegistry::load(&config.state_dir)?;
-                registry.unassign(&project)?;
-                registry.validate(&config, &VmStore::new(&config))?;
-                Ok(())
-            })();
+            let result = unassign_project(&config, &project);
             let (note, level) = match result {
-                Ok(()) => (
-                    format!("detached {project} from its VM; files untouched"),
+                Ok(Some(outcome)) if outcome.was_primary => {
+                    let next = match &outcome.primary {
+                        Some(next) => format!("; /workspace → {next}"),
+                        None => "; no exported members remain".to_string(),
+                    };
+                    (
+                        format!(
+                            "detached {} from VM {}; files untouched{next}",
+                            outcome.project, outcome.vm
+                        ),
+                        ToastLevel::Info,
+                    )
+                }
+                Ok(Some(outcome)) => (
+                    format!(
+                        "detached {} from VM {}; files untouched",
+                        outcome.project, outcome.vm
+                    ),
                     ToastLevel::Info,
+                ),
+                Ok(None) => (
+                    format!("{project} is not assigned to a VM"),
+                    ToastLevel::Warn,
                 ),
                 Err(err) => (format!("detach failed: {err:#}"), ToastLevel::Error),
             };
@@ -742,6 +744,204 @@ mod tests {
                 .unwrap()
                 .vm
                 .is_none()
+        );
+    }
+
+    fn register(app_config: &Config, name: &str, path: &std::path::Path, vm: Option<&str>) {
+        let mut registry = ProjectRegistry::load(&app_config.state_dir).unwrap();
+        registry
+            .upsert(crate::project::ProjectEntry {
+                name: name.into(),
+                path: path.canonicalize().unwrap(),
+                vm: None,
+                read_only: false,
+                kind: ProjectKind::External,
+                parent: None,
+                managed: false,
+                hidden: false,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        if let Some(vm) = vm {
+            registry.assign(name, vm, false).unwrap();
+        }
+    }
+
+    fn save_vm(config: &Config, name: &str, primary: Option<&str>) {
+        let mut vm = VmConfig::from_config(config, name, Some(Harness::Shell));
+        vm.primary = primary.map(str::to_string);
+        VmStore::new(config).save(&vm).unwrap();
+    }
+
+    #[test]
+    fn failed_assign_keeps_the_previous_vm_and_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config(dir.path());
+        config.max_projects_per_vm = 1;
+        save_vm(&config, "one", Some("alpha"));
+        save_vm(&config, "full", Some("beta"));
+        for name in ["alpha", "beta"] {
+            let path = config.projects_root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+        }
+        register(
+            &config,
+            "alpha",
+            &config.projects_root.join("alpha"),
+            Some("one"),
+        );
+        register(
+            &config,
+            "beta",
+            &config.projects_root.join("beta"),
+            Some("full"),
+        );
+
+        let (tx, rx) = mpsc::channel();
+        spawn_assign_project(
+            config.clone(),
+            "alpha".into(),
+            config.projects_root.join("alpha"),
+            "full".into(),
+            false,
+            tx,
+        );
+        let ScanMessage::VmsChanged { level, note } =
+            rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected VmsChanged");
+        };
+        assert_eq!(level, ToastLevel::Error, "{note}");
+        let registry = ProjectRegistry::load(&config.state_dir).unwrap();
+        assert_eq!(
+            registry.get("alpha").unwrap().vm.as_deref(),
+            Some("one"),
+            "the failed move must keep the previous VM"
+        );
+        assert_eq!(
+            VmStore::new(&config)
+                .load("one")
+                .unwrap()
+                .primary
+                .as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            VmStore::new(&config)
+                .load("full")
+                .unwrap()
+                .primary
+                .as_deref(),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn detaching_the_primary_hands_workspace_to_the_next_exported_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        save_vm(&config, "rust", Some("alpha"));
+        for name in ["alpha", "beta"] {
+            let path = config.projects_root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            register(&config, name, &path, Some("rust"));
+        }
+
+        let (tx, rx) = mpsc::channel();
+        spawn_unassign_project(config.clone(), "alpha".into(), tx);
+        let ScanMessage::VmsChanged { level, note } =
+            rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected VmsChanged");
+        };
+        assert_eq!(level, ToastLevel::Info, "{note}");
+        assert!(note.contains("beta"), "{note}");
+        assert_eq!(
+            VmStore::new(&config)
+                .load("rust")
+                .unwrap()
+                .primary
+                .as_deref(),
+            Some("beta")
+        );
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("alpha")
+                .unwrap()
+                .vm
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn detaching_the_last_member_clears_the_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        save_vm(&config, "rust", Some("alpha"));
+        let path = config.projects_root.join("alpha");
+        std::fs::create_dir_all(&path).unwrap();
+        register(&config, "alpha", &path, Some("rust"));
+
+        let (tx, rx) = mpsc::channel();
+        spawn_unassign_project(config.clone(), "alpha".into(), tx);
+        let ScanMessage::VmsChanged { level, note } =
+            rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected VmsChanged");
+        };
+        assert_eq!(level, ToastLevel::Info, "{note}");
+        assert!(note.contains("no exported members"), "{note}");
+        assert!(
+            VmStore::new(&config)
+                .load("rust")
+                .unwrap()
+                .primary
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn detaching_a_worktree_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        save_vm(&config, "rust", None);
+        let parent = config.projects_root.join("parser");
+        let worktree = parent.join(".hegn/worktrees/experiment");
+        std::fs::create_dir_all(&worktree).unwrap();
+        register(&config, "parser", &parent, Some("rust"));
+        let mut registry = ProjectRegistry::load(&config.state_dir).unwrap();
+        registry
+            .upsert(crate::project::ProjectEntry {
+                name: "experiment".into(),
+                path: worktree.canonicalize().unwrap(),
+                vm: Some("rust".into()),
+                read_only: false,
+                kind: ProjectKind::Worktree,
+                parent: Some("parser".into()),
+                managed: false,
+                hidden: false,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        spawn_unassign_project(config.clone(), "experiment".into(), tx);
+        let ScanMessage::VmsChanged { level, note } =
+            rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected VmsChanged");
+        };
+        assert_eq!(level, ToastLevel::Error, "{note}");
+        assert!(note.contains("worktree"), "{note}");
+        assert_eq!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("experiment")
+                .unwrap()
+                .vm
+                .as_deref(),
+            Some("rust")
         );
     }
 
