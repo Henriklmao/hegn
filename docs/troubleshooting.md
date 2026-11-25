@@ -4,6 +4,7 @@ Start with `hegn doctor`. It checks the host and tells you what is missing. Most
 problems are solved by `hegn doctor --fix`.
 
 - [A VM does not start](#a-vm-does-not-start)
+- [A project is not mounted](#a-project-is-not-mounted)
 - [Landlock is not active](#landlock-is-not-active)
 - [The guest has no network](#the-guest-has-no-network)
 - [Where to find logs](#where-to-find-logs)
@@ -16,7 +17,7 @@ problems are solved by `hegn doctor --fix`.
 2. Read the start log:
 
    ```bash
-   cat ~/.local/share/hegn/instances/<name>/run/hegn.log
+   cat ~/.local/share/hegn/vms/<vm>/run/hegn.log
    ```
 
 3. Check the VMM log and the relay log. See
@@ -24,6 +25,36 @@ problems are solved by `hegn doctor --fix`.
 
 The TUI doctor opens automatically after a start failure. That way the other host
 checks and the image state are visible too.
+
+Common membership errors:
+
+| Message | Fix |
+| --- | --- |
+| `VM '<vm>' has no projects` | `hegn project assign <project> --vm <vm>` |
+| `member directory ... missing` | Restore the directory or `hegn project unassign <project>` |
+| `duplicate project path` / `nested inside` | Assign only one of the overlapping projects |
+| `already exported by running VM` | Stop the other VM first |
+| `above max_projects_per_vm` | Unassign projects or raise the limit (hard ceiling 32) |
+| `primary project ... is not an exported member` | `hegn vm primary <vm> <project>` |
+
+If you changed membership while the VM was running, run `hegn vm apply <vm>`.
+That restarts the VM and kills running agents.
+
+---
+
+## A project is not mounted
+
+A VM boots with the membership recorded at start. Assigning or unassigning a
+project while it runs only changes the registry; attach prints a warning.
+
+```bash
+hegn vm projects <vm>
+hegn vm apply <vm>
+```
+
+Inside the guest, check `/projects` and `/workspace`. A missing mount count in
+the latest `hegn-health` line (`mounts=<ok>/<total>`) means a share failed to
+mount; the boot log names the member.
 
 ---
 
@@ -54,11 +85,17 @@ The full explanation is in [Networking](networking.md#troubleshooting-the-guest-
 
 | What | Command or path |
 | --- | --- |
-| Lifecycle and start errors | `run/hegn.log` in the instance directory |
+| Lifecycle and start errors | `run/hegn.log` in the VM directory |
 | Cloud Hypervisor (VMM) log | `run/cloud-hypervisor.log` |
 | Console relay log | `run/console-relay.log` |
+| Automatic checkpoint errors | `run/autosave.log` |
 | Serial output of all sessions | `hegn logs list`, then `hegn logs show <name>` |
+| Serial output for one VM | `hegn logs list --vm <vm>` |
 | Guest provisioning | the serial console and the journal. Look for `hegn: preset ready`. |
 
-The instance directory defaults to `~/.local/share/hegn/instances/<name>/`. See
+The VM directory defaults to `~/.local/share/hegn/vms/<vm>/`. See
 [Sessions, attach and logs](sessions-and-logs.md#session-logs).
+
+Legacy v1 instance directories under `~/.local/share/hegn/instances` are not
+used by v2. `hegn doctor` reports them. Their files are never deleted
+automatically; remove them yourself after you no longer need the diagnostics.

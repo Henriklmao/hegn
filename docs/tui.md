@@ -27,7 +27,7 @@ It never boots a VM.
 | `↑`/`↓`, `j`/`k` | Move the selection |
 | `Enter` / `o` | Open the project screen (does not boot) |
 | `/` | Fuzzy-filter projects |
-| `b` / `2` | Open the project screen on instances |
+| `b` / `2` | Open the project screen on its VM |
 | `s` / `3` | Open the project screen on snapshots |
 | `c` | Create a project |
 | `h` / `←` | Import an existing directory (symlink, no copy) |
@@ -35,7 +35,7 @@ It never boots a VM.
 | `F4` | Global settings editor (mouse supported, `Ctrl-S` saves) |
 | `e` | Open the selected project in `$EDITOR` |
 | `g` | Open the selected project in lazygit |
-| `r` | Refresh projects and instances |
+| `r` | Refresh projects and VMs |
 | `F3` | Doctor modal (host checks, image download) |
 | `?` / `F1` | Help |
 | `q` | Quit |
@@ -47,7 +47,7 @@ It never boots a VM.
 The title bar shows `hegn ▸ <project>`, the path and the VM state. The page has
 four numbered sections:
 
-1. instances,
+1. VM (state, tool profile, mount path, sibling projects),
 2. snapshots,
 3. health,
 4. git.
@@ -56,22 +56,23 @@ The terminal is a single line until you open it.
 
 | Key | Action |
 | --- | --- |
-| `1` / `2` / `3` / `4` | Instances / snapshots / health / git |
+| `1` / `2` / `3` / `4` | VM / snapshots / health / git |
 | `Tab` | Cycle through the sections |
 | `↑`/`↓`, `j`/`k` | Move inside the focused section |
-| `Enter` (instances) | Attach to the selected instance, or boot the default one |
+| `v` | Open the VM screen (projects, snapshots, tools, health) |
+| `Enter` (VM) | Attach to the VM, or start it |
 | `Enter` (snapshots) | Restore the selected snapshot |
-| `i` / `a` / `t` | Open or focus the terminal (starts an instance if needed) |
+| `i` / `a` / `t` | Open or focus the terminal (starts the VM if needed) |
 | `L` | Launch the configured agent or command in its terminal integration |
 | `Esc` | Insert → normal. Normal → section headers (the pane stays at 55%). |
 | `←` | Back to the dashboard (the VM keeps running) |
 | `F2` | Leave the TUI and start the real `hegn attach` client |
 | `Ctrl-B` / `Ctrl-]` | Back to the dashboard from any mode |
-| `n` | New instance (instances section) or new snapshot (snapshots section) |
-| `M` | Create multi-agent clones for this project |
-| `S` | Stop the selected instance |
-| `d` | Delete the selected instance or snapshot |
-| `F5` | Instance settings editor |
+| `n` | New project (dashboard) or new snapshot (snapshots section) |
+| `M` | Fork the project into a clone or worktree |
+| `S` | Stop the VM |
+| `d` | Delete the selected VM, project or snapshot |
+| `F5` | VM settings editor (`vm.toml`) |
 | `F6` | Project settings (`hegn.toml`): launch command, integration, auto-launch |
 | `e` / `g` | Editor / lazygit for the project |
 | `F4` | Global settings editor |
@@ -81,17 +82,16 @@ Opening the terminal moves it to the right and takes 55% of the width. Pressing 
 section number expands that section and shrinks the terminal to 30%. All four
 sections stay visible, and the ones you did not select collapse into a single
 header row. Focusing the terminal again restores 55%. The collapsed strip shows
-the selected instance and whether it is running.
+the selected VM and whether it is running.
 
-Destructive actions are never confirmed with `Enter`. Deleting an instance,
-snapshot or project, and allowing a flagged command, requires the explicit `y`
-key (or `a` for the security prompt). Pressing `Enter` keeps the confirmation
-open.
+Destructive actions are never confirmed with `Enter`. Deleting a VM, snapshot or
+project, and allowing a flagged command, requires the explicit `y` key (or `a`
+for the security prompt). Pressing `Enter` keeps the confirmation open.
 
 The project delete dialog first shows the branch, the sync state and the number
 of changed files. `y` removes the project from the dashboard and keeps its files.
 `f` also deletes the directory. An imported project only loses its symlink. Its
-original directory is never touched.
+original directory is never touched. The project's VM is never deleted here.
 
 ---
 
@@ -146,7 +146,7 @@ and then to the section headers. The pane stays open.
 | `L` | Launch the configured agent or command |
 | `Esc` | Insert → normal. Normal → section headers. |
 | `←` | Return to the dashboard (the VM keeps running) |
-| `M` | Create multi-agent clones for the open project |
+| `M` | Fork the open project into a clone or worktree |
 | `Enter` | In insert mode: check the command with `tirith-core`, then send it |
 | `F2` | Leave the TUI and start the real `hegn attach` client |
 | `Ctrl-B` / `Ctrl-]` | Return to the dashboard from any mode |

@@ -8,8 +8,13 @@ of snapshots:
 - **automatic checkpoints** that hegn creates in the background and uses to resume
   quickly.
 
+Snapshots belong to a **VM**, not to a project. A snapshot covers every exported
+member of that VM.
+
 - [Manual snapshots](#manual-snapshots)
 - [Automatic resume](#automatic-resume)
+- [Boot fingerprints](#boot-fingerprints)
+- [Legacy snapshots](#legacy-snapshots)
 - [Guest safeguards](#guest-safeguards)
 - [What a snapshot does not cover](#what-a-snapshot-does-not-cover)
 - [Configuration](#configuration)
@@ -20,10 +25,16 @@ of snapshots:
 
 ```bash
 hegn snapshot list
-hegn snapshot create before-refactor
-hegn snapshot restore before-refactor
+hegn snapshot create before-refactor --instance dev
+hegn snapshot restore before-refactor --instance dev
 hegn snapshot delete before-refactor
+hegn snapshot show before-refactor
 ```
+
+Without an owner flag, `hegn snapshot create` uses the only running VM.
+`hegn snapshot restore` defaults to the VM recorded in the snapshot metadata.
+`hegn snapshot list` shows the owning VM and whether the snapshot is `v2` or
+`legacy`.
 
 `hegn snapshot create` pauses the VM. Cloud Hypervisor writes `config.json`,
 `state.json` and `memory-ranges` into a private directory. Then the VM resumes.
@@ -41,15 +52,67 @@ While a VM runs, a detached worker process (`run/autosave.pid`):
 
 1. pauses the VM every `snapshot_interval_secs`,
 2. writes a checkpoint tagged `autosave`,
-3. keeps only the newest `snapshot_keep` checkpoints per instance.
+3. keeps only the newest `snapshot_keep` checkpoints per VM.
 
-When you start an instance again, hegn first restores the newest automatic
-checkpoint. Only if that fails does it fall back to a cold boot. A normal stop or
-a crash therefore costs seconds instead of a full boot.
+When you start the VM again, hegn restores the newest automatic checkpoint whose
+boot fingerprint matches. If none matches, or the restore fails, hegn cold boots
+and writes the reason to `run/hegn.log`. A normal stop or a crash therefore costs
+seconds instead of a full boot.
 
 - Manual snapshots are never loaded automatically and never pruned.
-- If a checkpoint cannot be restored, the reason is written to `run/hegn.log`.
-  The instance then cold-boots.
+- Legacy snapshots are never selected for automatic resume.
+- A paused VM is not resumed just to take an automatic checkpoint.
+
+---
+
+## Boot fingerprints
+
+A v2 snapshot records:
+
+```text
+vm: "dev"
+boot_fingerprint: "sha256:..."
+membership: [ { name, path, tag, guest_path, read_only, kind } ... ]
+```
+
+`membership` lists the members that were actually exported. Worktrees are not
+listed: they ride their parent's share and do not change the device tree, so
+adding a worktree does not invalidate a snapshot.
+
+`boot_fingerprint` hashes everything that changes the VMM device tree:
+
+- ordered membership (name, canonical path, tag, guest mount, read-only, kind),
+- `vcpus`, `memory_mib`, rootfs path and format,
+- `network_index`, profile-share presence,
+- the `primary` project that drives `/workspace`.
+
+Semantics:
+
+- **Automatic resume:** a checkpoint whose fingerprint differs is skipped with a
+  logged reason, and the VM cold boots. hegn never restores a VM whose embedded
+  mounts no longer exist.
+- **Manual restore:** a fingerprint mismatch is refused with a message naming the
+  changed fields and suggesting `hegn vm apply`. There is no `--force` in v1 of
+  this model; a restored VM cannot be reconciled with added or removed shares
+  after the fact.
+- **Restore flow:** hegn re-spawns one `virtiofsd` per recorded member on the
+  same indexed sockets, regenerates the seed from the recorded membership,
+  restores the VMM, and rewrites the session record.
+
+Assigning or unassigning a project, changing the primary, or changing VM
+resources therefore makes older snapshots non-resumable. Take a new snapshot
+after `hegn vm apply` if you need a restorable checkpoint of the new layout.
+
+---
+
+## Legacy snapshots
+
+Snapshots written by hegn v1 have no fingerprint and no membership list. They
+still appear in `hegn snapshot list`, marked `legacy`, with the label
+`legacy v1 snapshot (no boot fingerprint; not restorable)`.
+
+hegn never restores them and never deletes them automatically. Delete one
+explicitly with `hegn snapshot delete <name>` if you no longer need the files.
 
 ---
 
@@ -77,20 +140,23 @@ Automatic checkpoints restore the guest's RAM and CPU state. They do **not**
 restore the writable rootfs. They make resuming fast, but they are not a
 crash-consistent backup of the disk.
 
-Stop the instance cleanly before you upgrade the kernel or do anything that must
-survive a rollback.
+Stop the VM cleanly before you upgrade the kernel or do anything that must
+survive a rollback. A snapshot also does not capture host-side project files:
+those are the same directories the VM exported before and after the restore.
 
 ---
 
 ## Configuration
 
+Global defaults live in `config.toml`; new VMs copy them into `vm.toml`:
+
 ```toml
 periodic_snapshots      = true
 snapshot_interval_secs  = 300  # 30–86400
-snapshot_keep           = 2    # 1–32 per instance
+snapshot_keep           = 2    # 1–32 per VM
 auto_resume             = true
 ```
 
-With the defaults, each running instance keeps two checkpoints. Budget about
-twice the guest RAM per running instance for them. See
-[Resource usage](resources.md) for the numbers.
+With the defaults, each running VM keeps two checkpoints. Budget about twice the
+guest RAM per running VM for them. See [Resource usage](resources.md) for the
+numbers.

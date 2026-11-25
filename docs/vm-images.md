@@ -30,8 +30,8 @@ hegn images verify          # re-hash installed files (exit 1 on mismatch)
 ```
 
 `hegn images download` only fetches images that are missing. Existing images are
-replaced only with `--force`. Instances that already have their own rootfs copy
-keep it. See [Instance layout](projects-and-instances.md#instance-layout-on-disk).
+replaced only with `--force`. VMs that already have their own rootfs copy
+keep it. See [On-disk layout](projects-and-instances.md#on-disk-layout).
 
 ---
 

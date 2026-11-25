@@ -9,20 +9,21 @@ build box.
 
 ## Summary
 
-- **RAM:** a running session uses the configured `memory_mib` (default 2 GiB),
-  plus about 50 MiB for `virtiofsd`, the console relay and VMM bookkeeping.
-  The TUI adds about 26 MiB while it is open. A harness profile that exports files
-  or skills starts a second `virtiofsd`, which adds about 12 MiB.
-- **Scaling:** base instances and clones can run at the same time. The cost
-  scales with each instance.
-- **Disk:** the pinned images take about 2.2 GiB and are shared by all projects.
-  The binary is about 19 MiB. A snapshot is about as large as the guest RAM.
-  Automatic checkpoints keep the newest `snapshot_keep` per instance (2 by
-  default), so budget about 2× guest RAM per running instance. Session logs are
-  pruned by count.
+- **RAM:** a running VM uses the configured `memory_mib` (default 2 GiB), plus
+  about 5 MiB for the console relay and a few MiB of VMM bookkeeping. Every
+  exported project adds one `virtiofsd` of about 12 MiB. The TUI adds about
+  26 MiB while it is open. A harness profile that exports files or skills starts
+  one additional `virtiofsd` for the whole VM.
+- **Scaling:** VMs are independent and run at the same time. Within a VM, cost
+  scales with the number of exported projects, not with a second rootfs.
+- **Disk:** the pinned images take about 2.2 GiB and are shared by all VMs. The
+  binary is about 19 MiB. Each VM gets one private rootfs; projects do not get
+  their own. A snapshot is about as large as the guest RAM. Automatic
+  checkpoints keep the newest `snapshot_keep` per VM (2 by default), so budget
+  about 2× guest RAM per running VM. Session logs are pruned by count.
 - **Speed:** computation runs at near-native speed under KVM. Many small file
-  operations are slower, because the workspace is exported through virtio-fs with
-  `--cache=never`.
+  operations are slower, because every project is exported through virtio-fs
+  with `--cache=never`.
 
 ## What runs where
 
@@ -33,8 +34,8 @@ processes plus the guest:
 | --- | --- | --- |
 | `hegn` (TUI or CLI) | state machine, rendering, VMM API client | ~26 MiB for the TUI (10 000-line serial scrollback); a CLI run is short-lived |
 | `hegn __console-relay` | detached serial relay, keeps the session log growing | ~5 MiB |
-| `virtiofsd` (parent + worker) | shares the project directory into the guest (`--sandbox=namespace --cache=never`) | ~12 MiB total |
-| `virtiofsd` (profile share) | optional second daemon for copied config/skill payloads | ~12 MiB total when the profile has content |
+| `virtiofsd` (parent + worker), one per project | shares one project directory into the guest (`--sandbox=namespace --cache=never`) | ~12 MiB total each |
+| `virtiofsd` (profile share) | optional daemon for the VM's copied config/skill payload | ~12 MiB total when the profile has content |
 | `cloud-hypervisor(-static)` | the VMM and all guest RAM | ~404 MiB resident with a 2 GiB guest, ~2.1 GiB virtual |
 | `hegn attach` | optional second client on the console socket | ~7 MiB |
 
@@ -44,26 +45,25 @@ The VMM maps the configured guest memory up front, so its virtual size is
 less than its configured RAM; a guest that runs a full build converges on
 `memory_mib`.
 
-Practical sizing rule for each running instance:
+Practical sizing rule for each running VM with `N` exported projects:
 
 ```text
-per instance ≈ memory_mib + ~50 MiB (virtiofsd + relay + VMM bookkeeping)
-              + ~12 MiB when a profile share is active
-              + ~26 MiB if the TUI stays open
+per VM ≈ memory_mib + N × ~12 MiB (project virtiofsd)
+         + ~5 MiB (relay) + VMM bookkeeping
+         + ~12 MiB when a profile share is active
+         + ~26 MiB if the TUI stays open
 ```
 
-| `memory_mib` | Host cost per instance (worst case) | Typical idle (estimate) |
+| `memory_mib` | Host cost per VM, 1 project (worst case) | Typical idle (estimate) |
 | --- | --- | --- |
 | 1024 | ~1.1 GiB | ~0.3–0.5 GiB |
 | 2048 (default) | ~2.1 GiB | ~0.4–0.6 GiB |
 | 4096 | ~4.1 GiB | grows with guest use |
 | 8192 | ~8.1 GiB | grows with guest use |
 
-Several instances can run concurrently: the base instance of a project plus any
-clones created for parallel agents (a clone gets its own workspace copy and,
-unless configured otherwise, its own rootfs). The cost multiplies per instance,
-so two default guests need roughly 4.2 GiB of host RAM in the worst case.
-`hegn benchmark` lists every running instance and totals their RAM.
+Adding a project to a VM costs one `virtiofsd` (about 12 MiB), not another
+rootfs or another guest. Several VMs can run concurrently; the cost multiplies
+per VM. `hegn benchmark` lists running VMs and totals their RAM.
 
 ## CPU overhead
 
@@ -73,42 +73,41 @@ so two default guests need roughly 4.2 GiB of host RAM in the worst case.
   per trap.
 - **Idle is cheap.** An idle guest parks its vCPU threads in the kernel; the
   VMM consumes well under a core.
-- **File I/O has a real cost.** The workspace is a `virtiofsd` FUSE export with
-  `--cache=never`, so every guest file operation is a round trip to the host:
+- **File I/O has a real cost.** Each project is a `virtiofsd` FUSE export with
+  `--cache=never`, so guest file operations are round trips to the host:
   large sequential reads/writes come close to native, while workloads with
   many small files (`git status` on a huge tree, `npm install`,
-  `node_modules` churn) are noticeably slower than on the host.
+  `node_modules` churn) are noticeably slower than on the host. A VM with more
+  members runs more daemons, but each member's I/O is independent.
 - **Terminal output** is relayed over a Unix socket. Dumping hundreds of
   megabytes to the serial console is bounded by the relay and the TUI
   scrollback, not by the guest.
 - **Command interception** (`tirith-core`) runs in-process on the submitting
   side before a line reaches the guest. It adds a per-command check, not a
   per-syscall one; `hegn check` is the scripted equivalent.
-- **No network device.** The guest has no NIC by design, so there is no host
-  network overhead — and no in-guest downloads either. Install tooling in the
-  shared rootfs once, or keep dependencies in the workspace.
 
 ## Start, attach, stop, snapshot
 
 | Operation | Cost |
 | --- | --- |
-| `hegn instance start` | spawns virtiofsd, boots the VMM and waits for the Cloud Hypervisor API socket (15 s cap; usually well under a second on a local SSD), then starts the relay (5 s cap) |
+| `hegn vm start` | spawns one virtiofsd per member, boots the VMM and waits for the Cloud Hypervisor API socket (15 s cap; usually well under a second on a local SSD), then starts the relay (5 s cap) |
 | Guest login prompt | a few seconds after boot on the pinned kernel |
 | First-boot cloud-init | runs in the background; measured ~91 s until "cloud-init finished" in the sample guest (it probes for a network that does not exist). The console is usable before that |
 | `hegn attach` | connects to an existing socket; effectively instant |
-| `hegn instance stop` | SIGTERM to the VMM, 2 s grace, then SIGKILL; the relay and virtiofsd are terminated and the run directory is cleaned |
+| `hegn vm stop` | SIGTERM to the VMM, 2 s grace, then SIGKILL; the relay, autosave worker and every member virtiofsd are terminated and the run directory is cleaned |
+| `hegn vm apply` | full stop plus cold start (or a fingerprint-matching resume); kills running agents |
 | `hegn snapshot create` | pauses the VM, writes guest RAM and device state, resumes; proportional to `memory_mib` and disk write speed |
 
-Because `instance stop` signals the VMM rather than asking the guest to shut
-down, dirty pages in the guest page cache may be lost. Finish or sync
-in-flight work before stopping; snapshots do **not** preserve disk contents.
+Because `vm stop` signals the VMM rather than asking the guest to shut down,
+dirty pages in the guest page cache may be lost. Finish or sync in-flight work
+before stopping; snapshots do **not** preserve disk contents.
 
 ## Disk usage
 
 | Item | Size (measured) | Notes |
 | --- | --- | --- |
 | Guest kernel | 46 MiB | `vmlinux-x86_64`, pinned and SHA-256 verified |
-| Guest rootfs | 1.9 GiB base, 16 GiB virtual per instance | the pinned qcow2 is copied (reflink where supported) per instance and grown sparsely for the harness packages; only written blocks consume host space |
+| Guest rootfs | 1.9 GiB base, 16 GiB virtual per VM | the pinned qcow2 is copied (reflink where supported) per VM and grown sparsely for the harness packages; only written blocks consume host space |
 | `images/` total | 2.2 GiB | after the pre-Cloud-Hypervisor migration a checkout may still contain the old `rootfs.ext4` (300 MiB) and `vmlinux.bin` (42 MiB); they can be deleted |
 | `hegn` binary | 19 MiB | stripped release build |
 | `cloud-hypervisor-static` | 7 MiB | upstream static binary |
@@ -117,22 +116,22 @@ in-flight work before stopping; snapshots do **not** preserve disk contents.
 | Session logs | ~45 KiB per interactive session | line-based; verbose builds can produce far more. Retention is by count (default 50), `hegn logs prune --keep N` |
 | Snapshot | ≈ `memory_mib` + a few KiB | `memory-ranges` holds guest RAM (sparse where the guest never touched pages); `state.json`/`config.json` are small. Disk contents are not copied |
 | Project workspace | 0 | shared read-write through virtio-fs, never copied |
+| Clone workspace | size of one checkout | `<vms_dir>/<vm>/workspaces/<name>`; shares the VM's rootfs and tools |
 | Development checkout | ~9.3 GiB `target/` (this repository) | debug and release artifacts; `cargo clean` reclaims it |
 
 Minimum free space for a usable install: **~2.5 GiB** (images plus tools), plus
-whatever the guest writes into its rootfs, plus snapshots. The 16 GiB instance
-size is sparse; a fully provisioned OpenCode guest typically uses a few GiB.
-Budget **5 GiB** if snapshots of the default 2 GiB guest are part of the
-workflow.
+whatever the guest writes into its rootfs, plus snapshots. The 16 GiB VM size is
+sparse; a fully provisioned OpenCode guest typically uses a few GiB. Budget
+**5 GiB** if snapshots of the default 2 GiB guest are part of the workflow.
 
 ### Lifecycle of the rootfs
 
-Each instance gets its own writable rootfs copy on first start. Guest changes
-(installed packages, edited dotfiles, experiment leftovers) persist in that
-instance and are not shared with other projects. Snapshots capture RAM, not the
-disk. To get a clean rootfs back, delete the instance; the next start copies
-the pristine pinned image again. `hegn images download --force` only replaces
-the shared base image.
+Each VM gets one writable rootfs copy on first start. Guest changes (installed
+packages, edited dotfiles, experiment leftovers) persist in that VM and are
+shared by every project assigned to it; they are not shared with other VMs.
+Snapshots capture RAM, not the disk. To get a clean rootfs back, use
+`hegn vm rebuild <vm>`; the next start copies the pristine pinned image again.
+`hegn images download --force` only replaces the shared base image.
 
 ## Compared with working natively
 
@@ -142,10 +141,10 @@ the shared base image.
 | Compute | baseline | near-native via KVM |
 | Many-small-file I/O | baseline | slower (virtio-fs, `cache=never`) |
 | Large sequential I/O | baseline | close to native |
-| Memory | project process only | `memory_mib` + ~50 MiB, TUI optional |
-| Disk | project only | +2.2 GiB images, + snapshots (≈ guest RAM each), + logs |
-| Network | available | none by design |
-| Guest state | host state | persistent shared rootfs across projects |
+| Memory | project process only | `memory_mib` + relay + N × virtiofsd, TUI optional |
+| Disk | project only | +2.2 GiB images, + one rootfs and snapshots per VM, + logs |
+| Network | available | none by design unless `network = "guarded"` |
+| Guest state | host state | persistent rootfs shared by the VM's projects |
 | Isolation | none | Cloud Hypervisor seccomp + Landlock, sandboxed virtiofsd, `tirith-core` interception |
 | Rollback | git | git checkpoints plus VM snapshots (RAM/state, not disk) |
 
@@ -158,30 +157,30 @@ around every command and snapshot-based rollback.
 `hegn benchmark` performs the measurements this document is based on:
 
 ```bash
-hegn benchmark               # running instance; offers to boot one when idle
-hegn benchmark my-project    # boot (or reuse) that project's instance
+hegn benchmark               # running VM; offers to boot one when idle
+hegn benchmark my-project    # boot (or reuse) that project's VM
 hegn benchmark --clean       # throwaway project + VM, measured, then removed
 hegn benchmark --json        # machine-readable report
 ```
 
-Without arguments and without a running instance, the command asks on an
+Without arguments and without a running VM, the command asks on an
 interactive terminal whether it should create a temporary test project. It
 never prompts when stdin is not a terminal or `--json` is set, so scripts and
 agents get the passive report instead.
 
-`--clean` creates `<projects_root>/hegn-benchmark-<timestamp>`, boots it,
-measures it, stops the instance and deletes the directory again; the report
-records the cleanup and refuses to delete anything that is not one of its own
-projects. `hegn benchmark <project>` leaves the instance running so you can
-attach to it afterwards, and reports only that project's instance while noting
-any others that are running. With several instances (clones) active, the plain
+`--clean` creates `<projects_root>/hegn-benchmark-<timestamp>`, boots a
+one-member VM for it, measures it, stops the VM and deletes the project
+directory again; the report records the cleanup and refuses to delete anything
+that is not one of its own projects. `hegn benchmark <project>` leaves the VM
+running so you can attach to it afterwards, and reports only that VM while
+noting any others that are running. With several VMs active, the plain
 invocation lists each one and totals their RAM; JSON exposes them as
 `sessions`.
 
 ```text
 hegn benchmark
 
-Session   oc test (opencode)
+VM        oc test (opencode)
 Project   /home/you/Projects/hegn/oc test
 Uptime    16m 30s
 Guest     2 vCPU, 2.0 GiB configured (populated on demand)
@@ -197,19 +196,21 @@ images           2.1 GiB     2.2 GiB       4  /home/you/.local/share/hegn/images
 snapshots            0 B         0 B       0  /home/you/.local/share/hegn/snapshots
 logs           116.0 KiB   105.2 KiB       4  /home/you/.local/state/hegn/logs
 state          184.0 KiB     4.1 MiB      16  /home/you/.local/state/hegn
-instances              -           -       -  /home/you/.local/share/hegn/instances
+vms                    -           -       -  /home/you/.local/share/hegn/vms
 disk total       2.1 GiB
 
 Notes:
 - guest RAM is populated on demand: 2 vCPU, 2.0 GiB configured
 ```
 
+A VM with several projects shows one `virtiofsd` row per member.
+
 What the columns mean:
 
-- **RSS / VIRTUAL** — resident and virtual memory of the session process and
-  its descendants. `virtiofsd` re-executes itself into a sandboxed worker, so
-  the role covers both processes. The TUI and an attached client are not
-  recorded in `session.json`; add roughly 26 MiB and 7 MiB when they are open.
+- **RSS / VIRTUAL** — resident and virtual memory of the VM process and its
+  descendants. `virtiofsd` re-executes itself into a sandboxed worker, so the
+  role covers both processes. The TUI and an attached client are not recorded
+  in `session.json`; add roughly 26 MiB and 7 MiB when they are open.
 - **ALLOCATED / APPARENT** — blocks actually used on disk versus the sum of
   file sizes. They differ for sparse files such as `cloud-init.img` and the
   qcow2 image, and allocated is the number that matters for free space.
@@ -218,33 +219,36 @@ What the columns mean:
 - **Notes** — stale session metadata, stopped processes and the configured
   guest RAM are reported here instead of failing the command.
 
-Without a running instance the command still reports disk usage and the
-configured guest cost. For deeper checks, splurge on the raw sources:
+Without a running VM the command still reports disk usage and the configured
+guest cost. For deeper checks, inspect the raw sources:
 
 ```bash
-hegn instance status --json        # vcpus, memory_mib, pids, running flags
-hegn images status                # kernel/rootfs state and size
-hegn doctor                       # resolved binaries and versions
-hegn logs list                    # session logs and sizes
+hegn vm list --json                # state, vcpus, memory_mib, member counts
+hegn vm show <vm> --json           # membership and config path
+hegn images status                 # kernel/rootfs state and size
+hegn doctor                        # resolved binaries and versions
+hegn logs list                     # session logs and sizes
 
 ps -o pid,rss,vsz,args -C cloud-hypervisor-static,virtiofsd,hegn
 du -sh ~/.local/share/hegn/images ~/.local/share/hegn/snapshots \
-       ~/.local/state/hegn/logs
+       ~/.local/state/hegn/logs ~/.local/share/hegn/vms
 df -h ~/.local/share/hegn
 free -m
 ```
 
 ## Reducing the footprint
 
-- Lower `memory_mib` (minimum 128) and `vcpus` (minimum 1) in `config.toml`
-  for small projects; a shell-based session does not need 2 GiB.
-- Keep the TUI closed for long unattended runs; `hegn instance start`,
-  `hegn instance status --json` and `hegn logs` need a few MiB, not ~26 MiB.
+- Lower `memory_mib` (minimum 128) and `vcpus` (minimum 1) in `vm.toml` for
+  small VMs; a shell-based VM does not need 2 GiB.
+- Keep the TUI closed for long unattended runs; `hegn vm start`,
+  `hegn vm list --json` and `hegn logs` need a few MiB, not ~26 MiB.
+- Group projects that share a toolchain in one VM instead of starting several
+  VMs. Each extra project costs one `virtiofsd`, not another guest.
 - Delete snapshots you no longer need: `hegn snapshot list`,
   `hegn snapshot delete <name>`. Each one costs roughly the guest RAM.
 - Prune logs: `hegn logs prune --keep 20`.
 - Remove the pre-Cloud-Hypervisor leftovers (`rootfs.ext4`, `vmlinux.bin`)
   from `~/.local/share/hegn/images/` after migrating.
-- Reset a bloated rootfs with `hegn images download --force` when guest state
-  no longer matters.
-- In a development checkout, `cargo clean` frees several GiB of `target/`.
+- Reset a bloated rootfs with `hegn vm rebuild <vm>`.
+- Delete old VMs with `hegn vm delete <vm> --yes --delete-files` after
+  unassigning anything you want to keep.

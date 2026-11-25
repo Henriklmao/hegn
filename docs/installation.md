@@ -114,6 +114,25 @@ The VM backend and the config schema changed. Before you start the new build:
 An unreadable `session.json` is treated as a hard error and is never silently
 overwritten. This way a VMM from an older version cannot be leaked.
 
+### Upgrading from the v1 project model
+
+hegn v2 replaces the one-project-per-VM model with projects and VMs. There is no
+automatic migration:
+
+- stop any VM started by an older version,
+- create a VM with `hegn vm create` and assign your projects with
+  `hegn project import <path> --vm <vm>`,
+- old instance directories are ignored and reported by `hegn doctor`, never
+  deleted,
+- old snapshots without a boot fingerprint are listed as legacy and cannot be
+  restored,
+- old logs stay readable.
+
+A v1 `config.toml` still starts: `instances_dir`, `shared_tag` and `guest_mount`
+parse as deprecated aliases for `vms_dir`, `share_tag_prefix` and
+`guest_projects_base`. Rewrite the keys when convenient. The full mapping is in
+[Migrating to v2](migration-v2.md).
+
 ---
 
 ## Next steps

@@ -1,8 +1,8 @@
 # Multi-project VMs: project-first design
 
-**Status:** accepted, implementation pending
+**Status:** accepted, implemented (v2)
 **Supersedes:** the one-project-per-VM model described in
-[Projects and instances](../projects-and-instances.md) and
+[Projects, VMs and workspaces](../projects-and-instances.md) and
 [Architecture §2–§6](../architecture.md).
 **ADRs:** [ADR-006 … ADR-010](../architecture.md#13-decisions-and-trade-offs).
 
@@ -10,7 +10,7 @@
 
 ## 1. Summary
 
-Today a project *is* a VM: `InstanceConfig` stores one `project`, one
+Today a project *is* a VM: the v1 instance config stores one `project`, one
 `workspace`, one `shared_tag`, and one `guest_mount`; boot spawns one
 `virtiofsd` and one `--fs` device. Tools (Node, Rust, Python, the harness CLI)
 are installed into that VM's rootfs, so ten projects mean ten rootfs copies and
