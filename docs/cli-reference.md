@@ -92,6 +92,9 @@ Notes:
 - `project create` and `project import` without `--vm` ask whether to create a
   one-member VM named after the project. `--solo` does that without a prompt;
   non-interactive use requires `--vm` or `--solo`.
+- `--json` counts as non-interactive: commands require explicit flags
+  (`--vm`/`--solo`, `--yes`, `--delete-files`/`--keep-files`) and fail with an
+  actionable error, not a guess; prompts go to stderr, stdout stays parseable.
 - `project assign` and `project unassign` never start, stop or delete a VM. A
   running VM keeps its current shares until `hegn vm apply`.
 - `project fork` always creates a member of the parent's VM. Clone is the
