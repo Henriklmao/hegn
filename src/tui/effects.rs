@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+use crate::project::{ProjectKind, ProjectRegistry};
 use crate::tui::App;
 use crate::tui::app::{Effect, ToastLevel};
 use crate::tui::jobs::{
@@ -29,6 +30,38 @@ use crate::tui::jobs::{
 use crate::tui::launch::launch_agent;
 use crate::tui::messages::ScanMessage;
 use crate::tui::terminal::with_suspended_terminal;
+
+/// Delete one dashboard project, routing registry-only External projects through
+/// the domain helper and leaving clone/worktree removal to the VM surfaces.
+pub(super) fn delete_project_entry(
+    config: &crate::config::Config,
+    project: &Path,
+    delete_files: bool,
+) -> anyhow::Result<crate::project::ProjectDeleteOutcome> {
+    let canonical = project.canonicalize().ok();
+    let registry = ProjectRegistry::load(&config.state_dir)?;
+    let entry = canonical
+        .as_deref()
+        .and_then(|path| registry.find_by_path(path))
+        .cloned();
+    match entry {
+        Some(entry) if entry.kind == ProjectKind::External => {
+            crate::project::delete_registered_project(config, &entry, delete_files)
+        }
+        Some(entry) => {
+            anyhow::bail!(
+                "project '{}' is a {}; delete it from the VM/workspace surface",
+                entry.name,
+                match entry.kind {
+                    ProjectKind::Clone => "managed clone",
+                    ProjectKind::Worktree => "worktree",
+                    ProjectKind::External => unreachable!(),
+                }
+            )
+        }
+        None => crate::project::delete_project(config, project, delete_files),
+    }
+}
 
 pub(super) fn handle_effects(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -257,7 +290,7 @@ pub(super) fn handle_effects(
             Effect::DeleteProject {
                 project,
                 delete_files,
-            } => match crate::project::delete_project(&app.config, &project, delete_files) {
+            } => match delete_project_entry(&app.config, &project, delete_files) {
                 Ok(outcome) => {
                     app.reload_state();
                     app.forget_project_locally(&project);
@@ -339,4 +372,149 @@ fn open_lazygit(path: &Path) -> Result<()> {
         anyhow::bail!("lazygit exited with {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::project::{ProjectEntry, ProjectKind, ProjectRegistry};
+
+    fn config(dir: &Path) -> Config {
+        let mut config = Config::default();
+        config.projects_root = dir.join("projects");
+        config.state_dir = dir.join("state");
+        config.snapshots_dir = dir.join("snapshots");
+        config.vms_dir = dir.join("vms");
+        config.templates_dir = dir.join("templates");
+        config.profiles_dir = dir.join("profiles");
+        std::fs::create_dir_all(&config.projects_root).unwrap();
+        config
+    }
+
+    fn register(config: &Config, name: &str, path: &Path, kind: ProjectKind) -> ProjectEntry {
+        let entry = ProjectEntry {
+            name: name.into(),
+            path: path.canonicalize().unwrap(),
+            vm: None,
+            read_only: false,
+            kind,
+            parent: None,
+            managed: matches!(kind, ProjectKind::Clone),
+            hidden: false,
+            created_at: chrono::Utc::now(),
+        };
+        ProjectRegistry::load(&config.state_dir)
+            .unwrap()
+            .upsert(entry.clone())
+            .unwrap();
+        entry
+    }
+
+    #[test]
+    fn outside_keep_files_unregisters_without_touching_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let outside = dir.path().join("code/parser");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("README.md"), b"keep").unwrap();
+        register(&config, "parser", &outside, ProjectKind::External);
+
+        let outcome = delete_project_entry(&config, &outside, false).unwrap();
+
+        assert!(!outcome.files_deleted);
+        assert!(outside.join("README.md").is_file());
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("parser")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn outside_delete_files_removes_the_canonical_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let outside = dir.path().join("code/parser");
+        std::fs::create_dir_all(&outside).unwrap();
+        let canonical = outside.canonicalize().unwrap();
+        register(&config, "parser", &outside, ProjectKind::External);
+
+        let outcome = delete_project_entry(&config, &outside, true).unwrap();
+
+        assert!(outcome.files_deleted);
+        assert!(!canonical.exists());
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("parser")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unsafe_registry_path_is_refused_and_stays_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        register(&config, "root", Path::new("/"), ProjectKind::External);
+
+        let err = delete_project_entry(&config, Path::new("/"), true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("refusing"), "{err}");
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("root")
+                .is_some(),
+            "a refused delete must keep the registry entry"
+        );
+        assert!(Path::new("/").is_dir());
+    }
+
+    #[test]
+    fn picker_delete_keeps_the_existing_keep_files_behaviour() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let picker = config.projects_root.join("demo");
+        std::fs::create_dir_all(&picker).unwrap();
+        std::fs::write(picker.join("README.md"), b"keep").unwrap();
+        register(&config, "demo", &picker, ProjectKind::External);
+
+        let outcome = delete_project_entry(&config, &picker, false).unwrap();
+
+        assert!(!outcome.files_deleted);
+        assert!(picker.join("README.md").is_file());
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("demo")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn clone_registered_paths_are_left_to_the_workspace_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let clone = config.vms_dir.join("rust/workspaces/parser-fix");
+        std::fs::create_dir_all(&clone).unwrap();
+        register(&config, "parser-fix", &clone, ProjectKind::Clone);
+
+        let err = delete_project_entry(&config, &clone, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("VM/workspace surface"), "{err}");
+        assert!(clone.is_dir());
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("parser-fix")
+                .is_some()
+        );
+    }
 }

@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::config::Config;
-use crate::project::{self, GitSummary, Project, ProjectEntry, ProjectMeta, ProjectRegistry};
+use crate::project::{
+    self, GitSummary, Project, ProjectEntry, ProjectKind, ProjectMeta, ProjectRegistry,
+};
 use crate::security::SecurityEngine;
 use crate::session::snapshot::SnapshotStore;
 use crate::session::state::StateStore;
@@ -110,18 +112,18 @@ impl App {
         let previous = self.selected_project().map(|p| p.path.clone());
         self.projects = projects;
         self.loading = false;
+        self.refresh_project_entries();
+        self.merge_registry_projects();
         self.refresh_filter();
         let preferred = previous.or_else(|| self.store.state().last_project.clone());
         if let Some(path) = preferred
             && let Some(index) = self
                 .visible
                 .iter()
-                .position(|&i| self.projects[i].path == path)
+                .position(|&i| crate::vm::same_project(&self.projects[i].path, &path))
         {
             self.selected = index;
         }
-        self.refresh_project_entries();
-        self.refresh_instance_filter();
     }
 
     pub fn add_project(&mut self, project: Project) {
@@ -140,16 +142,16 @@ impl App {
             .sort_by_key(|project| project.name.to_lowercase());
         self.loading = false;
         self.query.clear();
+        self.refresh_project_entries();
+        self.merge_registry_projects();
         self.refresh_filter();
         if let Some(index) = self
             .visible
             .iter()
-            .position(|&i| self.projects[i].path == path)
+            .position(|&i| crate::vm::same_project(&self.projects[i].path, &path))
         {
             self.selected = index;
         }
-        self.refresh_project_entries();
-        self.refresh_instance_filter();
     }
 
     /// Reload the private project registry (assignment and membership).
@@ -157,6 +159,41 @@ impl App {
         self.project_entries = ProjectRegistry::load(&self.config.state_dir)
             .map(|registry| registry.entries().to_vec())
             .unwrap_or_default();
+    }
+
+    /// Merge registry-only External projects that discovery cannot see.
+    ///
+    /// `hegn project assign ~/code/parser --vm rust` registers a project outside
+    /// the projects root without creating a picker link. Those rows still belong
+    /// in the dashboard, deduped by canonical path against discovery.
+    pub fn merge_registry_projects(&mut self) {
+        let opened = self.store.state().opened_at();
+        let root = self
+            .config
+            .projects_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.config.projects_root.clone());
+        for entry in self.project_entries.clone() {
+            if entry.kind != ProjectKind::External || entry.hidden {
+                continue;
+            }
+            let path = entry.path.clone();
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if canonical.starts_with(&root) {
+                continue;
+            }
+            if self
+                .projects
+                .iter()
+                .any(|project| crate::vm::same_project(&project.path, &canonical))
+            {
+                continue;
+            }
+            let mut project = Project::load(canonical.clone());
+            project.name = entry.name.clone();
+            project.last_opened = opened.get(&canonical).copied();
+            self.projects.push(project);
+        }
     }
 
     /// Registry entry for a project path, tolerating a symlinked projects root.
@@ -465,11 +502,22 @@ impl App {
         let selected = self
             .selected_instance()
             .map(|instance| instance.name.clone());
+        let selected_project = self.selected_project().map(|project| project.path.clone());
         let registry = crate::vm::registry::VmRegistry::new(self.config.clone());
         if let Ok(instances) = registry.summaries() {
             self.instances = instances;
         }
         self.refresh_project_entries();
+        self.merge_registry_projects();
+        self.refresh_filter();
+        if let Some(path) = selected_project
+            && let Some(index) = self
+                .visible
+                .iter()
+                .position(|&i| crate::vm::same_project(&self.projects[i].path, &path))
+        {
+            self.selected = index;
+        }
         self.refresh_instance_filter_named(selected);
         self.refresh_vm_members();
         self.refresh_project_snapshots();
@@ -952,6 +1000,52 @@ mod tests {
         app.screen = Screen::Project;
         app.open_project = Some(project);
         assert_eq!(app.window_title(), "hegn — demo · rust");
+    }
+
+    #[test]
+    fn registry_only_outside_projects_appear_with_vm_badge_and_open() {
+        let (_dir, mut app) = test_app();
+        let outside = app
+            .config
+            .projects_root
+            .parent()
+            .unwrap()
+            .join("code/parser");
+        std::fs::create_dir_all(&outside).unwrap();
+        let canonical = outside.canonicalize().unwrap();
+        let mut registry = ProjectRegistry::load(&app.config.state_dir).unwrap();
+        registry
+            .upsert(ProjectEntry {
+                name: "parser".into(),
+                path: canonical.clone(),
+                vm: None,
+                read_only: false,
+                kind: ProjectKind::External,
+                parent: None,
+                managed: false,
+                hidden: false,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        registry.assign("parser", "rust", false).unwrap();
+        app.instances = vec![fake_instance(&app, "rust", canonical.clone())];
+
+        app.set_projects(Vec::new());
+
+        let index = app
+            .projects
+            .iter()
+            .position(|project| project.name == "parser")
+            .expect("outside registry project is merged into the picker");
+        assert_eq!(app.project_vm_badge(&app.projects[index].path), "⬢ rust");
+        app.selected = app
+            .visible
+            .iter()
+            .position(|&visible| visible == index)
+            .expect("merged project is visible");
+        app.open_project();
+        assert_eq!(app.screen, Screen::Project);
+        assert_eq!(app.open_project.as_deref(), Some(canonical.as_path()));
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub(crate) fn render_delete_vm(
         DeleteVmStage::Files => (
             format!(
                 "Also delete the VM directory and its managed workspaces?\n\n{}\n\n\
-                 Choose 'Keep files' to unassign every project and leaves the VM directory in place. \
+                 Choose 'Keep files' to unassign every project and leave the VM directory in place. \
                  External project directories are never touched.",
                 modal.vm.config_path.display()
             ),
