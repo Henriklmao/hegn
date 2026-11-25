@@ -192,10 +192,10 @@ The old keys `instances_dir`, `shared_tag` and `guest_mount` still parse as
 deprecated aliases with a warning. Rewrite them to `vms_dir`,
 `share_tag_prefix` and `guest_projects_base`.
 
-Every value also has an environment override (`HEGN_CONFIG`,
+Selected values also have an environment override (`HEGN_CONFIG`,
 `HEGN_PROJECTS_ROOT`, `HEGN_STATE_DIR`, `HEGN_CLOUD_HYPERVISOR_BIN`,
-`HEGN_VIRTIOFSD_BIN`, `HEGN_KERNEL_IMAGE`, `HEGN_ROOTFS_IMAGE`, …), which is
-preferable for CI over editing the file.
+`HEGN_VIRTIOFSD_BIN`, `HEGN_KERNEL_IMAGE`, `HEGN_ROOTFS_IMAGE`, `HEGN_NETWORK`,
+…), which is preferable for CI over editing the file.
 
 **Gate:** `hegn config path` points at an existing file and `hegn config show`
 exits `0`.
@@ -257,9 +257,10 @@ hegn doctor --json       # machine-readable, one object per check
 
 **Gate:** exit code `0`. `hegn doctor` must report all required checks as ok:
 `cloud-hypervisor`, `virtiofsd`, `git`, `kvm`, `landlock`, `kernel image`,
-`rootfs image` and `projects root` (`serial logs` is optional). If `landlock`
-fails, the kernel is too old — do not disable the sandbox; report the kernel
-version.
+`rootfs image`, `projects root`, `backend` (always) and `network guard` (when
+`network = "guarded"`). This list is the common set, not every check; `serial
+logs` is optional. If `landlock` fails, the kernel is too old — do not disable
+the sandbox; report the kernel version.
 
 ---
 
@@ -357,7 +358,7 @@ allow, `1` block, `2` warn.
 | `~/.config/hegn/config.toml` | configuration (rejects unknown keys) |
 | `~/.config/hegn/templates/AGENTS.md` | template copied by `hegn project create` |
 | `~/.local/state/hegn/projects.toml` | private project registry (`0600`) |
-| `~/.local/state/hegn/logs/` | persistent guest serial logs (`0600`) |
+| `~/.local/state/hegn/logs/` | persistent guest serial logs (directory `0700`, files `0600`) |
 | `~/.local/share/hegn/images/` | pinned kernel and rootfs |
 | `~/.local/share/hegn/snapshots/` | VM snapshots |
 | `~/.local/share/hegn/vms/<vm>/` | `vm.toml`, run directory, private rootfs and managed workspaces |

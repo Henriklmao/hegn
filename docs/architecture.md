@@ -199,7 +199,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | --- | --- | --- |
 | `cli/` | Clap command surface, per-command modules, JSON/text output, exit codes | Every TUI operation has a CLI counterpart; no fallback paths |
 | `config/` | Schema, defaults, env overrides, validation, XDG paths, tool lookup; `form/` is the interactive settings editor | Unknown keys rejected; SHA-256 and HTTPS URL validation; log dir `0700`; `virtiofsd` resolved via `PATH` then distribution dirs; writes are validated and installed with an atomic tmp+rename; form edits a validated working copy and never touches disk before `Ctrl-S` |
-| `project/` | Discovery, create, import, git summaries, registry, deletion policy | The registry is private and authoritative; import only creates a symlink; dangerous targets rejected; deletion is limited to direct children of `projects_root` and never follows import links |
+| `project/` | Discovery, create, import, git summaries, registry, deletion policy | The registry is private and authoritative; import only creates a symlink; dangerous targets rejected; direct picker entries are deleted only as direct children of `projects_root`, while registry-only External projects outside it require `--delete-files` and are re-validated as safe export sources first; import links are never followed |
 | `project/registry.rs` | Private `<state_dir>/projects.toml`: membership, read-only, kind, lineage, validation | `0600`, `O_NOFOLLOW`, atomic writes, `flock` for writers; unique names and canonical paths; no ancestor/descendant except a named nested worktree; `max_projects_per_vm`; worktrees inherit their parent's VM |
 | `project/workspace.rs` | Clone and worktree forks | Clone is default and lives at `<vms_dir>/<vm>/workspaces/<name>`; clone target verified as a real `.git` directory at the parent HEAD; worktree must be a real `git worktree` inside its writable parent; deletion uses `git worktree remove` or a checked managed path |
 | `security/` | `tirith-core` integration and hegn workspace rules | Empty commands allowed; off mode disables tirith but still detects and warns about destructive workspace operations; every `/projects/*` root and `/workspace` is a workspace root |
@@ -646,19 +646,25 @@ and `root_device`; the official qcow2 image uses `/dev/vda1`.
 
 ## 8. TUI architecture
 
-- `app.rs` owns all state: projects, VMs, membership, selection, focus, modal,
-  VM status, snapshots, terminal scrollback, input mode, toasts and footer hit
-  rectangles.
-- `ui.rs` is a pure renderer. It returns hit rectangles for footer buttons,
-  project/VM/snapshot rows, and the settings modal's rows and `‹ ›`
-  steppers; mouse handling lives in `app.rs`.
-- `config_form.rs` owns settings-modal navigation, inline editing, validation
-  and the save. It edits a working copy and only writes on `Ctrl-S`
-  (`config::save_to` for globals, `VmStore::save` for `vm.toml`, project
-  presentation for `hegn.toml`).
-- `tui.rs` owns the terminal, the 50 ms tick, crossterm events and effects.
+- `src/tui/app/mod.rs` owns all state: projects, VMs, membership, selection,
+  focus, modal, VM status, snapshots, terminal scrollback, input mode, toasts
+  and footer hit rectangles. Its submodules cover actions, state, modals, keys,
+  mouse, config, project, snapshots, launch, doctor, security, provisioning and
+  the terminal.
+- `src/tui/ui/mod.rs` is a pure renderer, split into `screens/` and `modals/`.
+  It returns hit rectangles for footer buttons, project/VM/snapshot rows, and
+  the settings modal's rows and `‹ ›` steppers; mouse handling lives in
+  `src/tui/app/`.
+- `src/config/form/` owns settings-modal navigation, inline editing, validation
+  and the save (`state.rs`, `edit.rs`, `persist.rs`, `rows.rs`, `parse.rs`). It
+  edits a working copy and only writes on `Ctrl-S` (`config::save_to` for
+  globals, `VmStore::save` for `vm.toml`, project presentation for
+  `hegn.toml`).
+- `src/tui/event_loop.rs` owns the terminal, the 50 ms tick, crossterm events
+  and effects. `effects.rs`, `messages.rs` and `jobs.rs` define effects,
+  messages and background work.
 - Effects that must release or block the terminal (editor, lazygit) or run
-  async work (snapshots, image downloads) are returned to `tui.rs`.
+  async work (snapshots, image downloads) are returned to the event loop.
 - Project scanning and image downloads run on named background threads and
   report through an `mpsc` channel. The UI keeps ticking while a large image
   downloads.
@@ -691,7 +697,7 @@ Modals are responsive. `centered` grows small dialogs to the available width
 and height, the help key/description table and the settings label/value rows
 collapse to one column below their narrow thresholds, and overflowing bodies
 get a one-column scrollbar. The renderer returns the track rectangle as a
-`ScrollHit`; `app.rs` turns wheel events, `j`/`k`, arrows, `PgUp`/`PgDn`, clicks
+`ScrollHit`; `src/tui/app/` turns wheel events, `j`/`k`, arrows, `PgUp`/`PgDn`, clicks
 and drags into offset changes, and the thumb inverts while hovered or dragged.
 Long lines are ellipsized by `fit_line` rather than wrapped, so one logical line
 is always one row and the scrollbar offset stays exact.

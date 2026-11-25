@@ -113,7 +113,8 @@ attach rights.
 
 With `cloud_init = true`, the URLs are exported in the guest through
 `/etc/profile.d/hegn-endpoints.sh`. Each endpoint is also available as
-`HEGN_ENDPOINT_<NAME>`. `hegn vm show <vm>` shows the guest URLs.
+`HEGN_ENDPOINT_<NAME>`. `hegn vm start`, `restart` and `apply` print the guest
+endpoint URLs in their start report.
 
 ---
 

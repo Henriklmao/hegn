@@ -20,8 +20,9 @@ VMs are the isolated alternative.
 With `auto_branch = true` (the default), `hegn open <project>` checks out a branch
 named `agent/hegn-session-<timestamp>` in that project on the host once the VM
 has booted. Each opened project therefore gets its own branch, and the agent's
-commits end up there instead of on your main branch. `hegn open --no-branch`
-skips this step.
+commits end up there instead of on your main branch. With `auto_branch = false`,
+`hegn open` creates no branch automatically. `hegn open --no-branch` forces the
+branch off for one run.
 
 The setting lives in `config.toml` (see [Configuration](configuration.md)).
 `hegn attach <vm>` never creates a branch because it does not select a project.
