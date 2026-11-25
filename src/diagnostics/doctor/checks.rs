@@ -8,6 +8,7 @@ use std::process::Command;
 use serde::Serialize;
 
 use crate::config::{Config, VIRTIOFSD_FALLBACKS};
+use crate::session::snapshot::SnapshotStore;
 use crate::vm::images;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -269,6 +270,7 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
 fn legacy_checks(config: &Config, data_root: Option<&Path>, config_path: &Path) -> Vec<Check> {
     vec![
         legacy_instance_check(config, data_root),
+        legacy_snapshot_check(config),
         deprecated_project_keys_check(config),
         deprecated_config_keys_check(config_path),
     ]
@@ -317,6 +319,65 @@ fn legacy_instance_check(config: &Config, data_root: Option<&Path>) -> Check {
         format!(
             "ignored by v2: {paths}; verify they are unused, then remove them manually \
              (v2 never starts, restores or deletes them)"
+        ),
+    )
+}
+
+/// Snapshots written by v1 have no boot fingerprint and can never be restored.
+///
+/// The count and names come from the normal [`SnapshotStore`] listing, so the
+/// doctor sees exactly what `hegn snapshot list` sees. Nothing is selected,
+/// restored or deleted here.
+fn legacy_snapshot_check(config: &Config) -> Check {
+    let store = SnapshotStore::new(&config.snapshots_dir);
+    let snapshots = match store.list() {
+        Ok(snapshots) => snapshots,
+        Err(err) => {
+            return Check::new(
+                "legacy snapshots",
+                false,
+                false,
+                format!(
+                    "could not list snapshots in {}: {err}",
+                    config.snapshots_dir.display()
+                ),
+            );
+        }
+    };
+    let legacy = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.is_legacy() && snapshot.legacy_label().is_some())
+        .collect::<Vec<_>>();
+    if legacy.is_empty() {
+        return Check::new(
+            "legacy snapshots",
+            true,
+            false,
+            format!(
+                "none found in {} (legacy snapshots are never restored or auto-deleted)",
+                config.snapshots_dir.display()
+            ),
+        );
+    }
+    let mut names = legacy
+        .iter()
+        .map(|snapshot| snapshot.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort();
+    let names = names.join(", ");
+    let noun = if legacy.len() == 1 {
+        "snapshot"
+    } else {
+        "snapshots"
+    };
+    Check::new(
+        "legacy snapshots",
+        false,
+        false,
+        format!(
+            "{} legacy v1 {noun} (no boot fingerprint; not restorable): {names}; never restored \
+             or auto-deleted, manual cleanup only",
+            legacy.len()
         ),
     )
 }
@@ -794,6 +855,106 @@ mod tests {
         assert!(present.line().starts_with("! "), "{}", present.line());
     }
 
+    fn write_legacy_snapshot(root: &Path, name: &str) {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let meta = serde_json::json!({
+            "name": name,
+            "created_at": "2026-01-01T00:00:00Z",
+            "vm_state": "Paused",
+            "dir": dir,
+        });
+        fs::write(
+            dir.join("snapshot.json"),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_current_snapshot(root: &Path, name: &str) {
+        use crate::session::snapshot::{SNAPSHOT_VERSION, SnapshotBoot, SnapshotMeta};
+
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        SnapshotStore::new(root)
+            .save_meta(&SnapshotMeta {
+                name: name.to_string(),
+                dir,
+                version: SNAPSHOT_VERSION,
+                boot_fingerprint: Some("a".repeat(64)),
+                boot: Some(SnapshotBoot::default()),
+                ..SnapshotMeta::default()
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_snapshot_check_reports_count_names_and_manual_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        fs::create_dir_all(&config.snapshots_dir).unwrap();
+
+        let absent = legacy_snapshot_check(&config);
+        assert!(absent.ok);
+        assert!(!absent.required);
+        assert!(absent.detail.contains("none found"), "{}", absent.detail);
+
+        write_legacy_snapshot(&config.snapshots_dir, "old-a");
+        write_legacy_snapshot(&config.snapshots_dir, "old-b");
+        write_current_snapshot(&config.snapshots_dir, "current");
+
+        let present = legacy_snapshot_check(&config);
+        assert!(!present.ok);
+        assert!(!present.required);
+        for needle in [
+            "2 legacy v1 snapshots",
+            "old-a, old-b",
+            "no boot fingerprint",
+            "not restorable",
+            "never restored or auto-deleted",
+            "manual cleanup only",
+        ] {
+            assert!(
+                present.detail.contains(needle),
+                "missing {needle:?}: {}",
+                present.detail
+            );
+        }
+        assert!(
+            !present.detail.contains("current"),
+            "v2 snapshots are not legacy: {}",
+            present.detail
+        );
+        assert!(present.line().starts_with("! "), "{}", present.line());
+
+        let json = serde_json::to_value(&present).unwrap();
+        assert_eq!(json["name"], "legacy snapshots");
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["required"], false);
+        assert!(
+            json["detail"]
+                .as_str()
+                .unwrap()
+                .contains("manual cleanup only")
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_check_lists_a_corrupt_metadata_as_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        fs::create_dir_all(config.snapshots_dir.join("broken")).unwrap();
+        fs::write(
+            config.snapshots_dir.join("broken/snapshot.json"),
+            b"{not json",
+        )
+        .unwrap();
+
+        let check = legacy_snapshot_check(&config);
+        assert!(check.ok, "list skips unreadable entries: {}", check.detail);
+        assert!(check.detail.contains("none found"), "{}", check.detail);
+    }
+
     #[test]
     fn deprecated_project_keys_name_the_file_and_keys() {
         let dir = tempfile::tempdir().unwrap();
@@ -915,6 +1076,7 @@ mod tests {
             names,
             [
                 "legacy instance dirs",
+                "legacy snapshots",
                 "legacy project keys",
                 "deprecated config keys"
             ]
