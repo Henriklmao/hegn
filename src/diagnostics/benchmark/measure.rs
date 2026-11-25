@@ -22,10 +22,11 @@ use super::usage::{
 };
 use super::{MIB, TEMP_PREFIX};
 
-/// `session.json` written by `hegn instance start`.
+/// `session.json` written by `hegn vm start` (older `hegn instance start`
+/// records still parse).
 ///
-/// The struct is deliberately permissive: instance-scoped sessions gained
-/// fields over time, and `benchmark` must also read records written by older
+/// The struct is deliberately permissive: VM-scoped sessions gained fields
+/// over time, and `benchmark` must also read records written by older
 /// versions.
 #[derive(Debug, Deserialize)]
 struct SessionFile {
@@ -52,9 +53,9 @@ struct SessionFile {
 
 /// Measure the current host cost and print or emit the report.
 ///
-/// - no project and no `--clean`: measure every running instance; if nothing
+/// - no project and no `--clean`: measure every running VM; if nothing
 ///   runs and the terminal is interactive, offer to boot a throwaway one;
-/// - `project`: boot that project's instance (or reuse it) and measure it;
+/// - `project`: boot that project's VM (or reuse it) and measure it;
 /// - `clean`: create a temporary project, boot it, measure it, stop and remove
 ///   it again.
 pub fn run(config: &Config, project: Option<&str>, clean: bool, json: bool) -> Result<i32> {
@@ -110,19 +111,19 @@ fn confirm(question: &str) -> Result<bool> {
     ))
 }
 
-/// Boot (or reuse) the instance of an existing project and measure it.
+/// Boot (or reuse) the VM of an existing project and measure it.
 fn measure_project(config: &Config, project: &str, json: bool) -> Result<i32> {
     let path = crate::cli::resolve_project(config, project)?;
 
-    // Prefer an instance that is already running for this project, base or
-    // clone; otherwise create/reuse the base instance and start it.
+    // Prefer a VM that is already running for this project, base or clone;
+    // otherwise create/reuse the base VM and start it.
     if let Some((session, _)) = running_sessions(config).into_iter().find(|(session, _)| {
         session
             .project
             .as_ref()
             .is_some_and(|running| same_project(running, &path))
     }) {
-        // Prefer the recorded instance name; legacy records predate it.
+        // Prefer the recorded VM name; legacy records predate it.
         let mut report = match session.vm.as_deref().filter(|name| !name.is_empty()) {
             Some(name) => collect_for_vm(config, name),
             None => collect_for_project(config, &path),
@@ -143,10 +144,10 @@ fn measure_project(config: &Config, project: &str, json: bool) -> Result<i32> {
     report.notes.push(format!(
         "VM '{}' started; measured right after the VMM socket came up, so guest RSS \
          grows while the guest boots (attach with `hegn attach {}`, stop it with \
-         `hegn instance stop {}`)",
+         `hegn vm stop {}`)",
         vm.name, vm.name, vm.name
     ));
-    note_other_instances(config, &vm.name, &mut report.notes);
+    note_other_vms(config, &vm.name, &mut report.notes);
     emit(report, json)
 }
 
@@ -188,10 +189,10 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
         report.started = true;
         report.notes.push(
             "measured right after the VMM socket came up, so guest RSS grows while the guest \
-             boots; the instance was stopped and removed after this snapshot"
+             boots; the VM was stopped and removed after this snapshot"
                 .to_string(),
         );
-        note_other_instances(config, &vm.as_ref().unwrap().name, &mut report.notes);
+        note_other_vms(config, &vm.as_ref().unwrap().name, &mut report.notes);
         Ok(report)
     })();
 
@@ -203,7 +204,7 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
                 .is_ok_and(|manager| manager.stop().is_ok())
         })
         .unwrap_or(false);
-    let instance_removed = vm
+    let vm_removed = vm
         .as_ref()
         .map(|vm| registry.delete(&vm.name, true).is_ok())
         .unwrap_or(false);
@@ -219,8 +220,8 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
         Ok(mut report) => {
             report.cleanup = Some(Cleanup {
                 project: path.clone(),
-                instance: vm.as_ref().map(|vm| vm.name.clone()).unwrap_or_default(),
-                instance_stopped: stopped,
+                vm: vm.as_ref().map(|vm| vm.name.clone()).unwrap_or_default(),
+                vm_stopped: stopped,
                 removed,
             });
             if !stopped {
@@ -228,7 +229,7 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
                     .notes
                     .push("the temporary VM could not be stopped".to_string());
             }
-            if !instance_removed {
+            if !vm_removed {
                 report
                     .notes
                     .push("the temporary VM could not be removed".to_string());
@@ -371,7 +372,7 @@ fn totals(config: &Config, sessions: &[SessionCost]) -> (u32, u64, u64) {
     (vcpus, memory, rss)
 }
 
-/// The instances that are alive right now.
+/// The VMs that are alive right now.
 fn running_sessions(config: &Config) -> Vec<(SessionFile, PathBuf)> {
     let mut running = Vec::new();
     for path in session_candidates(config) {
@@ -390,7 +391,7 @@ fn running_sessions(config: &Config) -> Vec<(SessionFile, PathBuf)> {
     running
 }
 
-fn note_other_instances(config: &Config, measured: &str, notes: &mut Vec<String>) {
+fn note_other_vms(config: &Config, measured: &str, notes: &mut Vec<String>) {
     let others = running_sessions(config)
         .into_iter()
         .filter(|(session, _)| session.vm.as_deref() != Some(measured))
@@ -439,7 +440,7 @@ fn session_costs(
         if !keep(&session, &path) {
             continue;
         }
-        let (vcpus, memory_mib) = instance_limits(&path, config);
+        let (vcpus, memory_mib) = vm_limits(&path, config);
         costs.push(build_session(&session, config, vcpus, memory_mib, notes));
     }
     costs
@@ -520,7 +521,7 @@ fn build_session(
         .map(|started| (Utc::now() - started).num_seconds().max(0) as u64);
 
     SessionCost {
-        instance: session
+        vm: session
             .vm
             .clone()
             .or_else(|| {
@@ -566,8 +567,8 @@ fn session_candidates(config: &Config) -> Vec<PathBuf> {
     paths
 }
 
-/// Read per-instance limits from the sibling `hegn.toml`, if there is one.
-fn instance_limits(session: &Path, config: &Config) -> (u8, u32) {
+/// Read per-VM limits from the sibling `vm.toml`, if there is one.
+fn vm_limits(session: &Path, config: &Config) -> (u8, u32) {
     #[derive(Deserialize, Default)]
     struct Limits {
         vcpus: Option<u8>,
@@ -751,7 +752,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            vms_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("vms"),
             ..Config::default()
         };
 
@@ -761,7 +762,7 @@ mod tests {
 
         let candidates = session_candidates(&config);
         assert_eq!(candidates.len(), 1);
-        assert!(candidates[0].ends_with("instances/a/run/session.json"));
+        assert!(candidates[0].ends_with("vms/a/run/session.json"));
     }
 
     #[test]
@@ -770,7 +771,7 @@ mod tests {
         let config = Config {
             state_dir: dir.path().join("state"),
             snapshots_dir: dir.path().join("data/snapshots"),
-            vms_dir: dir.path().join("data/instances"),
+            vms_dir: dir.path().join("data/vms"),
             kernel_image: dir.path().join("data/images/kernel"),
             vcpus: 4,
             memory_mib: 1024,
@@ -801,7 +802,7 @@ mod tests {
             ..Config::default()
         };
         let session = |vcpus: u8, memory_mib: u32, rss: u64| SessionCost {
-            instance: "s".into(),
+            vm: "s".into(),
             project: None,
             workspace: None,
             harness: None,
@@ -839,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_limits_prefer_the_vm_config() {
+    fn vm_limits_prefer_the_vm_config() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             vcpus: 2,
@@ -855,12 +856,12 @@ mod tests {
         )
         .unwrap();
 
-        let (vcpus, memory) = instance_limits(&run.join("session.json"), &config);
+        let (vcpus, memory) = vm_limits(&run.join("session.json"), &config);
         assert_eq!((vcpus, memory), (8, 8192));
     }
 
     #[test]
-    fn instance_limits_default_without_or_with_a_broken_config() {
+    fn vm_limits_default_without_or_with_a_broken_config() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             vcpus: 2,
@@ -871,13 +872,13 @@ mod tests {
         fs::create_dir_all(&run).unwrap();
         let session = run.join("session.json");
 
-        assert_eq!(instance_limits(&session, &config), (2, 2048));
+        assert_eq!(vm_limits(&session, &config), (2, 2048));
 
         fs::write(dir.path().join("vm/vm.toml"), b"not = [valid").unwrap();
-        assert_eq!(instance_limits(&session, &config), (2, 2048));
+        assert_eq!(vm_limits(&session, &config), (2, 2048));
 
         fs::write(dir.path().join("vm/vm.toml"), b"vcpus = 4\n").unwrap();
-        assert_eq!(instance_limits(&session, &config), (4, 2048));
+        assert_eq!(vm_limits(&session, &config), (4, 2048));
     }
 
     #[test]
@@ -940,7 +941,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            vms_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("vms"),
             ..Config::default()
         };
         fs::create_dir_all(config.vms_dir.join("a/run")).unwrap();
@@ -977,7 +978,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            vms_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("vms"),
             snapshots_dir: dir.path().join("snapshots"),
             kernel_image: dir.path().join("images/kernel"),
             ..Config::default()
@@ -1017,7 +1018,7 @@ mod tests {
 
         let mut notes = Vec::new();
         let cost = build_session(&session, &config, 4, 512, &mut notes);
-        assert_eq!(cost.instance, "demo");
+        assert_eq!(cost.vm, "demo");
         assert_eq!(cost.uptime_secs, Some(0), "future timestamps clamp to zero");
         assert_eq!(cost.guest_memory_bytes, 512 * MIB);
         assert_eq!(cost.vcpus, 4);

@@ -4,10 +4,10 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One host process that belongs to a running VM.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessCost {
     /// `cloud-hypervisor`, `virtiofsd` or `console-relay`.
     pub role: String,
@@ -17,7 +17,7 @@ pub struct ProcessCost {
 }
 
 /// Disk usage of one hegn directory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskCost {
     pub name: String,
     pub path: PathBuf,
@@ -30,7 +30,7 @@ pub struct DiskCost {
 }
 
 /// Disk usage of one active VM below `vms_dir`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmDisk {
     pub name: String,
     pub path: PathBuf,
@@ -43,7 +43,7 @@ pub struct VmDisk {
 ///
 /// These are never active VMs in v2; the paths are reported so the user can
 /// verify and remove them manually.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegacyInstanceDisk {
     pub paths: Vec<PathBuf>,
     pub allocated_bytes: u64,
@@ -52,9 +52,10 @@ pub struct LegacyInstanceDisk {
 }
 
 /// The host cost of one VM, resolved from its `session.json`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCost {
-    pub instance: String,
+    #[serde(rename = "vm", alias = "instance")]
+    pub vm: String,
     pub project: Option<PathBuf>,
     pub workspace: Option<PathBuf>,
     pub harness: Option<String>,
@@ -99,11 +100,13 @@ pub struct BenchmarkReport {
 }
 
 /// Outcome of removing a `--clean` project after measuring it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cleanup {
     pub project: PathBuf,
-    pub instance: String,
-    pub instance_stopped: bool,
+    #[serde(rename = "vm", alias = "instance")]
+    pub vm: String,
+    #[serde(rename = "vm_stopped", alias = "instance_stopped")]
+    pub vm_stopped: bool,
     pub removed: bool,
 }
 
@@ -140,7 +143,7 @@ fn render_report(report: &BenchmarkReport) -> String {
     }
     for session in &report.sessions {
         let harness = session.harness.as_deref().unwrap_or("unknown harness");
-        writeln!(out, "\nVM        {} ({harness})", session.instance).unwrap();
+        writeln!(out, "\nVM        {} ({harness})", session.vm).unwrap();
         if let Some(project) = &session.project {
             writeln!(out, "Project   {}", project.display()).unwrap();
         }
@@ -201,8 +204,8 @@ fn render_report(report: &BenchmarkReport) -> String {
             out,
             "\nCleanup   {} [{}] (VM stopped: {}, project removed: {})",
             cleanup.project.display(),
-            cleanup.instance,
-            cleanup.instance_stopped,
+            cleanup.vm,
+            cleanup.vm_stopped,
             cleanup.removed
         )
         .unwrap();
@@ -372,7 +375,7 @@ mod tests {
         let report = BenchmarkReport {
             generated_at: Utc::now(),
             sessions: vec![SessionCost {
-                instance: "demo".into(),
+                vm: "demo".into(),
                 project: Some(PathBuf::from("/workspace/demo")),
                 workspace: None,
                 harness: Some("OpenCode".into()),
@@ -394,8 +397,8 @@ mod tests {
             started: true,
             cleanup: Some(Cleanup {
                 project: PathBuf::from("/workspace/hegn-benchmark-1"),
-                instance: "bench".into(),
-                instance_stopped: true,
+                vm: "bench".into(),
+                vm_stopped: true,
                 removed: true,
             }),
             snapshots: 1,
@@ -426,11 +429,12 @@ mod tests {
             notes: vec!["measured".into()],
         };
         let json = serde_json::to_value(&report).unwrap();
-        assert_eq!(json["sessions"][0]["instance"], "demo");
+        assert_eq!(json["sessions"][0]["vm"], "demo");
         assert_eq!(json["sessions"][0]["processes"][0]["role"], "virtiofsd");
         assert_eq!(json["sessions"][0]["uptime_secs"], 90);
         assert_eq!(json["cleanup"]["removed"], true);
-        assert_eq!(json["cleanup"]["instance_stopped"], true);
+        assert_eq!(json["cleanup"]["vm"], "bench");
+        assert_eq!(json["cleanup"]["vm_stopped"], true);
         assert_eq!(json["disk"][0]["allocated_bytes"], 4096);
         assert_eq!(json["vm_disk"][0]["name"], "demo");
         assert_eq!(json["vm_disk_allocated_bytes"], 8192);
@@ -440,11 +444,39 @@ mod tests {
     }
 
     #[test]
+    fn legacy_instance_json_aliases_still_load() {
+        let cleanup: Cleanup = serde_json::from_value(serde_json::json!({
+            "project": "/workspace/hegn-benchmark-1",
+            "instance": "bench",
+            "instance_stopped": true,
+            "removed": true,
+        }))
+        .unwrap();
+        assert_eq!(cleanup.vm, "bench");
+        assert!(cleanup.vm_stopped);
+
+        let session: SessionCost = serde_json::from_value(serde_json::json!({
+            "instance": "demo",
+            "project": "/workspace/demo",
+            "workspace": null,
+            "harness": "OpenCode",
+            "vcpus": 2,
+            "memory_mib": 1024,
+            "guest_memory_bytes": 1024 * MIB,
+            "started_at": null,
+            "uptime_secs": 60,
+            "processes": [],
+        }))
+        .unwrap();
+        assert_eq!(session.vm, "demo");
+    }
+
+    #[test]
     fn report_renders_vm_terminology_and_legacy_disk_lines() {
         let report = BenchmarkReport {
             generated_at: Utc::now(),
             sessions: vec![SessionCost {
-                instance: "demo".into(),
+                vm: "demo".into(),
                 project: Some(PathBuf::from("/workspace/demo")),
                 workspace: None,
                 harness: Some("OpenCode".into()),

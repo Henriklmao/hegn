@@ -1,4 +1,4 @@
-//! `hegn benchmark` — measured host cost of running instances.
+//! `hegn benchmark` — measured host cost of running VMs.
 //!
 //! The report answers the questions behind `docs/resources.md`: how much RAM
 //! the VMM, `virtiofsd` and the console relay actually use, how much disk the
@@ -7,9 +7,9 @@
 //!
 //! Three modes:
 //!
-//! - no argument: measure every running instance (read-only), or ask whether to
+//! - no argument: measure every running VM (read-only), or ask whether to
 //!   boot a throwaway one when nothing is running;
-//! - `benchmark <project>`: boot that project's instance (or reuse it) and
+//! - `benchmark <project>`: boot that project's VM (or reuse it) and
 //!   measure it;
 //! - `benchmark --clean`: create a temporary project, boot it, measure it, stop
 //!   it and delete the project again.
