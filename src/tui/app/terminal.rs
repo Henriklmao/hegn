@@ -22,12 +22,12 @@ impl App {
         }
         let vm = self
             .active_vm_name()
-            .or_else(|| self.session.as_ref().map(|s| s.instance_name().to_string()));
+            .or_else(|| self.session.as_ref().map(|s| s.vm_name().to_string()));
         if let Some(name) = vm.clone() {
             if self
                 .session
                 .as_ref()
-                .is_some_and(|session| session.instance_name() == name)
+                .is_some_and(|session| session.vm_name() == name)
             {
                 self.project_view = ProjectView::Split;
                 self.terminal_focus = true;
@@ -53,7 +53,7 @@ impl App {
     pub(super) fn attach_console_external(&mut self) -> Vec<Effect> {
         let vm = self
             .active_vm_name()
-            .or_else(|| self.session.as_ref().map(|s| s.instance_name().to_string()));
+            .or_else(|| self.session.as_ref().map(|s| s.vm_name().to_string()));
         let Some(vm) = vm else {
             self.toast("no VM selected", ToastLevel::Warn);
             return Vec::new();
@@ -71,7 +71,7 @@ impl App {
             if self
                 .session
                 .as_ref()
-                .is_some_and(|session| session.instance_name() == vm)
+                .is_some_and(|session| session.vm_name() == vm)
             {
                 self.project_view = ProjectView::Split;
                 self.terminal_focus = true;
@@ -197,7 +197,7 @@ impl App {
         let attached_to_vm = self
             .session
             .as_ref()
-            .is_some_and(|session| session.instance_name() == vm);
+            .is_some_and(|session| session.vm_name() == vm);
         if attached_to_vm && self.session_active() {
             self.enter_project(project.path);
             self.project_view = ProjectView::Split;
@@ -248,7 +248,7 @@ impl App {
 
     /// Install a console for a successfully started/attached VM.
     pub fn attach_console(&mut self, console: Box<dyn TerminalConsole>) {
-        let vm_name = console.instance_name().to_string();
+        let vm_name = console.vm_name().to_string();
         self.vm.state = VmUiState::Running;
         self.vm.backend = "cloud-hypervisor";
         self.vm.note = Some(format!(

@@ -110,7 +110,7 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 harness,
                 started,
             }) => {
-                let vm = console.instance_name().to_string();
+                let vm = console.vm_name().to_string();
                 let project = console.project().to_path_buf();
                 app.attach_console(console);
                 app.queue_auto_launch(&vm, harness, &project, started);
@@ -194,7 +194,7 @@ mod tests {
             "fake · serial"
         }
 
-        fn instance_name(&self) -> &str {
+        fn vm_name(&self) -> &str {
             "fake"
         }
     }

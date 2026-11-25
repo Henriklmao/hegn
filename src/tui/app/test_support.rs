@@ -81,7 +81,7 @@ impl TerminalConsole for FakeConsole {
         "fake · serial"
     }
 
-    fn instance_name(&self) -> &str {
+    fn vm_name(&self) -> &str {
         "fake"
     }
 }
@@ -157,7 +157,7 @@ impl TerminalConsole for RecordingConsole {
         "recording · serial"
     }
 
-    fn instance_name(&self) -> &str {
+    fn vm_name(&self) -> &str {
         &self.name
     }
 }

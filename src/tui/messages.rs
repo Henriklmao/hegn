@@ -69,7 +69,7 @@ mod tests {
             "fake · serial"
         }
 
-        fn instance_name(&self) -> &str {
+        fn vm_name(&self) -> &str {
             "fake"
         }
     }
@@ -126,7 +126,7 @@ mod tests {
             started,
         } = &messages[1]
         {
-            assert_eq!(console.instance_name(), "fake");
+            assert_eq!(console.vm_name(), "fake");
             assert_eq!(console.label(), "fake · serial");
             assert!(matches!(branch, Some(Ok(name)) if name == "hegn/session-1"));
             assert_eq!(*harness, Harness::Opencode);

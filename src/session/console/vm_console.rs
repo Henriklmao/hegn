@@ -22,7 +22,7 @@ pub struct VmConsole {
     cloud_hypervisor_bin: PathBuf,
     vm_pid: u32,
     relay_pid: u32,
-    instance: String,
+    vm: String,
     project: PathBuf,
     harness: String,
     label: String,
@@ -86,7 +86,7 @@ impl VmConsole {
             cloud_hypervisor_bin: vm_binary,
             vm_pid: session.vm_pid,
             relay_pid: session.relay_pid,
-            instance: vm.name.clone(),
+            vm: vm.name.clone(),
             // Clones live in their own workspace; older records only have the
             // original project.
             project: if session.workspace.as_os_str().is_empty() {
@@ -125,9 +125,9 @@ impl VmConsole {
         self.vm_pid
     }
 
-    /// Instance name shown in the attach bar and TUI.
-    pub fn instance_name(&self) -> &str {
-        &self.instance
+    /// VM name shown in the attach bar and TUI.
+    pub fn vm_name(&self) -> &str {
+        &self.vm
     }
 
     fn read_new(&mut self) -> Vec<Vec<u8>> {
@@ -210,8 +210,8 @@ impl TerminalConsole for VmConsole {
         &self.label
     }
 
-    fn instance_name(&self) -> &str {
-        &self.instance
+    fn vm_name(&self) -> &str {
+        &self.vm
     }
 }
 

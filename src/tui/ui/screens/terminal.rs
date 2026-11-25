@@ -22,7 +22,7 @@ pub(crate) fn render_terminal_strip(frame: &mut Frame, app: &App, area: Rect) ->
     let selected = selected.or_else(|| {
         app.session
             .as_ref()
-            .map(|session| (session.instance_name().to_string(), "running".to_string()))
+            .map(|session| (session.vm_name().to_string(), "running".to_string()))
     });
     let (text, color) = match selected {
         Some((name, state)) => {
@@ -54,7 +54,7 @@ pub(crate) fn render_terminal_pane(frame: &mut Frame, app: &App, area: Rect) {
     let name = app
         .session
         .as_ref()
-        .map(|session| session.instance_name().to_string())
+        .map(|session| session.vm_name().to_string())
         .or_else(|| {
             app.active_vm_summary()
                 .or_else(|| app.selected_instance())
@@ -209,7 +209,7 @@ mod tests {
             "fake · serial"
         }
 
-        fn instance_name(&self) -> &str {
+        fn vm_name(&self) -> &str {
             "fake"
         }
     }
