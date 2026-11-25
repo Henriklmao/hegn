@@ -134,7 +134,7 @@ impl ConfigForm {
                 validate_share_tag_prefix(text, config.max_projects_per_vm)?;
                 config.share_tag_prefix = text.to_string();
             }
-            (Draft::Global(config), ConfigField::GuestMount) => {
+            (Draft::Global(config), ConfigField::GuestProjectsBase) => {
                 validate_guest_mount(text)?;
                 config.guest_projects_base = text.to_string();
             }
