@@ -53,9 +53,9 @@ hegn vm projects <vm>
 hegn vm apply <vm>
 ```
 
-Inside the guest, check `/projects` and `/workspace`. A missing mount count in
-the latest `hegn-health` line (`mounts=<ok>/<total>`) means a share failed to
-mount; the boot log names the member.
+Inside the guest, check `/projects` and `/workspace`. If the latest `hegn-health`
+line reports `mounts=<ok>/<total>` with `<ok>` below `<total>`, a share failed to
+mount. The boot log names the member.
 
 ---
 

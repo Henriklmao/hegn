@@ -112,7 +112,7 @@ The old one-project-per-VM keys still parse as aliases:
 
 hegn prints a warning to stderr for each deprecated key found in `config.toml`.
 `hegn doctor` also lists them as the optional `deprecated config keys` check
-(marked `!`). Read the values correctly, but rewrite the file with the new
+(marked `!`). The old values still apply, but rewrite the file with the new
 names. `vms_dir` must be an absolute path and must not contain a comma.
 
 The old v1 default `guest_mount = "/workspace"` is migrated to `/projects` with

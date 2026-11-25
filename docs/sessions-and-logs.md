@@ -25,7 +25,7 @@ commits end up there instead of on your main branch. With `auto_branch = false`,
 branch off for one run.
 
 The setting lives in `config.toml` (see [Configuration](configuration.md)).
-`hegn attach <vm>` never creates a branch because it does not select a project.
+`hegn attach` never creates a branch, because it does not open a project.
 
 ---
 
@@ -46,9 +46,8 @@ If several VMs run at the same time, pass the VM name (or a project that names
 exactly one VM). Without an argument, `attach` only connects when exactly one VM
 is running.
 
-Detach with `Ctrl-B`, or with `Ctrl-]` when hegn runs inside tmux. In tmux,
-`Ctrl-B` is tmux's own prefix key, so hegn's detach key is `Ctrl-]` there. Both
-keys are shown in the bar.
+Detach with `Ctrl-B` or `Ctrl-]`. Inside tmux, `Ctrl-B` is tmux's own prefix key,
+so use `Ctrl-]` there. Both keys are shown in the bar.
 
 Detaching leaves the VM running.
 
@@ -90,8 +89,8 @@ Every VM session writes its serial output to:
 <state_dir>/logs/session-<timestamp>-<project>-<pid>.log
 ```
 
-The log is created with private permissions and is kept for the whole VM
-lifetime. Stopping the VM does not erase the boot log.
+The log is created with private permissions. Stopping the VM does not delete it;
+only `hegn logs prune` removes old logs.
 
 ```bash
 hegn logs                       # list, newest first

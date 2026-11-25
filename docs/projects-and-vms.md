@@ -72,9 +72,9 @@ integration = "herdr"
 auto_start = true
 ```
 
-Membership, read-only status, resources and the harness live in hegn's private
-state. A file inside the project cannot change what is exported or how it is
-mounted.
+Membership and read-only status live in the private registry. Resources and the
+harness live in the VM's `vm.toml`. A file inside the project cannot change what
+is exported or how it is mounted.
 
 ---
 
@@ -100,10 +100,9 @@ hegn vm rebuild dev   # new private rootfs from the base image
 ```
 
 The harness, extra packages, vCPUs, memory, security and snapshot policy belong
-to the VM.
-Changing `harness` or `extra_packages` does not rewrite an existing rootfs:
-install tools inside the guest or rebuild the rootfs with `hegn vm rebuild`.
-Manual guest installs persist in the shared rootfs.
+to the VM. Changing `harness` or `extra_packages` does not rewrite an existing
+rootfs: install tools inside the guest or rebuild the rootfs with
+`hegn vm rebuild`. Manual guest installs persist in the shared rootfs.
 
 `hegn vm apply` is an explicit restart because it kills running agents. Use it
 after assigning or unassigning a project while the VM is running.
@@ -252,7 +251,6 @@ git command in one worktree can affect the parent. That is the opt-in tradeoff
 for near-zero disk and instant creation; clones remain the isolation-preserving
 default.
 
-
 ---
 
 ## Deleting projects
@@ -345,5 +343,5 @@ registry, so there is only one source of truth.
 
 Every VM gets one rootfs copy on first start, using a reflink on btrfs or XFS and
 a full copy otherwise. A shared explicit `rootfs_image` is refused when two VMs
-point at the same writable disk. `hegn images download` only refreshes the base
-image.
+point at the same writable disk. `hegn images download` only touches the shared
+base image. Existing VM rootfs copies are not changed.

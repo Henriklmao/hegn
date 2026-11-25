@@ -105,8 +105,9 @@ The VM section shows the primary marker, read-only status and sibling projects.
 `Enter` attaches; the terminal title and header carry `project · vm`.
 
 Destructive actions are never confirmed with `Enter`. Deleting a VM, snapshot or
-project, and allowing a flagged command, requires the explicit `y` key (or `a`
-for the security prompt). Pressing `Enter` keeps the confirmation open.
+project, restoring a snapshot, and allowing a flagged command require an explicit
+key: `y` for most prompts, `a` for the security prompt. Pressing `Enter` keeps the
+confirmation open.
 
 The project delete dialog first shows the branch, the sync state and the number
 of changed files. `y` removes the project from the dashboard and keeps its files;
@@ -117,8 +118,8 @@ original directory is never touched. The project's VM is never deleted here.
 
 ## VM screen
 
-Press `v` on the dashboard, project screen or VM member list to open the
-reusable VM screen. It has four numbered sections:
+Press `v` on the dashboard or the project screen to open the VM screen. It has
+four numbered sections:
 
 1. Projects (members, kind, read-only and primary markers),
 2. snapshots,
@@ -165,8 +166,8 @@ second offers `y` to delete files (the VM directory and managed workspaces) or
 `n` to keep files (unassign every project and leave the VM directory in place).
 `Esc` cancels.
 
-There is no separate instances screen. Projects are the dashboard rows; the VM
-screen is the member list.
+There is no separate VM list screen. Projects are the dashboard rows, and the VM
+screen lists the members of one VM.
 
 ---
 

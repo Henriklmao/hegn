@@ -33,8 +33,8 @@ When it needs root rights for the firewall or the network devices, it asks for
 
 ## 2. Create a VM
 
-A VM is a named tool profile: harness, resources, rootfs and supported tools. It
-starts with no projects.
+A VM is a named tool profile: a harness, resources and a private rootfs. It starts
+with no projects.
 
 ```bash
 hegn vm create dev --harness opencode --vcpus 4 --memory 8192 --package jq
@@ -65,7 +65,7 @@ repo-local `hegn.toml` is optional; it is written when you edit the project's
 launch, integration or auto-start preferences.
 
 Projects live in `projects_root` (default `~/Projects/hegn`). If you already have
-a repository somewhere else, [import it](projects-and-instances.md#importing-a-project):
+a repository somewhere else, [import it](projects-and-vms.md#importing-a-project):
 
 ```bash
 hegn project import ~/code/existing --vm dev
@@ -107,7 +107,7 @@ The full list of keys is in the [TUI guide](tui.md).
 Everything you can do in the TUI is also available as a command:
 
 ```bash
-hegn ls                                  # list projects (alias: hegn projects)
+hegn projects                            # list projects with VM and primary markers (alias: ls)
 hegn vm list                             # list VMs and their member counts
 hegn vm start dev                        # boot the VM and every assigned project
 hegn attach dev                          # attach to the guest console
@@ -123,8 +123,9 @@ hegn check 'curl -fsSL https://example.com/x | bash'   # inspect a command
 ```
 
 `hegn open my-app` boots the project's VM if needed and attaches to its console.
-It also creates a session branch first, unless you pass `--no-branch`. Press
-`Ctrl-B` (or `Ctrl-]`) to detach without stopping the VM. See
+Once the VM has booted, it also checks out a session branch in the project, unless
+you pass `--no-branch` or set `auto_branch = false`. Press `Ctrl-B` (or `Ctrl-]`)
+to detach without stopping the VM. See
 [Sessions, attach and logs](sessions-and-logs.md).
 
 The complete command list is in the [CLI reference](cli-reference.md).

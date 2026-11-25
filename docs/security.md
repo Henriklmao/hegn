@@ -55,7 +55,8 @@ it protects against, and what it does not protect against.
    - `off` disables `tirith-core` but keeps hegn's checks for destructive workspace
      operations.
 8. **Recovery.** A flagged command that you allow can be preceded by a git
-   checkpoint. VM snapshots also allow an instant rollback beyond git.
+   checkpoint. Git is the rollback for project files. VM snapshots restore RAM and
+   CPU state, not the disk.
 
 ### Export invariants
 
@@ -126,8 +127,8 @@ Consequences:
 - encoded or obfuscated payloads,
 - destructive operations in any workspace root.
 
-A flagged command can be allowed once, denied, or preceded by an automatic git
-checkpoint. See the [Security modal](tui.md#security-modal).
+A flagged command can be allowed once, denied, or preceded by a git checkpoint.
+See the [Security modal](tui.md#security-modal).
 
 To check a command without running it, use:
 
@@ -220,7 +221,7 @@ Project import only creates a symlink. It refuses targets that would expose `/`,
 - Every project in a VM is readable by every other project in that VM. Read-only
   prevents writes, not reads.
 - One VM has one serial console. Several agents in one VM share it and need guest
-  `tmux`; there is no vsock session broker in v1.
+  `tmux`; there is no vsock session broker yet.
 - Membership changes need a restart (`hegn vm apply`), which kills running agents.
 
 For the technical details, the threat notes and the invariants that the code must

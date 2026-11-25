@@ -117,7 +117,7 @@ before stopping; snapshots do **not** preserve disk contents.
 | Snapshot | ≈ `memory_mib` + a few KiB | `memory-ranges` holds guest RAM (sparse where the guest never touched pages); `state.json`/`config.json` are small. Disk contents are not copied |
 | Project workspace | 0 | shared read-write through virtio-fs, never copied |
 | Clone workspace | size of one checkout | `<vms_dir>/<vm>/workspaces/<name>`; shares the VM's rootfs and tools |
-| Development checkout | ~9.3 GiB `target/` (this repository) | debug and release artifacts; `cargo clean` reclaims it |
+| Build output | ~9.3 GiB `target/` in a hegn source checkout | debug and release artifacts; `cargo clean` reclaims it |
 
 Minimum free space for a usable install: **~2.5 GiB** (images plus tools), plus
 whatever the guest writes into its rootfs, plus snapshots. The 16 GiB VM size is

@@ -1,8 +1,8 @@
 # hegn — setup guide for LLM agents
 
 This guide is written for an automated coding agent that installs **hegn**, a
-MicroVM-based containerization wizard, on a user's Linux machine. Follow the
-steps in order, run the verification gate after each step, and never report
+Cloud Hypervisor VM manager for coding agents, on a user's Linux machine. Follow
+the steps in order, run the verification gate after each step, and never report
 success based on assumptions — only on command output you actually saw.
 
 hegn is not a container runtime. It boots coding agents inside Cloud Hypervisor
@@ -119,8 +119,8 @@ sudo apt install virtiofsd        # or qemu-virtiofsd on older releases
 sudo pacman -S virtiofsd
 ```
 
-`cloud-hypervisor` (not packaged outside the AUR on Arch; use the upstream
-static build elsewhere):
+`cloud-hypervisor` (on Arch, use the AUR package; elsewhere, use the upstream
+static build):
 
 ```bash
 # upstream static binary; hegn accepts the -static name automatically
@@ -188,8 +188,8 @@ harness         = "shell"   # default for new VMs
 network         = "guarded" # "guarded" (web+DNS only) or "off" (no NIC)
 ```
 
-The old keys `instances_dir`, `shared_tag` and `guest_mount` still parse as
-deprecated aliases with a warning. Rewrite them to `vms_dir`,
+The old keys `instances_dir`, `sandboxes_dir`, `shared_tag` and `guest_mount` still
+parse as deprecated aliases with a warning. Rewrite them to `vms_dir`,
 `share_tag_prefix` and `guest_projects_base`.
 
 Selected values also have an environment override (`HEGN_CONFIG`,
@@ -348,7 +348,7 @@ user. Full measurements, the native-vs-VM comparison and cleanup tips are in
 | AUR helper wants to build `cloud-hypervisor` | AUR-only dependency | Accept it, or install `cloud-hypervisor-bin` first. |
 | Download refuses to run | No SHA-256 for a custom image | Restore the pinned images or use `--allow-unverified` only on explicit request. |
 | Attach fails after a reboot | Stale pid/socket in `<vms_dir>/<vm>/run` | `hegn vm show <vm>`; stop the stale VM and remove its run directory only if no VMM is alive. |
-| `hegn check` exits `1` | Command blocked by policy | Report the finding; do not add `--raw` workarounds or disable `security`. |
+| `hegn check` exits `1` | Command blocked by policy | Report the finding; do not work around the block or disable `security`. |
 
 Exit codes: `hegn doctor` → `1` when a required check fails; `hegn check` → `0`
 allow, `1` block, `2` warn.
@@ -370,6 +370,6 @@ allow, `1` block, `2` warn.
 
 Each project is mounted at `/projects/<slug>`; `/workspace` is a symlink to the
 VM's primary project. The guest uses a persistent rootfs shared by the VM's
-projects. With the default `network = "guarded"`, the guest has a TAP device whose host-side
-rules permit only public HTTP(S) and public DNS; the host LAN, IPv6 and all
-guest-to-host traffic are dropped.
+projects. With the default `network = "guarded"`, the guest has a TAP device whose
+host-side rules permit only public HTTP(S) and public DNS; the host LAN, IPv6 and
+all guest-to-host traffic are dropped.

@@ -9,7 +9,7 @@ the short version.
 | --- | --- |
 | [Installation](installation.md) | Requirements, install methods, upgrading |
 | [Getting started](getting-started.md) | First VM, first project, harness presets |
-| [Projects, VMs and workspaces](projects-and-instances.md) | Membership, imports, forks, deleting, read-only exports |
+| [Projects, VMs and workspaces](projects-and-vms.md) | Membership, imports, forks, deleting, read-only exports |
 | [Harnesses and profiles](harnesses.md) | Harness presets, profiles, skill sync, launch commands |
 | [Sessions, attach and logs](sessions-and-logs.md) | Attaching, the attach bar, session logs |
 | [Configuration](configuration.md) | `config.toml`, `vm.toml`, project `hegn.toml`, environment variables |
@@ -34,9 +34,9 @@ the short version.
 ## Features in detail
 
 - **Project, VM, workspace:** a project is a host directory. A VM is a named tool
-  profile and runtime that hosts one or more projects. A workspace is the
+  profile and runtime that hosts zero or more projects. A workspace is the
   concrete checkout exported for a project: the project itself, a clone, or a
-  worktree. See [Projects, VMs and workspaces](projects-and-instances.md).
+  worktree. See [Projects, VMs and workspaces](projects-and-vms.md).
 - **Isolation:** each VM runs in Cloud Hypervisor with its own kernel and root
   filesystem. The hypervisor runs with seccomp and Landlock. See
   [Security](security.md).
@@ -47,8 +47,9 @@ the short version.
 - **Membership is private:** assignments, read-only flags and fork lineage live
   in `<state_dir>/projects.toml`, outside every exported directory. A repo-local
   `hegn.toml` only carries launch and presentation preferences.
-- **Multiple VMs:** VMs are independent. Each has its own settings, sockets, log,
-  private rootfs and snapshots. A project belongs to at most one VM.
+- **Multiple VMs:** VMs are independent. Each has its own settings, sockets,
+  private rootfs and snapshots. Session logs are shared and can be filtered per
+  VM. A project belongs to at most one VM.
 - **Parallel workspaces:** independent git clones are the default fork. Nested
   git worktrees are opt-in and share git state with their parent.
 - **Harness profiles and skills:** API keys, files and skills are copied into
@@ -67,7 +68,7 @@ the short version.
   and one-key launch into `$EDITOR` or `lazygit`. See [TUI guide](tui.md).
 - **Project import and scaffolding:** import existing repositories by symlink, or
   create a project with `AGENTS.md`, `README.md`, git and a VM assignment. See
-  [Projects, VMs and workspaces](projects-and-instances.md#importing-a-project).
+  [Projects, VMs and workspaces](projects-and-vms.md#importing-a-project).
 - **Pinned VM images:** the official upstream kernel and cloud image, verified with
   SHA-256. See [VM images](vm-images.md).
 - **Machine-readable output:** `--json` for most commands, plus meaningful exit

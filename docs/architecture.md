@@ -799,7 +799,7 @@ matters when hegn runs inside tmux and `Ctrl-B` is consumed as the tmux prefix.
 | Status | header/sidebar | `hegn vm list`, `hegn vm show` |
 | VM settings | `F5` (`vm.toml`) | `hegn vm config` |
 | Snapshots | snapshot panel | `hegn snapshot list/create/restore/delete` |
-| Logs | — | `hegn logs list/path/show/prune --vm` |
+| Logs | — | `hegn logs list/path/show/prune` (`--vm` on list, path and show) |
 | Security check | modal + insert-mode input | `hegn check` |
 | Fork workspace | fork modal | `hegn project fork` |
 | Launch agent/command | `L` (uses project settings) | `hegn launch`, `hegn open --command` |
@@ -1085,8 +1085,8 @@ snapshot and security surface. Keeping only one path also keeps the security
 invariants auditable.
 
 **Consequence:** upgrading is a deliberate recreate. Global `config.toml`
-still accepts `instances_dir`, `shared_tag` and `guest_mount` as deprecated
-aliases with warnings, so startup is not bricked; logs remain readable.
+still accepts `instances_dir`, `sandboxes_dir`, `shared_tag` and `guest_mount` as
+deprecated aliases with warnings, so startup does not fail; logs remain readable.
 
 ### ADR-010: Snapshot boot fingerprint
 
@@ -1156,7 +1156,7 @@ src/
   network/       guarded TAP pool, nftables rules and reservations
   vm/            config/ vm.toml model and store
                  manager/ lifecycle, boot plan, membership, lock, session
-                 registry/ VM listing and lookup
+                 registry.rs VM listing and lookup
                  hypervisor/ REST client
                  cloud_init/ NoCloud seed generation
                  images/ upstream pins, downloads, SHA-256
@@ -1188,7 +1188,7 @@ vendor/
   tirith-core/      patched newest upstream release (RustSec fixes)
 docs/
   architecture.md   this document
-  projects-and-instances.md  projects, VMs and workspaces
+  projects-and-vms.md  projects, VMs and workspaces
   migration-v2.md   v1 → v2 hard-cut notes
   llm-setup.md      install guide written for LLM agents
   resources.md      host cost, overhead and storage

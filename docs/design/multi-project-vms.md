@@ -2,7 +2,7 @@
 
 **Status:** accepted, implemented (v2)
 **Supersedes:** the one-project-per-VM model described in
-[Projects, VMs and workspaces](../projects-and-instances.md) and
+[Projects, VMs and workspaces](../projects-and-vms.md) and
 [Architecture §2–§6](../architecture.md).
 **ADRs:** [ADR-006 … ADR-010](../architecture.md#13-decisions-and-trade-offs).
 

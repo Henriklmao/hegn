@@ -25,7 +25,7 @@ Run `hegn <command> --help` for the full options of each command.
 
 ```text
   tui                              Open the interactive TUI (default)
-  projects [QUERY]                 List registered projects (alias: ls)
+  projects [QUERY]                 List projects with VM and primary markers (alias: ls)
   project create NAME              Scaffold a project (+ AGENTS.md, README, git)
           [--template PATH] [--vm VM | --solo]
   project import PATH [--name N]   Register an existing directory (symlink, no copy)
@@ -68,15 +68,17 @@ Run `hegn <command> --help` for the full options of each command.
   instance ...                     Removed v1 command group; prints the v2 mapping
                                    and exits non-zero (hidden from --help)
 
-  snapshot list                    List snapshots with VM and format (alias: ls)
-  snapshot create [NAME] --vm VM
-  snapshot restore NAME [--vm VM] | delete NAME | show NAME
+  snapshot list [--vm VM]          List snapshots with owner and format (alias: ls)
+  snapshot create [NAME] --vm VM   Pause the VM, save its state, resume
+  snapshot restore NAME [--vm VM]  Restore a snapshot into its owning VM
+  snapshot delete NAME [--vm VM]   Delete a snapshot
+  snapshot show NAME [--vm VM]     Show snapshot metadata
   check [--cwd PATH] CMD...        Inspect a command with tirith-core
   config show | path | init
   profile list | show HARNESS | path HARNESS [--edit] | init
-  profile sync PROJECT|VM          Refresh a VM's profile payload
-  skills sync PROJECT|VM           Copy host skills into the VM's profile copy
-  skills sync-back PROJECT|VM [--dry-run] [--force]
+  profile sync VM                  Refresh a VM's profile payload
+  skills sync VM                   Copy host skills into the VM's profile copy
+  skills sync-back VM [--dry-run] [--force]
   images download [--force]        Fetch missing pinned kernel/rootfs images
           [--allow-unverified]
   images status | verify           Show or re-hash the configured images
@@ -99,9 +101,9 @@ Notes:
   directory and its managed clone workspaces.
 - `profile sync` and `skills sync` accept a VM name, a project name or a project
   path and operate on that VM's private profile copy.
-- `snapshot create` requires `--vm <vm>` (or a project assigned to a VM).
-  `--instance` remains a hidden deprecated alias for `--vm` and prints a
-  warning.
+- `snapshot create` requires `--vm <vm>`. The value can also be a project name or
+  path that resolves to its VM. `--instance` remains a hidden deprecated alias for
+  `--vm` and prints a warning. Without `--vm`, `snapshot list` covers every VM.
 
 ---
 
@@ -129,7 +131,7 @@ Short examples for the most common tasks are in
 [Getting started](getting-started.md#5-or-use-the-command-line). Other pages cover
 the individual areas:
 
-- projects, VMs and workspaces: [Projects, VMs and workspaces](projects-and-instances.md)
+- projects, VMs and workspaces: [Projects, VMs and workspaces](projects-and-vms.md)
 - attach and logs: [Sessions, attach and logs](sessions-and-logs.md)
 - snapshots: [Snapshots](snapshots.md)
 - profiles and launch: [Harnesses and profiles](harnesses.md)

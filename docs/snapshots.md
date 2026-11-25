@@ -31,11 +31,15 @@ hegn snapshot delete before-refactor
 hegn snapshot show before-refactor
 ```
 
-`hegn snapshot create` requires `--vm <vm>` (or a project assigned to a VM);
-without it the command fails with `snapshot create needs a VM: pass --vm <vm>`.
-`hegn snapshot restore` defaults to the VM recorded in the snapshot metadata.
-`hegn snapshot list` shows the owning VM and whether the snapshot is `v2` or
-`legacy`.
+`hegn snapshot create` requires `--vm <vm>`. The value can also be a project name
+or path that resolves to its VM. Without it the command fails with
+`snapshot create needs a VM: pass --vm <vm> (or a project assigned to a VM)`.
+
+`hegn snapshot list` shows the owning VM and whether each snapshot is `v2` or
+`legacy`. Without `--vm` it lists the snapshots of every VM.
+`hegn snapshot restore` defaults to the VM recorded in the snapshot metadata. It
+refuses legacy and ownerless snapshots. `delete` and `show` work without `--vm`;
+with `--vm` they first check that the snapshot belongs to that VM.
 
 The old `--instance` spelling is accepted as a hidden deprecated alias and
 prints a warning. Use `--vm`.
@@ -96,9 +100,9 @@ Semantics:
   logged reason, and the VM cold boots. hegn never restores a VM whose embedded
   mounts no longer exist.
 - **Manual restore:** a fingerprint mismatch is refused with a message naming the
-  changed fields and suggesting `hegn vm apply`. There is no `--force` in v1 of
-  this model; a restored VM cannot be reconciled with added or removed shares
-  after the fact.
+  changed fields and suggesting `hegn vm apply`. There is no `--force` option. A
+  restored VM cannot be reconciled with shares that were added or removed after
+  the snapshot was taken.
 - **Restore flow:** hegn re-spawns one `virtiofsd` per recorded member on the
   same indexed sockets, regenerates the seed from the recorded membership,
   restores the VMM, and rewrites the session record.

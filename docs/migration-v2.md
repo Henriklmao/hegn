@@ -1,4 +1,4 @@
-# Migrating from v1 (one project per VM)
+# Migrating to v2
 
 hegn v2 is a hard cut. There is no automatic migration from the v1
 one-project-per-VM model.
@@ -20,14 +20,15 @@ one-project-per-VM model.
 | `<vms_dir>/<vm>/vm.toml` | Active per-VM config (version 2) |
 | Project `hegn.toml` | Only `launch`, `integration`, `auto_start` |
 | `instances_dir` in `config.toml` | Deprecated alias for `vms_dir`; warning |
+| `sandboxes_dir` in `config.toml` | Deprecated alias for `vms_dir`; warning |
 | `shared_tag` in `config.toml` | Deprecated alias for `share_tag_prefix`; warning |
 | `guest_mount` in `config.toml` | Deprecated alias; `/workspace` migrates to `/projects` with a specific warning |
 | v1 instance directories | Ignored, reported by `hegn doctor`, never deleted |
 | v1 snapshots without a fingerprint | Listed as legacy; never restored or deleted |
 | v1 session logs | Still readable with `hegn logs` |
 
-A v1 `config.toml` keeps working for the renamed global keys, so startup is not
-bricked. The old values are read; rewrite them to the new names when convenient.
+A v1 `config.toml` keeps working for the renamed global keys, so startup does not
+fail. The old values are read; rewrite them to the new names when convenient.
 Unknown keys are still rejected.
 
 The old v1 default `guest_mount = "/workspace"` is migrated to
@@ -121,8 +122,8 @@ VM named after the project.
 
 ## Limitations carried into v2
 
-- **One console per VM.** A vsock session broker is out of scope for v1 of this
-  model. Use guest `tmux` for several agents in one VM, or separate VMs.
+- **One console per VM.** A vsock session broker is out of scope for this
+  release. Use guest `tmux` for several agents in one VM, or separate VMs.
 - **Membership changes require a restart.** There is no live virtio-fs hot-plug;
   `hegn vm apply` restarts the VM and kills running agents.
 - **Tool changes are not reconciled.** A provisioner installs the baseline once.

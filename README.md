@@ -1,7 +1,6 @@
 <div align="center">
 
-<!-- Platzhalter: Icon unter docs/assets/icon.png ablegen -->
-<img src="docs/assets/icon.png" width="128" alt="hegn icon">
+<!-- Icon: add docs/assets/icon.png, then restore the <img width="128" alt="hegn icon"> tag here. -->
 
 # hegn
 
@@ -13,12 +12,7 @@
 
 </div>
 
-<!-- Platzhalter-Screenshots: durch echte Vorschaubilder ersetzen -->
-<p align="center">
-  <img src="docs/assets/preview-dashboard.png" alt="hegn dashboard with the project picker" width="90%">
-  <br>
-  <img src="docs/assets/preview-session.png" alt="hegn attached to a coding agent in a VM" width="90%">
-</p>
+<!-- Screenshots: add docs/assets/preview-dashboard.png and docs/assets/preview-session.png, then restore the centered <p align="center"> image block here. -->
 
 *hegn* is Norwegian/Danish for "fence" or "enclosure". That is what it does: it
 keeps your coding agents and research projects in a secure enclosure. Agents run
@@ -26,8 +20,8 @@ inside Cloud Hypervisor VMs, and each project is exported to a VM through its ow
 sandboxed `virtiofsd`, so an agent can work on your code without reaching the
 rest of your system.
 
-A VM can host several projects and pays for its toolchain once. Projects in the
-same VM can read each other's files: the VM, not the project, is the trust
+A VM can host several projects and installs its toolchain once. Projects in the
+same VM can read each other's files, so the VM, not the project, is the trust
 boundary.
 
 ---
@@ -68,20 +62,23 @@ to trust them with your whole machine. hegn gives every project a boundary:
   harness, toolchain and rootfs. Each project is still its own sandboxed
   `virtiofsd` export; the VM trust boundary is documented in
   [Security](docs/security.md#projects-in-one-vm-are-mutually-visible).
-- **Project-first control plane.** `hegn project assign` builds membership. The
-  private registry cannot be changed by an agent inside the VM.
+- **Explicit membership.** `hegn project assign` adds a project to a VM, and
+  `hegn vm` controls the VM. The membership registry is private: an agent inside
+  the VM cannot change it.
 - **Parallel workspaces.** Fork a project into an independent clone (the default)
   or, opt-in, a nested git worktree. See
-  [Projects, VMs and workspaces](docs/projects-and-instances.md#parallel-workspaces).
+  [Projects, VMs and workspaces](docs/projects-and-vms.md#parallel-workspaces).
 - **Ready-made harnesses** for OpenCode, Claude Code, Codex, pi, Prime Agent, Aider
   and Gemini CLI. Each VM installs its harness tools automatically on first boot.
 - **Profiles** pass API keys, config files and skills into the VM. Skills are
-  copied, never linked, so the guest cannot change your real skill folders.
+  copied into the per-VM profile, never linked to your host skill folders, so the
+  guest cannot change the real skill folders.
 - **Snapshots** save and restore the full VM state. A boot fingerprint prevents a
-  restore from silently using stale membership. Automatic checkpoints make
-  restarts fast.
+  restore from silently using stale membership. Automatic checkpoints let a
+  restart resume instead of cold booting.
 - **Guarded network.** The guest can reach the public web and DNS. The local
-  network and your host stay closed.
+  network and your host stay closed, except for the local LLM endpoints you
+  configure.
 - **Command guardrails** based on [`tirith-core`](https://crates.io/crates/tirith-core)
   and hegn's own checks. Every `/projects/*` mount and `/workspace` is a guarded
   workspace root.
@@ -146,7 +143,7 @@ Press `Ctrl-B` to detach. The VM keeps running. The full walkthrough is in
 | --- | --- |
 | [Installation](docs/installation.md) | Requirements, install methods, upgrading |
 | [Getting started](docs/getting-started.md) | First VM, first project, harness presets |
-| [Projects, VMs and workspaces](docs/projects-and-instances.md) | Membership, imports, forks, read-only exports |
+| [Projects, VMs and workspaces](docs/projects-and-vms.md) | Membership, imports, forks, read-only exports |
 | [Harnesses and profiles](docs/harnesses.md) | API keys, skills, launch commands and terminal integrations |
 | [Sessions, attach and logs](docs/sessions-and-logs.md) | Attaching, the status bar, session logs |
 | [Configuration](docs/configuration.md) | `config.toml`, `vm.toml`, project settings, the settings editor |

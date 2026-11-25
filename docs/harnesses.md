@@ -88,7 +88,7 @@ A second, sandboxed `virtiofsd` exports that **copy** to the guest at
   run again.
 
 The guest's skill directory links to that copy, **not** to the host directory. A
-compromised guest can therefore change only the throw-away copy, never your real
+compromised guest can therefore change only the per-VM copy, never your real
 skills.
 
 ```bash
@@ -131,7 +131,7 @@ configured agent in a real terminal. Press `L` to launch it again later.
 `launch.default` in `config.toml` decides what starts:
 
 - `"harness"` starts the agent of the VM's harness (`opencode`, `claude`,
-  `codex`, `pi`, `gemini`).
+  `codex`, `pi`, `prime-agent`, `aider` or `gemini`).
 - `"shell"` only opens the maintenance shell.
 - Any other value refers to an entry in `[[launch.commands]]`.
 
@@ -201,5 +201,5 @@ hegn open my-app --command opencode        # attach and type one command
 hegn attach my-app --command opencode --no-bar
 ```
 
-`auto_start = false` in a project's `hegn.toml` keeps that project's VM boots
-quiet, even when the global `launch.auto_start` is on.
+`auto_start = false` in a project's `hegn.toml` turns off the automatic launch
+after boot for that project, even when the global `launch.auto_start` is on.
