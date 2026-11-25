@@ -152,7 +152,8 @@ those are the same directories the VM exported before and after the restore.
 
 ## Configuration
 
-Global defaults live in `config.toml`; new VMs copy them into `vm.toml`:
+These are VM settings in `vm.toml`. Global defaults in `config.toml` seed them
+when a VM is created:
 
 ```toml
 periodic_snapshots      = true

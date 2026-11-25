@@ -99,7 +99,8 @@ hegn vm apply dev     # restart to pick up config or membership changes
 hegn vm rebuild dev   # new private rootfs from the base image
 ```
 
-The harness, extra packages, vCPUs, memory and snapshot policy belong to the VM.
+The harness, extra packages, vCPUs, memory, security and snapshot policy belong
+to the VM.
 Changing `harness` or `extra_packages` does not rewrite an existing rootfs:
 install tools inside the guest or rebuild the rootfs with `hegn vm rebuild`.
 Manual guest installs persist in the shared rootfs.
@@ -194,8 +195,10 @@ Inside the guest:
 ```
 
 `/workspace` is a guest-side symlink created at boot. It is not a separate
-export and cannot point outside `/projects`. The login shell starts there when
-it exists.
+export and cannot point outside the configured project base (default
+`/projects`). A custom base changes the mount paths; `/workspace` points at the
+primary project below it. `/workspace` and paths under it are reserved and
+cannot be the project base. The login shell starts there when it exists.
 
 One VM has one serial console. Starting any member starts the whole VM;
 attaching another member attaches the same console. For several agents in one

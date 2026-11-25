@@ -108,7 +108,9 @@ Consequences:
   registry entry and unassigns it; its VM and sibling projects stay. A VM is
   deleted only by `hegn vm delete`, with its own confirmation.
 - **`/workspace` is a validated symlink** to a mounted primary project, created
-  inside the guest. It cannot point at the host or outside `/projects`.
+  inside the guest. It cannot point at the host or outside the configured project
+  base (default `/projects`). `/workspace` and paths under it are reserved and
+  cannot be the project base.
 
 ---
 

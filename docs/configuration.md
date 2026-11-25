@@ -118,7 +118,9 @@ must be an absolute path and must not contain a comma.
 tag limit and must not be the reserved profile tag `hegn-profile`.
 
 `guest_projects_base` must be an absolute guest path with simple components.
-`/workspace` is reserved for the primary symlink and cannot be the project base.
+A base other than `/projects` is allowed; projects then mount below that base,
+and `/workspace` points at the primary project below it. `/workspace` and paths
+under it are reserved for the primary symlink and cannot be the project base.
 
 Some key groups have their own pages:
 
@@ -155,6 +157,8 @@ network_index = 3              # assigned once, kept across restores
 created_at = "2026-11-24T10:00:00Z"
 ```
 
+These are VM settings: `security` and the snapshot policy fields are stored per
+VM in `vm.toml` and copied from the global defaults when the VM is created.
 `vm.toml` deliberately does **not** list projects. Boot resolves the VM name to
 members by scanning the private registry, so membership has one source of truth.
 
@@ -293,5 +297,4 @@ These variables override the matching config values:
 | `HEGN_ROOTFS_FORMAT`, `HEGN_ROOT_DEVICE` | `rootfs_format`, `root_device` |
 | `HEGN_KERNEL_URL`, `HEGN_KERNEL_SHA256` | `kernel_url`, `kernel_sha256` |
 | `HEGN_ROOTFS_URL`, `HEGN_ROOTFS_SHA256` | `rootfs_url`, `rootfs_sha256` |
-
-Harnesses that hegn starts also receive `HEGN=1` and `HEGN_WORKSPACE=<guest path>`.
+| `HEGN_NETWORK` | `network` |
