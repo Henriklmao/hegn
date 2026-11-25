@@ -148,12 +148,12 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
             (
                 percent < u64::from(config.disk_usage_warn_percent),
                 format!(
-                    "{}% used on the instance filesystem (warn at {}%)",
+                    "{}% used on the VM filesystem (warn at {}%)",
                     percent, config.disk_usage_warn_percent
                 ),
             )
         }
-        _ => (true, "instance filesystem not created yet".to_string()),
+        _ => (true, "VM filesystem not created yet".to_string()),
     };
     checks.push(Check::new("disk space", disk_ok, false, disk_detail));
     let guarded = config.network == crate::config::NetworkMode::Guarded;
@@ -231,7 +231,7 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
         false,
         match &health {
             Some(health) => health.summary(now),
-            None => "no hegn-health line yet (boot an instance)".to_string(),
+            None => "no hegn-health line yet (boot a VM)".to_string(),
         },
     ));
     checks.push(Check::new(
