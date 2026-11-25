@@ -413,52 +413,100 @@ fn legacy_snapshot_check(config: &Config) -> Check {
     )
 }
 
-/// Deprecated repo-local keys in the project picker.
+/// Deprecated repo-local keys in the project picker and registry.
 ///
 /// `project::deprecated_legacy_keys` follows the same file preference as
 /// `read_meta`: the first readable, valid `hegn.toml` or `.hegn.toml` wins.
+/// Registry-only External projects outside `projects_root` are scanned too, so
+/// an imported project that is not visible in the picker still gets a finding.
 fn deprecated_project_keys_check(config: &Config) -> Check {
-    let mut findings = Vec::new();
+    let mut candidates = Vec::new();
+    let mut scan_error = None;
     match fs::read_dir(&config.projects_root) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.is_dir() {
-                    continue;
+                if path.is_dir() {
+                    candidates.push(path);
                 }
-                let keys = crate::project::deprecated_legacy_keys(&path);
-                if keys.is_empty() {
-                    continue;
-                }
-                let file = deprecated_project_meta_file(&path).unwrap_or("hegn.toml");
-                findings.push(format!(
-                    "{} (`{file}`: {})",
-                    path.display(),
-                    keys.join(", ")
-                ));
             }
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => {
-            return Check::new(
-                "legacy project keys",
-                false,
-                false,
-                format!(
-                    "could not scan {} for deprecated keys: {err}",
-                    config.projects_root.display()
-                ),
-            );
+            scan_error = Some(format!(
+                "could not scan {} for deprecated keys: {err}",
+                config.projects_root.display()
+            ));
         }
     }
+
+    let mut registry_error = None;
+    match crate::project::ProjectRegistry::load(&config.state_dir) {
+        Ok(registry) => candidates.extend(
+            registry
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind == crate::project::ProjectKind::External)
+                .map(|entry| entry.path.clone()),
+        ),
+        Err(err) => {
+            registry_error = Some(format!(
+                "could not read project registry {}: {err}",
+                config
+                    .state_dir
+                    .join(crate::project::REGISTRY_FILE)
+                    .display()
+            ));
+        }
+    }
+
+    // A picker symlink and its canonical registry path are the same project.
+    let mut unique = std::collections::BTreeMap::new();
+    for path in candidates {
+        unique.entry(project_scan_key(&path)).or_insert(path);
+    }
+    let mut paths = unique.into_values().collect::<Vec<_>>();
+    paths.sort();
+
+    let mut findings = Vec::new();
+    for path in &paths {
+        if !path.is_dir() {
+            continue;
+        }
+        let keys = crate::project::deprecated_legacy_keys(path);
+        if keys.is_empty() {
+            continue;
+        }
+        let file = deprecated_project_meta_file(path).unwrap_or("hegn.toml");
+        findings.push(format!(
+            "{} (`{file}`: {})",
+            path.display(),
+            keys.join(", ")
+        ));
+    }
     findings.sort();
+
+    let scan_failed = scan_error.is_some();
+    let mut notes = Vec::new();
+    if let Some(error) = scan_error {
+        notes.push(error);
+    }
+    if let Some(error) = registry_error {
+        notes.push(error);
+    }
+    let suffix = if notes.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", notes.join("; "))
+    };
+
     if findings.is_empty() {
         return Check::new(
             "legacy project keys",
-            true,
+            !scan_failed,
             false,
             format!(
-                "none found under {} (harness, packages and template belong in vm.toml)",
+                "none found under {} (harness, packages and template belong in vm.toml){suffix}",
                 config.projects_root.display()
             ),
         );
@@ -469,10 +517,25 @@ fn deprecated_project_keys_check(config: &Config) -> Check {
         false,
         format!(
             "{}; these keys belong in vm.toml or `hegn vm create` now and are ignored for control \
-             in v2",
+             in v2{suffix}",
             findings.join("; ")
         ),
     )
+}
+
+/// Canonical path when possible, otherwise an absolute lexical path.
+///
+/// This lets a picker symlink and its registry entry collapse to one scan.
+fn project_scan_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
 }
 
 /// Which project metadata file `deprecated_legacy_keys` read.
@@ -1079,6 +1142,84 @@ mod tests {
         });
         assert!(absent.ok);
         assert!(absent.detail.contains("none found"), "{}", absent.detail);
+    }
+
+    fn write_registry(config: &Config, entries: &[(&str, &Path)]) {
+        let mut raw = String::from("version = 2\n");
+        for (name, path) in entries {
+            raw.push_str(&format!(
+                "\n[[project]]\nname = {name:?}\npath = {:?}\nvm = \"demo-vm\"\n\
+                 created_at = \"2026-01-01T00:00:00Z\"\n",
+                path.display().to_string()
+            ));
+        }
+        fs::create_dir_all(&config.state_dir).unwrap();
+        fs::write(config.state_dir.join(crate::project::REGISTRY_FILE), raw).unwrap();
+    }
+
+    #[test]
+    fn registry_only_external_projects_are_scanned_for_deprecated_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let outside = dir.path().join("outside/demo");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("hegn.toml"), "harness = \"opencode\"\n").unwrap();
+        write_registry(&config, &[("demo", &outside)]);
+
+        let check = deprecated_project_keys_check(&config);
+        assert!(!check.ok);
+        assert!(!check.required);
+        assert!(
+            check.detail.contains(&outside.display().to_string()),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("`hegn.toml`: harness"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn picker_and_registry_project_paths_are_scanned_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let demo = config.projects_root.join("demo");
+        fs::create_dir_all(&demo).unwrap();
+        fs::write(demo.join("hegn.toml"), "packages = [\"git\"]\n").unwrap();
+        write_registry(&config, &[("demo", &demo)]);
+
+        let check = deprecated_project_keys_check(&config);
+        let path = demo.display().to_string();
+        assert_eq!(
+            check.detail.matches(&path).count(),
+            1,
+            "the picker and registry entries are one project: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn registry_read_error_is_reported_without_failing_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        fs::create_dir_all(&config.state_dir).unwrap();
+        fs::write(
+            config.state_dir.join(crate::project::REGISTRY_FILE),
+            b"version = [not valid",
+        )
+        .unwrap();
+
+        let check = deprecated_project_keys_check(&config);
+        assert!(check.ok, "a registry read error is informational");
+        assert!(!check.required);
+        assert!(
+            check.detail.contains("could not read project registry"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("none found"), "{}", check.detail);
     }
 
     #[test]
