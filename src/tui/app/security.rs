@@ -83,18 +83,19 @@ impl App {
         }
     }
 
-    /// Derive the guest workspace policy for one command.
+    /// Derive the security mode and workspace policy for one command.
     ///
-    /// The policy is intentionally not cached: attaching, detaching, applying
-    /// a VM or changing the security mode must be visible on the next command.
-    pub fn workspace_policy_for(
+    /// Nothing is cached: attaching, detaching, applying a VM or editing a
+    /// `vm.toml` security mode must be visible on the next command. The
+    /// attached VM wins over the project's assignment; an unassigned project
+    /// falls back to the global mode and the configured guest base.
+    pub fn command_security(
         &self,
         project: Option<&Path>,
-    ) -> anyhow::Result<GuestWorkspacePolicy> {
+    ) -> anyhow::Result<(SecurityMode, GuestWorkspacePolicy)> {
         if let Some(vm) = &self.attached_vm {
-            return VmRegistry::new(self.config.clone())
-                .manager_by_name(vm)?
-                .workspace_policy();
+            let manager = VmRegistry::new(self.config.clone()).manager_by_name(vm)?;
+            return Ok((manager.security_mode(), manager.workspace_policy()?));
         }
         if let Some(project) = project {
             let canonical = project
@@ -104,12 +105,14 @@ impl App {
             if let Some(entry) = registry.find_by_path(&canonical)
                 && let Some(vm) = &entry.vm
             {
-                return VmRegistry::new(self.config.clone())
-                    .manager_by_name(vm)?
-                    .workspace_policy();
+                let manager = VmRegistry::new(self.config.clone()).manager_by_name(vm)?;
+                return Ok((manager.security_mode(), manager.workspace_policy()?));
             }
         }
-        GuestWorkspacePolicy::new(&self.config.guest_projects_base).map_err(Into::into)
+        Ok((
+            self.config.security,
+            GuestWorkspacePolicy::new(&self.config.guest_projects_base)?,
+        ))
     }
 
     /// Test/uploads access to the security engine.
@@ -346,6 +349,18 @@ mod tests {
             .unwrap();
     }
 
+    fn save_vm_with_security(app: &App, name: &str, mode: SecurityMode) {
+        let mut vm = crate::vm::config::VmConfig::from_config(
+            &app.config,
+            name,
+            Some(crate::config::Harness::Shell),
+        );
+        vm.security = mode;
+        crate::vm::config::VmStore::new(&app.config)
+            .save(&vm)
+            .unwrap();
+    }
+
     fn register_project(app: &mut App, name: &str, path: &Path, vm: Option<&str>) {
         let mut registry = crate::project::ProjectRegistry::load(&app.config.state_dir).unwrap();
         registry
@@ -374,7 +389,7 @@ mod tests {
         let path = vm_project_path(&app, "parser");
         register_project(&mut app, "parser", &path, Some("rust"));
 
-        let policy = app.workspace_policy_for(Some(&path)).unwrap();
+        let (_, policy) = app.command_security(Some(&path)).unwrap();
         assert!(policy.contains("/projects/parser"));
         assert!(policy.contains("/workspace"));
         assert_eq!(policy.roots(), vec!["/projects/parser", "/workspace"]);
@@ -392,7 +407,7 @@ mod tests {
         let path = vm_project_path(&app, "parser");
         register_project(&mut app, "parser", &path, None);
 
-        let policy = app.workspace_policy_for(Some(&path)).unwrap();
+        let (_, policy) = app.command_security(Some(&path)).unwrap();
         assert_eq!(policy.roots(), vec!["/workspace"]);
         assert!(!policy.contains("/projects/parser"));
     }
@@ -407,7 +422,7 @@ mod tests {
         register_project(&mut app, "other", &unassigned, None);
 
         app.attached_vm = Some("rust".into());
-        let policy = app.workspace_policy_for(Some(&unassigned)).unwrap();
+        let (_, policy) = app.command_security(Some(&unassigned)).unwrap();
         assert!(policy.contains("/projects/parser"));
         assert!(!policy.contains("/projects/other"));
     }
@@ -428,7 +443,7 @@ mod tests {
         let toast = app.toast.as_ref().expect("a refusal toast");
         assert_eq!(toast.level, ToastLevel::Error);
         assert!(
-            toast.text.starts_with("workspace guard unavailable: "),
+            toast.text.starts_with("command guard unavailable: "),
             "{}",
             toast.text
         );
@@ -451,6 +466,128 @@ mod tests {
             app.toast
                 .as_ref()
                 .is_some_and(|toast| toast.text.contains("workspace guard"))
+        );
+    }
+
+    #[test]
+    fn vm_security_off_overrides_a_global_enforce_mode() {
+        let (_dir, mut app) = test_app();
+        app.config.security = SecurityMode::Enforce;
+        save_vm_with_security(&app, "rust", SecurityMode::Off);
+        let path = vm_project_path(&app, "parser");
+        register_project(&mut app, "parser", &path, Some("rust"));
+        let log = ConsoleLog::default();
+        app.session = Some(log.console(path));
+        app.input = "rm -rf /projects/parser".into();
+
+        app.submit_input();
+
+        assert_eq!(log.sent_text(), "rm -rf /projects/parser\r");
+        assert!(app.modal.is_none());
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("workspace guard"))
+        );
+    }
+
+    #[test]
+    fn vm_security_enforce_overrides_a_global_off_mode() {
+        let (_dir, mut app) = test_app();
+        app.config.security = SecurityMode::Off;
+        save_vm_with_security(&app, "rust", SecurityMode::Enforce);
+        let path = vm_project_path(&app, "parser");
+        register_project(&mut app, "parser", &path, Some("rust"));
+        let log = ConsoleLog::default();
+        app.session = Some(log.console(path));
+        app.input = "rm -rf /projects/parser".into();
+
+        app.submit_input();
+
+        assert!(log.sent().is_empty(), "the VM's enforce mode must block");
+        match &app.modal {
+            Some(Modal::Security(prompt)) => {
+                assert_eq!(prompt.inspection.decision, Decision::Block);
+            }
+            other => panic!("expected the security prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attached_vm_security_mode_takes_precedence_over_the_command_project() {
+        let (_dir, mut app) = test_app();
+        save_vm_with_security(&app, "attached", SecurityMode::Off);
+        save_vm_with_security(&app, "assigned", SecurityMode::Enforce);
+        let attached_path = vm_project_path(&app, "other");
+        register_project(&mut app, "other", &attached_path, Some("attached"));
+        let assigned_path = vm_project_path(&app, "parser");
+        register_project(&mut app, "parser", &assigned_path, Some("assigned"));
+        app.attached_vm = Some("attached".into());
+
+        let (mode, policy) = app.command_security(Some(&assigned_path)).unwrap();
+
+        assert_eq!(mode, SecurityMode::Off);
+        assert!(policy.contains("/projects/other"));
+        assert!(!policy.contains("/projects/parser"));
+    }
+
+    #[test]
+    fn unassigned_project_uses_the_global_security_mode() {
+        let (_dir, mut app) = test_app();
+        app.config.security = SecurityMode::Warn;
+        let path = vm_project_path(&app, "parser");
+        register_project(&mut app, "parser", &path, None);
+
+        let (mode, policy) = app.command_security(Some(&path)).unwrap();
+
+        assert_eq!(mode, SecurityMode::Warn);
+        assert_eq!(policy.roots(), vec!["/workspace"]);
+    }
+
+    #[test]
+    fn unreadable_vm_config_fails_closed_without_writing() {
+        let (_dir, mut app) = test_app();
+        let path = vm_project_path(&app, "parser");
+        register_project(&mut app, "parser", &path, Some("rust"));
+        std::fs::create_dir_all(app.config.vms_dir.join("rust")).unwrap();
+        std::fs::write(app.config.vms_dir.join("rust/vm.toml"), "not = [valid").unwrap();
+        let log = ConsoleLog::default();
+        app.session = Some(log.console(path));
+        app.input = "rm -rf /projects/parser".into();
+
+        app.submit_input();
+
+        assert!(log.sent().is_empty(), "a broken VM config must not write");
+        let toast = app.toast.as_ref().expect("a refusal toast");
+        assert_eq!(toast.level, ToastLevel::Error);
+        assert!(
+            toast.text.starts_with("command guard unavailable: "),
+            "{}",
+            toast.text
+        );
+    }
+
+    #[test]
+    fn editing_vm_security_takes_effect_on_the_next_command() {
+        let (_dir, mut app) = test_app();
+        save_vm_with_security(&app, "rust", SecurityMode::Off);
+        let path = vm_project_path(&app, "parser");
+        register_project(&mut app, "parser", &path, Some("rust"));
+
+        assert_eq!(
+            app.command_security(Some(&path)).unwrap().0,
+            SecurityMode::Off
+        );
+
+        let store = crate::vm::config::VmStore::new(&app.config);
+        let mut vm = store.load("rust").unwrap();
+        vm.security = SecurityMode::Enforce;
+        store.save(&vm).unwrap();
+        app.refresh_project_entries();
+
+        assert_eq!(
+            app.command_security(Some(&path)).unwrap().0,
+            SecurityMode::Enforce
         );
     }
 
