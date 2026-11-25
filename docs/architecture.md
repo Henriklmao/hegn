@@ -380,8 +380,9 @@ Restore:
 ### 5.5 Project create, import and assignment
 
 Create writes into `projects_root` (default `~/Projects/hegn`), seeds
-`AGENTS.md`/`README.md`, initializes git, writes only presentation defaults to
-`hegn.toml`, and registers a `ProjectEntry` in `<state_dir>/projects.toml`. With
+`AGENTS.md`/`README.md`, initializes git, and registers a `ProjectEntry` in
+`<state_dir>/projects.toml`. A repo-local `hegn.toml` is optional and is written
+only when presentation settings are edited. With
 `--vm` it assigns the entry immediately; with `--solo` (or an accepted prompt)
 it creates a one-member VM named after the project and assigns it; otherwise the
 project stays unassigned.

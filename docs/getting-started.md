@@ -60,8 +60,9 @@ hegn project create my-app --vm dev
 
 `--vm` assigns the new project to an existing VM. Without it, hegn asks whether to
 create a one-member VM named after the project; `--solo` does that without
-prompting. The project gets an `AGENTS.md`, a `README.md`, a git repository and a
-presentation-only `hegn.toml`.
+prompting. The project gets an `AGENTS.md`, a `README.md` and a git repository. A
+repo-local `hegn.toml` is optional; it is written when you edit the project's
+launch, integration or auto-start preferences.
 
 Projects live in `projects_root` (default `~/Projects/hegn`). If you already have
 a repository somewhere else, [import it](projects-and-instances.md#importing-a-project):

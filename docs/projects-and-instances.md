@@ -227,7 +227,8 @@ hegn project fork parser --name parser-fix-tests
   back to a normal clone across devices.
 
 A clone contains only **committed** history. Commit or stash uncommitted work
-first. Cloning a repository without commits gives an empty clone.
+first. hegn refuses to fork a repository without commits with `has no git
+commit to fork; create an initial commit first`.
 
 ### Worktree (opt-in, shared git state)
 
@@ -251,9 +252,6 @@ git command in one worktree can affect the parent. That is the opt-in tradeoff
 for near-zero disk and instant creation; clones remain the isolation-preserving
 default.
 
-Importing an existing host worktree as a project is supported only when its
-gitdir resolves inside the exported tree. Otherwise hegn refuses and suggests a
-clone.
 
 ---
 
@@ -328,7 +326,7 @@ without `--read-only`. The change takes effect on the next start.
 ```text
 <vms_dir>/<vm>/vm.toml                  VM profile (0600)
 <vms_dir>/<vm>/run/                     sockets, pids, session and membership
-<vms_dir>/<vm>/rootfs.qcow2             private rootfs (first start)
+<vms_dir>/<vm>/rootfs.<rootfs_format>   private rootfs (first start; .qcow2 or .raw)
 <vms_dir>/<vm>/workspaces/<name>/       hegn-managed clone workspaces
 
 <state_dir>/projects.toml               private project registry (0600)
