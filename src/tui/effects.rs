@@ -300,13 +300,13 @@ pub(super) fn handle_effects(
                     } else {
                         "files kept"
                     };
-                    let instances = if outcome.instances.is_empty() {
+                    let vms = if outcome.instances.is_empty() {
                         String::new()
                     } else {
                         format!(" · removed {}", outcome.instances.join(", "))
                     };
                     app.toast(
-                        format!("project {} deleted ({files}){instances}", project.display()),
+                        format!("project {} deleted ({files}){vms}", project.display()),
                         ToastLevel::Info,
                     );
                 }

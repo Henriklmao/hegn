@@ -85,15 +85,15 @@ pub(crate) fn profile_command(command: ProfileCommands, config: Config, json: bo
             }
             Ok(0)
         }
-        ProfileCommands::Sync { instance } => {
+        ProfileCommands::Sync { instance: selector } => {
             let registry = VmRegistry::new(config);
-            let instance = registry.resolve(&instance)?;
-            let plan = crate::agent::profile::prepare_for_start(registry.config(), &instance)?;
+            let vm = registry.resolve(&selector)?;
+            let plan = crate::agent::profile::prepare_for_start(registry.config(), &vm)?;
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "instance": instance.name,
+                        "instance": vm.name,
                         "packages": plan.packages,
                         "share": plan.share.as_ref().map(|share| &share.bundle_dir),
                         "warnings": plan.warnings,
@@ -103,12 +103,12 @@ pub(crate) fn profile_command(command: ProfileCommands, config: Config, json: bo
                 match &plan.share {
                     Some(share) => println!(
                         "Profile payload for '{}' refreshed at {}",
-                        instance.name,
+                        vm.name,
                         share.bundle_dir.display()
                     ),
                     None => println!(
                         "Profile for '{}' has no files, skills or environment to export",
-                        instance.name
+                        vm.name
                     ),
                 }
                 for warning in &plan.warnings {

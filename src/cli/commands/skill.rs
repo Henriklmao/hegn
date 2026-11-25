@@ -11,9 +11,9 @@ use crate::cli::args::SkillCommands;
 pub(crate) fn skill_command(command: SkillCommands, config: Config, json: bool) -> Result<i32> {
     let registry = VmRegistry::new(config);
     match command {
-        SkillCommands::Sync { instance } => {
-            let instance = registry.resolve(&instance)?;
-            let report = crate::agent::profile::sync_skills(registry.config(), &instance)?;
+        SkillCommands::Sync { instance: selector } => {
+            let vm = registry.resolve(&selector)?;
+            let report = crate::agent::profile::sync_skills(registry.config(), &vm)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -28,20 +28,19 @@ pub(crate) fn skill_command(command: SkillCommands, config: Config, json: bool) 
             Ok(0)
         }
         SkillCommands::SyncBack {
-            instance,
+            instance: selector,
             dry_run,
             force,
         } => {
-            let instance = registry.resolve(&instance)?;
-            let manager = registry.manager(instance.clone())?;
+            let vm = registry.resolve(&selector)?;
+            let manager = registry.manager(vm.clone())?;
             if manager.is_running() && !force && !dry_run {
                 bail!(
                     "instance '{}' is running; stop it first or pass --force to copy live files",
-                    instance.name
+                    vm.name
                 );
             }
-            let report =
-                crate::agent::profile::sync_skills_back(registry.config(), &instance, dry_run)?;
+            let report = crate::agent::profile::sync_skills_back(registry.config(), &vm, dry_run)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {

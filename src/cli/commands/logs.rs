@@ -87,12 +87,12 @@ pub(crate) fn logs_command(command: LogCommands, config: Config, json: bool) -> 
             Ok(0)
         }
         LogCommands::Prune { keep } => {
-            // Never unlink a log a running instance is still writing to.
+            // Never unlink a log a running VM is still writing to.
             let registry = VmRegistry::new(config.clone());
             let protected: Vec<PathBuf> = registry
                 .summaries()?
                 .into_iter()
-                .filter_map(|instance| instance.serial_log)
+                .filter_map(|vm| vm.serial_log)
                 .collect();
             let removed = store.prune_except_many(keep, &protected)?;
             if json {
