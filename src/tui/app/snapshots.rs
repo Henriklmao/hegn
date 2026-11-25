@@ -121,6 +121,7 @@ mod tests {
                 project: None,
                 size_bytes: 0,
                 note: None,
+                ..SnapshotMeta::default()
             })
             .unwrap();
         app.refresh_snapshots();
@@ -146,6 +147,7 @@ mod tests {
                 project,
                 size_bytes: 0,
                 note: None,
+                ..SnapshotMeta::default()
             })
             .unwrap();
     }
@@ -221,6 +223,7 @@ mod tests {
                 project: Some(demo.clone()),
                 size_bytes: 0,
                 note: None,
+                ..SnapshotMeta::default()
             },
             SnapshotMeta {
                 name: "by-instance".into(),
@@ -231,6 +234,7 @@ mod tests {
                 project: None,
                 size_bytes: 0,
                 note: None,
+                ..SnapshotMeta::default()
             },
             SnapshotMeta {
                 name: "unrelated".into(),
@@ -241,6 +245,7 @@ mod tests {
                 project: Some(app.config.projects_root.join("other")),
                 size_bytes: 0,
                 note: None,
+                ..SnapshotMeta::default()
             },
         ];
         app.project_snapshot_selected = 9;
@@ -274,6 +279,7 @@ mod tests {
                 project: Some(PathBuf::from("/projects/demo")),
                 size_bytes: 0,
                 note: None,
+                ..SnapshotMeta::default()
             },
             SnapshotMeta {
                 name: "two".into(),
@@ -284,6 +290,7 @@ mod tests {
                 project: Some(PathBuf::from("/projects/other")),
                 size_bytes: 0,
                 note: None,
+                ..SnapshotMeta::default()
             },
         ];
         app.refresh_project_snapshots();

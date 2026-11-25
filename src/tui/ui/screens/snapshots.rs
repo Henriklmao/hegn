@@ -65,11 +65,15 @@ pub(crate) fn render_snapshots(
             Style::default().fg(TEXT)
         };
         let prefix = if row == offset { " ▾ " } else { "   " };
+        let mut detail = format!("  {}", snapshot.size_label());
+        if snapshot.is_legacy() {
+            detail.push_str("  · legacy");
+        }
         lines.push(Line::from(vec![
             Span::styled(prefix, style.fg(if selected { ON_ACCENT } else { CYAN })),
             Span::styled(truncate(&snapshot.name, 20), style),
             Span::styled(
-                format!("  {}", snapshot.size_label()),
+                detail,
                 if selected {
                     Style::default().fg(ON_ACCENT).bg(CYAN)
                 } else {
@@ -114,6 +118,7 @@ mod tests {
             project: Some(PathBuf::from("/projects/demo")),
             size_bytes: 1024 * 1024,
             note: None,
+            ..crate::session::snapshot::SnapshotMeta::default()
         }];
         app.refresh_project_snapshots();
         let (text, hits) = render(&app);
@@ -132,6 +137,7 @@ mod tests {
             project: project.map(PathBuf::from),
             size_bytes: 1024,
             note: None,
+            ..crate::session::snapshot::SnapshotMeta::default()
         }
     }
 

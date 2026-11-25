@@ -25,6 +25,7 @@ use crate::config::Config;
 use crate::shared::fs::create_private_dir;
 use crate::vm::config::VmStore;
 
+use super::discovery::absolute_or_canonical;
 use super::import::validate_export_source;
 use super::meta::validate_project_name;
 
@@ -80,6 +81,86 @@ struct RegistryDocument {
     version: u32,
     #[serde(default)]
     project: Vec<ProjectEntry>,
+}
+
+/// Validate one exported member recorded in snapshot metadata before a restore
+/// hands its path to `virtiofsd`.
+///
+/// Snapshot files are host-private, but a corrupted or edited `snapshot.json`
+/// must not be able to redirect an export at `/`, `$HOME`, hegn state, the
+/// snapshots or VMs directories, or another VM's workspace. This re-applies the
+/// same rules as a boot-time registry validation:
+///
+/// - a `worktree` is never exported separately and is always rejected,
+/// - an `external` path must pass [`validate_export_source`] (the full
+///   protected-path check),
+/// - a `clone` must be a real directory at exactly
+///   `<vms_dir>/<vm>/workspaces/<name>`. Clones intentionally live below
+///   `vms_dir`, so they bypass the protected-path check that would reject
+///   every managed workspace; their exact location is enforced instead.
+///
+/// Returns the canonical path.
+pub fn validate_recorded_export(
+    config: &Config,
+    vm: &str,
+    name: &str,
+    kind: ProjectKind,
+    path: &Path,
+) -> Result<PathBuf> {
+    match kind {
+        ProjectKind::Worktree => bail!(
+            "recorded member '{name}' at {} is a worktree; worktrees ride their parent's share \
+             and are never exported separately",
+            path.display()
+        ),
+        ProjectKind::External => {
+            validate_export_source(path, &config.projects_root, &config.protected_paths())
+                .with_context(|| format!("recorded external member '{name}'"))
+        }
+        ProjectKind::Clone => {
+            let clean_name = validate_project_name(name)
+                .with_context(|| format!("recorded clone member '{name}'"))?;
+            let workspaces = VmStore::new(config).workspaces_dir(vm)?;
+            let expected = absolute_or_canonical(&workspaces).join(clean_name);
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+                    "recorded clone member '{name}' path {} is a symlink; managed clones must be \
+                     real directories",
+                    path.display()
+                ),
+                Ok(metadata) if !metadata.is_dir() => bail!(
+                    "recorded clone member '{name}' path {} is not a directory",
+                    path.display()
+                ),
+                Ok(_) => {}
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to inspect recorded clone member '{}' at {}",
+                            name,
+                            path.display()
+                        )
+                    });
+                }
+            }
+            let canonical = path.canonicalize().with_context(|| {
+                format!(
+                    "failed to resolve recorded clone member '{name}' at {}",
+                    path.display()
+                )
+            })?;
+            if canonical != expected {
+                bail!(
+                    "recorded clone member '{name}' must live at {} inside VM '{vm}', but its \
+                     path {} resolves to {}",
+                    expected.display(),
+                    path.display(),
+                    canonical.display()
+                );
+            }
+            Ok(canonical)
+        }
+    }
 }
 
 /// Snapshot of the private project registry bound to a state directory.

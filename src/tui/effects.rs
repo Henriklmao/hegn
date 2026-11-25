@@ -271,8 +271,7 @@ pub(super) fn handle_effects(
             Effect::RestoreSnapshot(snapshot) => {
                 let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
                 let instance = snapshot
-                    .instance
-                    .as_deref()
+                    .vm()
                     .and_then(|name| registry.store().load(name).ok())
                     .or_else(|| {
                         snapshot

@@ -27,16 +27,17 @@ pub(crate) fn snapshot_command(
                 println!("No snapshots in {}.", store.root().display());
             } else {
                 println!(
-                    "{:<32} {:<20} {:<18} {:>10}",
-                    "NAME", "INSTANCE", "CREATED", "SIZE"
+                    "{:<32} {:<20} {:<18} {:>10} {:<10}",
+                    "NAME", "VM", "CREATED", "SIZE", "FORMAT"
                 );
                 for snapshot in snapshots {
                     println!(
-                        "{:<32} {:<20} {:<18} {:>10}",
+                        "{:<32} {:<20} {:<18} {:>10} {:<10}",
                         snapshot.name,
-                        snapshot.instance.as_deref().unwrap_or("-"),
+                        snapshot.vm().unwrap_or("-"),
                         snapshot.created_at.format("%Y-%m-%d %H:%M:%S"),
-                        snapshot.size_label()
+                        snapshot.size_label(),
+                        if snapshot.is_legacy() { "legacy" } else { "v2" }
                     );
                 }
             }
@@ -52,9 +53,14 @@ pub(crate) fn snapshot_command(
         }
         SnapshotCommands::Restore { name, instance } => {
             let meta = store.load(&name)?;
+            if let Some(label) = meta.legacy_label() {
+                anyhow::bail!(
+                    "snapshot '{name}' is {label}; take a new snapshot with `hegn snapshot create`"
+                );
+            }
             let vm = match instance {
                 Some(selector) => registry.resolve(&selector)?,
-                None => match meta.instance.as_deref() {
+                None => match meta.vm() {
                     Some(name) => registry.store().load(name)?,
                     None => {
                         let project = meta

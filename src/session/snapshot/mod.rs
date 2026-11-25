@@ -15,11 +15,15 @@
 //! Finished snapshots are renamed out of `.staging` before metadata is saved,
 //! so the VMM's Landlock rule never covers completed checkpoints.
 //!
-//! `model` holds [`SnapshotMeta`], [`SnapshotPaths`] and name validation;
-//! `store` owns staging, finalizing, persistence and listing.
+//! `model` holds [`SnapshotMeta`], its v2 boot fingerprint, [`SnapshotPaths`]
+//! and name validation; `store` owns staging, finalizing, persistence and
+//! listing.
 
 mod model;
 mod store;
 
-pub use model::{AUTOSAVE_NOTE, SnapshotMeta, SnapshotPaths, sanitize_name};
+pub use model::{
+    AUTOSAVE_NOTE, SNAPSHOT_VERSION, SnapshotBoot, SnapshotMember, SnapshotMeta, SnapshotPaths,
+    compute_fingerprint, describe_boot_changes, sanitize_name,
+};
 pub use store::SnapshotStore;

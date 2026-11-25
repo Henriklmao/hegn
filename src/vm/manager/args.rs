@@ -560,6 +560,7 @@ mod tests {
             project: None,
             size_bytes: 0,
             note: None,
+            ..SnapshotMeta::default()
         }
     }
 

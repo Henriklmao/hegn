@@ -10,7 +10,7 @@ use std::process::Child;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
-use crate::agent::profile;
+use crate::agent::profile::{self, ProfilePlan};
 use crate::agent::provision::ProvisionPlan;
 use crate::config::{Config, Harness, VIRTIOFSD_FALLBACKS};
 use crate::network;
@@ -144,6 +144,13 @@ impl VmManager {
         ensure_rootfs_unique(&self.config, &self.store, &self.vm)?;
         let rootfs = prepare_rootfs(&self.config, &self.vm)?;
         ensure_no_running_export(&self.config, &self.store, &plan)?;
+        // Materialize the harness profile before the auto-resume decision: its
+        // presence is part of the boot fingerprint, and a cold boot would use
+        // the same plan. A bad profile must fail before any process spawns.
+        let profile_plan = profile::prepare_for_start(&self.config, &self.vm)?;
+        for warning in &profile_plan.warnings {
+            append_event_log(&paths.event_log, &format!("profile: {warning}"));
+        }
 
         // Build the runtime before any spawn so the auto-resume attempt and the
         // cold boot share one async runtime.
@@ -156,48 +163,66 @@ impl VmManager {
                 return Err(err).context("failed to build async runtime");
             }
         };
-        // Try the newest automatic checkpoint first: this is what turns a
-        // restart into a resume instead of a full cold boot. A broken or
-        // foreign checkpoint must not brick the VM, so failures fall through
-        // to a normal boot and are recorded in the lifecycle log.
+        // Try a matching automatic checkpoint first: this is what turns a
+        // restart into a resume instead of a full cold boot. A checkpoint whose
+        // device tree no longer matches is skipped with a logged reason, never
+        // deleted, and the VM cold boots.
         if self.config.auto_resume {
             let store = SnapshotStore::new(&self.config.snapshots_dir);
-            match store.latest_autosave(&self.vm.name) {
-                Ok(Some(snapshot)) => {
-                    append_event_log(
-                        &paths.event_log,
-                        &format!("auto-resuming from snapshot {}", snapshot.name),
+            match store.autosaves_for(&self.vm.name) {
+                Ok(candidates) if !candidates.is_empty() => {
+                    let current = super::snapshot::current_boot(
+                        &self.config,
+                        &self.vm,
+                        &plan,
+                        profile_plan.share.is_some(),
                     );
-                    match runtime.block_on(self.restore_snapshot_locked(&snapshot, &plan, &rootfs))
-                    {
-                        Ok(()) => {
+                    let members = super::snapshot::current_membership(&plan);
+                    match super::snapshot::select_auto_resume(candidates, &current, &members) {
+                        super::snapshot::AutoResume::Resume(snapshot) => {
                             append_event_log(
                                 &paths.event_log,
-                                &format!("auto-resume from {} succeeded", snapshot.name),
+                                &format!("auto-resuming from snapshot {}", snapshot.name),
                             );
-                            return self.status();
+                            match runtime
+                                .block_on(self.restore_snapshot_locked(&snapshot, &profile_plan))
+                            {
+                                Ok(()) => {
+                                    append_event_log(
+                                        &paths.event_log,
+                                        &format!("auto-resume from {} succeeded", snapshot.name),
+                                    );
+                                    return self.status();
+                                }
+                                Err(err) => append_event_log(
+                                    &paths.event_log,
+                                    &format!(
+                                        "auto-resume from {} failed, cold booting: {err:#}",
+                                        snapshot.name
+                                    ),
+                                ),
+                            }
                         }
-                        Err(err) => append_event_log(
-                            &paths.event_log,
-                            &format!(
-                                "auto-resume from {} failed, cold booting: {err:#}",
-                                snapshot.name
-                            ),
-                        ),
+                        super::snapshot::AutoResume::ColdBoot(reasons) => {
+                            for reason in reasons {
+                                append_event_log(
+                                    &paths.event_log,
+                                    &format!("auto-resume {reason}"),
+                                );
+                            }
+                            append_event_log(
+                                &paths.event_log,
+                                "auto-resume found no matching checkpoint; cold booting",
+                            );
+                        }
                     }
                 }
-                Ok(None) => {}
+                Ok(_) => {}
                 Err(err) => append_event_log(
                     &paths.event_log,
                     &format!("warning: could not inspect automatic snapshots: {err:#}"),
                 ),
             }
-        }
-        // Materialize the harness profile before reserving the network so a
-        // bad profile cannot leave a TAP reservation behind.
-        let profile_plan = profile::prepare_for_start(&self.config, &self.vm)?;
-        for warning in &profile_plan.warnings {
-            append_event_log(&paths.event_log, &format!("profile: {warning}"));
         }
         let mut packages = self.vm.extra_packages.clone();
         packages.extend(profile_plan.packages.iter().cloned());
@@ -436,10 +461,9 @@ impl VmManager {
     async fn restore_snapshot_locked(
         &self,
         snapshot: &SnapshotMeta,
-        plan: &BootPlan,
-        rootfs: &Path,
+        profile_plan: &ProfilePlan,
     ) -> Result<()> {
-        super::snapshot::restore_snapshot_locked(self, snapshot, plan, rootfs).await
+        super::snapshot::restore_snapshot_locked(self, snapshot, profile_plan).await
     }
 }
 
@@ -520,7 +544,7 @@ fn ensure_rootfs_unique(config: &Config, store: &VmStore, vm: &VmConfig) -> Resu
     Ok(())
 }
 
-fn effective_rootfs(config: &Config, vm: &VmConfig) -> PathBuf {
+pub(super) fn effective_rootfs(config: &Config, vm: &VmConfig) -> PathBuf {
     let path = vm.rootfs_path(config);
     path.canonicalize().unwrap_or(path)
 }

@@ -33,5 +33,7 @@ pub use meta::{
     write_meta,
 };
 pub use model::{GitSummary, Project, ProjectDeleteOutcome, ProjectMeta};
-pub use registry::{ProjectEntry, ProjectKind, ProjectRegistry, REGISTRY_FILE};
+pub use registry::{
+    ProjectEntry, ProjectKind, ProjectRegistry, REGISTRY_FILE, validate_recorded_export,
+};
 pub use workspace::{ForkMode, WorkspaceService, default_worktree_path, is_real_worktree};
