@@ -70,7 +70,7 @@ pub(crate) fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     };
     frame.render_widget(Paragraph::new(left).style(Style::default()), inner);
 
-    let status = match app.instance.state {
+    let status = match app.vm.state {
         VmUiState::Running => ("● running".to_string(), GREEN),
         VmUiState::Starting => (format!("{} starting", spinner(app.tick())), YELLOW),
         VmUiState::Paused => ("Ⅱ paused".to_string(), YELLOW),
@@ -83,7 +83,7 @@ pub(crate) fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
     };
-    let right_text = format!("{}  {} ", status.0, app.instance.backend);
+    let right_text = format!("{}  {} ", status.0, app.vm.backend);
     let width = right_text.width() as u16;
     if inner.width > width + 10 {
         let right = Rect {

@@ -88,7 +88,7 @@ impl App {
                 effects
             }
             Some(Applied::Vm) => {
-                self.refresh_instances();
+                self.refresh_vms();
                 self.modal = Some(Modal::Config(form));
                 self.toast("instance settings saved", ToastLevel::Info);
                 Vec::new()
@@ -120,7 +120,7 @@ impl App {
                     Vec::new()
                 }
             },
-            ConfigKind::Instance => {
+            ConfigKind::Vm => {
                 match form.vm_name().map(str::to_string) {
                     Some(name) => {
                         self.show_vm_config_form(&name, Some("reverted to the file on disk".into()))
@@ -140,15 +140,15 @@ impl App {
         self.security_engine = SecurityEngine::new(config.security);
         self.store = StateStore::load(config.state_dir.join("state.json"));
         self.config = config;
-        self.instance.vcpus = self.config.vcpus;
-        self.instance.memory_mib = self.config.memory_mib;
-        self.instance.virtiofs = if self.config.vm_assets_ready() {
+        self.vm.vcpus = self.config.vcpus;
+        self.vm.memory_mib = self.config.memory_mib;
+        self.vm.virtiofs = if self.config.vm_assets_ready() {
             "configured"
         } else {
             "missing VM"
         };
         self.refresh_snapshots();
-        self.refresh_instances();
+        self.refresh_vms();
     }
 
     /// Open the per-project settings editor for the project screen.
@@ -291,7 +291,7 @@ impl App {
         };
         vec![Effect::LaunchAgent {
             spec,
-            instance: instance.name,
+            vm: instance.name,
             project: instance.workspace,
         }]
     }
@@ -382,10 +382,10 @@ mod tests {
             app.handle_key(key(KeyCode::Right));
         }
         let effects = app.handle_key(key(KeyCode::Char('r')));
-        let [Effect::LaunchAgent { spec, instance, .. }] = effects.as_slice() else {
+        let [Effect::LaunchAgent { spec, vm, .. }] = effects.as_slice() else {
             panic!("expected one launch effect, got {effects:?}");
         };
-        assert_eq!(instance, "demo");
+        assert_eq!(vm, "demo");
         assert_eq!(spec.integration, Integration::Tmux);
         assert_eq!(
             project::read_meta(&project).integration,
@@ -407,7 +407,7 @@ mod tests {
         }
         app.modal = None;
         let inside = app.config.vms_dir.join("demo").join("workspace");
-        app.focus = Focus::Instances;
+        app.focus = Focus::Vm;
         let instance = fake_instance(&app, "demo", inside.clone());
         let stored = crate::vm::config::VmConfig {
             name: "demo".into(),
@@ -421,7 +421,7 @@ mod tests {
         install_instances(&mut app, vec![instance]);
         app.handle_key(key(KeyCode::F(5)));
         match &app.modal {
-            Some(Modal::Config(form)) => assert_eq!(form.kind, ConfigKind::Instance),
+            Some(Modal::Config(form)) => assert_eq!(form.kind, ConfigKind::Vm),
             other => panic!("expected instance settings, got {other:?}"),
         }
     }
@@ -516,7 +516,7 @@ mod tests {
             .unwrap();
         let instance = fake_instance(&app, "demo", inside);
         install_instances(&mut app, vec![instance]);
-        app.focus = Focus::Instances;
+        app.focus = Focus::Vm;
 
         app.handle_key(key(KeyCode::F(5)));
         app.handle_key(key(KeyCode::Down)); // Harness -> vCPUs
@@ -530,7 +530,7 @@ mod tests {
 
         match &app.modal {
             Some(Modal::Config(form)) => {
-                assert_eq!(form.kind, ConfigKind::Instance);
+                assert_eq!(form.kind, ConfigKind::Vm);
                 assert_eq!(form.value(ConfigField::Vcpus), "2");
                 assert!(!form.dirty());
                 assert_eq!(form.status.as_deref(), Some("reverted to the file on disk"));

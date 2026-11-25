@@ -46,9 +46,9 @@ impl App {
         self.screen = Screen::Project;
         self.project_view = ProjectView::Compact;
         self.terminal_focus = false;
-        self.focus = Focus::Instances;
+        self.focus = Focus::Vm;
         self.terminal_mode = TerminalMode::Normal;
-        self.refresh_instances();
+        self.refresh_vms();
         self.refresh_snapshots();
     }
 
@@ -169,7 +169,7 @@ impl App {
         self.store = StateStore::load(self.config.state_dir.join("state.json"));
     }
 
-    pub(super) fn workspace_is_inside_instance(&self, instance: &VmSummary) -> bool {
+    pub(super) fn workspace_is_inside_vm(&self, instance: &VmSummary) -> bool {
         let dir = self.config.vms_dir.join(&instance.name);
         let dir = dir.canonicalize().unwrap_or(dir);
         let workspace = instance
@@ -194,7 +194,7 @@ impl App {
     pub fn open_selected(&mut self) -> Vec<Effect> {
         match self.focus {
             Focus::Snapshots => self.confirm_restore_snapshot(),
-            Focus::Instances => self.attach_selected_instance(),
+            Focus::Vm => self.attach_selected_instance(),
             Focus::Health | Focus::Git => Vec::new(),
             Focus::Projects => {
                 if self.screen == Screen::Project {
@@ -360,7 +360,7 @@ mod tests {
         );
         assert_eq!(app.screen, Screen::Project);
         assert_eq!(app.project_view, ProjectView::Compact);
-        assert_eq!(app.instance.state, VmUiState::Stopped);
+        assert_eq!(app.vm.state, VmUiState::Stopped);
         assert_eq!(app.open_project.as_deref(), Some(project.path.as_path()));
     }
 

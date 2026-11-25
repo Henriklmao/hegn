@@ -33,7 +33,7 @@ impl App {
                 Some(Modal::MultiAgent(_)) => {
                     self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 }
-                Some(Modal::Confirm(_) | Modal::DeleteInstance(_) | Modal::DeleteProject(_)) => {
+                Some(Modal::Confirm(_) | Modal::DeleteVm(_) | Modal::DeleteProject(_)) => {
                     self.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
                 }
                 _ => Vec::new(),
@@ -43,7 +43,7 @@ impl App {
                     self.modal,
                     Some(
                         Modal::Confirm(_)
-                            | Modal::DeleteInstance(_)
+                            | Modal::DeleteVm(_)
                             | Modal::DeleteProject(_)
                             | Modal::MultiAgent(_)
                             | Modal::ProjectConfig(_)
@@ -82,7 +82,7 @@ impl App {
             },
             ActionId::Edit => self.effect_for_selected(Effect::OpenEditor),
             ActionId::Lazygit => self.effect_for_selected(Effect::OpenLazygit),
-            ActionId::Refresh => vec![Effect::RefreshProjects, Effect::RefreshInstances],
+            ActionId::Refresh => vec![Effect::RefreshProjects, Effect::RefreshVms],
             ActionId::Doctor => {
                 self.modal = Some(Modal::Doctor(DoctorModal::new(
                     crate::diagnostics::doctor::run(&self.config),
@@ -163,14 +163,14 @@ impl App {
             }
             ActionId::Restore => self.confirm_restore_snapshot(),
             ActionId::DeleteSnapshot => self.confirm_delete_snapshot(),
-            ActionId::FocusInstances => {
-                self.focus = Focus::Instances;
-                self.refresh_instances();
+            ActionId::FocusVm => {
+                self.focus = Focus::Vm;
+                self.refresh_vms();
                 Vec::new()
             }
-            ActionId::StartInstance => self.open_selected(),
-            ActionId::StopInstance => self.stop_selected_instance(),
-            ActionId::DeleteInstance => self.confirm_delete_instance(),
+            ActionId::StartVm => self.open_selected(),
+            ActionId::StopVm => self.stop_selected_instance(),
+            ActionId::DeleteVm => self.confirm_delete_instance(),
             ActionId::DeleteProject => self.confirm_delete_project(),
             ActionId::DeleteProjectFiles => {
                 if matches!(self.modal, Some(Modal::DeleteProject(_))) {

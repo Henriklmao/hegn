@@ -81,13 +81,7 @@ impl ConfigForm {
     pub fn vm(vm: VmConfig, base: Config) -> Self {
         let path = base.vms_dir.join(&vm.name).join(VM_CONFIG_FILE);
         let title = format!("instance '{}' settings", vm.name);
-        Self::build(
-            ConfigKind::Instance,
-            title,
-            path,
-            Draft::Vm(Box::new(vm)),
-            base,
-        )
+        Self::build(ConfigKind::Vm, title, path, Draft::Vm(Box::new(vm)), base)
     }
 
     fn build(kind: ConfigKind, title: String, path: PathBuf, draft: Draft, base: Config) -> Self {

@@ -71,7 +71,7 @@ pub(super) fn spawn_image_download(
     }
 }
 
-pub(super) fn spawn_attach(config: Config, instance: String, tx: mpsc::Sender<ScanMessage>) {
+pub(super) fn spawn_attach(config: Config, vm: String, tx: mpsc::Sender<ScanMessage>) {
     let thread_tx = tx.clone();
     let spawned = std::thread::Builder::new()
         .name("hegn-attach-vm".into())
@@ -79,11 +79,11 @@ pub(super) fn spawn_attach(config: Config, instance: String, tx: mpsc::Sender<Sc
             let registry = crate::vm::registry::VmRegistry::new(config);
             let harness = registry
                 .store()
-                .load(&instance)
+                .load(&vm)
                 .map(|config| config.harness)
                 .unwrap_or_default();
             let warning = registry
-                .manager_by_name(&instance)
+                .manager_by_name(&vm)
                 .ok()
                 .and_then(|manager| manager.membership_warning());
             if let Some(warning) = warning {
@@ -93,7 +93,7 @@ pub(super) fn spawn_attach(config: Config, instance: String, tx: mpsc::Sender<Sc
                 });
             }
             let result = registry
-                .manager_by_name(&instance)
+                .manager_by_name(&vm)
                 .and_then(|manager| manager.ensure_console());
             match result {
                 Ok(console) => {

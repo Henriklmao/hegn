@@ -10,7 +10,7 @@ use crate::config::{Harness, LocalEndpoint};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKind {
     Global,
-    Instance,
+    Vm,
 }
 
 /// Pages (tabs) inside the settings modal.
@@ -278,7 +278,7 @@ const PROFILE_ROWS: &[ConfigRow] = &[
     ConfigRow::Note("CLI: hegn profile show <harness> · hegn skills sync-back <instance>"),
 ];
 
-const INSTANCE_ROWS: &[ConfigRow] = &[
+const VM_ROWS: &[ConfigRow] = &[
     ConfigRow::Group("Runtime"),
     ConfigRow::Field(ConfigField::Harness),
     ConfigRow::Field(ConfigField::Vcpus),
@@ -309,7 +309,7 @@ pub fn pages(kind: ConfigKind) -> &'static [ConfigPage] {
             ConfigPage::Profiles,
             ConfigPage::LocalLlm,
         ],
-        ConfigKind::Instance => &[ConfigPage::General],
+        ConfigKind::Vm => &[ConfigPage::General],
     }
 }
 
@@ -318,7 +318,7 @@ pub fn rows_for(kind: ConfigKind, page: ConfigPage) -> &'static [ConfigRow] {
         (ConfigKind::Global, ConfigPage::General) => GENERAL_ROWS,
         (ConfigKind::Global, ConfigPage::Profiles) => PROFILE_ROWS,
         (ConfigKind::Global, ConfigPage::LocalLlm) => LOCAL_LLM_ROWS,
-        (ConfigKind::Instance, _) => INSTANCE_ROWS,
+        (ConfigKind::Vm, _) => VM_ROWS,
     }
 }
 

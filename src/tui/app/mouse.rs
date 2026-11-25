@@ -141,7 +141,7 @@ impl App {
                     .find(|row| rect_contains(row.rect, pos))
                     .copied()
                 {
-                    self.focus = Focus::Instances;
+                    self.focus = Focus::Vm;
                     self.instance_selected = row.index;
                     let path = self
                         .selected_instance()
@@ -323,9 +323,9 @@ mod tests {
 
         assert!(matches!(
             effects.as_slice(),
-            [Effect::AttachInstance { instance }] if instance == "demo"
+            [Effect::AttachVm { vm }] if vm == "demo"
         ));
-        assert_eq!(app.instance.state, VmUiState::Starting);
+        assert_eq!(app.vm.state, VmUiState::Starting);
     }
 
     #[test]
@@ -345,7 +345,7 @@ mod tests {
         assert!(!app.terminal_focus);
 
         app.project_view = ProjectView::Compact;
-        app.focus = Focus::Instances;
+        app.focus = Focus::Vm;
         app.handle_mouse(click(1, 1));
         assert_eq!(app.focus, Focus::Snapshots);
         assert_eq!(app.project_view, ProjectView::Compact);

@@ -6,9 +6,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 
-use crate::tui::app::{
-    ActionId, App, DeleteInstanceModal, DeleteInstanceStage, DeleteProjectModal,
-};
+use crate::tui::app::{ActionId, App, DeleteProjectModal, DeleteVmModal, DeleteVmStage};
 
 use super::super::ModalHits;
 use super::super::screens::footer::FooterDef;
@@ -18,16 +16,16 @@ use super::message::render_message;
 pub(crate) fn render_delete_instance(
     frame: &mut Frame,
     app: &App,
-    modal: &DeleteInstanceModal,
+    modal: &DeleteVmModal,
     area: Rect,
 ) -> ModalHits {
     let (body, color, buttons): (String, Color, &[FooterDef]) = match modal.stage {
-        DeleteInstanceStage::Confirm => (
+        DeleteVmStage::Confirm => (
             format!(
                 "Delete instance '{}'?\n\nProject: {}\nWorkspace: {}\n\nThe VM is stopped first.",
-                modal.instance.name,
-                modal.instance.project.display(),
-                modal.instance.workspace.display()
+                modal.vm.name,
+                modal.vm.project.display(),
+                modal.vm.workspace.display()
             ),
             YELLOW,
             &[
@@ -43,10 +41,10 @@ pub(crate) fn render_delete_instance(
                 },
             ],
         ),
-        DeleteInstanceStage::Files => (
+        DeleteVmStage::Files => (
             format!(
                 "Also delete the cloned workspace files?\n\n{}\n\nChoose 'Keep files' to unregister the instance but keep the clone.",
-                modal.instance.workspace.display()
+                modal.vm.workspace.display()
             ),
             RED,
             &[
@@ -245,9 +243,9 @@ mod tests {
     #[test]
     fn delete_instance_confirm_stage_names_the_instance_and_stop_first() {
         let (_dir, mut app) = app();
-        app.modal = Some(Modal::DeleteInstance(DeleteInstanceModal {
-            instance: instance(&app, "build", "running"),
-            stage: DeleteInstanceStage::Confirm,
+        app.modal = Some(Modal::DeleteVm(DeleteVmModal {
+            vm: instance(&app, "build", "running"),
+            stage: DeleteVmStage::Confirm,
             error: None,
             scroll: 0,
         }));
@@ -278,9 +276,9 @@ mod tests {
     #[test]
     fn delete_instance_files_stage_offers_keep_files_and_shows_errors() {
         let (_dir, mut app) = app();
-        app.modal = Some(Modal::DeleteInstance(DeleteInstanceModal {
-            instance: instance(&app, "build", "stopped"),
-            stage: DeleteInstanceStage::Files,
+        app.modal = Some(Modal::DeleteVm(DeleteVmModal {
+            vm: instance(&app, "build", "stopped"),
+            stage: DeleteVmStage::Files,
             error: Some("workspace is still mounted".into()),
             scroll: 0,
         }));

@@ -146,22 +146,18 @@ pub(super) fn handle_effects(
                     app.toast(format!("lazygit failed: {err}"), ToastLevel::Error);
                 }
             }
-            Effect::StartProjectInstance { project, harness } => {
+            Effect::StartVm { project, harness } => {
                 app.toast("starting VM…", ToastLevel::Info);
                 spawn_start(app.config.clone(), project, harness, scan_tx.clone());
             }
-            Effect::LaunchAgent {
-                spec,
-                instance,
-                project,
-            } => {
-                launch_agent(terminal, app, spec, instance, project)?;
+            Effect::LaunchAgent { spec, vm, project } => {
+                launch_agent(terminal, app, spec, vm, project)?;
             }
-            Effect::AttachInstance { instance } => {
-                app.toast(format!("attaching to {instance}…"), ToastLevel::Info);
-                spawn_attach(app.config.clone(), instance, scan_tx.clone());
+            Effect::AttachVm { vm } => {
+                app.toast(format!("attaching to {vm}…"), ToastLevel::Info);
+                spawn_attach(app.config.clone(), vm, scan_tx.clone());
             }
-            Effect::AttachConsole { instance } => {
+            Effect::AttachConsole { vm } => {
                 let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
                 // Release the embedded client first. Otherwise the external
                 // attach replaces it in the relay and the TUI keeps a dead
@@ -169,12 +165,12 @@ pub(super) fn handle_effects(
                 app.pending_launch = None;
                 app.detach_console();
                 let result = with_suspended_terminal(terminal, || {
-                    let config = registry.resolve(&instance)?;
+                    let config = registry.resolve(&vm)?;
                     let console = registry.manager(config)?.ensure_console()?;
                     crate::session::console::run_interactive(console, true)
                 });
                 let reattached = registry
-                    .resolve(&instance)
+                    .resolve(&vm)
                     .ok()
                     .and_then(|config| registry.manager(config).ok()?.attach_console().ok());
                 if let Some(console) = reattached {
@@ -192,36 +188,32 @@ pub(super) fn handle_effects(
                     }
                 }
             }
-            Effect::StopInstance { instance } => {
+            Effect::StopVm { vm } => {
                 let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
                 app.pending_launch = None;
-                match registry.stop(&instance) {
+                match registry.stop(&vm) {
                     Ok(()) => {
-                        app.toast(format!("instance {instance} stopped"), ToastLevel::Info);
-                        app.refresh_instances();
+                        app.toast(format!("VM {vm} stopped"), ToastLevel::Info);
+                        app.refresh_vms();
                     }
                     Err(err) => app.toast(format!("stop failed: {err}"), ToastLevel::Error),
                 }
             }
-            Effect::DeleteInstance {
-                instance,
-                delete_files,
-            } => {
+            Effect::DeleteVm { vm, delete_files } => {
                 let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
-                match registry.delete(&instance, delete_files) {
+                match registry.delete(&vm, delete_files) {
                     Ok(outcome) => {
                         let message = match outcome.kept_workspace {
-                            Some(path) => format!(
-                                "instance {instance} removed; files kept at {}",
-                                path.display()
-                            ),
-                            None if delete_files => {
-                                format!("instance {instance} and files deleted")
+                            Some(path) => {
+                                format!("VM {vm} removed; files kept at {}", path.display())
                             }
-                            None => format!("instance {instance} removed; project files kept"),
+                            None if delete_files => {
+                                format!("VM {vm} and files deleted")
+                            }
+                            None => format!("VM {vm} removed; project files kept"),
                         };
                         app.toast(message, ToastLevel::Info);
-                        app.refresh_instances();
+                        app.refresh_vms();
                     }
                     Err(err) => app.toast(format!("delete failed: {err}"), ToastLevel::Error),
                 }
@@ -233,7 +225,7 @@ pub(super) fn handle_effects(
                 Ok(outcome) => {
                     app.reload_state();
                     app.forget_project_locally(&project);
-                    app.refresh_instances();
+                    app.refresh_vms();
                     let files = if outcome.files_deleted {
                         "files deleted"
                     } else {
@@ -267,7 +259,7 @@ pub(super) fn handle_effects(
                     scan_tx.clone(),
                 );
             }
-            Effect::RefreshInstances => app.refresh_instances(),
+            Effect::RefreshVms => app.refresh_vms(),
             Effect::RestoreSnapshot(snapshot) => {
                 let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
                 let instance = snapshot

@@ -61,7 +61,7 @@ impl ProjectSection {
 
     pub fn focus(self) -> Focus {
         match self {
-            Self::Instances => Focus::Instances,
+            Self::Instances => Focus::Vm,
             Self::Snapshots => Focus::Snapshots,
             Self::Health => Focus::Health,
             Self::Git => Focus::Git,
@@ -73,7 +73,7 @@ impl ProjectSection {
             Focus::Snapshots => Self::Snapshots,
             Focus::Health => Self::Health,
             Focus::Git => Self::Git,
-            Focus::Projects | Focus::Instances => Self::Instances,
+            Focus::Projects | Focus::Vm => Self::Instances,
         }
     }
 }
@@ -103,7 +103,7 @@ pub enum TerminalMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Projects,
-    Instances,
+    Vm,
     Snapshots,
     Health,
     Git,
@@ -125,29 +125,29 @@ pub enum Effect {
     /// network as needed. Privileged steps prompt via sudo/pkexec.
     SetupEnvironment,
     /// Ensure an instance for a project and attach its console.
-    StartProjectInstance {
+    StartVm {
         project: PathBuf,
         harness: Harness,
     },
     /// Start (if needed) and attach an existing instance.
-    AttachInstance {
-        instance: String,
+    AttachVm {
+        vm: String,
     },
     /// Launch a configured command through a terminal integration.
     LaunchAgent {
         spec: LaunchSpec,
-        instance: String,
+        vm: String,
         project: PathBuf,
     },
     /// Leave the TUI and attach the real serial console client.
     AttachConsole {
-        instance: String,
+        vm: String,
     },
-    StopInstance {
-        instance: String,
+    StopVm {
+        vm: String,
     },
-    DeleteInstance {
-        instance: String,
+    DeleteVm {
+        vm: String,
         delete_files: bool,
     },
     /// Remove a project from the dashboard, its instances and optionally its
@@ -162,7 +162,7 @@ pub enum Effect {
         harness: Harness,
         start: bool,
     },
-    RefreshInstances,
+    RefreshVms,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,7 +197,7 @@ impl Toast {
 #[derive(Debug, Clone)]
 pub struct PendingLaunch {
     pub spec: LaunchSpec,
-    pub instance: String,
+    pub vm: String,
     pub project: PathBuf,
     pub since: Instant,
     pub provision_seen: bool,
@@ -226,7 +226,7 @@ impl VmUiState {
 }
 
 #[derive(Debug, Clone)]
-pub struct InstanceStatus {
+pub struct VmStatus {
     pub state: VmUiState,
     pub backend: &'static str,
     pub vcpus: u8,
@@ -239,13 +239,13 @@ pub struct InstanceStatus {
 
 /// Last guest-reported health line from the serial log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InstanceHealth {
+pub struct VmHealth {
     pub apt: Option<u32>,
     pub reason: String,
     pub checked: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-impl InstanceHealth {
+impl VmHealth {
     pub(super) fn parse(text: &str) -> Option<Self> {
         for line in text.lines().rev() {
             let Some(rest) = line.trim().strip_prefix("hegn-health v1 ") else {
@@ -283,7 +283,7 @@ impl InstanceHealth {
     }
 }
 
-impl InstanceStatus {
+impl VmStatus {
     pub fn from_config(config: &Config) -> Self {
         let backend = "cloud-hypervisor";
         let virtiofs = if config.vm_assets_ready() {
@@ -335,11 +335,11 @@ pub enum ActionId {
     NewSnapshot,
     DeleteSnapshot,
     Restore,
-    FocusInstances,
-    StartInstance,
-    StopInstance,
+    FocusVm,
+    StartVm,
+    StopVm,
     CloneInstance,
-    DeleteInstance,
+    DeleteVm,
     DeleteProject,
     DeleteProjectFiles,
     VmConfig,
@@ -592,15 +592,15 @@ pub struct ConfigTabHit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeleteInstanceStage {
+pub enum DeleteVmStage {
     Confirm,
     Files,
 }
 
 #[derive(Debug, Clone)]
-pub struct DeleteInstanceModal {
-    pub instance: VmSummary,
-    pub stage: DeleteInstanceStage,
+pub struct DeleteVmModal {
+    pub vm: VmSummary,
+    pub stage: DeleteVmStage,
     pub error: Option<String>,
     pub scroll: usize,
 }
@@ -704,7 +704,7 @@ pub enum Modal {
     Security(SecurityPrompt),
     Confirm(ConfirmPrompt),
     Config(ConfigForm),
-    DeleteInstance(DeleteInstanceModal),
+    DeleteVm(DeleteVmModal),
     DeleteProject(DeleteProjectModal),
     MultiAgent(MultiAgentForm),
     ProjectConfig(ProjectConfigForm),
@@ -738,9 +738,9 @@ pub struct App {
     pub terminal_hit: Option<Rect>,
     pub terminal_strip_hit: Option<Rect>,
     pub modal: Option<Modal>,
-    pub instance: InstanceStatus,
+    pub vm: VmStatus,
     /// Health line parsed from the selected instance's serial log.
-    pub health: Option<InstanceHealth>,
+    pub health: Option<VmHealth>,
     pub snapshots: Vec<SnapshotMeta>,
     pub selected_snapshot: usize,
     /// Indices into [`App::snapshots`] for the open project.
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn health_parser_takes_the_last_guest_line() {
-        let parsed = InstanceHealth::parse(
+        let parsed = VmHealth::parse(
             "boot\nhegn-health v1 apt=2 checked=1700000000 reason=ok\n\
              hegn-health v1 apt=5 checked=1700003600 reason=ok\n",
         )
@@ -873,6 +873,6 @@ mod tests {
         assert_eq!(parsed.apt, Some(5));
         assert_eq!(parsed.reason, "ok");
         assert!(parsed.checked.is_some());
-        assert!(InstanceHealth::parse("no health line").is_none());
+        assert!(VmHealth::parse("no health line").is_none());
     }
 }

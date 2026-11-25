@@ -17,7 +17,7 @@ pub(crate) fn render_instances(
     area: Rect,
     number: usize,
 ) -> Vec<RowHit> {
-    let active = app.focus == Focus::Instances;
+    let active = app.focus == Focus::Vm;
     let title = format!(" instances ({}) ", app.instance_visible.len());
     let block = tab_block(title, number, active);
     let inner = block.inner(area);

@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::app::{
-    ActionId, App, DeleteInstanceStage, Focus, FooterHit, Modal, ProjectView, Screen, TerminalMode,
+    ActionId, App, DeleteVmStage, Focus, FooterHit, Modal, ProjectView, Screen, TerminalMode,
 };
 
 use super::super::theme::{ACCENT, BORDER, MUTED, ON_ACCENT};
@@ -203,8 +203,8 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 action: ActionId::Close,
             },
         ],
-        Some(Modal::DeleteInstance(modal)) => match modal.stage {
-            DeleteInstanceStage::Confirm => vec![
+        Some(Modal::DeleteVm(modal)) => match modal.stage {
+            DeleteVmStage::Confirm => vec![
                 FooterDef {
                     key: "y",
                     label: "Continue",
@@ -216,7 +216,7 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                     action: ActionId::Cancel,
                 },
             ],
-            DeleteInstanceStage::Files => vec![
+            DeleteVmStage::Files => vec![
                 FooterDef {
                     key: "y",
                     label: "Delete files",
@@ -307,7 +307,7 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
         None if app.screen == Screen::Project => {
             let mut buttons = match app.project_view {
                 ProjectView::Compact => match app.focus {
-                    Focus::Instances => {
+                    Focus::Vm => {
                         let label = if app.selected_instance().is_some() {
                             "Open"
                         } else {
@@ -317,7 +317,7 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                             FooterDef {
                                 key: "Enter",
                                 label,
-                                action: ActionId::StartInstance,
+                                action: ActionId::StartVm,
                             },
                             FooterDef {
                                 key: "i",
@@ -327,12 +327,12 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                             FooterDef {
                                 key: "S",
                                 label: "Stop",
-                                action: ActionId::StopInstance,
+                                action: ActionId::StopVm,
                             },
                             FooterDef {
                                 key: "d",
                                 label: "Delete",
-                                action: ActionId::DeleteInstance,
+                                action: ActionId::DeleteVm,
                             },
                         ]
                     }
@@ -441,21 +441,21 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                         action: ActionId::Edit,
                     },
                 ],
-                Focus::Instances => vec![
+                Focus::Vm => vec![
                     FooterDef {
                         key: "Enter",
                         label: "Attach",
-                        action: ActionId::StartInstance,
+                        action: ActionId::StartVm,
                     },
                     FooterDef {
                         key: "S",
                         label: "Stop",
-                        action: ActionId::StopInstance,
+                        action: ActionId::StopVm,
                     },
                     FooterDef {
                         key: "d",
                         label: "Delete",
-                        action: ActionId::DeleteInstance,
+                        action: ActionId::DeleteVm,
                     },
                     FooterDef {
                         key: "F5",
@@ -576,8 +576,8 @@ mod tests {
     use super::*;
     use crate::config::Harness;
     use crate::tui::app::{
-        App, ConfirmPrompt, DeleteInstanceModal, DeleteInstanceStage::Confirm,
-        DeleteInstanceStage::Files, DeleteProjectModal, MultiAgentForm,
+        App, ConfirmPrompt, DeleteProjectModal, DeleteVmModal, DeleteVmStage::Confirm,
+        DeleteVmStage::Files, MultiAgentForm,
     };
     use crate::tui::ui::test_support::*;
     use crate::vm::registry::VmSummary;
@@ -634,14 +634,14 @@ mod tests {
         ] {
             assert!(buttons.contains(&action), "missing {action:?}");
         }
-        assert!(!buttons.contains(&ActionId::StartInstance));
+        assert!(!buttons.contains(&ActionId::StartVm));
 
-        app.focus = Focus::Instances;
+        app.focus = Focus::Vm;
         let buttons = actions(&app);
         for action in [
-            ActionId::StartInstance,
-            ActionId::StopInstance,
-            ActionId::DeleteInstance,
+            ActionId::StartVm,
+            ActionId::StopVm,
+            ActionId::DeleteVm,
             ActionId::VmConfig,
         ] {
             assert!(buttons.contains(&action), "missing {action:?}");
@@ -666,7 +666,7 @@ mod tests {
         app.screen = Screen::Project;
         app.open_project = Some(PathBuf::from("/projects/demo"));
         app.project_view = ProjectView::Compact;
-        app.focus = Focus::Instances;
+        app.focus = Focus::Vm;
 
         assert!(labels(&app).contains(&"Start"));
 
@@ -731,8 +731,8 @@ mod tests {
         let (_dir, mut app) = app();
         let build = instance(&app, "build", "running");
 
-        app.modal = Some(Modal::DeleteInstance(DeleteInstanceModal {
-            instance: build.clone(),
+        app.modal = Some(Modal::DeleteVm(DeleteVmModal {
+            vm: build.clone(),
             stage: Confirm,
             error: None,
             scroll: 0,
@@ -741,8 +741,8 @@ mod tests {
         assert_eq!(buttons, vec![ActionId::Confirm, ActionId::Cancel]);
         assert!(labels(&app).contains(&"Continue"));
 
-        app.modal = Some(Modal::DeleteInstance(DeleteInstanceModal {
-            instance: build,
+        app.modal = Some(Modal::DeleteVm(DeleteVmModal {
+            vm: build,
             stage: Files,
             error: None,
             scroll: 0,
@@ -791,7 +791,7 @@ mod tests {
     #[test]
     fn footer_buttons_stay_inside_a_narrow_terminal() {
         let (_dir, mut app) = app();
-        app.focus = Focus::Instances;
+        app.focus = Focus::Vm;
         let (text, hits) = render_sized(&app, 40, 15);
         assert!(!hits.footer.is_empty(), "{text}");
         for hit in &hits.footer {

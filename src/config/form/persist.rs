@@ -83,7 +83,7 @@ mod tests {
         store.save(&vm).unwrap();
 
         let mut form = ConfigForm::vm(vm, config);
-        assert_eq!(form.kind, ConfigKind::Instance);
+        assert_eq!(form.kind, ConfigKind::Vm);
         assert_eq!(form.vm_name(), Some("demo"));
         select(&mut form, ConfigField::Vcpus);
         form.adjust(1);

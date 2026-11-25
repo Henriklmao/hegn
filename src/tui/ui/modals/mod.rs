@@ -118,7 +118,7 @@ pub(crate) fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Re
         Modal::ImportProject(form) => {
             ModalHits::buttons(import::render_import_form(frame, app, form, area))
         }
-        Modal::DeleteInstance(modal) => delete::render_delete_instance(frame, app, modal, area),
+        Modal::DeleteVm(modal) => delete::render_delete_instance(frame, app, modal, area),
         Modal::DeleteProject(modal) => delete::render_delete_project(frame, app, modal, area),
         Modal::MultiAgent(form) => multi_agent::render_multi_agent(frame, app, form, area),
         Modal::ProjectConfig(form) => {

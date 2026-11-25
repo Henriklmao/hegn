@@ -23,7 +23,7 @@ impl App {
         let instances = crate::vm::registry::VmRegistry::new(config.clone())
             .summaries()
             .unwrap_or_default();
-        let instance = InstanceStatus::from_config(&config);
+        let vm = VmStatus::from_config(&config);
         let security_engine = SecurityEngine::new(config.security);
         Self {
             config,
@@ -42,7 +42,7 @@ impl App {
             terminal_hit: None,
             terminal_strip_hit: None,
             modal: None,
-            instance,
+            vm,
             health: None,
             snapshots,
             selected_snapshot: 0,
@@ -151,7 +151,7 @@ impl App {
         };
         let bytes = crate::session::logs::tail_bytes(path, 200).unwrap_or_default();
         let text = String::from_utf8_lossy(&bytes);
-        self.health = InstanceHealth::parse(&text);
+        self.health = VmHealth::parse(&text);
     }
 
     pub fn refresh_filter(&mut self) {
@@ -261,7 +261,7 @@ impl App {
 
     /// Refresh the instance list from disk/process state. Cheap enough for the
     /// UI tick; it only reads files and `/proc`.
-    pub fn refresh_instances(&mut self) {
+    pub fn refresh_vms(&mut self) {
         let selected = self
             .selected_instance()
             .map(|instance| instance.name.clone());
@@ -272,22 +272,22 @@ impl App {
         self.refresh_instance_filter_named(selected);
         let selected = self.selected_instance().cloned();
         if let Some(summary) = selected {
-            self.instance.vcpus = summary.vcpus;
-            self.instance.memory_mib = summary.memory_mib;
+            self.vm.vcpus = summary.vcpus;
+            self.vm.memory_mib = summary.memory_mib;
             // Do not overwrite the optimistic Starting state while the attach
             // thread is still booting; it would re-enable double starts.
-            if self.instance.state != VmUiState::Starting {
-                self.instance.state = match summary.state.as_str() {
+            if self.vm.state != VmUiState::Starting {
+                self.vm.state = match summary.state.as_str() {
                     "running" => VmUiState::Running,
                     "paused" => VmUiState::Paused,
                     _ => VmUiState::Stopped,
                 };
             }
-        } else if self.session.is_none() && self.instance.state != VmUiState::Starting {
-            self.instance.state = VmUiState::Stopped;
-            self.instance.started_at = None;
-            self.instance.note = None;
-            self.instance.socket = None;
+        } else if self.session.is_none() && self.vm.state != VmUiState::Starting {
+            self.vm.state = VmUiState::Stopped;
+            self.vm.started_at = None;
+            self.vm.note = None;
+            self.vm.socket = None;
         }
         self.refresh_health();
     }
@@ -298,11 +298,11 @@ impl App {
             return;
         }
         self.focus = match self.focus {
-            Focus::Projects => Focus::Instances,
-            Focus::Instances => Focus::Snapshots,
+            Focus::Projects => Focus::Vm,
+            Focus::Vm => Focus::Snapshots,
             Focus::Snapshots => Focus::Health,
             Focus::Health => Focus::Git,
-            Focus::Git => Focus::Instances,
+            Focus::Git => Focus::Vm,
         };
         if self.project_view == ProjectView::Section {
             self.project_section();
@@ -319,7 +319,7 @@ impl App {
                 self.selected = clamp_index(self.selected, delta, max);
                 self.refresh_instance_filter();
             }
-            Focus::Instances => {
+            Focus::Vm => {
                 if self.instance_visible.is_empty() {
                     return;
                 }
@@ -370,7 +370,7 @@ impl App {
     pub fn poll(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         if self.tick.is_multiple_of(40) {
-            self.refresh_instances();
+            self.refresh_vms();
         }
         let mut closed = false;
         if let Some(session) = &mut self.session {
@@ -383,8 +383,8 @@ impl App {
         }
         if closed && !self.session_closed_reported {
             self.session_closed_reported = true;
-            self.instance.state = VmUiState::Stopped;
-            self.instance.started_at = None;
+            self.vm.state = VmUiState::Stopped;
+            self.vm.started_at = None;
             self.toast("session exited", ToastLevel::Info);
         }
         if self
@@ -638,7 +638,7 @@ mod tests {
                 integration: crate::agent::launch::Integration::External,
                 bar: true,
             },
-            instance: "demo".into(),
+            vm: "demo".into(),
             project: PathBuf::from("/projects/demo"),
             since,
             provision_seen,
@@ -703,7 +703,7 @@ mod tests {
         log.set_exited(true);
 
         app.poll();
-        assert_eq!(app.instance.state, VmUiState::Stopped);
+        assert_eq!(app.vm.state, VmUiState::Stopped);
         assert!(app.terminal.len() >= 2);
         assert!(
             app.toast
@@ -722,16 +722,16 @@ mod tests {
     #[test]
     fn refresh_does_not_clear_the_starting_state() {
         let (_dir, mut app) = test_app();
-        app.instance.state = VmUiState::Starting;
-        app.refresh_instances();
-        assert_eq!(app.instance.state, VmUiState::Starting);
+        app.vm.state = VmUiState::Starting;
+        app.refresh_vms();
+        assert_eq!(app.vm.state, VmUiState::Starting);
     }
 
     #[test]
     fn instance_status_reflects_config() {
         let (_dir, app) = test_app();
-        assert_eq!(app.instance.state, VmUiState::Stopped);
-        assert_eq!(app.instance.backend, "cloud-hypervisor");
-        assert_eq!(app.instance.vcpus, app.config.vcpus);
+        assert_eq!(app.vm.state, VmUiState::Stopped);
+        assert_eq!(app.vm.backend, "cloud-hypervisor");
+        assert_eq!(app.vm.vcpus, app.config.vcpus);
     }
 }

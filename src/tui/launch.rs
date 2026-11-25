@@ -20,11 +20,11 @@ pub(super) fn launch_agent(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     spec: LaunchSpec,
-    instance: String,
+    vm: String,
     project: std::path::PathBuf,
 ) -> Result<()> {
     let hegn = std::env::current_exe().context("failed to locate the hegn executable")?;
-    let action = match launch::action(&spec, &instance, &project, &hegn) {
+    let action = match launch::action(&spec, &vm, &project, &hegn) {
         Ok(action) => action,
         Err(err) => {
             app.toast(format!("launch failed: {err}"), ToastLevel::Error);

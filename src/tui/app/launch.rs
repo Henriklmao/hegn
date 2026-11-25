@@ -12,13 +12,7 @@ use super::*;
 
 impl App {
     /// Queue the configured command after the TUI started a VM with Enter.
-    pub fn queue_auto_launch(
-        &mut self,
-        instance: &str,
-        harness: Harness,
-        project: &Path,
-        started: bool,
-    ) {
+    pub fn queue_auto_launch(&mut self, vm: &str, harness: Harness, project: &Path, started: bool) {
         if !started {
             return;
         }
@@ -27,7 +21,7 @@ impl App {
         let meta_project = self
             .instances
             .iter()
-            .find(|candidate| candidate.name == instance)
+            .find(|candidate| candidate.name == vm)
             .map(|candidate| candidate.project.as_path())
             .unwrap_or(project);
         let meta = project::read_meta(meta_project);
@@ -58,7 +52,7 @@ impl App {
         }
         self.pending_launch = Some(PendingLaunch {
             spec,
-            instance: instance.to_string(),
+            vm: vm.to_string(),
             project: project.to_path_buf(),
             since: Instant::now(),
             provision_seen: self.provision_running,
@@ -82,13 +76,13 @@ impl App {
             return None;
         }
         let pending = self.pending_launch.take()?;
-        Some((pending.spec, pending.instance, pending.project))
+        Some((pending.spec, pending.vm, pending.project))
     }
 
     /// Launch a command for the selected instance right now.
     pub fn request_launch(&mut self, selector: Option<&str>) -> Vec<Effect> {
         let Some(instance) = self.selected_instance().cloned() else {
-            self.toast("no instance selected", ToastLevel::Warn);
+            self.toast("no VM selected", ToastLevel::Warn);
             return Vec::new();
         };
         let meta = if self.open_project.as_deref() == Some(instance.project.as_path()) {
@@ -111,7 +105,7 @@ impl App {
         self.pending_launch = None;
         vec![Effect::LaunchAgent {
             spec,
-            instance: instance.name,
+            vm: instance.name,
             project: instance.workspace,
         }]
     }
@@ -158,9 +152,9 @@ mod tests {
         app.provision_started();
         assert!(app.take_due_launch().is_none());
         app.provision_ready();
-        let (spec, instance, _project) = app.take_due_launch().expect("ready");
+        let (spec, vm, _project) = app.take_due_launch().expect("ready");
         assert_eq!(spec.command, "opencode");
-        assert_eq!(instance, "demo");
+        assert_eq!(vm, "demo");
         assert!(app.take_due_launch().is_none());
     }
 
@@ -271,7 +265,7 @@ mod tests {
         assert!(
             app.toast
                 .as_ref()
-                .is_some_and(|toast| toast.text.contains("no instance selected"))
+                .is_some_and(|toast| toast.text.contains("no VM selected"))
         );
 
         let inside = app.config.vms_dir.join("demo").join("workspace");
@@ -283,17 +277,10 @@ mod tests {
 
         let effects = app.request_launch(None);
 
-        let [
-            Effect::LaunchAgent {
-                spec,
-                instance,
-                project,
-            },
-        ] = effects.as_slice()
-        else {
+        let [Effect::LaunchAgent { spec, vm, project }] = effects.as_slice() else {
             panic!("expected one launch effect, got {effects:?}");
         };
-        assert_eq!(instance, "demo");
+        assert_eq!(vm, "demo");
         assert_eq!(project, &inside);
         assert_eq!(spec.name, Harness::Opencode.label());
         assert_eq!(spec.command, Harness::Opencode.command());

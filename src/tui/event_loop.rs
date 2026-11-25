@@ -74,15 +74,11 @@ pub(super) fn run_loop(
         }
 
         drain_scan(app, scan_rx);
-        if let Some((spec, instance, project)) = app.take_due_launch() {
+        if let Some((spec, vm, project)) = app.take_due_launch() {
             handle_effects(
                 terminal,
                 app,
-                vec![Effect::LaunchAgent {
-                    spec,
-                    instance,
-                    project,
-                }],
+                vec![Effect::LaunchAgent { spec, vm, project }],
                 scan_tx,
                 runtime,
             )?;
@@ -104,10 +100,10 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 harness,
                 started,
             }) => {
-                let instance = console.instance_name().to_string();
+                let vm = console.instance_name().to_string();
                 let project = console.project().to_path_buf();
                 app.attach_console(console);
-                app.queue_auto_launch(&instance, harness, &project, started);
+                app.queue_auto_launch(&vm, harness, &project, started);
                 match branch {
                     Some(Ok(branch)) => {
                         app.toast(format!("session branch {branch}"), ToastLevel::Info)
@@ -120,7 +116,7 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
             }
             Ok(ScanMessage::StartFailed(err)) => app.fail_start(err),
             Ok(ScanMessage::InstancesChanged { note, level }) => {
-                app.refresh_instances();
+                app.refresh_vms();
                 app.toast(note, level);
             }
             Ok(ScanMessage::Error(err)) => {
@@ -360,7 +356,7 @@ mod tests {
             .unwrap();
         drain_scan(&mut app, &rx);
         assert!(app.session.is_none());
-        assert_eq!(app.instance.state, VmUiState::Failed);
+        assert_eq!(app.vm.state, VmUiState::Failed);
         assert_eq!(
             toast(&app),
             ("VM start failed: missing kernel image", ToastLevel::Error)
