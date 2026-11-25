@@ -6,9 +6,18 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::*;
 
 impl App {
-    /// Feed a synthetic key to the multi-agent modal (used by clickable hints).
-    pub(super) fn multi_agent_key(&mut self, code: KeyCode) -> Vec<Effect> {
-        if matches!(self.modal, Some(Modal::MultiAgent(_))) {
+    /// Feed a synthetic key to the fork form (used by clickable hints).
+    pub(super) fn fork_key(&mut self, code: KeyCode) -> Vec<Effect> {
+        if matches!(self.modal, Some(Modal::ForkWorkspace(_))) {
+            self.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Feed a synthetic key to the assignment form.
+    pub(super) fn assign_key(&mut self, code: KeyCode) -> Vec<Effect> {
+        if matches!(self.modal, Some(Modal::AssignProject(_))) {
             self.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
         } else {
             Vec::new()
@@ -29,13 +38,16 @@ impl App {
                 self.modal = Some(Modal::ImportProject(ImportProjectForm::new()));
                 Vec::new()
             }
-            ActionId::Confirm => match self.modal {
-                Some(Modal::MultiAgent(_)) => {
+            ActionId::Confirm => match &self.modal {
+                Some(Modal::ForkWorkspace(_) | Modal::AssignProject(_)) => {
                     self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 }
-                Some(Modal::Confirm(_) | Modal::DeleteVm(_) | Modal::DeleteProject(_)) => {
-                    self.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-                }
+                Some(
+                    Modal::Confirm(_)
+                    | Modal::DeleteVm(_)
+                    | Modal::DeleteProject(_)
+                    | Modal::DetachProject(_),
+                ) => self.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
                 _ => Vec::new(),
             },
             ActionId::Cancel => {
@@ -45,7 +57,9 @@ impl App {
                         Modal::Confirm(_)
                             | Modal::DeleteVm(_)
                             | Modal::DeleteProject(_)
-                            | Modal::MultiAgent(_)
+                            | Modal::DetachProject(_)
+                            | Modal::ForkWorkspace(_)
+                            | Modal::AssignProject(_)
                             | Modal::ProjectConfig(_)
                     )
                 ) {
@@ -57,7 +71,13 @@ impl App {
             ActionId::NextField => {
                 if matches!(
                     self.modal,
-                    Some(Modal::CreateProject(_) | Modal::ImportProject(_))
+                    Some(
+                        Modal::CreateProject(_)
+                            | Modal::ImportProject(_)
+                            | Modal::CreateVm(_)
+                            | Modal::ForkWorkspace(_)
+                            | Modal::AssignProject(_)
+                    )
                 ) {
                     self.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
                 } else {
@@ -80,6 +100,16 @@ impl App {
                 }
                 None => Vec::new(),
             },
+            ActionId::SubmitVm => match self.modal.take() {
+                Some(Modal::CreateVm(form)) => self.submit_create_vm(form),
+                Some(other) => {
+                    self.modal = Some(other);
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
+            ActionId::SubmitAssign => self.assign_key(KeyCode::Enter),
+            ActionId::SubmitFork => self.fork_key(KeyCode::Enter),
             ActionId::Edit => self.effect_for_selected(Effect::OpenEditor),
             ActionId::Lazygit => self.effect_for_selected(Effect::OpenLazygit),
             ActionId::Refresh => vec![Effect::RefreshProjects, Effect::RefreshVms],
@@ -129,7 +159,11 @@ impl App {
                 vec![Effect::Quit]
             }
             ActionId::Back => {
-                self.leave_project();
+                if self.screen == Screen::Vm {
+                    self.leave_vm();
+                } else {
+                    self.leave_project();
+                }
                 Vec::new()
             }
             ActionId::ToggleRaw => {
@@ -164,13 +198,59 @@ impl App {
             ActionId::Restore => self.confirm_restore_snapshot(),
             ActionId::DeleteSnapshot => self.confirm_delete_snapshot(),
             ActionId::FocusVm => {
-                self.focus = Focus::Vm;
-                self.refresh_vms();
+                if self.screen == Screen::Vm {
+                    self.focus = Focus::Projects;
+                    self.refresh_vms();
+                    Vec::new()
+                } else {
+                    self.open_selected_projects_vm()
+                }
+            }
+            ActionId::StartVm | ActionId::Shell => self.attach_active_vm(),
+            ActionId::StopVm => self.stop_selected_instance(),
+            ActionId::ApplyVm => self.apply_selected_vm(),
+            ActionId::DeleteVm => self.confirm_delete_vm(),
+            ActionId::AssignProject => match self.screen {
+                Screen::Vm => self.assign_project_to_open_vm_action(),
+                Screen::Project => {
+                    let Some(project) = self
+                        .active_project()
+                        .map(|project| project.path.clone())
+                        .or_else(|| self.selected_project().map(|p| p.path.clone()))
+                    else {
+                        return Vec::new();
+                    };
+                    self.open_assign_form(project, None)
+                }
+                Screen::Dashboard => {
+                    let Some(project) = self.selected_project().map(|p| p.path.clone()) else {
+                        return Vec::new();
+                    };
+                    self.open_assign_form(project, None)
+                }
+            },
+            ActionId::DetachProject => {
+                if self.screen == Screen::Vm {
+                    self.detach_selected_member()
+                } else {
+                    self.confirm_detach_project()
+                }
+            }
+            ActionId::ForkWorkspace => {
+                if self.screen == Screen::Vm {
+                    self.fork_selected_member()
+                } else {
+                    self.open_fork_workspace()
+                }
+            }
+            ActionId::SetPrimary => {
+                self.set_selected_primary();
                 Vec::new()
             }
-            ActionId::StartVm => self.open_selected(),
-            ActionId::StopVm => self.stop_selected_instance(),
-            ActionId::DeleteVm => self.confirm_delete_instance(),
+            ActionId::NewVm => {
+                self.open_create_vm_form();
+                Vec::new()
+            }
             ActionId::DeleteProject => self.confirm_delete_project(),
             ActionId::DeleteProjectFiles => {
                 if matches!(self.modal, Some(Modal::DeleteProject(_))) {
@@ -196,7 +276,6 @@ impl App {
                     Vec::new()
                 }
             },
-            ActionId::CloneInstance | ActionId::MultiAgent => self.open_multi_agent(),
             ActionId::KeepFiles => {
                 self.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             }
@@ -264,11 +343,8 @@ impl App {
                     Vec::new()
                 }
             }
-            ActionId::MultiAgentMore => self.multi_agent_key(KeyCode::Up),
-            ActionId::MultiAgentFewer => self.multi_agent_key(KeyCode::Down),
-            ActionId::HarnessPrev => self.multi_agent_key(KeyCode::Left),
-            ActionId::HarnessNext => self.multi_agent_key(KeyCode::Right),
-            ActionId::ToggleCloneStart => self.multi_agent_key(KeyCode::Char(' ')),
+            ActionId::ToggleForkMode => self.fork_key(KeyCode::Tab),
+            ActionId::ToggleReadOnly => self.assign_key(KeyCode::Char('r')),
             ActionId::Close => {
                 self.modal = None;
                 self.scroll_hover = false;
@@ -276,6 +352,25 @@ impl App {
                 Vec::new()
             }
         }
+    }
+}
+
+/// Helper exposed for the footer action; the modal form is owned by the state
+/// machine, so this keeps the dispatch in one place.
+impl App {
+    pub(super) fn assign_project_to_open_vm_action(&mut self) -> Vec<Effect> {
+        let Some(vm) = self.vm_open.clone() else {
+            return Vec::new();
+        };
+        let candidates = self.unassigned_project_candidates();
+        if candidates.is_empty() {
+            self.toast("no unassigned projects", ToastLevel::Warn);
+            return Vec::new();
+        }
+        self.modal = Some(Modal::AssignProject(AssignProjectForm::for_vm(
+            vm, candidates,
+        )));
+        Vec::new()
     }
 }
 
@@ -349,19 +444,52 @@ mod tests {
     }
 
     #[test]
-    fn multi_agent_hint_actions_drive_the_form() {
+    fn fork_hint_actions_drive_the_form() {
         let (_dir, mut app) = test_app();
-        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
-        app.handle_key(key(KeyCode::Char('M')));
-        app.handle_action(ActionId::MultiAgentMore);
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        app.instances = vec![fake_instance(&app, "rust", project.clone())];
+        assign_fake_project(&mut app, &project, "rust");
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path: project.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+        app.screen = Screen::Project;
+        app.open_project = Some(project);
+        app.handle_action(ActionId::ForkWorkspace);
+        assert!(matches!(app.modal, Some(Modal::ForkWorkspace(_))));
+        app.handle_action(ActionId::ToggleForkMode);
         match &app.modal {
-            Some(Modal::MultiAgent(form)) => assert_eq!(form.count, 3),
-            other => panic!("expected multi-agent modal, got {other:?}"),
+            Some(Modal::ForkWorkspace(form)) => assert_eq!(form.mode_label(), "worktree"),
+            other => panic!("expected fork modal, got {other:?}"),
         }
-        app.handle_action(ActionId::ToggleCloneStart);
-        match &app.modal {
-            Some(Modal::MultiAgent(form)) => assert!(!form.start),
-            other => panic!("expected multi-agent modal, got {other:?}"),
-        }
+    }
+
+    #[test]
+    fn vm_footer_actions_attach_stop_and_apply() {
+        let (_dir, mut app) = test_app();
+        app.instances = vec![fake_instance(
+            &app,
+            "rust",
+            app.config.projects_root.join("demo"),
+        )];
+        app.open_vm_screen("rust".into());
+
+        assert!(matches!(
+            app.handle_action(ActionId::StartVm).as_slice(),
+            [Effect::AttachVm { vm }] if vm == "rust"
+        ));
+        assert!(matches!(
+            app.handle_action(ActionId::StopVm).as_slice(),
+            [Effect::StopVm { vm }] if vm == "rust"
+        ));
+        assert!(matches!(
+            app.handle_action(ActionId::ApplyVm).as_slice(),
+            [Effect::ApplyVm { vm }] if vm == "rust"
+        ));
     }
 }

@@ -1,11 +1,11 @@
-//! Settings modals: the global, per-instance and per-project editors and their
-//! save/revert/launch transitions.
+//! Settings modals: the global (F4), VM (F5) and project presentation (F6)
+//! editors and their save/revert/launch transitions.
 
 use std::path::Path;
 
 use crate::agent::launch::{self, Integration};
+use crate::config::Config;
 use crate::config::form::{Applied, ConfigPage};
-use crate::config::{Config, Harness};
 use crate::project::{self, ProjectMeta};
 use crate::security::SecurityEngine;
 use crate::session::state::StateStore;
@@ -35,15 +35,20 @@ impl App {
         }
     }
 
+    /// Open the `vm.toml` editor for the active VM.
     pub(super) fn open_vm_config(&mut self) -> Vec<Effect> {
-        let Some(instance) = self
-            .selected_instance()
-            .map(|instance| instance.name.clone())
+        let Some(vm) = self
+            .active_vm_name()
+            .or_else(|| {
+                self.selected_instance()
+                    .map(|instance| instance.name.clone())
+            })
+            .or_else(|| self.instances.first().map(|instance| instance.name.clone()))
         else {
-            self.toast("select an instance first", ToastLevel::Warn);
+            self.toast("select a VM first", ToastLevel::Warn);
             return Vec::new();
         };
-        self.show_vm_config_form(&instance, None);
+        self.show_vm_config_form(&vm, None);
         Vec::new()
     }
 
@@ -57,7 +62,7 @@ impl App {
                 self.modal = Some(Modal::Config(form));
             }
             Err(err) => self.toast(
-                format!("could not load instance config: {err:#}"),
+                format!("could not load VM config: {err:#}"),
                 ToastLevel::Error,
             ),
         }
@@ -90,7 +95,7 @@ impl App {
             Some(Applied::Vm) => {
                 self.refresh_vms();
                 self.modal = Some(Modal::Config(form));
-                self.toast("instance settings saved", ToastLevel::Info);
+                self.toast("VM settings saved — apply to restart", ToastLevel::Info);
                 Vec::new()
             }
             None => {
@@ -126,7 +131,7 @@ impl App {
                         self.show_vm_config_form(&name, Some("reverted to the file on disk".into()))
                     }
                     None => {
-                        form.error = Some("instance name is missing".into());
+                        form.error = Some("VM name is missing".into());
                         self.modal = Some(Modal::Config(form));
                     }
                 }
@@ -151,7 +156,7 @@ impl App {
         self.refresh_vms();
     }
 
-    /// Open the per-project settings editor for the project screen.
+    /// Open the per-project presentation editor for the project screen.
     pub(super) fn open_project_config(&mut self) -> Vec<Effect> {
         let Some(project) = self.open_project.clone() else {
             self.toast(
@@ -203,12 +208,6 @@ impl App {
                 let values = [None, Some(true), Some(false)];
                 form.auto_start = cycle_value(&values, &form.auto_start, delta);
             }
-            3 => {
-                let values: Vec<Option<Harness>> = std::iter::once(None)
-                    .chain(Harness::ALL.map(Some))
-                    .collect();
-                form.harness = cycle_value(&values, &form.harness, delta);
-            }
             _ => {}
         }
     }
@@ -218,7 +217,6 @@ impl App {
         // Refuse to rewrite a file that no longer parses: `read_meta` would
         // silently return defaults and wipe the user's hand-written settings.
         let mut meta = project::try_read_meta(&form.project)?;
-        meta.harness = form.harness;
         meta.launch = form.launch.clone();
         meta.integration = form.integration;
         meta.auto_start = form.auto_start;
@@ -270,16 +268,16 @@ impl App {
         self.apply_project_meta(&form.project, meta);
         self.modal = None;
 
-        let Some(instance) = self.selected_instance().cloned() else {
+        let Some(vm) = self.active_vm_summary().cloned() else {
             self.toast(
-                "start the project first; the command runs inside its VM",
+                "assign the project to a VM first; the command runs inside it",
                 ToastLevel::Warn,
             );
             return Vec::new();
         };
         let spec = match launch::resolve(
             &self.config,
-            instance.harness,
+            vm.harness,
             form.launch.as_deref(),
             form.integration,
         ) {
@@ -291,8 +289,8 @@ impl App {
         };
         vec![Effect::LaunchAgent {
             spec,
-            vm: instance.name,
-            project: instance.workspace,
+            vm: vm.name,
+            project: form.project,
         }]
     }
 }
@@ -302,15 +300,28 @@ mod tests {
     use super::*;
     use crate::tui::app::test_support::*;
 
+    fn selected_project_app(app: &mut App) -> std::path::PathBuf {
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        app.instances = vec![fake_instance(app, "rust", project.clone())];
+        assign_fake_project(app, &project, "rust");
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path: project.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+        app.screen = Screen::Project;
+        app.open_project = Some(project.clone());
+        project
+    }
+
     #[test]
     fn project_settings_cycle_the_integration_and_save_hegn_toml() {
         let (_dir, mut app) = test_app();
-        let project = app.config.projects_root.join("demo");
-        std::fs::create_dir_all(&project).unwrap();
-        let instance = fake_instance(&app, "demo", project.join("workspace"));
-        install_instances(&mut app, vec![instance]);
-        app.screen = Screen::Project;
-        app.open_project = Some(project.clone());
+        let project = selected_project_app(&mut app);
 
         app.handle_key(key(KeyCode::F(6)));
         assert!(matches!(app.modal, Some(Modal::ProjectConfig(_))));
@@ -337,6 +348,18 @@ mod tests {
     }
 
     #[test]
+    fn project_settings_have_no_harness_field() {
+        let (_dir, mut app) = test_app();
+        selected_project_app(&mut app);
+        app.handle_key(key(KeyCode::F(6)));
+        let Some(Modal::ProjectConfig(form)) = &app.modal else {
+            panic!("expected project settings");
+        };
+        assert!(!form.project.join(project::PROJECT_META_FILE).exists());
+        assert_eq!(ProjectConfigForm::ROWS, 3);
+    }
+
+    #[test]
     fn project_settings_open_from_the_focused_terminal() {
         let (_dir, mut app) = test_app();
         let project = app.config.projects_root.join("demo");
@@ -356,24 +379,19 @@ mod tests {
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
         let file = project.join(project::PROJECT_META_FILE);
-        std::fs::write(&file, "harness = [\n").unwrap();
+        std::fs::write(&file, "launch = [\n").unwrap();
         app.screen = Screen::Project;
         app.open_project = Some(project);
 
         app.handle_key(key(KeyCode::F(6)));
         assert!(app.modal.is_none(), "the editor must not open");
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "harness = [\n");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "launch = [\n");
     }
 
     #[test]
     fn project_settings_save_and_launch_returns_a_launch_effect() {
         let (_dir, mut app) = test_app();
-        let project = app.config.projects_root.join("demo");
-        std::fs::create_dir_all(&project).unwrap();
-        let instance = fake_instance(&app, "demo", project.join("workspace"));
-        install_instances(&mut app, vec![instance]);
-        app.screen = Screen::Project;
-        app.open_project = Some(project.clone());
+        let project = selected_project_app(&mut app);
         app.config.launch.default = Some(launch::HARNESS.to_string());
 
         app.handle_key(key(KeyCode::F(6)));
@@ -382,10 +400,18 @@ mod tests {
             app.handle_key(key(KeyCode::Right));
         }
         let effects = app.handle_key(key(KeyCode::Char('r')));
-        let [Effect::LaunchAgent { spec, vm, .. }] = effects.as_slice() else {
+        let [
+            Effect::LaunchAgent {
+                spec,
+                vm,
+                project: launched,
+            },
+        ] = effects.as_slice()
+        else {
             panic!("expected one launch effect, got {effects:?}");
         };
-        assert_eq!(vm, "demo");
+        assert_eq!(vm, "rust");
+        assert_eq!(launched, &project);
         assert_eq!(spec.integration, Integration::Tmux);
         assert_eq!(
             project::read_meta(&project).integration,
@@ -394,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn config_menus_open_for_global_and_instance() {
+    fn config_menus_open_for_global_and_vm() {
         let (_dir, mut app) = test_app();
         app.handle_key(key(KeyCode::F(4)));
         match &app.modal {
@@ -407,8 +433,11 @@ mod tests {
         }
         app.modal = None;
         let inside = app.config.vms_dir.join("demo").join("workspace");
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
         app.focus = Focus::Vm;
-        let instance = fake_instance(&app, "demo", inside.clone());
+        app.instances = vec![fake_instance(&app, "demo", inside.clone())];
+        assign_fake_project(&mut app, &project, "demo");
         let stored = crate::vm::config::VmConfig {
             name: "demo".into(),
             harness: Harness::Shell,
@@ -418,11 +447,10 @@ mod tests {
         crate::vm::config::VmStore::new(&app.config)
             .save(&stored)
             .unwrap();
-        install_instances(&mut app, vec![instance]);
         app.handle_key(key(KeyCode::F(5)));
         match &app.modal {
             Some(Modal::Config(form)) => assert_eq!(form.kind, ConfigKind::Vm),
-            other => panic!("expected instance settings, got {other:?}"),
+            other => panic!("expected VM settings, got {other:?}"),
         }
     }
 
@@ -499,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn reloading_instance_settings_discards_the_edit() {
+    fn reloading_vm_settings_discards_the_edit() {
         let (_dir, mut app) = test_app();
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
@@ -514,8 +542,8 @@ mod tests {
                 ..crate::vm::config::VmConfig::default()
             })
             .unwrap();
-        let instance = fake_instance(&app, "demo", inside);
-        install_instances(&mut app, vec![instance]);
+        app.instances = vec![fake_instance(&app, "demo", inside)];
+        assign_fake_project(&mut app, &project, "demo");
         app.focus = Focus::Vm;
 
         app.handle_key(key(KeyCode::F(5)));
@@ -535,7 +563,7 @@ mod tests {
                 assert!(!form.dirty());
                 assert_eq!(form.status.as_deref(), Some("reverted to the file on disk"));
             }
-            other => panic!("expected instance settings, got {other:?}"),
+            other => panic!("expected VM settings, got {other:?}"),
         }
     }
 
@@ -544,8 +572,6 @@ mod tests {
         let (_dir, mut app) = test_app();
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
-        let instance = fake_instance(&app, "demo", project.join("workspace"));
-        install_instances(&mut app, vec![instance]);
         app.screen = Screen::Project;
         app.open_project = Some(project.clone());
 

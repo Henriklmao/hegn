@@ -5,6 +5,10 @@
 //! need the real terminal are wrapped in
 //! [`with_suspended_terminal`](super::terminal::with_suspended_terminal) so raw
 //! mode is restored even when they fail.
+//!
+//! Every host mutation goes through the same library APIs as the CLI
+//! (`VmRegistry`, `VmManager`, `ProjectRegistry`, `WorkspaceService`,
+//! `SnapshotStore`); the TUI never shells out to `hegn`.
 
 use std::io::Stdout;
 use std::path::Path;
@@ -17,7 +21,11 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::tui::App;
 use crate::tui::app::{Effect, ToastLevel};
-use crate::tui::jobs::{spawn_attach, spawn_clones, spawn_image_download, spawn_scan, spawn_start};
+use crate::tui::jobs::{
+    spawn_apply_vm, spawn_assign_project, spawn_attach_vm, spawn_create_vm, spawn_delete_vm,
+    spawn_fork_workspace, spawn_image_download, spawn_scan, spawn_set_primary, spawn_start_vm,
+    spawn_stop_vm, spawn_unassign_project,
+};
 use crate::tui::launch::launch_agent;
 use crate::tui::messages::ScanMessage;
 use crate::tui::terminal::with_suspended_terminal;
@@ -37,6 +45,7 @@ pub(super) fn handle_effects(
                 app.toast("refreshing projects…", ToastLevel::Info);
                 spawn_scan(app.config.clone(), scan_tx.clone());
             }
+            Effect::RefreshVms => app.refresh_vms(),
             Effect::DownloadImages => {
                 app.toast("downloading VM images…", ToastLevel::Info);
                 spawn_image_download(app.config.clone(), scan_tx.clone(), Vec::new());
@@ -146,16 +155,73 @@ pub(super) fn handle_effects(
                     app.toast(format!("lazygit failed: {err}"), ToastLevel::Error);
                 }
             }
-            Effect::StartVm { project, harness } => {
-                app.toast("starting VM…", ToastLevel::Info);
-                spawn_start(app.config.clone(), project, harness, scan_tx.clone());
+            Effect::StartVm { vm, project } => {
+                app.toast(format!("starting VM {vm}…"), ToastLevel::Info);
+                spawn_start_vm(app.config.clone(), vm, project, scan_tx.clone());
+            }
+            Effect::AttachVm { vm } => {
+                app.toast(format!("attaching to VM {vm}…"), ToastLevel::Info);
+                spawn_attach_vm(app.config.clone(), vm, scan_tx.clone());
+            }
+            Effect::ApplyVm { vm } => {
+                app.toast(format!("restarting VM {vm}…"), ToastLevel::Info);
+                spawn_apply_vm(app.config.clone(), vm, scan_tx.clone());
+            }
+            Effect::StopVm { vm } => {
+                app.toast(format!("stopping VM {vm}…"), ToastLevel::Info);
+                spawn_stop_vm(app.config.clone(), vm, scan_tx.clone());
+            }
+            Effect::DeleteVm { vm, delete_files } => {
+                spawn_delete_vm(app.config.clone(), vm, delete_files, scan_tx.clone());
+            }
+            Effect::CreateVm {
+                name,
+                harness,
+                vcpus,
+                memory_mib,
+                packages,
+            } => {
+                app.toast(format!("creating VM {name}…"), ToastLevel::Info);
+                spawn_create_vm(
+                    app.config.clone(),
+                    name,
+                    harness,
+                    vcpus,
+                    memory_mib,
+                    packages,
+                    scan_tx.clone(),
+                );
+            }
+            Effect::AssignProject {
+                project,
+                path,
+                vm,
+                read_only,
+            } => {
+                app.toast(format!("assigning {project} to {vm}…"), ToastLevel::Info);
+                spawn_assign_project(
+                    app.config.clone(),
+                    project,
+                    path,
+                    vm,
+                    read_only,
+                    scan_tx.clone(),
+                );
+            }
+            Effect::UnassignProject { project } => {
+                app.toast(format!("detaching {project}…"), ToastLevel::Info);
+                spawn_unassign_project(app.config.clone(), project, scan_tx.clone());
+            }
+            Effect::SetVmPrimary { vm, project } => {
+                app.toast(format!("setting {project} as primary…"), ToastLevel::Info);
+                spawn_set_primary(app.config.clone(), vm, project, scan_tx.clone());
+            }
+            Effect::ForkWorkspace { parent, name, mode } => {
+                app.toast(format!("forking {parent}…"), ToastLevel::Info);
+                spawn_fork_workspace(app.config.clone(), parent, name, mode, scan_tx.clone());
             }
             Effect::LaunchAgent { spec, vm, project } => {
                 launch_agent(terminal, app, spec, vm, project)?;
-            }
-            Effect::AttachVm { vm } => {
-                app.toast(format!("attaching to {vm}…"), ToastLevel::Info);
-                spawn_attach(app.config.clone(), vm, scan_tx.clone());
             }
             Effect::AttachConsole { vm } => {
                 let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
@@ -165,14 +231,14 @@ pub(super) fn handle_effects(
                 app.pending_launch = None;
                 app.detach_console();
                 let result = with_suspended_terminal(terminal, || {
-                    let config = registry.resolve(&vm)?;
-                    let console = registry.manager(config)?.ensure_console()?;
+                    let manager = registry.manager_by_name(&vm)?;
+                    let console = manager.ensure_console()?;
                     crate::session::console::run_interactive(console, true)
                 });
                 let reattached = registry
-                    .resolve(&vm)
+                    .manager_by_name(&vm)
                     .ok()
-                    .and_then(|config| registry.manager(config).ok()?.attach_console().ok());
+                    .and_then(|manager| manager.attach_console().ok());
                 if let Some(console) = reattached {
                     app.attach_console(Box::new(console));
                     app.project_view = crate::tui::app::ProjectView::Split;
@@ -186,36 +252,6 @@ pub(super) fn handle_effects(
                         }
                         Err(err) => app.toast(format!("attach failed: {err}"), ToastLevel::Error),
                     }
-                }
-            }
-            Effect::StopVm { vm } => {
-                let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
-                app.pending_launch = None;
-                match registry.stop(&vm) {
-                    Ok(()) => {
-                        app.toast(format!("VM {vm} stopped"), ToastLevel::Info);
-                        app.refresh_vms();
-                    }
-                    Err(err) => app.toast(format!("stop failed: {err}"), ToastLevel::Error),
-                }
-            }
-            Effect::DeleteVm { vm, delete_files } => {
-                let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
-                match registry.delete(&vm, delete_files) {
-                    Ok(outcome) => {
-                        let message = match outcome.kept_workspace {
-                            Some(path) => {
-                                format!("VM {vm} removed; files kept at {}", path.display())
-                            }
-                            None if delete_files => {
-                                format!("VM {vm} and files deleted")
-                            }
-                            None => format!("VM {vm} removed; project files kept"),
-                        };
-                        app.toast(message, ToastLevel::Info);
-                        app.refresh_vms();
-                    }
-                    Err(err) => app.toast(format!("delete failed: {err}"), ToastLevel::Error),
                 }
             }
             Effect::DeleteProject {
@@ -243,42 +279,16 @@ pub(super) fn handle_effects(
                 }
                 Err(err) => app.toast(format!("delete project failed: {err:#}"), ToastLevel::Error),
             },
-            Effect::CloneInstance {
-                source,
-                count,
-                harness,
-                start,
-            } => {
-                app.toast(format!("creating {count} clone(s)…"), ToastLevel::Info);
-                spawn_clones(
-                    app.config.clone(),
-                    source,
-                    count,
-                    harness,
-                    start,
-                    scan_tx.clone(),
-                );
-            }
-            Effect::RefreshVms => app.refresh_vms(),
             Effect::RestoreSnapshot(snapshot) => {
                 let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
-                let instance = snapshot
+                let Some(vm) = snapshot
                     .vm()
                     .and_then(|name| registry.store().load(name).ok())
-                    .or_else(|| {
-                        snapshot
-                            .project
-                            .as_deref()
-                            .and_then(|project| registry.resolve(&project.to_string_lossy()).ok())
-                    });
-                let Some(instance) = instance else {
-                    app.toast(
-                        "restore failed: no instance for snapshot",
-                        ToastLevel::Error,
-                    );
+                else {
+                    app.toast("restore failed: no VM for snapshot", ToastLevel::Error);
                     continue;
                 };
-                let manager = registry.manager(instance)?;
+                let manager = registry.manager(vm)?;
                 match runtime.block_on(manager.restore_snapshot(&snapshot)) {
                     Ok(()) => match manager.attach_console() {
                         Ok(console) => {

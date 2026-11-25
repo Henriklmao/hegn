@@ -1,4 +1,4 @@
-//! Health panel: versions, pinned assets, instance age and backups.
+//! Health panel: versions, pinned assets, VM age, newest snapshot and apt state.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -17,7 +17,7 @@ pub(crate) fn render_health(frame: &mut Frame, app: &App, area: Rect, number: us
     frame.render_widget(block, area);
 
     let project = app.active_project();
-    let instance = app.selected_instance();
+    let vm = app.active_vm_summary();
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(" hegn      ", Style::default().fg(MUTED)),
@@ -38,10 +38,10 @@ pub(crate) fn render_health(frame: &mut Frame, app: &App, area: Rect, number: us
             }),
         ),
     ]));
-    let age = instance
-        .map(|instance| {
-            let created = instance.created_at.format("%Y-%m-%d").to_string();
-            if instance.state == "running" {
+    let age = vm
+        .map(|vm| {
+            let created = vm.created_at.format("%Y-%m-%d").to_string();
+            if vm.state == "running" {
                 format!("{created} · running")
             } else {
                 created
@@ -59,10 +59,8 @@ pub(crate) fn render_health(frame: &mut Frame, app: &App, area: Rect, number: us
         Span::styled(" age       ", Style::default().fg(MUTED)),
         Span::styled(age, Style::default().fg(TEXT)),
     ]));
-    let backup = app
-        .project_snapshots
-        .first()
-        .and_then(|&index| app.snapshots.get(index))
+    let backup = vm
+        .and_then(|vm| app.newest_snapshot_for_vm(&vm.name))
         .map(|snapshot| {
             format!(
                 "{} · {}",
@@ -72,7 +70,7 @@ pub(crate) fn render_health(frame: &mut Frame, app: &App, area: Rect, number: us
         })
         .unwrap_or_else(|| "none".into());
     lines.push(Line::from(vec![
-        Span::styled(" backup    ", Style::default().fg(MUTED)),
+        Span::styled(" snapshot  ", Style::default().fg(MUTED)),
         Span::styled(backup, Style::default().fg(TEXT)),
     ]));
     let apt = app
@@ -84,23 +82,16 @@ pub(crate) fn render_health(frame: &mut Frame, app: &App, area: Rect, number: us
         Span::styled(" apt       ", Style::default().fg(MUTED)),
         Span::styled(apt, Style::default().fg(TEXT)),
     ]));
-    let template = if let Some(template) = &app.project_meta.template {
-        template.clone()
-    } else {
-        "—".into()
-    };
-    lines.push(Line::from(vec![
-        Span::styled(" template  ", Style::default().fg(MUTED)),
-        Span::styled(
-            format!(
-                "{template} · {}",
-                app.project_meta
-                    .harness
-                    .unwrap_or(app.config.harness)
-                    .label()
-            ),
-            Style::default().fg(TEXT),
-        ),
-    ]));
+    if app.screen == crate::tui::app::Screen::Project {
+        let template = app
+            .project_meta
+            .template
+            .clone()
+            .unwrap_or_else(|| "—".into());
+        lines.push(Line::from(vec![
+            Span::styled(" template  ", Style::default().fg(MUTED)),
+            Span::styled(template, Style::default().fg(TEXT)),
+        ]));
+    }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }

@@ -1,4 +1,4 @@
-//! Destructive delete prompts for instances and projects.
+//! Destructive delete prompts for VMs and projects.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -13,7 +13,7 @@ use super::super::screens::footer::FooterDef;
 use super::super::theme::{RED, YELLOW, centered};
 use super::message::render_message;
 
-pub(crate) fn render_delete_instance(
+pub(crate) fn render_delete_vm(
     frame: &mut Frame,
     app: &App,
     modal: &DeleteVmModal,
@@ -22,10 +22,11 @@ pub(crate) fn render_delete_instance(
     let (body, color, buttons): (String, Color, &[FooterDef]) = match modal.stage {
         DeleteVmStage::Confirm => (
             format!(
-                "Delete instance '{}'?\n\nProject: {}\nWorkspace: {}\n\nThe VM is stopped first.",
+                "Delete VM '{}'?\n\nHarness: {}\nMembers: {}\n\nThe VM is stopped first. \
+                 External projects are unassigned, never deleted.",
                 modal.vm.name,
-                modal.vm.project.display(),
-                modal.vm.workspace.display()
+                modal.vm.harness.label(),
+                modal.members
             ),
             YELLOW,
             &[
@@ -43,8 +44,10 @@ pub(crate) fn render_delete_instance(
         ),
         DeleteVmStage::Files => (
             format!(
-                "Also delete the cloned workspace files?\n\n{}\n\nChoose 'Keep files' to unregister the instance but keep the clone.",
-                modal.vm.workspace.display()
+                "Also delete the VM directory and its managed workspaces?\n\n{}\n\n\
+                 Choose 'Keep files' to unassign every project and leaves the VM directory in place. \
+                 External project directories are never touched.",
+                modal.vm.config_path.display()
             ),
             RED,
             &[
@@ -73,7 +76,7 @@ pub(crate) fn render_delete_instance(
         72,
         42,
         1,
-        "delete instance",
+        "delete VM",
         &body,
         color,
         modal.scroll,
@@ -129,10 +132,10 @@ pub(crate) fn render_delete_project(
     if git.is_dirty() {
         body.push_str("\nWARNING: uncommitted changes will be lost if the files are deleted.\n");
     }
-    if !modal.instances.is_empty() {
+    if !modal.vms.is_empty() {
         body.push_str(&format!(
-            "\nInstances to remove: {}\n",
-            modal.instances.join(", ")
+            "\nDetached from VM(s): {} (the VM itself is never deleted)\n",
+            modal.vms.join(", ")
         ));
     }
     body.push_str(
@@ -187,12 +190,12 @@ mod tests {
     use crate::vm::registry::VmSummary;
     use std::path::PathBuf;
 
-    fn instance(app: &App, name: &str, state: &str) -> VmSummary {
+    fn summary(app: &App, name: &str, state: &str) -> VmSummary {
         VmSummary {
             name: name.into(),
             harness: Harness::Opencode,
             primary: Some("demo".into()),
-            members: 1,
+            members: 2,
             project: PathBuf::from("/projects/demo"),
             workspace: PathBuf::from(format!("/workspaces/{name}")),
             created_at: chrono::Utc::now(),
@@ -219,13 +222,14 @@ mod tests {
                 untracked: 1,
                 ..GitSummary::default()
             },
-            instances: vec!["demo".into()],
+            vms: vec!["rust".into()],
             scroll: 0,
         }));
         let (text, hits) = render(&app);
         assert!(text.contains("delete project"), "{text}");
         assert!(text.contains("main"), "{text}");
         assert!(text.contains("uncommitted changes"), "{text}");
+        assert!(text.contains("never deleted"), "{text}");
         assert!(text.contains("Remove, keep files"), "{text}");
         assert!(text.contains("Delete files"), "{text}");
         assert!(
@@ -241,21 +245,23 @@ mod tests {
     }
 
     #[test]
-    fn delete_instance_confirm_stage_names_the_instance_and_stop_first() {
+    fn delete_vm_confirm_stage_names_the_vm_and_protects_projects() {
         let (_dir, mut app) = app();
         app.modal = Some(Modal::DeleteVm(DeleteVmModal {
-            vm: instance(&app, "build", "running"),
+            vm: summary(&app, "build", "running"),
+            members: 2,
             stage: DeleteVmStage::Confirm,
             error: None,
             scroll: 0,
         }));
         let (text, hits) = render(&app);
 
-        assert!(text.contains("delete instance"), "{text}");
-        assert!(text.contains("Delete instance 'build'"), "{text}");
-        assert!(text.contains("Project: /projects/demo"), "{text}");
-        assert!(text.contains("Workspace: /workspaces/build"), "{text}");
-        assert!(text.contains("The VM is stopped first."), "{text}");
+        assert!(text.contains("delete VM"), "{text}");
+        assert!(text.contains("Delete VM 'build'"), "{text}");
+        assert!(
+            text.contains("External projects are unassigned, never deleted"),
+            "{text}"
+        );
         assert!(text.contains("<y> Continue"), "{text}");
         assert!(text.contains("<n> Cancel"), "{text}");
         assert!(
@@ -274,25 +280,23 @@ mod tests {
     }
 
     #[test]
-    fn delete_instance_files_stage_offers_keep_files_and_shows_errors() {
+    fn delete_vm_files_stage_offers_keep_files_and_shows_errors() {
         let (_dir, mut app) = app();
         app.modal = Some(Modal::DeleteVm(DeleteVmModal {
-            vm: instance(&app, "build", "stopped"),
+            vm: summary(&app, "build", "stopped"),
+            members: 1,
             stage: DeleteVmStage::Files,
-            error: Some("workspace is still mounted".into()),
+            error: Some("VM is still running".into()),
             scroll: 0,
         }));
         let (text, hits) = render(&app);
 
-        assert!(
-            text.contains("Also delete the cloned workspace files?"),
-            "{text}"
-        );
+        assert!(text.contains("Also delete the VM directory"), "{text}");
         assert!(text.contains("Choose 'Keep files'"), "{text}");
         assert!(text.contains("<y> Delete files"), "{text}");
         assert!(text.contains("<n> Keep files"), "{text}");
         assert!(text.contains("<Esc> Cancel"), "{text}");
-        assert!(text.contains("workspace is still mounted"), "{text}");
+        assert!(text.contains("VM is still running"), "{text}");
         assert!(
             hits.footer
                 .iter()
@@ -303,7 +307,6 @@ mod tests {
                 .iter()
                 .any(|hit| hit.action == ActionId::Confirm)
         );
-        assert!(hits.footer.iter().any(|hit| hit.action == ActionId::Cancel));
     }
 
     #[test]
@@ -317,7 +320,7 @@ mod tests {
                 error: Some("git unavailable".into()),
                 ..GitSummary::default()
             },
-            instances: Vec::new(),
+            vms: Vec::new(),
             scroll: 0,
         }));
         let (text, hits) = render(&app);
@@ -327,7 +330,7 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("uncommitted changes"), "{text}");
-        assert!(!text.contains("Instances to remove"), "{text}");
+        assert!(!text.contains("Detached from VM"), "{text}");
         assert!(text.contains("keep every project file"), "{text}");
         assert!(
             text.contains("Imported projects only lose their picker symlink"),

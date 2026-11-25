@@ -72,8 +72,10 @@ pub(crate) fn render_footer(frame: &mut Frame, app: &App, area: Rect) -> Vec<Foo
             " typing filter · ↑↓ select · Enter open · Esc cancel ".to_string()
         } else if app.screen == Screen::Project {
             " Esc/← dashboard · Ctrl-B/^] dashboard · PgUp/PgDn scroll · Ctrl-L clear ".to_string()
+        } else if app.screen == Screen::Vm {
+            " Esc/← dashboard · v from a project opens its VM · j/k select · ? help ".to_string()
         } else {
-            " / filter · 1-3 focus · Tab cycle · Enter open · c create · ? help ".to_string()
+            " / filter · Enter open+attach · v VM · a assign · n new VM · ? help ".to_string()
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(MUTED)))),
@@ -124,6 +126,23 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 action: ActionId::Close,
             },
         ],
+        Some(Modal::CreateVm(_)) => vec![
+            FooterDef {
+                key: "Tab",
+                label: "Next field",
+                action: ActionId::NextField,
+            },
+            FooterDef {
+                key: "Enter",
+                label: "Create VM",
+                action: ActionId::SubmitVm,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Cancel",
+                action: ActionId::Close,
+            },
+        ],
         Some(Modal::ImportProject(_)) => vec![
             FooterDef {
                 key: "Tab",
@@ -134,6 +153,45 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 key: "Enter",
                 label: "Import",
                 action: ActionId::SubmitImport,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Cancel",
+                action: ActionId::Close,
+            },
+        ],
+        Some(Modal::AssignProject(_)) => vec![
+            FooterDef {
+                key: "←/→",
+                label: "Choose",
+                action: ActionId::NextField,
+            },
+            FooterDef {
+                key: "r",
+                label: "Read-only",
+                action: ActionId::ToggleReadOnly,
+            },
+            FooterDef {
+                key: "Enter",
+                label: "Assign",
+                action: ActionId::SubmitAssign,
+            },
+            FooterDef {
+                key: "Esc",
+                label: "Cancel",
+                action: ActionId::Close,
+            },
+        ],
+        Some(Modal::ForkWorkspace(_)) => vec![
+            FooterDef {
+                key: "Tab",
+                label: "Clone/worktree",
+                action: ActionId::ToggleForkMode,
+            },
+            FooterDef {
+                key: "Enter",
+                label: "Fork",
+                action: ActionId::SubmitFork,
             },
             FooterDef {
                 key: "Esc",
@@ -234,6 +292,18 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 },
             ],
         },
+        Some(Modal::DetachProject(_)) => vec![
+            FooterDef {
+                key: "y",
+                label: "Detach",
+                action: ActionId::Confirm,
+            },
+            FooterDef {
+                key: "n",
+                label: "Cancel",
+                action: ActionId::Cancel,
+            },
+        ],
         Some(Modal::DeleteProject(_)) => vec![
             FooterDef {
                 key: "y",
@@ -244,18 +314,6 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 key: "f",
                 label: "Delete files",
                 action: ActionId::DeleteProjectFiles,
-            },
-            FooterDef {
-                key: "Esc",
-                label: "Cancel",
-                action: ActionId::Cancel,
-            },
-        ],
-        Some(Modal::MultiAgent(_)) => vec![
-            FooterDef {
-                key: "Enter",
-                label: "Create clones",
-                action: ActionId::Confirm,
             },
             FooterDef {
                 key: "Esc",
@@ -304,38 +362,147 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 action: ActionId::Close,
             }]
         }
+        None if app.screen == Screen::Vm => {
+            let mut buttons = match app.focus {
+                Focus::Projects => vec![
+                    FooterDef {
+                        key: "Enter",
+                        label: "Open",
+                        action: ActionId::Open,
+                    },
+                    FooterDef {
+                        key: "a",
+                        label: "Assign",
+                        action: ActionId::AssignProject,
+                    },
+                    FooterDef {
+                        key: "p",
+                        label: "Primary",
+                        action: ActionId::SetPrimary,
+                    },
+                    FooterDef {
+                        key: "d",
+                        label: "Detach",
+                        action: ActionId::DetachProject,
+                    },
+                    FooterDef {
+                        key: "f",
+                        label: "Fork",
+                        action: ActionId::ForkWorkspace,
+                    },
+                ],
+                Focus::Snapshots => vec![
+                    FooterDef {
+                        key: "Enter",
+                        label: "Restore",
+                        action: ActionId::Restore,
+                    },
+                    FooterDef {
+                        key: "n",
+                        label: "New",
+                        action: ActionId::NewSnapshot,
+                    },
+                    FooterDef {
+                        key: "d",
+                        label: "Delete",
+                        action: ActionId::DeleteSnapshot,
+                    },
+                ],
+                Focus::Tools => vec![
+                    FooterDef {
+                        key: "Enter",
+                        label: "Shell",
+                        action: ActionId::Shell,
+                    },
+                    FooterDef {
+                        key: "s",
+                        label: "Start",
+                        action: ActionId::StartVm,
+                    },
+                    FooterDef {
+                        key: "S",
+                        label: "Stop",
+                        action: ActionId::StopVm,
+                    },
+                    FooterDef {
+                        key: "A",
+                        label: "Apply",
+                        action: ActionId::ApplyVm,
+                    },
+                    FooterDef {
+                        key: "e",
+                        label: "vm.toml",
+                        action: ActionId::VmConfig,
+                    },
+                ],
+                Focus::Health | Focus::Git | Focus::Vm => vec![FooterDef {
+                    key: "Enter",
+                    label: "Shell",
+                    action: ActionId::Shell,
+                }],
+            };
+            buttons.push(FooterDef {
+                key: "F2",
+                label: "Attach",
+                action: ActionId::ToggleRaw,
+            });
+            buttons.push(FooterDef {
+                key: "F5",
+                label: "VM config",
+                action: ActionId::VmConfig,
+            });
+            buttons.push(FooterDef {
+                key: "D",
+                label: "Delete VM",
+                action: ActionId::DeleteVm,
+            });
+            buttons.push(FooterDef {
+                key: "n",
+                label: "New VM",
+                action: ActionId::NewVm,
+            });
+            buttons.push(FooterDef {
+                key: "Esc",
+                label: "Back",
+                action: ActionId::Back,
+            });
+            buttons.push(FooterDef {
+                key: "?",
+                label: "Help",
+                action: ActionId::Help,
+            });
+            buttons
+        }
         None if app.screen == Screen::Project => {
             let mut buttons = match app.project_view {
                 ProjectView::Compact => match app.focus {
-                    Focus::Vm => {
-                        let label = if app.selected_instance().is_some() {
-                            "Open"
-                        } else {
-                            "Start"
-                        };
-                        vec![
-                            FooterDef {
-                                key: "Enter",
-                                label,
-                                action: ActionId::StartVm,
-                            },
-                            FooterDef {
-                                key: "i",
-                                label: "Terminal",
-                                action: ActionId::InsertMode,
-                            },
-                            FooterDef {
-                                key: "S",
-                                label: "Stop",
-                                action: ActionId::StopVm,
-                            },
-                            FooterDef {
-                                key: "d",
-                                label: "Delete",
-                                action: ActionId::DeleteVm,
-                            },
-                        ]
-                    }
+                    Focus::Vm => vec![
+                        FooterDef {
+                            key: "Enter",
+                            label: "Attach",
+                            action: ActionId::StartVm,
+                        },
+                        FooterDef {
+                            key: "S",
+                            label: "Stop",
+                            action: ActionId::StopVm,
+                        },
+                        FooterDef {
+                            key: "A",
+                            label: "Apply",
+                            action: ActionId::ApplyVm,
+                        },
+                        FooterDef {
+                            key: "d",
+                            label: "Detach",
+                            action: ActionId::DetachProject,
+                        },
+                        FooterDef {
+                            key: "f",
+                            label: "Fork",
+                            action: ActionId::ForkWorkspace,
+                        },
+                    ],
                     Focus::Snapshots => vec![
                         FooterDef {
                             key: "Enter",
@@ -358,11 +525,13 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                             action: ActionId::InsertMode,
                         },
                     ],
-                    Focus::Health | Focus::Git | Focus::Projects => vec![FooterDef {
-                        key: "i",
-                        label: "Terminal",
-                        action: ActionId::InsertMode,
-                    }],
+                    Focus::Health | Focus::Git | Focus::Projects | Focus::Tools => {
+                        vec![FooterDef {
+                            key: "i",
+                            label: "Terminal",
+                            action: ActionId::InsertMode,
+                        }]
+                    }
                 },
                 ProjectView::Split => {
                     if app.terminal_mode == TerminalMode::Insert {
@@ -386,6 +555,11 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 }],
             };
             buttons.push(FooterDef {
+                key: "v",
+                label: "VM screen",
+                action: ActionId::FocusVm,
+            });
+            buttons.push(FooterDef {
                 key: "L",
                 label: "Launch",
                 action: ActionId::Launch,
@@ -396,8 +570,13 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
                 action: ActionId::ToggleRaw,
             });
             buttons.push(FooterDef {
+                key: "F5",
+                label: "VM config",
+                action: ActionId::VmConfig,
+            });
+            buttons.push(FooterDef {
                 key: "F6",
-                label: "Project config",
+                label: "Project",
                 action: ActionId::ProjectConfig,
             });
             buttons.push(FooterDef {
@@ -413,70 +592,43 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<FooterDef> {
             buttons
         }
         None => {
-            let mut buttons = match app.focus {
-                Focus::Projects => vec![
-                    FooterDef {
-                        key: "Enter",
-                        label: "Open",
-                        action: ActionId::Open,
-                    },
-                    FooterDef {
-                        key: "c",
-                        label: "Create",
-                        action: ActionId::Create,
-                    },
-                    FooterDef {
-                        key: "h",
-                        label: "Import",
-                        action: ActionId::Import,
-                    },
-                    FooterDef {
-                        key: "d",
-                        label: "Delete project",
-                        action: ActionId::DeleteProject,
-                    },
-                    FooterDef {
-                        key: "e",
-                        label: "Editor",
-                        action: ActionId::Edit,
-                    },
-                ],
-                Focus::Vm => vec![
-                    FooterDef {
-                        key: "Enter",
-                        label: "Attach",
-                        action: ActionId::StartVm,
-                    },
-                    FooterDef {
-                        key: "S",
-                        label: "Stop",
-                        action: ActionId::StopVm,
-                    },
-                    FooterDef {
-                        key: "d",
-                        label: "Delete",
-                        action: ActionId::DeleteVm,
-                    },
-                    FooterDef {
-                        key: "F5",
-                        label: "Instance config",
-                        action: ActionId::VmConfig,
-                    },
-                ],
-                Focus::Snapshots => vec![
-                    FooterDef {
-                        key: "n",
-                        label: "New snapshot",
-                        action: ActionId::NewSnapshot,
-                    },
-                    FooterDef {
-                        key: "d",
-                        label: "Delete",
-                        action: ActionId::DeleteSnapshot,
-                    },
-                ],
-                Focus::Health | Focus::Git => Vec::new(),
-            };
+            let mut buttons = vec![
+                FooterDef {
+                    key: "Enter",
+                    label: "Open",
+                    action: ActionId::Open,
+                },
+                FooterDef {
+                    key: "c",
+                    label: "Create",
+                    action: ActionId::Create,
+                },
+                FooterDef {
+                    key: "h",
+                    label: "Import",
+                    action: ActionId::Import,
+                },
+                FooterDef {
+                    key: "a",
+                    label: "Assign VM",
+                    action: ActionId::AssignProject,
+                },
+                FooterDef {
+                    key: "v",
+                    label: "VM screen",
+                    action: ActionId::FocusVm,
+                },
+                FooterDef {
+                    key: "n",
+                    label: "New VM",
+                    action: ActionId::NewVm,
+                },
+                FooterDef {
+                    key: "d",
+                    label: "Delete",
+                    action: ActionId::DeleteProject,
+                },
+            ];
             buttons.push(FooterDef {
                 key: "F4",
                 label: "Config",
@@ -577,7 +729,7 @@ mod tests {
     use crate::config::Harness;
     use crate::tui::app::{
         App, ConfirmPrompt, DeleteProjectModal, DeleteVmModal, DeleteVmStage::Confirm,
-        DeleteVmStage::Files, MultiAgentForm,
+        DeleteVmStage::Files, ForkWorkspaceForm, Modal,
     };
     use crate::tui::ui::test_support::*;
     use crate::vm::registry::VmSummary;
@@ -597,7 +749,7 @@ mod tests {
             .collect()
     }
 
-    fn instance(app: &App, name: &str, state: &str) -> VmSummary {
+    fn summary(app: &App, name: &str, state: &str) -> VmSummary {
         VmSummary {
             name: name.into(),
             harness: Harness::Shell,
@@ -609,7 +761,7 @@ mod tests {
             state: state.into(),
             vm_pid: None,
             serial_log: None,
-            config_path: app.config.vms_dir.join(name).join("hegn.toml"),
+            config_path: app.config.vms_dir.join(name).join("vm.toml"),
             vcpus: 2,
             memory_mib: 2048,
             error: None,
@@ -617,15 +769,17 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_footer_tracks_the_focused_panel() {
-        let (_dir, mut app) = app();
+    fn dashboard_footer_offers_vm_actions() {
+        let (_dir, app) = app();
         let buttons = actions(&app);
         for action in [
             ActionId::Open,
             ActionId::Create,
             ActionId::Import,
+            ActionId::AssignProject,
+            ActionId::FocusVm,
+            ActionId::NewVm,
             ActionId::DeleteProject,
-            ActionId::Edit,
             ActionId::GlobalConfig,
             ActionId::Doctor,
             ActionId::Refresh,
@@ -634,30 +788,7 @@ mod tests {
         ] {
             assert!(buttons.contains(&action), "missing {action:?}");
         }
-        assert!(!buttons.contains(&ActionId::StartVm));
-
-        app.focus = Focus::Vm;
-        let buttons = actions(&app);
-        for action in [
-            ActionId::StartVm,
-            ActionId::StopVm,
-            ActionId::DeleteVm,
-            ActionId::VmConfig,
-        ] {
-            assert!(buttons.contains(&action), "missing {action:?}");
-        }
-        assert!(labels(&app).contains(&"Attach"));
-
-        app.focus = Focus::Snapshots;
-        let buttons = actions(&app);
-        assert!(buttons.contains(&ActionId::NewSnapshot));
-        assert!(buttons.contains(&ActionId::DeleteSnapshot));
-        assert!(!buttons.contains(&ActionId::Open));
-
-        app.focus = Focus::Health;
-        let buttons = actions(&app);
-        assert!(!buttons.contains(&ActionId::NewSnapshot));
-        assert!(buttons.contains(&ActionId::GlobalConfig));
+        assert!(!buttons.contains(&ActionId::StopVm));
     }
 
     #[test]
@@ -668,24 +799,31 @@ mod tests {
         app.project_view = ProjectView::Compact;
         app.focus = Focus::Vm;
 
-        assert!(labels(&app).contains(&"Start"));
-
-        app.instances = vec![instance(&app, "build", "running")];
-        app.refresh_instance_filter();
-        assert!(
-            labels(&app).contains(&"Open"),
-            "an existing instance is opened instead of started"
-        );
+        assert!(labels(&app).contains(&"Attach"));
+        for action in [
+            ActionId::StartVm,
+            ActionId::StopVm,
+            ActionId::ApplyVm,
+            ActionId::DetachProject,
+            ActionId::ForkWorkspace,
+            ActionId::FocusVm,
+            ActionId::ToggleRaw,
+            ActionId::VmConfig,
+            ActionId::ProjectConfig,
+            ActionId::Back,
+            ActionId::Help,
+        ] {
+            assert!(actions(&app).contains(&action), "missing {action:?}");
+        }
 
         app.focus = Focus::Snapshots;
-        let buttons = actions(&app);
         for action in [
             ActionId::Restore,
             ActionId::NewSnapshot,
             ActionId::DeleteSnapshot,
             ActionId::InsertMode,
         ] {
-            assert!(buttons.contains(&action), "missing {action:?}");
+            assert!(actions(&app).contains(&action), "missing {action:?}");
         }
 
         app.project_view = ProjectView::Split;
@@ -712,27 +850,57 @@ mod tests {
                 .iter()
                 .any(|button| button.action == ActionId::InsertMode && button.label == "Terminal")
         );
+    }
+
+    #[test]
+    fn vm_footer_tracks_the_focused_section() {
+        let (_dir, mut app) = app();
+        app.instances = vec![summary(&app, "rust", "running")];
+        app.open_vm_screen("rust".into());
         for action in [
-            ActionId::Launch,
+            ActionId::Open,
+            ActionId::AssignProject,
+            ActionId::SetPrimary,
+            ActionId::DetachProject,
+            ActionId::ForkWorkspace,
+            ActionId::DeleteVm,
+            ActionId::NewVm,
             ActionId::ToggleRaw,
-            ActionId::ProjectConfig,
+            ActionId::VmConfig,
             ActionId::Back,
-            ActionId::Help,
         ] {
-            assert!(
-                buttons.iter().any(|button| button.action == action),
-                "missing {action:?}"
-            );
+            assert!(actions(&app).contains(&action), "missing {action:?}");
+        }
+
+        app.focus = Focus::Tools;
+        for action in [
+            ActionId::Shell,
+            ActionId::StartVm,
+            ActionId::StopVm,
+            ActionId::ApplyVm,
+            ActionId::VmConfig,
+        ] {
+            assert!(actions(&app).contains(&action), "missing {action:?}");
+        }
+
+        app.focus = Focus::Snapshots;
+        for action in [
+            ActionId::Restore,
+            ActionId::NewSnapshot,
+            ActionId::DeleteSnapshot,
+        ] {
+            assert!(actions(&app).contains(&action), "missing {action:?}");
         }
     }
 
     #[test]
     fn modal_footer_offers_stage_specific_destructive_choices() {
         let (_dir, mut app) = app();
-        let build = instance(&app, "build", "running");
+        let build = summary(&app, "build", "running");
 
         app.modal = Some(Modal::DeleteVm(DeleteVmModal {
             vm: build.clone(),
+            members: 2,
             stage: Confirm,
             error: None,
             scroll: 0,
@@ -743,6 +911,7 @@ mod tests {
 
         app.modal = Some(Modal::DeleteVm(DeleteVmModal {
             vm: build,
+            members: 2,
             stage: Files,
             error: None,
             scroll: 0,
@@ -760,7 +929,7 @@ mod tests {
         app.modal = Some(Modal::DeleteProject(DeleteProjectModal {
             project,
             git: crate::project::GitSummary::default(),
-            instances: vec!["build".into()],
+            vms: vec!["build".into()],
             scroll: 0,
         }));
         assert_eq!(
@@ -772,11 +941,17 @@ mod tests {
             ]
         );
 
-        app.modal = Some(Modal::MultiAgent(MultiAgentForm::new(
-            "build".into(),
-            Harness::Shell,
+        app.modal = Some(Modal::ForkWorkspace(ForkWorkspaceForm::new(
+            "build", "rust",
         )));
-        assert_eq!(actions(&app), vec![ActionId::Confirm, ActionId::Cancel]);
+        assert_eq!(
+            actions(&app),
+            vec![
+                ActionId::ToggleForkMode,
+                ActionId::SubmitFork,
+                ActionId::Close
+            ]
+        );
 
         app.modal = Some(Modal::Confirm(ConfirmPrompt {
             title: "Delete snapshot".into(),
@@ -790,8 +965,7 @@ mod tests {
 
     #[test]
     fn footer_buttons_stay_inside_a_narrow_terminal() {
-        let (_dir, mut app) = app();
-        app.focus = Focus::Vm;
+        let (_dir, app) = app();
         let (text, hits) = render_sized(&app, 40, 15);
         assert!(!hits.footer.is_empty(), "{text}");
         for hit in &hits.footer {
@@ -828,7 +1002,7 @@ mod tests {
         let (_dir, mut app) = app();
 
         let text = footer_text(&app, 120, 4);
-        assert!(text.contains("Tab cycle"), "{text}");
+        assert!(text.contains("Enter open+attach"), "{text}");
         assert!(text.contains("<Enter> Open"), "{text}");
 
         app.searching = true;

@@ -1,5 +1,5 @@
 //! Agent launch requests: queueing after boot, releasing when provisioning is
-//! done, and resolving commands for the selected instance.
+//! done, and resolving commands for the active VM.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use crate::project;
 use super::*;
 
 impl App {
-    /// Queue the configured command after the TUI started a VM with Enter.
+    /// Queue the configured command after the TUI started a VM.
     pub fn queue_auto_launch(&mut self, vm: &str, harness: Harness, project: &Path, started: bool) {
         if !started {
             return;
@@ -79,20 +79,25 @@ impl App {
         Some((pending.spec, pending.vm, pending.project))
     }
 
-    /// Launch a command for the selected instance right now.
+    /// Launch a command for the active VM right now.
     pub fn request_launch(&mut self, selector: Option<&str>) -> Vec<Effect> {
-        let Some(instance) = self.selected_instance().cloned() else {
+        let Some(vm) = self.active_vm_summary().cloned() else {
             self.toast("no VM selected", ToastLevel::Warn);
             return Vec::new();
         };
-        let meta = if self.open_project.as_deref() == Some(instance.project.as_path()) {
+        let project = self
+            .open_project
+            .clone()
+            .or_else(|| self.selected_project().map(|project| project.path.clone()))
+            .unwrap_or_else(|| vm.project.clone());
+        let meta = if self.open_project.as_deref() == Some(project.as_path()) {
             self.project_meta.clone()
         } else {
-            project::read_meta(&instance.project)
+            project::read_meta(&project)
         };
         let spec = match launch::resolve(
             &self.config,
-            instance.harness,
+            vm.harness,
             selector.or(meta.launch.as_deref()),
             meta.integration,
         ) {
@@ -105,28 +110,15 @@ impl App {
         self.pending_launch = None;
         vec![Effect::LaunchAgent {
             spec,
-            vm: instance.name,
-            project: instance.workspace,
+            vm: vm.name,
+            project,
         }]
     }
 
-    pub(super) fn open_multi_agent(&mut self) -> Vec<Effect> {
-        let Some(session) = self.session.as_ref() else {
-            self.toast(
-                "open a project first — multi-agent clones live inside its terminal",
-                ToastLevel::Warn,
-            );
-            return Vec::new();
-        };
-        let instance = session.instance_name().to_string();
-        let harness = self
-            .instances
-            .iter()
-            .find(|entry| entry.name == instance)
-            .map(|entry| entry.harness)
-            .unwrap_or(self.config.harness);
-        self.modal = Some(Modal::MultiAgent(MultiAgentForm::new(instance, harness)));
-        Vec::new()
+    /// Fork the open project into a clone or worktree (the VM screen's fork
+    /// action). The form picks the mode.
+    pub(super) fn open_fork_workspace(&mut self) -> Vec<Effect> {
+        self.confirm_fork_workspace(None)
     }
 }
 
@@ -135,6 +127,25 @@ mod tests {
     use super::*;
     use crate::project::ProjectMeta;
     use crate::tui::app::test_support::*;
+
+    fn assigned_app() -> (tempfile::TempDir, App, PathBuf) {
+        let (dir, mut app) = test_app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        app.instances = vec![fake_instance(&app, "rust", project.clone())];
+        assign_fake_project(&mut app, &project, "rust");
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path: project.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+        app.open_project = Some(project.clone());
+        app.screen = Screen::Project;
+        (dir, app, project)
+    }
 
     #[test]
     fn auto_launch_waits_for_provisioning_then_releases_the_command() {
@@ -258,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn request_launch_requires_a_selected_instance_and_resolves_its_harness() {
+    fn request_launch_requires_an_assigned_vm_and_resolves_its_harness() {
         let (_dir, mut app) = test_app();
         let effects = app.request_launch(None);
         assert!(effects.is_empty());
@@ -268,22 +279,25 @@ mod tests {
                 .is_some_and(|toast| toast.text.contains("no VM selected"))
         );
 
-        let inside = app.config.vms_dir.join("demo").join("workspace");
-        let mut instance = fake_instance(&app, "demo", inside.clone());
-        instance.harness = Harness::Opencode;
-        install_instances(&mut app, vec![instance]);
+        let (_dir, mut app, project) = assigned_app();
         app.config.launch.default = Some(crate::agent::launch::HARNESS.to_string());
         app.pending_launch = None;
 
         let effects = app.request_launch(None);
 
-        let [Effect::LaunchAgent { spec, vm, project }] = effects.as_slice() else {
+        let [
+            Effect::LaunchAgent {
+                spec,
+                vm,
+                project: launched,
+            },
+        ] = effects.as_slice()
+        else {
             panic!("expected one launch effect, got {effects:?}");
         };
-        assert_eq!(vm, "demo");
-        assert_eq!(project, &inside);
-        assert_eq!(spec.name, Harness::Opencode.label());
-        assert_eq!(spec.command, Harness::Opencode.command());
+        assert_eq!(vm, "rust");
+        assert_eq!(launched, &project);
+        assert_eq!(spec.name, Harness::Shell.label());
         assert!(
             app.pending_launch.is_none(),
             "a manual launch clears the queue"
@@ -291,19 +305,15 @@ mod tests {
     }
 
     #[test]
-    fn multi_agent_form_submits_clone_effect() {
-        let (_dir, mut app) = test_app();
-        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
-        app.handle_key(key(KeyCode::Char('M')));
-        assert!(matches!(app.modal, Some(Modal::MultiAgent(_))));
-        let effects = app.handle_key(key(KeyCode::Enter));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::CloneInstance {
-                count: 2,
-                start: true,
-                ..
-            }]
-        ));
+    fn fork_action_opens_the_workspace_form() {
+        let (_dir, mut app, _project) = assigned_app();
+        app.handle_key(key(KeyCode::Char('f')));
+        match &app.modal {
+            Some(Modal::ForkWorkspace(form)) => {
+                assert_eq!(form.parent, "demo");
+                assert_eq!(form.vm, "rust");
+            }
+            other => panic!("expected fork form, got {other:?}"),
+        }
     }
 }

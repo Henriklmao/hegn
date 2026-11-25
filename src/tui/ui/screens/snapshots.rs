@@ -18,15 +18,15 @@ pub(crate) fn render_snapshots(
     number: usize,
 ) -> Vec<RowHit> {
     let active = app.focus == Focus::Snapshots;
-    let indices: Vec<usize> = if app.screen == Screen::Project {
-        app.project_snapshots.clone()
-    } else {
-        (0..app.snapshots.len()).collect()
+    let indices: Vec<usize> = match app.screen {
+        Screen::Project => app.project_snapshots.clone(),
+        Screen::Vm => app.vm_snapshots.clone(),
+        Screen::Dashboard => (0..app.snapshots.len()).collect(),
     };
-    let selected_index = if app.screen == Screen::Project {
-        app.project_snapshot_selected
-    } else {
-        app.selected_snapshot
+    let selected_index = match app.screen {
+        Screen::Project => app.project_snapshot_selected,
+        Screen::Vm => app.vm_snapshot_selected,
+        Screen::Dashboard => app.selected_snapshot,
     };
     let title = format!(" snapshots ({}) ", indices.len());
     let block = tab_block(title, number, active);

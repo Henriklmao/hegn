@@ -1,18 +1,18 @@
-//! Project lifecycle: entering and leaving the project screen, terminal input
-//! submission and local list maintenance after background workers run.
+//! Project lifecycle: entering and leaving the project screen, VM attachment,
+//! terminal input submission and local list maintenance after background
+//! workers run.
 
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::project::{self};
+use crate::project::{self, Project};
 use crate::security::Decision;
 use crate::session::state::StateStore;
-use crate::vm::registry::VmSummary;
 
 use super::*;
 
 impl App {
-    /// Open the selected project without booting a VM.
+    /// Open the selected project screen without booting a VM.
     pub fn open_project(&mut self) -> Vec<Effect> {
         let Some(project) = self.selected_project().cloned() else {
             self.toast("no project selected", ToastLevel::Warn);
@@ -42,13 +42,15 @@ impl App {
 
     pub(super) fn enter_project(&mut self, path: PathBuf) {
         self.project_meta = project::read_meta(&path);
+        self.vm_open = None;
         self.open_project = Some(path);
         self.screen = Screen::Project;
         self.project_view = ProjectView::Compact;
         self.terminal_focus = false;
         self.focus = Focus::Vm;
         self.terminal_mode = TerminalMode::Normal;
-        self.refresh_vms();
+        self.refresh_project_entries();
+        self.refresh_instance_filter();
         self.refresh_snapshots();
     }
 
@@ -65,10 +67,165 @@ impl App {
     pub fn leave_project(&mut self) {
         self.screen = Screen::Dashboard;
         self.open_project = None;
+        self.vm_open = None;
         self.project_view = ProjectView::Compact;
         self.terminal_focus = false;
         self.focus = Focus::Projects;
         self.refresh_filter();
+    }
+
+    /// Leave the VM screen without touching the VM.
+    pub fn leave_vm(&mut self) {
+        self.screen = Screen::Dashboard;
+        self.vm_open = None;
+        self.open_project = None;
+        self.focus = Focus::Projects;
+        self.refresh_filter();
+    }
+
+    /// Attach the VM of the active project, or ask for an assignment when the
+    /// project is not part of a VM yet.
+    pub(super) fn attach_project_vm(&mut self) -> Vec<Effect> {
+        let Some(project) = self
+            .active_project()
+            .map(|project| project.path.clone())
+            .or_else(|| self.open_project.clone())
+        else {
+            self.toast("no project selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        match self.project_vm_name(&project).map(str::to_string) {
+            Some(vm) => {
+                self.vm.state = VmUiState::Starting;
+                self.vm.started_at = None;
+                self.vm.note = Some(format!("starting VM {vm}"));
+                vec![Effect::StartVm {
+                    vm,
+                    project: Some(project),
+                }]
+            }
+            None => self.open_assign_form(project, None),
+        }
+    }
+
+    /// Ask the user to pick a VM for a project (optionally pinning one).
+    pub(super) fn open_assign_form(&mut self, project: PathBuf, vm: Option<String>) -> Vec<Effect> {
+        let candidates: Vec<String> = match vm {
+            Some(vm) => vec![vm],
+            None => self
+                .instances
+                .iter()
+                .map(|summary| summary.name.clone())
+                .collect(),
+        };
+        if candidates.is_empty() {
+            self.toast(
+                "no VMs exist yet — create one, then assign this project",
+                ToastLevel::Warn,
+            );
+            self.modal = Some(Modal::CreateVm(CreateVmForm::new(
+                self.config.harness,
+                self.config.vcpus,
+                self.config.memory_mib,
+            )));
+            return Vec::new();
+        }
+        let name = self
+            .project_entry(&project)
+            .map(|entry| entry.name.clone())
+            .or_else(|| {
+                project
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| project.display().to_string());
+        self.modal = Some(Modal::AssignProject(AssignProjectForm::for_project(
+            name, candidates,
+        )));
+        Vec::new()
+    }
+
+    /// Confirm detaching the open project from its VM.
+    pub(super) fn confirm_detach_project(&mut self) -> Vec<Effect> {
+        let Some(project) = self
+            .open_project
+            .clone()
+            .or_else(|| self.active_project().map(|project| project.path.clone()))
+        else {
+            self.toast("no project selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        let Some(name) = self.project_entry(&project).map(|entry| entry.name.clone()) else {
+            self.toast("project is not registered with hegn", ToastLevel::Warn);
+            return Vec::new();
+        };
+        let vm = self.project_vm_name(&project).unwrap_or("").to_string();
+        self.modal = Some(Modal::DetachProject(DetachProjectModal {
+            project: name,
+            vm,
+            scroll: 0,
+        }));
+        Vec::new()
+    }
+
+    pub(super) fn confirm_fork_workspace(&mut self, parent: Option<String>) -> Vec<Effect> {
+        let parent = parent.or_else(|| {
+            self.project_entry(
+                &self
+                    .open_project
+                    .clone()
+                    .or_else(|| self.active_project().map(|project| project.path.clone()))
+                    .unwrap_or_default(),
+            )
+            .map(|entry| entry.name.clone())
+        });
+        let Some(parent) = parent else {
+            self.toast("select a registered project first", ToastLevel::Warn);
+            return Vec::new();
+        };
+        let Some(vm) = self
+            .project_entry(
+                &self
+                    .open_project
+                    .clone()
+                    .or_else(|| self.active_project().map(|project| project.path.clone()))
+                    .unwrap_or_default(),
+            )
+            .and_then(|entry| entry.vm.clone())
+        else {
+            self.toast(
+                "the project is unassigned — assign it to a VM before forking",
+                ToastLevel::Warn,
+            );
+            return Vec::new();
+        };
+        self.modal = Some(Modal::ForkWorkspace(ForkWorkspaceForm::new(parent, vm)));
+        Vec::new()
+    }
+
+    pub(super) fn confirm_delete_vm(&mut self) -> Vec<Effect> {
+        let Some(vm) = self
+            .active_vm_summary()
+            .or_else(|| self.selected_instance())
+            .or_else(|| self.instances.first())
+            .cloned()
+        else {
+            self.toast("no VM selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        let members = self
+            .project_entries
+            .iter()
+            .filter(|entry| entry.vm.as_deref() == Some(vm.name.as_str()))
+            .count();
+        self.modal = Some(Modal::DeleteVm(DeleteVmModal {
+            vm,
+            members,
+            stage: DeleteVmStage::Confirm,
+            error: None,
+            scroll: 0,
+        }));
+        Vec::new()
     }
 
     /// Inspect and submit the terminal input buffer.
@@ -169,17 +326,7 @@ impl App {
         self.store = StateStore::load(self.config.state_dir.join("state.json"));
     }
 
-    pub(super) fn workspace_is_inside_vm(&self, instance: &VmSummary) -> bool {
-        let dir = self.config.vms_dir.join(&instance.name);
-        let dir = dir.canonicalize().unwrap_or(dir);
-        let workspace = instance
-            .workspace
-            .canonicalize()
-            .unwrap_or_else(|_| instance.workspace.clone());
-        workspace.starts_with(&dir)
-    }
-
-    /// Reload global and instance configuration after an editor round-trip.
+    /// Reload global configuration after an editor round-trip.
     pub fn reload_after_edit(&mut self) {
         match Config::load() {
             Ok(config) => self.apply_global_config(config),
@@ -187,23 +334,44 @@ impl App {
         }
     }
 
-    /// Open the selected project or instance.
-    ///
-    /// On the dashboard this enters the project screen without booting a VM.
-    /// On the project screen it attaches/boots the selected instance.
+    /// Enter on the dashboard opens the project; on the project screen it
+    /// attaches the VM; on the VM screen it opens the selected member.
     pub fn open_selected(&mut self) -> Vec<Effect> {
-        match self.focus {
-            Focus::Snapshots => self.confirm_restore_snapshot(),
-            Focus::Vm => self.attach_selected_instance(),
-            Focus::Health | Focus::Git => Vec::new(),
-            Focus::Projects => {
-                if self.screen == Screen::Project {
-                    self.open_terminal()
-                } else {
-                    self.open_project()
+        match self.screen {
+            Screen::Vm => match self.focus {
+                Focus::Projects => {
+                    let Some(member) = self.vm_members.get(self.vm_member_selected).cloned() else {
+                        return Vec::new();
+                    };
+                    self.open_project_path(member.path);
+                    self.attach_project_vm()
                 }
+                Focus::Snapshots => self.confirm_restore_snapshot(),
+                Focus::Tools => self.attach_active_vm(),
+                Focus::Health | Focus::Git | Focus::Vm => Vec::new(),
+            },
+            Screen::Project => match self.focus {
+                Focus::Snapshots => self.confirm_restore_snapshot(),
+                Focus::Vm | Focus::Projects => self.attach_project_vm(),
+                Focus::Health | Focus::Git | Focus::Tools => Vec::new(),
+            },
+            Screen::Dashboard => {
+                let mut effects = self.open_project();
+                if self.screen == Screen::Project {
+                    effects.extend(self.attach_project_vm());
+                }
+                effects
             }
         }
+    }
+
+    fn open_project_path(&mut self, path: PathBuf) {
+        let project = Project::load(path.clone());
+        if !self.projects.iter().any(|candidate| candidate.path == path) {
+            self.projects.push(project);
+        }
+        let _ = self.store.touch(&path);
+        self.enter_project(path);
     }
 }
 
@@ -347,13 +515,13 @@ mod tests {
     }
 
     #[test]
-    fn entering_a_project_does_not_start_a_vm() {
+    fn entering_a_project_does_not_start_a_vm_by_itself() {
         let (_dir, mut app) = test_app();
         let mut project = fake_project("demo");
         project.path = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project.path).unwrap();
         app.set_projects(vec![project.clone()]);
-        let effects = app.handle_key(key(KeyCode::Enter));
+        let effects = app.open_project();
         assert!(
             effects.is_empty(),
             "opening a project must not boot: {effects:?}"
@@ -365,19 +533,47 @@ mod tests {
     }
 
     #[test]
-    fn reopening_the_same_project_through_a_symlink_reuses_the_console() {
-        let (dir, mut app) = test_app();
-        let real = app.config.projects_root.join("demo");
-        std::fs::create_dir_all(&real).unwrap();
-        let link = dir.path().join("demo-link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let mut project = fake_project("demo");
-        project.path = link;
-        app.set_projects(vec![project]);
+    fn enter_on_an_assigned_project_starts_its_vm() {
+        let (_dir, mut app) = test_app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        app.set_projects(vec![Project {
+            name: "demo".into(),
+            path: project.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        }]);
+        app.instances = vec![fake_instance(&app, "rust", project.clone())];
+        assign_fake_project(&mut app, &project, "rust");
 
-        app.attach_console(Box::new(FakeConsole::new(&real)));
         let effects = app.open_selected();
-        assert!(effects.is_empty(), "must not boot a second VM");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StartVm { vm, project: Some(path) }]
+                if vm == "rust" && path == &project
+        ));
         assert_eq!(app.screen, Screen::Project);
+    }
+
+    #[test]
+    fn enter_on_an_unassigned_project_opens_the_assign_modal() {
+        let (_dir, mut app) = test_app();
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        app.set_projects(vec![Project {
+            name: "demo".into(),
+            path: project,
+            git: GitSummary::default(),
+            last_opened: None,
+        }]);
+        app.instances = vec![fake_instance(
+            &app,
+            "rust",
+            app.config.projects_root.join("demo"),
+        )];
+
+        let effects = app.open_selected();
+        assert!(effects.is_empty());
+        assert!(matches!(app.modal, Some(Modal::AssignProject(_))));
     }
 }

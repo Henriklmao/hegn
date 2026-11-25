@@ -14,6 +14,7 @@ use crate::config::form::{ConfigField, ConfigPage};
 pub use crate::config::form::{ConfigForm, ConfigKind};
 use crate::config::{Config, Harness};
 use crate::diagnostics::doctor::DoctorReport;
+use crate::project::ForkMode;
 use crate::project::{GitSummary, Project, ProjectEntry, ProjectMeta};
 use crate::security::{Inspection, SecurityEngine};
 use crate::session::console::TerminalConsole;
@@ -23,27 +24,30 @@ use crate::session::terminal::TerminalBuffer;
 use crate::vm::registry::VmSummary;
 
 const TOAST_TTL: Duration = Duration::from_secs(6);
+
+/// Top-level screens. `Vm` is the reusable VM view opened with `v`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Dashboard,
     Project,
+    Vm,
 }
 
 /// Sections shown on the project screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectSection {
-    Instances,
+    Vm,
     Snapshots,
     Health,
     Git,
 }
 
 impl ProjectSection {
-    pub const ALL: [Self; 4] = [Self::Instances, Self::Snapshots, Self::Health, Self::Git];
+    pub const ALL: [Self; 4] = [Self::Vm, Self::Snapshots, Self::Health, Self::Git];
 
     pub fn number(self) -> usize {
         match self {
-            Self::Instances => 1,
+            Self::Vm => 1,
             Self::Snapshots => 2,
             Self::Health => 3,
             Self::Git => 4,
@@ -52,7 +56,7 @@ impl ProjectSection {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Instances => "instances",
+            Self::Vm => "vm",
             Self::Snapshots => "snapshots",
             Self::Health => "health",
             Self::Git => "git",
@@ -61,7 +65,7 @@ impl ProjectSection {
 
     pub fn focus(self) -> Focus {
         match self {
-            Self::Instances => Focus::Vm,
+            Self::Vm => Focus::Vm,
             Self::Snapshots => Focus::Snapshots,
             Self::Health => Focus::Health,
             Self::Git => Focus::Git,
@@ -73,7 +77,57 @@ impl ProjectSection {
             Focus::Snapshots => Self::Snapshots,
             Focus::Health => Self::Health,
             Focus::Git => Self::Git,
-            Focus::Projects | Focus::Vm => Self::Instances,
+            Focus::Projects | Focus::Vm | Focus::Tools => Self::Vm,
+        }
+    }
+}
+
+/// Sections shown on the reusable VM screen opened with `v`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmSection {
+    Projects,
+    Snapshots,
+    Tools,
+    Health,
+}
+
+impl VmSection {
+    pub const ALL: [Self; 4] = [Self::Projects, Self::Snapshots, Self::Tools, Self::Health];
+
+    pub fn number(self) -> usize {
+        match self {
+            Self::Projects => 1,
+            Self::Snapshots => 2,
+            Self::Tools => 3,
+            Self::Health => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Projects => "projects",
+            Self::Snapshots => "snapshots",
+            Self::Tools => "tools",
+            Self::Health => "health",
+        }
+    }
+
+    pub fn focus(self) -> Focus {
+        match self {
+            Self::Projects => Focus::Projects,
+            Self::Snapshots => Focus::Snapshots,
+            Self::Tools => Focus::Tools,
+            Self::Health => Focus::Health,
+        }
+    }
+
+    pub fn from_focus(focus: Focus) -> Self {
+        match focus {
+            Focus::Projects => Self::Projects,
+            Focus::Snapshots => Self::Snapshots,
+            Focus::Tools => Self::Tools,
+            Focus::Health => Self::Health,
+            Focus::Vm | Focus::Git => Self::Projects,
         }
     }
 }
@@ -102,11 +156,14 @@ pub enum TerminalMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
+    /// Project picker on the dashboard or member list on the VM screen.
     Projects,
     Vm,
     Snapshots,
     Health,
     Git,
+    /// Tool profile, packages and resources section of the VM screen.
+    Tools,
 }
 
 /// Side effects that need the terminal to be released (editor/lazygit), an
@@ -124,14 +181,51 @@ pub enum Effect {
     /// Create directories/config, download images and configure the guarded
     /// network as needed. Privileged steps prompt via sudo/pkexec.
     SetupEnvironment,
-    /// Ensure an instance for a project and attach its console.
+    /// Start a VM (when needed) and attach its console. The optional project
+    /// selects the guest working directory for an agent launch.
     StartVm {
-        project: PathBuf,
-        harness: Harness,
+        vm: String,
+        project: Option<PathBuf>,
     },
-    /// Start (if needed) and attach an existing instance.
+    /// Attach an existing VM, booting it first when it is stopped.
     AttachVm {
         vm: String,
+    },
+    /// Restart a running VM so a changed config or membership takes effect.
+    ApplyVm {
+        vm: String,
+    },
+    StopVm {
+        vm: String,
+    },
+    DeleteVm {
+        vm: String,
+        delete_files: bool,
+    },
+    CreateVm {
+        name: String,
+        harness: Harness,
+        vcpus: u8,
+        memory_mib: u32,
+        packages: Vec<String>,
+    },
+    AssignProject {
+        project: String,
+        path: PathBuf,
+        vm: String,
+        read_only: bool,
+    },
+    UnassignProject {
+        project: String,
+    },
+    SetVmPrimary {
+        vm: String,
+        project: String,
+    },
+    ForkWorkspace {
+        parent: String,
+        name: String,
+        mode: ForkMode,
     },
     /// Launch a configured command through a terminal integration.
     LaunchAgent {
@@ -143,24 +237,10 @@ pub enum Effect {
     AttachConsole {
         vm: String,
     },
-    StopVm {
-        vm: String,
-    },
-    DeleteVm {
-        vm: String,
-        delete_files: bool,
-    },
-    /// Remove a project from the dashboard, its instances and optionally its
-    /// files. Instances are deleted first.
+    /// Remove a project from the dashboard and optionally its files.
     DeleteProject {
         project: PathBuf,
         delete_files: bool,
-    },
-    CloneInstance {
-        source: String,
-        count: usize,
-        harness: Harness,
-        start: bool,
     },
     RefreshVms,
 }
@@ -225,6 +305,7 @@ impl VmUiState {
     }
 }
 
+/// Lifecycle state of the VM the TUI is attached to (or last attached to).
 #[derive(Debug, Clone)]
 pub struct VmStatus {
     pub state: VmUiState,
@@ -320,6 +401,9 @@ pub enum ActionId {
     NextField,
     SubmitCreate,
     SubmitImport,
+    SubmitVm,
+    SubmitAssign,
+    SubmitFork,
     Edit,
     Lazygit,
     Refresh,
@@ -338,7 +422,13 @@ pub enum ActionId {
     FocusVm,
     StartVm,
     StopVm,
-    CloneInstance,
+    ApplyVm,
+    Shell,
+    AssignProject,
+    DetachProject,
+    ForkWorkspace,
+    SetPrimary,
+    NewVm,
     DeleteVm,
     DeleteProject,
     DeleteProjectFiles,
@@ -347,7 +437,6 @@ pub enum ActionId {
     ProjectConfig,
     ProjectConfigSave,
     ProjectConfigLaunch,
-    MultiAgent,
     Launch,
     KeepFiles,
     EditConfig,
@@ -358,11 +447,8 @@ pub enum ActionId {
     Allow,
     Checkpoint,
     Deny,
-    MultiAgentMore,
-    MultiAgentFewer,
-    HarnessPrev,
-    HarnessNext,
-    ToggleCloneStart,
+    ToggleForkMode,
+    ToggleReadOnly,
     SaveConfig,
     Close,
 }
@@ -385,6 +471,13 @@ pub struct RowHit {
 pub struct SectionHit {
     pub rect: Rect,
     pub section: ProjectSection,
+}
+
+/// Clickable VM section header or tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmSectionHit {
+    pub rect: Rect,
+    pub section: VmSection,
 }
 
 /// Scrollbar geometry and bounds recorded by the renderer for the open modal.
@@ -592,6 +685,166 @@ pub struct ConfigTabHit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateVmFocus {
+    Name,
+    Harness,
+    Vcpus,
+    Memory,
+    Packages,
+    Create,
+}
+
+/// Form for `hegn vm create` (the `v`/`n` path on the VM screen).
+#[derive(Debug, Clone)]
+pub struct CreateVmForm {
+    pub name: String,
+    pub harness: Harness,
+    pub vcpus: u8,
+    pub memory_mib: u32,
+    pub focus: CreateVmFocus,
+    pub packages: Vec<PackageOption>,
+    pub package_cursor: usize,
+    pub error: Option<String>,
+}
+
+impl CreateVmForm {
+    pub fn new(default_harness: Harness, vcpus: u8, memory_mib: u32) -> Self {
+        Self {
+            name: String::new(),
+            harness: default_harness,
+            vcpus,
+            memory_mib,
+            focus: CreateVmFocus::Name,
+            packages: PACKAGE_CHOICES
+                .iter()
+                .map(|name| PackageOption {
+                    name,
+                    selected: false,
+                })
+                .collect(),
+            package_cursor: 0,
+            error: None,
+        }
+    }
+
+    pub fn selected_packages(&self) -> Vec<String> {
+        self.packages
+            .iter()
+            .filter(|package| package.selected)
+            .map(|package| package.name.to_string())
+            .collect()
+    }
+
+    pub(super) fn cycle_focus(&mut self, backwards: bool) {
+        let order = [
+            CreateVmFocus::Name,
+            CreateVmFocus::Harness,
+            CreateVmFocus::Vcpus,
+            CreateVmFocus::Memory,
+            CreateVmFocus::Packages,
+            CreateVmFocus::Create,
+        ];
+        let current = order.iter().position(|f| *f == self.focus).unwrap_or(0);
+        let next = if backwards {
+            (current + order.len() - 1) % order.len()
+        } else {
+            (current + 1) % order.len()
+        };
+        self.focus = order[next];
+    }
+}
+
+/// Choose an existing VM for a project, or an unassigned project for a VM.
+#[derive(Debug, Clone)]
+pub struct AssignProjectForm {
+    /// Project being assigned; empty when the user still picks one.
+    pub project: Option<String>,
+    /// Fixed target VM; empty when the user still picks one.
+    pub vm: Option<String>,
+    pub candidates: Vec<String>,
+    pub cursor: usize,
+    pub read_only: bool,
+    pub error: Option<String>,
+}
+
+impl AssignProjectForm {
+    /// Pick the VM that receives `project`.
+    pub fn for_project(project: impl Into<String>, vms: Vec<String>) -> Self {
+        Self {
+            project: Some(project.into()),
+            vm: None,
+            candidates: vms,
+            cursor: 0,
+            read_only: false,
+            error: None,
+        }
+    }
+
+    /// Pick the project that joins `vm`.
+    pub fn for_vm(vm: impl Into<String>, projects: Vec<String>) -> Self {
+        Self {
+            project: None,
+            vm: Some(vm.into()),
+            candidates: projects,
+            cursor: 0,
+            read_only: false,
+            error: None,
+        }
+    }
+
+    pub fn selected(&self) -> Option<&str> {
+        self.candidates.get(self.cursor).map(String::as_str)
+    }
+
+    pub(super) fn cycle(&mut self, delta: isize) {
+        if self.candidates.is_empty() {
+            return;
+        }
+        let len = self.candidates.len() as isize;
+        self.cursor = (self.cursor as isize + delta).rem_euclid(len) as usize;
+    }
+}
+
+/// Fork a project into an isolated clone or a nested git worktree.
+#[derive(Debug, Clone)]
+pub struct ForkWorkspaceForm {
+    pub parent: String,
+    pub vm: String,
+    pub name: String,
+    pub mode: ForkMode,
+    pub error: Option<String>,
+}
+
+impl ForkWorkspaceForm {
+    pub fn new(parent: impl Into<String>, vm: impl Into<String>) -> Self {
+        let parent = parent.into();
+        let vm = vm.into();
+        let name = format!("{parent}-fork");
+        Self {
+            parent,
+            vm,
+            name,
+            mode: ForkMode::Clone,
+            error: None,
+        }
+    }
+
+    pub fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            ForkMode::Clone => ForkMode::Worktree,
+            ForkMode::Worktree => ForkMode::Clone,
+        };
+    }
+
+    pub fn mode_label(&self) -> &'static str {
+        match self.mode {
+            ForkMode::Clone => "clone",
+            ForkMode::Worktree => "worktree",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteVmStage {
     Confirm,
     Files,
@@ -600,8 +853,17 @@ pub enum DeleteVmStage {
 #[derive(Debug, Clone)]
 pub struct DeleteVmModal {
     pub vm: VmSummary,
+    /// Exported members that will be unassigned, never deleted.
+    pub members: usize,
     pub stage: DeleteVmStage,
     pub error: Option<String>,
+    pub scroll: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct DetachProjectModal {
+    pub project: String,
+    pub vm: String,
     pub scroll: usize,
 }
 
@@ -610,42 +872,18 @@ pub struct DeleteProjectModal {
     pub project: Project,
     /// Git state shown before deletion so the user can decide about files.
     pub git: GitSummary,
-    /// Instances that will be stopped and removed with the project.
-    pub instances: Vec<String>,
+    /// VMs referenced by the project (unassigned, never deleted).
+    pub vms: Vec<String>,
     pub scroll: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct MultiAgentForm {
-    pub source: String,
-    pub count: usize,
-    pub harness: Harness,
-    pub start: bool,
-    pub error: Option<String>,
-    pub scroll: usize,
-}
-
-impl MultiAgentForm {
-    pub fn new(source: String, harness: Harness) -> Self {
-        Self {
-            source,
-            count: 2,
-            harness,
-            start: true,
-            error: None,
-            scroll: 0,
-        }
-    }
-}
-
-/// Editable per-project settings stored in the project's `hegn.toml`.
+/// Editable per-project presentation settings stored in `hegn.toml`.
 ///
-/// `None` means "inherit the global setting", so the form distinguishes an
-/// explicit choice from the default instead of writing a snapshot of it.
+/// V2 keeps only presentation keys here; the VM tool profile, packages and
+/// harness live in the VM config, and membership lives in the registry.
 #[derive(Debug, Clone)]
 pub struct ProjectConfigForm {
     pub project: PathBuf,
-    pub harness: Option<Harness>,
     pub launch: Option<String>,
     pub integration: Option<Integration>,
     pub auto_start: Option<bool>,
@@ -654,12 +892,11 @@ pub struct ProjectConfigForm {
 }
 
 impl ProjectConfigForm {
-    pub const ROWS: usize = 4;
+    pub const ROWS: usize = 3;
 
     pub fn new(project: PathBuf, meta: &ProjectMeta) -> Self {
         Self {
             project,
-            harness: meta.harness,
             launch: meta.launch.clone(),
             integration: meta.integration,
             auto_start: meta.auto_start,
@@ -704,9 +941,12 @@ pub enum Modal {
     Security(SecurityPrompt),
     Confirm(ConfirmPrompt),
     Config(ConfigForm),
+    CreateVm(CreateVmForm),
+    AssignProject(AssignProjectForm),
+    ForkWorkspace(ForkWorkspaceForm),
     DeleteVm(DeleteVmModal),
+    DetachProject(DetachProjectModal),
     DeleteProject(DeleteProjectModal),
-    MultiAgent(MultiAgentForm),
     ProjectConfig(ProjectConfigForm),
     Help(HelpState),
     Error {
@@ -729,32 +969,46 @@ pub struct App {
     pub screen: Screen,
     /// Project whose dedicated screen is open, frozen while the user browses.
     pub open_project: Option<PathBuf>,
+    /// VM whose reusable screen is open.
+    pub vm_open: Option<String>,
     pub project_view: ProjectView,
     /// True while the terminal pane has keyboard focus in [`ProjectView::Split`].
     pub terminal_focus: bool,
     /// Clickable section headers recorded by the renderer.
     pub section_hits: Vec<SectionHit>,
+    /// Clickable VM section headers.
+    pub vm_section_hits: Vec<VmSectionHit>,
     /// Clickable terminal pane and collapsed strip for mouse focus.
     pub terminal_hit: Option<Rect>,
     pub terminal_strip_hit: Option<Rect>,
     pub modal: Option<Modal>,
+    /// Lifecycle of the VM the embedded console is attached to.
     pub vm: VmStatus,
-    /// Health line parsed from the selected instance's serial log.
+    /// VM name the embedded console is attached to, when any.
+    pub attached_vm: Option<String>,
+    /// Health line parsed from the selected VM's serial log.
     pub health: Option<VmHealth>,
     pub snapshots: Vec<SnapshotMeta>,
     pub selected_snapshot: usize,
-    /// Private project registry entries, refreshed with the project scan.
-    pub project_entries: Vec<ProjectEntry>,
-    /// Indices into [`App::snapshots`] for the open project.
+    /// Indices into [`App::snapshots`] for the open project's VM.
     pub project_snapshots: Vec<usize>,
     pub project_snapshot_selected: usize,
+    /// Indices into [`App::snapshots`] for the open VM screen's VM.
+    pub vm_snapshots: Vec<usize>,
+    pub vm_snapshot_selected: usize,
     pub snapshot_rows: Vec<RowHit>,
+    /// Private project registry entries, refreshed with the project scan.
+    pub project_entries: Vec<ProjectEntry>,
     pub instances: Vec<VmSummary>,
     /// Indices into [`App::instances`] for the selected project.
     pub instance_visible: Vec<usize>,
     pub instance_selected: usize,
     pub(super) instance_project: Option<PathBuf>,
     pub instance_rows: Vec<RowHit>,
+    /// Projects assigned to [`App::vm_open`].
+    pub vm_members: Vec<ProjectEntry>,
+    pub vm_member_selected: usize,
+    pub vm_member_rows: Vec<RowHit>,
     pub project_rows: Vec<RowHit>,
     /// Settings read from the open project's `hegn.toml`.
     pub project_meta: ProjectMeta,
@@ -813,7 +1067,7 @@ mod tests {
 
         help.query = "stop snapshot".into();
         assert!(
-            !help.matches("Instances", "S", "stop selected instance"),
+            !help.matches("Vm", "S", "stop selected VM"),
             "every query term must match"
         );
 
@@ -846,6 +1100,25 @@ mod tests {
     }
 
     #[test]
+    fn create_vm_form_cycles_and_package_selection() {
+        let mut form = CreateVmForm::new(Harness::Shell, 2, 2048);
+        assert_eq!(form.focus, CreateVmFocus::Name);
+        for expected in [
+            CreateVmFocus::Harness,
+            CreateVmFocus::Vcpus,
+            CreateVmFocus::Memory,
+            CreateVmFocus::Packages,
+            CreateVmFocus::Create,
+            CreateVmFocus::Name,
+        ] {
+            form.cycle_focus(false);
+            assert_eq!(form.focus, expected);
+        }
+        form.packages[0].selected = true;
+        assert_eq!(form.selected_packages(), vec!["git"]);
+    }
+
+    #[test]
     fn import_and_project_config_forms_cycle_their_focus() {
         let mut import = ImportProjectForm::new();
         assert_eq!(import.focus, ImportFocus::Path);
@@ -866,6 +1139,28 @@ mod tests {
     }
 
     #[test]
+    fn assign_and_fork_forms_cycle_choices() {
+        let mut assign = AssignProjectForm::for_project("demo", vec!["one".into(), "two".into()]);
+        assert_eq!(assign.project.as_deref(), Some("demo"));
+        assert_eq!(assign.selected(), Some("one"));
+        assign.cycle(-1);
+        assert_eq!(assign.selected(), Some("two"));
+        assign.cycle(1);
+        assert_eq!(assign.selected(), Some("one"));
+        let assign = AssignProjectForm::for_vm("rust", vec!["demo".into()]);
+        assert_eq!(assign.vm.as_deref(), Some("rust"));
+        assert_eq!(assign.project, None);
+
+        let mut fork = ForkWorkspaceForm::new("demo", "rust");
+        assert_eq!(fork.mode, ForkMode::Clone);
+        assert_eq!(fork.name, "demo-fork");
+        fork.toggle_mode();
+        assert_eq!(fork.mode_label(), "worktree");
+        fork.toggle_mode();
+        assert_eq!(fork.mode_label(), "clone");
+    }
+
+    #[test]
     fn health_parser_takes_the_last_guest_line() {
         let parsed = VmHealth::parse(
             "boot\nhegn-health v1 apt=2 checked=1700000000 reason=ok\n\
@@ -876,5 +1171,15 @@ mod tests {
         assert_eq!(parsed.reason, "ok");
         assert!(parsed.checked.is_some());
         assert!(VmHealth::parse("no health line").is_none());
+    }
+
+    #[test]
+    fn section_lookup_maps_focus_round_trip() {
+        for section in ProjectSection::ALL {
+            assert_eq!(ProjectSection::from_focus(section.focus()), section);
+        }
+        for section in VmSection::ALL {
+            assert_eq!(VmSection::from_focus(section.focus()), section);
+        }
     }
 }

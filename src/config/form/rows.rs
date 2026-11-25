@@ -1,6 +1,6 @@
 //! Fields, pages and row tables for the settings modal.
 //!
-//! The same field enum covers the global `config.toml` and an instance's
+//! The same field enum covers the global `config.toml` and an VM's
 //! `hegn.toml`; fields that do not apply to the current kind render as `—` and
 //! never appear in the row list.
 
@@ -70,7 +70,7 @@ pub enum ConfigField {
     LocalEndpoints,
     /// A harness profile template (`profiles/<harness>.toml`).
     Profile(Harness),
-    // Instance-only, read-only context.
+    // VM-only, read-only context.
     Project,
     Workspace,
     RootfsPath,
@@ -267,7 +267,7 @@ const LOCAL_LLM_ROWS: &[ConfigRow] = &[
 const PROFILE_ROWS: &[ConfigRow] = &[
     ConfigRow::Group("Harness profiles"),
     ConfigRow::Note("Enter opens the profile TOML; missing templates are created"),
-    ConfigRow::Note("host files and skills are copied into a per-instance bundle"),
+    ConfigRow::Note("host files and skills are copied into a per-VM bundle"),
     ConfigRow::Field(ConfigField::Profile(Harness::Opencode)),
     ConfigRow::Field(ConfigField::Profile(Harness::ClaudeCode)),
     ConfigRow::Field(ConfigField::Profile(Harness::Codex)),
@@ -300,7 +300,7 @@ pub fn rows(kind: ConfigKind) -> &'static [ConfigRow] {
     rows_for(kind, ConfigPage::General)
 }
 
-/// Pages available for a file kind. Endpoints are host-wide, so an instance's
+/// Pages available for a file kind. Endpoints are host-wide, so an VM's
 /// config has only the general page.
 pub fn pages(kind: ConfigKind) -> &'static [ConfigPage] {
     match kind {
@@ -372,7 +372,7 @@ mod tests {
     use crate::vm::config::{VmConfig, VmStore};
 
     #[test]
-    fn instance_form_has_no_endpoint_page() {
+    fn vm_form_has_no_endpoint_page() {
         let dir = tempfile::tempdir().unwrap();
         let config = global_config(dir.path());
         let store = VmStore::new(&config);

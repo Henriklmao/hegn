@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::SetTitle;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -33,7 +35,13 @@ pub(super) fn run_loop(
     runtime: &tokio::runtime::Runtime,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
+    let mut last_title = String::new();
     loop {
+        let title = app.window_title();
+        if title != last_title {
+            execute!(terminal.backend_mut(), SetTitle(title.clone()))?;
+            last_title = title;
+        }
         let size = terminal.size()?;
         app.set_viewport(size.width, size.height);
         let mut hits = ui::UiHits::default();
@@ -43,8 +51,10 @@ pub(super) fn run_loop(
         app.footer_hits = hits.footer;
         app.project_rows = hits.projects;
         app.instance_rows = hits.instances;
+        app.vm_member_rows = hits.vm_members;
         app.snapshot_rows = hits.snapshots;
         app.section_hits = hits.sections;
+        app.vm_section_hits = hits.vm_sections;
         app.terminal_hit = hits.terminal;
         app.terminal_strip_hit = hits.terminal_strip;
         app.config_rows = hits.config;
@@ -115,7 +125,7 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 }
             }
             Ok(ScanMessage::StartFailed(err)) => app.fail_start(err),
-            Ok(ScanMessage::InstancesChanged { note, level }) => {
+            Ok(ScanMessage::VmsChanged { note, level }) => {
                 app.refresh_vms();
                 app.toast(note, level);
             }
@@ -270,13 +280,13 @@ mod tests {
         assert_eq!(app.visible, vec![0]);
         assert!(!app.loading);
 
-        tx.send(ScanMessage::InstancesChanged {
-            note: "instance list refreshed".into(),
+        tx.send(ScanMessage::VmsChanged {
+            note: "VM list refreshed".into(),
             level: ToastLevel::Warn,
         })
         .unwrap();
         drain_scan(&mut app, &rx);
-        assert_eq!(toast(&app), ("instance list refreshed", ToastLevel::Warn));
+        assert_eq!(toast(&app), ("VM list refreshed", ToastLevel::Warn));
 
         tx.send(ScanMessage::Error("state file unreadable".into()))
             .unwrap();

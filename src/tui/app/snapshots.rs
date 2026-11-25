@@ -1,5 +1,5 @@
-//! Snapshot list state for the dashboard and project screens, including the
-//! destructive delete/restore confirmations.
+//! Snapshot list state for the dashboard, project and VM screens, including
+//! the destructive delete/restore confirmations.
 
 use crate::session::snapshot::{SnapshotMeta, SnapshotStore};
 
@@ -14,40 +14,40 @@ impl App {
             self.selected_snapshot = self.snapshots.len().saturating_sub(1);
         }
         self.refresh_project_snapshots();
+        self.refresh_vm_snapshots();
     }
 
-    /// Rebuild the project-scoped snapshot list. Older snapshots without a
-    /// recorded project are intentionally left out of the project screen.
+    /// Rebuild the project-scoped snapshot list. A project screen is VM-scoped:
+    /// every snapshot of the project's VM is relevant. Legacy snapshots without
+    /// a recorded owner stay out.
     pub fn refresh_project_snapshots(&mut self) {
-        let project = self
+        let Some(project) = self
             .active_project()
             .map(|project| project.path.clone())
-            .or_else(|| self.open_project.clone());
-        let instance_names: Vec<&str> = project
-            .as_ref()
-            .map(|project| {
-                self.instances
-                    .iter()
-                    .filter(|instance| crate::vm::same_project(&instance.project, project))
-                    .map(|instance| instance.name.as_str())
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.project_snapshots = match project {
-            Some(project) => self
+            .or_else(|| self.open_project.clone())
+        else {
+            self.project_snapshots.clear();
+            return;
+        };
+        let vm = self.project_vm_name(&project).map(str::to_string);
+        self.project_snapshots = match vm {
+            Some(vm) => self
                 .snapshots
                 .iter()
                 .enumerate()
                 .filter(|(_, snapshot)| {
-                    snapshot.project.as_deref() == Some(project.as_path())
-                        || snapshot
-                            .instance
-                            .as_deref()
-                            .is_some_and(|name| instance_names.contains(&name))
+                    snapshot.vm() == Some(vm.as_str())
+                        || snapshot.project.as_deref() == Some(project.as_path())
                 })
                 .map(|(index, _)| index)
                 .collect(),
-            None => Vec::new(),
+            None => self
+                .snapshots
+                .iter()
+                .enumerate()
+                .filter(|(_, snapshot)| snapshot.project.as_deref() == Some(project.as_path()))
+                .map(|(index, _)| index)
+                .collect(),
         };
         if self.project_snapshot_selected >= self.project_snapshots.len() {
             self.project_snapshot_selected = self.project_snapshots.len().saturating_sub(1);
@@ -55,12 +55,16 @@ impl App {
     }
 
     pub fn selected_snapshot(&self) -> Option<&SnapshotMeta> {
-        if self.screen == Screen::Project {
-            self.project_snapshots
+        match self.screen {
+            Screen::Project => self
+                .project_snapshots
                 .get(self.project_snapshot_selected)
-                .and_then(|&index| self.snapshots.get(index))
-        } else {
-            self.snapshots.get(self.selected_snapshot)
+                .and_then(|&index| self.snapshots.get(index)),
+            Screen::Vm => self
+                .vm_snapshots
+                .get(self.vm_snapshot_selected)
+                .and_then(|&index| self.snapshots.get(index)),
+            Screen::Dashboard => self.snapshots.get(self.selected_snapshot),
         }
     }
 
@@ -133,7 +137,7 @@ mod tests {
         assert!(!app.config.snapshots_dir.join("old").exists());
     }
 
-    fn save_snapshot(app: &App, name: &str, project: Option<PathBuf>, instance: Option<&str>) {
+    fn save_snapshot(app: &App, name: &str, project: Option<PathBuf>, vm: Option<&str>) {
         let paths = SnapshotStore::new(&app.config.snapshots_dir)
             .prepare(name)
             .unwrap();
@@ -143,7 +147,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 vm_state: "Paused".into(),
                 dir: paths.dir,
-                instance: instance.map(str::to_string),
+                instance: vm.map(str::to_string),
                 project,
                 size_bytes: 0,
                 note: None,
@@ -184,7 +188,17 @@ mod tests {
         let (_dir, mut app) = test_app();
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
-        save_snapshot(&app, "before-upgrade", Some(project.clone()), None);
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path: project.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+        app.instances = vec![fake_instance(&app, "rust", project.clone())];
+        assign_fake_project(&mut app, &project, "rust");
+        save_snapshot(&app, "before-upgrade", Some(project.clone()), Some("rust"));
         app.open_project = Some(project);
         app.screen = Screen::Project;
         app.refresh_snapshots();
@@ -204,97 +218,44 @@ mod tests {
     }
 
     #[test]
-    fn project_snapshots_include_snapshots_of_scoped_instances() {
+    fn project_snapshots_are_scoped_to_the_projects_vm() {
         let (_dir, mut app) = test_app();
         let demo = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&demo).unwrap();
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path: demo.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+        app.instances = vec![fake_instance(&app, "rust", demo.clone())];
+        assign_fake_project(&mut app, &demo, "rust");
         app.open_project = Some(demo.clone());
         app.screen = Screen::Project;
-        let mut clone = fake_instance(&app, "demo-1", demo.join("clone-1"));
-        clone.project = demo.clone();
-        app.instances = vec![clone];
-        app.snapshots = vec![
-            SnapshotMeta {
-                name: "by-project".into(),
-                created_at: chrono::Utc::now(),
-                vm_state: "Paused".into(),
-                dir: PathBuf::from("/snap/by-project"),
-                instance: None,
-                project: Some(demo.clone()),
-                size_bytes: 0,
-                note: None,
-                ..SnapshotMeta::default()
-            },
-            SnapshotMeta {
-                name: "by-instance".into(),
-                created_at: chrono::Utc::now(),
-                vm_state: "Paused".into(),
-                dir: PathBuf::from("/snap/by-instance"),
-                instance: Some("demo-1".into()),
-                project: None,
-                size_bytes: 0,
-                note: None,
-                ..SnapshotMeta::default()
-            },
-            SnapshotMeta {
-                name: "unrelated".into(),
-                created_at: chrono::Utc::now(),
-                vm_state: "Paused".into(),
-                dir: PathBuf::from("/snap/unrelated"),
-                instance: Some("other".into()),
-                project: Some(app.config.projects_root.join("other")),
-                size_bytes: 0,
-                note: None,
-                ..SnapshotMeta::default()
-            },
-        ];
-        app.project_snapshot_selected = 9;
-        app.refresh_project_snapshots();
+        save_snapshot(&app, "mine", None, Some("rust"));
+        save_snapshot(&app, "other", None, Some("other"));
+        app.refresh_snapshots();
 
-        assert_eq!(app.project_snapshots, vec![0, 1]);
-        assert_eq!(
-            app.project_snapshot_selected, 1,
-            "a zoomed-out selection clamps to the scoped list"
-        );
-        let names: Vec<&str> = app
-            .project_snapshots
-            .iter()
-            .map(|&index| app.snapshots[index].name.as_str())
-            .collect();
-        assert_eq!(names, ["by-project", "by-instance"]);
-        assert_eq!(app.selected_snapshot().unwrap().name, "by-instance");
+        assert_eq!(app.project_snapshots.len(), 1);
+        assert_eq!(app.selected_snapshot().unwrap().name, "mine");
     }
 
     #[test]
-    fn project_snapshots_are_filtered_by_project() {
+    fn vm_screen_snapshots_are_scoped_to_the_open_vm() {
         let (_dir, mut app) = test_app();
-        app.open_project = Some(PathBuf::from("/projects/demo"));
-        app.snapshots = vec![
-            SnapshotMeta {
-                name: "one".into(),
-                created_at: chrono::Utc::now(),
-                vm_state: "Paused".into(),
-                dir: PathBuf::from("/snap/one"),
-                instance: None,
-                project: Some(PathBuf::from("/projects/demo")),
-                size_bytes: 0,
-                note: None,
-                ..SnapshotMeta::default()
-            },
-            SnapshotMeta {
-                name: "two".into(),
-                created_at: chrono::Utc::now(),
-                vm_state: "Paused".into(),
-                dir: PathBuf::from("/snap/two"),
-                instance: None,
-                project: Some(PathBuf::from("/projects/other")),
-                size_bytes: 0,
-                note: None,
-                ..SnapshotMeta::default()
-            },
+        app.instances = vec![
+            fake_instance(&app, "rust", app.config.projects_root.join("demo")),
+            fake_instance(&app, "go", app.config.projects_root.join("other")),
         ];
-        app.refresh_project_snapshots();
-        assert_eq!(app.project_snapshots.len(), 1);
-        assert_eq!(app.selected_snapshot().unwrap().name, "one");
+        save_snapshot(&app, "rust-one", None, Some("rust"));
+        save_snapshot(&app, "go-one", None, Some("go"));
+        app.refresh_snapshots();
+        app.open_vm_screen("rust".into());
+
+        assert_eq!(app.screen, Screen::Vm);
+        assert_eq!(app.vm_snapshots.len(), 1);
+        assert_eq!(app.selected_snapshot().unwrap().name, "rust-one");
     }
 }

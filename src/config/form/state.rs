@@ -56,7 +56,7 @@ pub struct ConfigForm {
     pub status: Option<String>,
     pub(super) draft: Draft,
     pub(super) original: Draft,
-    /// Global config the instance belongs to; used for derived paths and saving.
+    /// Global config the VM belongs to; used for derived paths and saving.
     pub(super) base: Box<Config>,
     page: ConfigPage,
     selected: usize,
@@ -80,7 +80,7 @@ impl ConfigForm {
     /// Open the editor for an existing VM.
     pub fn vm(vm: VmConfig, base: Config) -> Self {
         let path = base.vms_dir.join(&vm.name).join(VM_CONFIG_FILE);
-        let title = format!("instance '{}' settings", vm.name);
+        let title = format!("VM '{}' settings", vm.name);
         Self::build(ConfigKind::Vm, title, path, Draft::Vm(Box::new(vm)), base)
     }
 

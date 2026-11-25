@@ -71,41 +71,70 @@ pub(crate) fn render_help(
             "Projects",
             &[
                 ("↑/↓ j/k", "move selection"),
-                ("Enter", "open the project screen (does not boot)"),
+                ("Enter", "open the project and attach its VM"),
                 ("/", "fuzzy filter projects"),
-                ("b / 2", "open the project screen on instances"),
-                ("s / 3", "open the project screen on snapshots"),
+                ("1 / 2 / 3 / 4", "open on vm / snapshots / health / git"),
                 ("c", "create project"),
                 ("h / ←", "import existing project"),
+                ("a", "assign the project to a VM"),
+                ("f", "fork the project (clone or worktree)"),
+                ("D", "detach the project from its VM"),
+                ("v", "open the project's VM screen"),
+                ("n / V", "create a VM"),
                 ("d", "delete project (git status · keep or delete files)"),
-                ("F4", "global settings (arrows/mouse · Ctrl-S saves)"),
-                ("e", "open in $EDITOR"),
-                ("g", "open in lazygit"),
-                ("r", "refresh projects + instances"),
+                ("F4 / F5", "global settings / VM vm.toml"),
+                ("e / g", "editor / lazygit"),
+                ("r", "refresh projects + VMs"),
                 ("F3", "doctor (host checks, automatic setup)"),
             ],
         ),
         (
             "Project",
             &[
-                ("1 / 2 / 3 / 4", "instances / snapshots / health / git"),
+                ("1 / 2 / 3 / 4", "vm / snapshots / health / git"),
                 ("Tab", "cycle project sections"),
-                ("i / a / Enter", "open the terminal or attach the instance"),
+                ("i / a / Enter", "open the terminal or attach the VM"),
                 ("Esc", "sections → split; ×2 back to dashboard"),
                 ("←", "back to dashboard (VM keeps running)"),
                 ("L", "launch the configured agent/command"),
                 (
                     "F6",
-                    "project settings: launch command, integration, auto-launch",
+                    "project presentation: launch, integration, auto-launch",
                 ),
                 ("F2", "real attach mode (Ctrl-B/^] detaches)"),
-                ("S", "stop selected instance"),
-                ("n", "start a new instance / new snapshot"),
-                ("M", "multi-agent clones for this project"),
-                ("F5", "instance settings"),
-                ("d", "delete instance or snapshot"),
+                ("S / A", "stop / apply (restart) the VM"),
+                ("n", "new snapshot"),
+                ("M / f", "fork the project (clone or worktree)"),
+                ("d", "detach from the VM / delete snapshot"),
+                ("v", "open the VM screen"),
+                ("F5", "VM settings (vm.toml)"),
+                ("F4", "global settings"),
                 ("security", "a allow · c checkpoint + allow · d deny"),
                 ("Ctrl-B / Ctrl-]", "back to dashboard from every mode"),
+            ],
+        ),
+        (
+            "VM",
+            &[
+                ("1 / 2 / 3 / 4", "projects / snapshots / tools / health"),
+                ("Tab", "cycle VM sections"),
+                (
+                    "Enter",
+                    "open member project · shell (tools) · restore snapshot",
+                ),
+                ("a", "assign an unassigned project to this VM"),
+                ("p", "set the selected project as primary"),
+                ("d", "detach the selected project"),
+                ("f", "fork the selected project"),
+                ("s / S / A", "start / stop / apply the VM"),
+                (
+                    "D",
+                    "delete the VM (projects are unassigned, never deleted)",
+                ),
+                ("n", "create a VM"),
+                ("F5 / e", "edit vm.toml"),
+                ("F2", "external attach"),
+                ("Esc / ←", "back to the dashboard"),
             ],
         ),
         (
@@ -257,7 +286,7 @@ mod tests {
         let (text, hits) = render(&app);
         assert!(text.contains("hegn help"));
         assert!(text.contains("fuzzy filter"));
-        assert!(text.contains("checkpoint"));
+        assert!(text.contains("VM"));
         assert!(text.contains("search keybindings"));
         assert!(
             hits.footer

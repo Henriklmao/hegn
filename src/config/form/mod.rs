@@ -1,6 +1,6 @@
 //! Interactive settings editor behind the `F4`/`F5` configuration modal.
 //!
-//! The modal edits a working copy of the global `config.toml` or an instance's
+//! The modal edits a working copy of the global `config.toml` or an VM's
 //! `hegn.toml`. Nothing touches disk until the user saves, and every change is
 //! validated against the same schema the CLI uses. Keyboard handling lives here
 //! so navigation, editing and persistence are unit-testable without a terminal;

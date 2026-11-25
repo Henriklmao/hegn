@@ -21,7 +21,7 @@ pub(super) enum ScanMessage {
         started: bool,
     },
     StartFailed(String),
-    InstancesChanged {
+    VmsChanged {
         note: String,
         level: ToastLevel,
     },
@@ -93,8 +93,8 @@ mod tests {
                 started: true,
             },
             ScanMessage::StartFailed("missing kernel".into()),
-            ScanMessage::InstancesChanged {
-                note: "instances refreshed".into(),
+            ScanMessage::VmsChanged {
+                note: "VMs refreshed".into(),
                 level: ToastLevel::Warn,
             },
             ScanMessage::Error("unreadable state".into()),
@@ -139,7 +139,7 @@ mod tests {
             matches!(&messages[0], ScanMessage::Projects(_)),
             matches!(&messages[1], ScanMessage::Started { .. }),
             matches!(&messages[2], ScanMessage::StartFailed(_)),
-            matches!(&messages[3], ScanMessage::InstancesChanged { .. }),
+            matches!(&messages[3], ScanMessage::VmsChanged { .. }),
             matches!(&messages[4], ScanMessage::Error(_)),
             matches!(&messages[5], ScanMessage::Doctor { .. }),
             matches!(&messages[6], ScanMessage::DownloadProgress(_)),

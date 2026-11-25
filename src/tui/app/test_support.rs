@@ -194,8 +194,36 @@ pub(super) fn fake_instance(app: &App, name: &str, workspace: PathBuf) -> VmSumm
     }
 }
 
+/// Register a fake project and assign it to `vm`, then reload the app's
+/// registry snapshot. The project directory must already exist.
+pub(super) fn assign_fake_project(app: &mut App, path: &std::path::Path, vm: &str) {
+    use crate::project::{ProjectEntry, ProjectKind, ProjectRegistry};
+
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let name = canonical
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "demo".into());
+    let mut registry = ProjectRegistry::load(&app.config.state_dir).unwrap();
+    registry
+        .upsert(ProjectEntry {
+            name: name.clone(),
+            path: canonical,
+            vm: None,
+            read_only: false,
+            kind: ProjectKind::External,
+            parent: None,
+            managed: false,
+            hidden: false,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+    registry.assign(&name, vm, false).unwrap();
+    app.refresh_project_entries();
+}
+
 /// Install an instance list and select the matching fake project, so the
-/// project-scoped instance filter has something to work with.
+/// project-scoped VM filter has something to work with.
 pub(super) fn install_instances(app: &mut App, instances: Vec<VmSummary>) {
     if let Some(project) = instances.first().map(|instance| instance.project.clone()) {
         let name = project

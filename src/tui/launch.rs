@@ -62,8 +62,8 @@ pub(super) fn launch_agent(
             let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
             app.detach_console();
             let result = with_suspended_terminal(terminal, || {
-                let config = registry.resolve(&instance)?;
-                let console = registry.manager(config)?.attach_console()?;
+                let manager = registry.manager_by_name(&instance)?;
+                let console = manager.attach_console()?;
                 crate::session::console::run_interactive_with_command(
                     console,
                     bar,
@@ -73,9 +73,9 @@ pub(super) fn launch_agent(
             // The external client closed on detach; restore the embedded view so
             // the project screen is not left without a console.
             let reattached = registry
-                .resolve(&instance)
+                .manager_by_name(&instance)
                 .ok()
-                .and_then(|config| registry.manager(config).ok()?.attach_console().ok());
+                .and_then(|manager| manager.attach_console().ok());
             if let Some(console) = reattached {
                 app.attach_console(Box::new(console));
                 app.project_view = crate::tui::app::ProjectView::Split;
