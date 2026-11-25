@@ -32,7 +32,7 @@ pub struct ProfileFile {
 pub struct ProfileSkill {
     /// Host skill directory. `~` expands to the user's home directory.
     pub source: PathBuf,
-    /// Absolute guest directory. The guest target links to the per-instance
+    /// Absolute guest directory. The guest target links to the per-VM
     /// copy, never to the host directory.
     pub target: String,
     /// Permit `hegn skills sync-back` to copy guest changes to the host.
@@ -132,7 +132,7 @@ pub struct ProfileShare {
     pub manifest_id: String,
 }
 
-/// Result of preparing a profile for an instance start.
+/// Result of preparing a profile for a VM start.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProfilePlan {
     /// Packages contributed by the profile.
@@ -144,9 +144,10 @@ pub struct ProfilePlan {
 }
 
 /// Report from `hegn skills sync`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncReport {
-    pub instance: String,
+    #[serde(alias = "instance")]
+    pub vm: String,
     pub harness: Harness,
     pub sources: usize,
     pub copied_files: usize,
@@ -154,9 +155,10 @@ pub struct SyncReport {
 }
 
 /// Report from `hegn skills sync-back`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncBackReport {
-    pub instance: String,
+    #[serde(alias = "instance")]
+    pub vm: String,
     pub harness: Harness,
     pub copied_files: usize,
     pub skipped_files: usize,
@@ -167,6 +169,18 @@ pub struct SyncBackReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_reports_serialize_vm_and_read_the_legacy_instance_alias() {
+        let legacy =
+            r#"{"instance":"demo","harness":"shell","sources":0,"copied_files":0,"warnings":[]}"#;
+        let report: SyncReport = serde_json::from_str(legacy).unwrap();
+        assert_eq!(report.vm, "demo");
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["vm"], "demo");
+        assert!(json.get("instance").is_none());
+    }
 
     #[test]
     fn manifest_id_changes_with_the_payload() {

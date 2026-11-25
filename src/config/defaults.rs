@@ -19,7 +19,7 @@ impl Default for Config {
             projects_root: home.join("Projects/hegn"),
             state_dir: state_dir.join("hegn"),
             snapshots_dir: data_dir.join("hegn/snapshots"),
-            instances_dir: data_dir.join("hegn/instances"),
+            vms_dir: data_dir.join("hegn/vms"),
             templates_dir: config_dir.join("hegn/templates"),
             profiles_dir: config_dir.join("hegn/profiles"),
             cloud_hypervisor_bin: PathBuf::from("cloud-hypervisor"),
@@ -42,8 +42,9 @@ impl Default for Config {
             memory_mib: 2048,
             max_rootfs_gib: 64,
             disk_usage_warn_percent: 80,
-            shared_tag: "workspace".to_string(),
-            guest_mount: "/workspace".to_string(),
+            share_tag_prefix: "hegn-prj".to_string(),
+            guest_projects_base: "/projects".to_string(),
+            max_projects_per_vm: 16,
             virtiofs_sandbox: VirtiofsSandbox::Namespace,
             backend: BackendKind::Auto,
             harness: Harness::Shell,
@@ -64,7 +65,7 @@ impl Default for Config {
 /// `AGENTS.md` seeded into new projects from `templates_dir`.
 pub const DEFAULT_AGENTS_MD: &str = r#"# Agent instructions
 
-This project runs inside a hegn instance.
+This project runs inside a hegn VM.
 
 ## Rules
 
@@ -90,8 +91,9 @@ mod tests {
     fn defaults_are_valid() {
         let config = Config::default();
         config.validate().unwrap();
-        assert_eq!(config.guest_mount, "/workspace");
-        assert_eq!(config.shared_tag, "workspace");
+        assert_eq!(config.guest_projects_base, "/projects");
+        assert_eq!(config.share_tag_prefix, "hegn-prj");
+        assert_eq!(config.max_projects_per_vm, 16);
         assert_eq!(config.security, SecurityMode::Enforce);
         assert!(
             config.projects_root.ends_with("Projects/hegn"),

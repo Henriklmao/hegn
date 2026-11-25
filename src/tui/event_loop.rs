@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::SetTitle;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -33,7 +35,13 @@ pub(super) fn run_loop(
     runtime: &tokio::runtime::Runtime,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
+    let mut last_title = String::new();
     loop {
+        let title = app.window_title();
+        if title != last_title {
+            execute!(terminal.backend_mut(), SetTitle(title.clone()))?;
+            last_title = title;
+        }
         let size = terminal.size()?;
         app.set_viewport(size.width, size.height);
         let mut hits = ui::UiHits::default();
@@ -42,9 +50,11 @@ pub(super) fn run_loop(
         })?;
         app.footer_hits = hits.footer;
         app.project_rows = hits.projects;
-        app.instance_rows = hits.instances;
+        app.vm_rows = hits.vms;
+        app.vm_member_rows = hits.vm_members;
         app.snapshot_rows = hits.snapshots;
         app.section_hits = hits.sections;
+        app.vm_section_hits = hits.vm_sections;
         app.terminal_hit = hits.terminal;
         app.terminal_strip_hit = hits.terminal_strip;
         app.config_rows = hits.config;
@@ -74,15 +84,11 @@ pub(super) fn run_loop(
         }
 
         drain_scan(app, scan_rx);
-        if let Some((spec, instance, project)) = app.take_due_launch() {
+        if let Some((spec, vm, project)) = app.take_due_launch() {
             handle_effects(
                 terminal,
                 app,
-                vec![Effect::LaunchAgent {
-                    spec,
-                    instance,
-                    project,
-                }],
+                vec![Effect::LaunchAgent { spec, vm, project }],
                 scan_tx,
                 runtime,
             )?;
@@ -104,10 +110,10 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 harness,
                 started,
             }) => {
-                let instance = console.instance_name().to_string();
+                let vm = console.vm_name().to_string();
                 let project = console.project().to_path_buf();
                 app.attach_console(console);
-                app.queue_auto_launch(&instance, harness, &project, started);
+                app.queue_auto_launch(&vm, harness, &project, started);
                 match branch {
                     Some(Ok(branch)) => {
                         app.toast(format!("session branch {branch}"), ToastLevel::Info)
@@ -119,13 +125,17 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 }
             }
             Ok(ScanMessage::StartFailed(err)) => app.fail_start(err),
-            Ok(ScanMessage::InstancesChanged { note, level }) => {
-                app.refresh_instances();
+            Ok(ScanMessage::VmsChanged { note, level }) => {
+                app.refresh_vms();
                 app.toast(note, level);
             }
-            Ok(ScanMessage::InstanceError(err)) => {
-                app.refresh_instances();
-                app.toast(err, ToastLevel::Error);
+            Ok(ScanMessage::Error(err)) => {
+                if app.loading {
+                    app.loading = false;
+                    app.toast(format!("project scan failed: {err}"), ToastLevel::Error);
+                } else {
+                    app.toast(err, ToastLevel::Error);
+                }
             }
             Ok(ScanMessage::Doctor { report, note }) => {
                 app.clear_download_progress();
@@ -138,10 +148,6 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
             }
             Ok(ScanMessage::ProvisionReady) => app.provision_ready(),
             Ok(ScanMessage::ProvisionFailed(err)) => app.provision_failed(err),
-            Ok(ScanMessage::Error(err)) => {
-                app.loading = false;
-                app.toast(format!("project scan failed: {err}"), ToastLevel::Error);
-            }
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
         }
     }
@@ -159,7 +165,7 @@ mod tests {
     use crate::config::Harness;
     use crate::project::{GitSummary, Project};
     use crate::session::console::TerminalConsole;
-    use crate::tui::app::{InstanceState, Modal, Screen, ToastLevel};
+    use crate::tui::app::{Modal, Screen, ToastLevel, VmUiState};
     use crate::vm::images::DownloadProgress;
     use std::path::{Path, PathBuf};
 
@@ -188,7 +194,7 @@ mod tests {
             "fake · serial"
         }
 
-        fn instance_name(&self) -> &str {
+        fn vm_name(&self) -> &str {
             "fake"
         }
     }
@@ -201,12 +207,12 @@ mod tests {
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
         config.templates_dir = dir.path().join("templates");
-        config.instances_dir = dir.path().join("instances");
+        config.vms_dir = dir.path().join("vms");
         config.profiles_dir = dir.path().join("profiles");
         config.backend = crate::config::BackendKind::Auto;
         config.auto_branch = false;
         std::fs::create_dir_all(&config.projects_root).unwrap();
-        std::fs::create_dir_all(&config.instances_dir).unwrap();
+        std::fs::create_dir_all(&config.vms_dir).unwrap();
         let app = App::new(config);
         (dir, app)
     }
@@ -262,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_scan_applies_projects_instance_changes_and_errors() {
+    fn drain_scan_applies_projects_vm_changes_and_errors() {
         let (_dir, mut app) = test_app();
         let (tx, rx) = mpsc::channel();
         let demo = project(&app);
@@ -274,15 +280,15 @@ mod tests {
         assert_eq!(app.visible, vec![0]);
         assert!(!app.loading);
 
-        tx.send(ScanMessage::InstancesChanged {
-            note: "instance list refreshed".into(),
+        tx.send(ScanMessage::VmsChanged {
+            note: "VM list refreshed".into(),
             level: ToastLevel::Warn,
         })
         .unwrap();
         drain_scan(&mut app, &rx);
-        assert_eq!(toast(&app), ("instance list refreshed", ToastLevel::Warn));
+        assert_eq!(toast(&app), ("VM list refreshed", ToastLevel::Warn));
 
-        tx.send(ScanMessage::InstanceError("state file unreadable".into()))
+        tx.send(ScanMessage::Error("state file unreadable".into()))
             .unwrap();
         drain_scan(&mut app, &rx);
         assert_eq!(toast(&app), ("state file unreadable", ToastLevel::Error));
@@ -360,7 +366,7 @@ mod tests {
             .unwrap();
         drain_scan(&mut app, &rx);
         assert!(app.session.is_none());
-        assert_eq!(app.instance.state, InstanceState::Failed);
+        assert_eq!(app.vm.state, VmUiState::Failed);
         assert_eq!(
             toast(&app),
             ("VM start failed: missing kernel image", ToastLevel::Error)

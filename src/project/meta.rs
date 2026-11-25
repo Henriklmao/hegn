@@ -49,6 +49,37 @@ pub fn try_read_meta(path: &Path) -> Result<ProjectMeta> {
     Ok(ProjectMeta::default())
 }
 
+/// Legacy repo-local keys that v2 treats as presentation-only leftovers.
+///
+/// v1 still parses them so existing projects keep working. A later doctor/CLI
+/// pass uses this detector to warn once per project; Phase 1 changes no
+/// behaviour.
+const LEGACY_PROJECT_META_KEYS: &[&str] = &["harness", "packages", "template"];
+
+/// Deprecated legacy keys present in the project's `hegn.toml` or `.hegn.toml`.
+///
+/// Follows the same file preference as [`read_meta`]: the first file that can
+/// be read and parsed wins. Returns an empty list when neither file exists.
+pub fn deprecated_legacy_keys(path: &Path) -> Vec<&'static str> {
+    for name in [PROJECT_META_FILE, LEGACY_PROJECT_META_FILE] {
+        let Ok(raw) = fs::read_to_string(path.join(name)) else {
+            continue;
+        };
+        let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
+            continue;
+        };
+        let Some(table) = value.as_table() else {
+            continue;
+        };
+        return LEGACY_PROJECT_META_KEYS
+            .iter()
+            .copied()
+            .filter(|key| table.contains_key(*key))
+            .collect();
+    }
+    Vec::new()
+}
+
 pub fn write_meta(path: &Path, meta: &ProjectMeta) -> Result<()> {
     let raw = toml::to_string_pretty(meta)?;
     let target = path.join(PROJECT_META_FILE);
@@ -177,6 +208,43 @@ mod tests {
         let loaded = read_meta(dir.path());
         assert_eq!(loaded.harness, Some(crate::config::Harness::Codex));
         assert_eq!(loaded.packages, vec!["git"]);
+    }
+
+    #[test]
+    fn deprecated_legacy_keys_detects_old_control_plane_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(PROJECT_META_FILE),
+            "harness = \"codex\"\npackages = [\"git\"]\ntemplate = \"rust\"\nlaunch = \"review\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            deprecated_legacy_keys(dir.path()),
+            vec!["harness", "packages", "template"]
+        );
+
+        std::fs::write(dir.path().join(PROJECT_META_FILE), "launch = \"review\"\n").unwrap();
+        assert!(deprecated_legacy_keys(dir.path()).is_empty());
+        assert!(deprecated_legacy_keys(&dir.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn deprecated_legacy_keys_reads_the_legacy_dotfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(LEGACY_PROJECT_META_FILE),
+            "packages = [\"git\"]\n",
+        )
+        .unwrap();
+        assert_eq!(deprecated_legacy_keys(dir.path()), vec!["packages"]);
+
+        // A parseable current file wins, matching `read_meta`.
+        std::fs::write(dir.path().join(PROJECT_META_FILE), "launch = \"review\"\n").unwrap();
+        assert!(deprecated_legacy_keys(dir.path()).is_empty());
+
+        // A malformed current file falls through to the legacy dotfile.
+        std::fs::write(dir.path().join(PROJECT_META_FILE), "harness = [\n").unwrap();
+        assert_eq!(deprecated_legacy_keys(dir.path()), vec!["packages"]);
     }
 
     #[test]

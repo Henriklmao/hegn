@@ -20,7 +20,7 @@ pub(crate) fn render_multi_agent(
     area: Rect,
 ) -> ModalHits {
     let body = format!(
-        "Create temporary clones for parallel agents.\n\nInstance: {}\nClones:  {}\nHarness: {}\nStart:   {}\n\nEach clone gets its own workspace; commits cannot collide.",
+        "Create temporary clones for parallel agents.\n\nVM: {}\nClones:  {}\nHarness: {}\nStart:   {}\n\nEach clone gets its own workspace; commits cannot collide.",
         form.source,
         form.count,
         form.harness.label(),
@@ -109,7 +109,7 @@ mod tests {
         let (text, hits) = render(&app);
 
         assert!(text.contains("multi-agent clones"), "{text}");
-        assert!(text.contains("Instance: build"), "{text}");
+        assert!(text.contains("VM: build"), "{text}");
         assert!(text.contains("Clones:  3"), "{text}");
         assert!(text.contains("Harness: OpenCode"), "{text}");
         assert!(text.contains("Start:   yes"), "{text}");

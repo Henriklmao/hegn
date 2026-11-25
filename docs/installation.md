@@ -29,7 +29,7 @@ upgrade from an older version.
 Run `hegn doctor` after installing. It checks all of the above and tells you
 what is missing.
 
-Hegn always needs a real Cloud Hypervisor VM. If the kernel, rootfs, Cloud
+hegn always needs a real Cloud Hypervisor VM. If the kernel, rootfs, Cloud
 Hypervisor binary, virtiofsd or KVM device is missing, hegn stops with an error
 that tells you what to fix. There is no fallback to running things on the host.
 
@@ -40,7 +40,7 @@ that tells you what to fix. There is no fallback to running things on the host.
 You can hand the whole installation to a coding agent:
 
 ```text
-Install Hegn, a MicroVM base containerization wizard according to the following guide: https://github.com/Henriklmao/hegn/blob/main/docs/llm-setup.md
+Install hegn by following the setup guide at https://github.com/Henriklmao/hegn/blob/main/docs/llm-setup.md
 ```
 
 The guide walks the agent through host checks, installation on Arch (AUR) or any
@@ -112,7 +112,26 @@ The VM backend and the config schema changed. Before you start the new build:
      still configured.
 
 An unreadable `session.json` is treated as a hard error and is never silently
-overwritten. This way a VMM from an older version cannot be leaked.
+overwritten, so hegn does not lose track of a VMM started by an older version.
+
+### Upgrading from the v1 project model
+
+hegn v2 replaces the one-project-per-VM model with projects and VMs. There is no
+automatic migration:
+
+- stop any VM started by an older version,
+- create a VM with `hegn vm create` and assign your projects with
+  `hegn project import <path> --vm <vm>`,
+- old instance directories are ignored and reported by `hegn doctor`, never
+  deleted,
+- old snapshots without a boot fingerprint are listed as legacy and cannot be
+  restored,
+- old logs stay readable.
+
+A v1 `config.toml` still starts: `instances_dir`, `sandboxes_dir`, `shared_tag` and
+`guest_mount` parse as deprecated aliases for `vms_dir`, `share_tag_prefix` and
+`guest_projects_base`. Rewrite the keys when convenient. The full mapping is in
+[Migrating to v2](migration-v2.md).
 
 ---
 

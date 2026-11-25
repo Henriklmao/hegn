@@ -112,8 +112,8 @@ pub(super) fn template(harness: Harness) -> String {
 # Host paths may start with `~`. Guest targets must be absolute and stay under
 # /root, /home, /etc, /usr/local, /opt or /workspace.
 #
-# `hegn skills sync <instance>` copies host skill changes into the instance copy.
-# `hegn skills sync-back <instance>` copies guest changes back to the host.
+# `hegn skills sync <vm>` copies host skill changes into the VM copy.
+# `hegn skills sync-back <vm>` copies guest changes back to the host.
 version = {PROFILE_VERSION}
 
 # Extra apt packages installed on first boot, on top of the harness preset.
@@ -129,7 +129,7 @@ packages = []
 # the [environment] table above.
 {file_examples}
 # Copy skills from this machine into the guest. Skills are copied, never
-# linked; the guest target points at the per-instance copy. Missing source
+# linked; the guest target points at the per-VM copy. Missing source
 # directories are skipped.
 {skill_blocks}
 # Guest home for {label}: {home}

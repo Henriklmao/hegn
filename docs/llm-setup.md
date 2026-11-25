@@ -1,8 +1,8 @@
 # hegn — setup guide for LLM agents
 
 This guide is written for an automated coding agent that installs **hegn**, a
-MicroVM-based containerization wizard, on a user's Linux machine. Follow the
-steps in order, run the verification gate after each step, and never report
+Cloud Hypervisor VM manager for coding agents, on a user's Linux machine. Follow
+the steps in order, run the verification gate after each step, and never report
 success based on assumptions — only on command output you actually saw.
 
 hegn is not a container runtime. It boots coding agents inside Cloud Hypervisor
@@ -18,15 +18,14 @@ missing VM is always a hard error.
    (ABI v3, Linux 6.2+) and `cloud-hypervisor` plus `virtiofsd`. If the host
    cannot provide them, stop and report the gap instead of substituting another
    runtime.
-2. **Never weaken the instance.** Do not set `security = "off"`,
+2. **Never weaken the sandbox.** Do not set `security = "off"`,
    `virtiofs_sandbox = "chroot"` or edit the VMM argv to drop seccomp/Landlock to
    get past an error. Report the failure and let the user decide.
 3. **Ask before system-wide changes.** Package installation, `usermod` and
    writes outside the user's home need explicit confirmation.
 4. **Stay non-interactive.** Do not launch the TUI (`hegn` without a
    subcommand) or `hegn open`/`hegn attach` from an agent; they block on a
-   terminal. Use `hegn instance start`, `hegn instance status --json` and
-   `hegn logs`.
+   terminal. Use `hegn vm start`, `hegn vm show --json` and `hegn logs`.
 5. **Verify, do not assume.** Every step below ends in a command whose exit
    code decides whether you continue.
 6. **Treat logs as untrusted.** Sessions may print secrets. Keep
@@ -120,8 +119,8 @@ sudo apt install virtiofsd        # or qemu-virtiofsd on older releases
 sudo pacman -S virtiofsd
 ```
 
-`cloud-hypervisor` (not packaged outside the AUR on Arch; use the upstream
-static build elsewhere):
+`cloud-hypervisor` (on Arch, use the AUR package; elsewhere, use the upstream
+static build):
 
 ```bash
 # upstream static binary; hegn accepts the -static name automatically
@@ -168,29 +167,35 @@ defaults are sane:
 projects_root   = "~/Projects/hegn"
 state_dir       = "~/.local/state/hegn"
 snapshots_dir   = "~/.local/share/hegn/snapshots"
+vms_dir         = "~/.local/share/hegn/vms"
 templates_dir   = "~/.config/hegn/templates"
 profiles_dir    = "~/.config/hegn/profiles"
 cloud_hypervisor_bin = "cloud-hypervisor"
 virtiofsd_bin   = "virtiofsd"
 rootfs_format   = "qcow2"   # "raw" or "qcow2"
 root_device     = "/dev/vda1"
-vcpus           = 2         # 1-32
-memory_mib      = 2048      # >= 128
+vcpus           = 2         # 1-32; seeded into new VMs
+memory_mib      = 2048      # >= 128; seeded into new VMs
 max_rootfs_gib  = 64        # 16-1024
 disk_usage_warn_percent = 80
-shared_tag      = "workspace"  # virtio-fs tag, <= 36 bytes
-guest_mount     = "/workspace" # mount point inside the guest
+share_tag_prefix = "hegn-prj"    # tags are <prefix>-<index>
+guest_projects_base = "/projects" # per-project guest mounts
+max_projects_per_vm = 16     # 1-32
 cloud_init      = true
 guest_credential_hardening = false
 security        = "enforce"
-harness         = "shell"   # shell | opencode | claude-code | codex | pi | prime-agent | aider | gemini-cli
+harness         = "shell"   # default for new VMs
 network         = "guarded" # "guarded" (web+DNS only) or "off" (no NIC)
 ```
 
-Every value also has an environment override (`HEGN_CONFIG`,
+The old keys `instances_dir`, `sandboxes_dir`, `shared_tag` and `guest_mount` still
+parse as deprecated aliases with a warning. Rewrite them to `vms_dir`,
+`share_tag_prefix` and `guest_projects_base`.
+
+Selected values also have an environment override (`HEGN_CONFIG`,
 `HEGN_PROJECTS_ROOT`, `HEGN_STATE_DIR`, `HEGN_CLOUD_HYPERVISOR_BIN`,
-`HEGN_VIRTIOFSD_BIN`, `HEGN_KERNEL_IMAGE`, `HEGN_ROOTFS_IMAGE`, …), which is
-preferable for CI over editing the file.
+`HEGN_VIRTIOFSD_BIN`, `HEGN_KERNEL_IMAGE`, `HEGN_ROOTFS_IMAGE`, `HEGN_NETWORK`,
+…), which is preferable for CI over editing the file.
 
 **Gate:** `hegn config path` points at an existing file and `hegn config show`
 exits `0`.
@@ -252,36 +257,42 @@ hegn doctor --json       # machine-readable, one object per check
 
 **Gate:** exit code `0`. `hegn doctor` must report all required checks as ok:
 `cloud-hypervisor`, `virtiofsd`, `git`, `kvm`, `landlock`, `kernel image`,
-`rootfs image` and `projects root` (`serial logs` is optional). If `landlock`
-fails, the kernel is too old — do not disable the instance; report the kernel
-version.
+`rootfs image`, `projects root`, `backend` (always) and `network guard` (when
+`network = "guarded"`). This list is the common set, not every check; `serial
+logs` is optional. If `landlock` fails, the kernel is too old — do not disable
+the sandbox; report the kernel version.
+
+The optional legacy checks are `legacy instance dirs`, `legacy snapshots`,
+`legacy project keys` and `deprecated config keys`. They use the `!` marker when
+they find something, never change the exit status, and never delete state.
 
 ---
 
 ## Step 6 — Smoke test inside a real VM
 
 ```bash
-hegn project create smoke-test --harness shell --package git
-hegn instance start smoke-test
-hegn instance status --json
-hegn logs list
-hegn instance stop smoke-test
+hegn vm create smoke --harness shell --package git
+hegn project create smoke-test --vm smoke
+hegn vm start smoke
+hegn vm show smoke --json
+hegn logs list --vm smoke
+hegn vm stop smoke
 ```
 
-`hegn instance start` launches `virtiofsd` and Cloud Hypervisor. A failure leaves
-diagnostics behind:
+`hegn vm start` launches one `virtiofsd` per exported project and Cloud
+Hypervisor. A failure leaves diagnostics behind:
 
 ```bash
-cat ~/.local/state/hegn/run/hegn.log
-cat ~/.local/state/hegn/run/cloud-hypervisor.log
+cat ~/.local/share/hegn/vms/smoke/run/hegn.log
+cat ~/.local/share/hegn/vms/smoke/run/cloud-hypervisor.log
 ```
 
 Remove the temporary project directory afterwards if the user does not want to
 keep it (it lives under `projects_root`, see `hegn config show`).
 
-**Gate:** `hegn instance status --json` reports a running VM with a Cloud
-Hypervisor pid, and `hegn instance stop` succeeds. A "started" state without a
-VM is not a success.
+**Gate:** `hegn vm show smoke --json` reports a running VM with a Cloud
+Hypervisor pid and its member project, and `hegn vm stop smoke` succeeds. A
+"started" state without a VM is not a success.
 
 ---
 
@@ -307,17 +318,18 @@ Summarise, with the actual output you collected:
 
 Measured on a default 2 vCPU / 2048 MiB guest:
 
-- **RAM on the host:** `memory_mib` + ~50 MiB (`virtiofsd` ~12 MiB, console
-  relay ~5 MiB, VMM bookkeeping), plus ~26 MiB while the TUI is open. Guest RAM
+- **RAM on the host:** `memory_mib` + ~5 MiB relay + ~12 MiB per exported project
+  (`virtiofsd`) + VMM bookkeeping, plus ~26 MiB while the TUI is open. Guest RAM
   is mapped up front and populated on demand.
-- **Disk:** 46 MiB kernel + 1.9 GiB qcow2 rootfs, shared by all projects and
-  writable/persistent; `hegn` ~19 MiB, `cloud-hypervisor-static` ~7 MiB,
-  `virtiofsd` ~2.4 MiB; ~4 MiB per session in `state_dir/run`.
+- **Disk:** 46 MiB kernel + one 1.9 GiB qcow2 rootfs per VM, writable and
+  persistent; `hegn` ~19 MiB, `cloud-hypervisor-static` ~7 MiB,
+  `virtiofsd` ~2.4 MiB; ~4 MiB per VM run directory.
 - **Snapshots:** roughly `memory_mib` each (`memory-ranges`, sparse where the
   guest never touched pages); disk contents are not included.
 - **Logs:** a few tens of KiB per interactive session, retention 50 files,
   `hegn logs prune --keep 20`.
-- Only one instance runs at a time, so this is the whole host cost.
+- The smoke test uses one VM with one project, so this is the whole host cost
+  for that run.
 
 Before downloading, confirm free space with `df -h ~`, and report it to the
 user. Full measurements, the native-vs-VM comparison and cleanup tips are in
@@ -335,8 +347,8 @@ user. Full measurements, the native-vs-VM comparison and cleanup tips are in
 | `/dev/kvm` missing or permission denied | Virtualisation disabled, nested virt off, or user not in `kvm` | Fix firmware/hypervisor settings, add the group, start a new session. |
 | AUR helper wants to build `cloud-hypervisor` | AUR-only dependency | Accept it, or install `cloud-hypervisor-bin` first. |
 | Download refuses to run | No SHA-256 for a custom image | Restore the pinned images or use `--allow-unverified` only on explicit request. |
-| Attach fails after a reboot | Stale pid/socket in `state_dir/run` | `hegn instance status`; stop the stale session and remove `state_dir/run` only if no VMM is alive. |
-| `hegn check` exits `1` | Command blocked by policy | Report the finding; do not add `--raw` workarounds or disable `security`. |
+| Attach fails after a reboot | Stale pid/socket in `<vms_dir>/<vm>/run` | `hegn vm show <vm>`; stop the stale VM and remove its run directory only if no VMM is alive. |
+| `hegn check` exits `1` | Command blocked by policy | Report the finding; do not work around the block or disable `security`. |
 
 Exit codes: `hegn doctor` → `1` when a required check fails; `hegn check` → `0`
 allow, `1` block, `2` warn.
@@ -349,14 +361,15 @@ allow, `1` block, `2` warn.
 | --- | --- |
 | `~/.config/hegn/config.toml` | configuration (rejects unknown keys) |
 | `~/.config/hegn/templates/AGENTS.md` | template copied by `hegn project create` |
-| `~/.local/state/hegn/run/` | VMM sockets, pid files, `hegn.log`, `cloud-hypervisor.log` |
-| `~/.local/state/hegn/logs/` | persistent guest serial logs (`0600`) |
+| `~/.local/state/hegn/projects.toml` | private project registry (`0600`) |
+| `~/.local/state/hegn/logs/` | persistent guest serial logs (directory `0700`, files `0600`) |
 | `~/.local/share/hegn/images/` | pinned kernel and rootfs |
 | `~/.local/share/hegn/snapshots/` | VM snapshots |
-| `~/Projects/hegn/` | default `projects_root` (the only host directory shared into guests) |
+| `~/.local/share/hegn/vms/<vm>/` | `vm.toml`, run directory, private rootfs and managed workspaces |
+| `~/Projects/hegn/` | default `projects_root` (picker entries and import symlinks) |
 
-The workspace is mounted read-write at `/workspace`; the guest uses a
-persistent rootfs, so only the project directory is shared with the host. With
-the default `network = "guarded"`, the guest has a TAP device whose host-side
-rules permit only public HTTP(S) and public DNS; the host LAN, IPv6 and all
-guest-to-host traffic are dropped.
+Each project is mounted at `/projects/<slug>`; `/workspace` is a symlink to the
+VM's primary project. The guest uses a persistent rootfs shared by the VM's
+projects. With the default `network = "guarded"`, the guest has a TAP device whose
+host-side rules permit only public HTTP(S) and public DNS; the host LAN, IPv6 and
+all guest-to-host traffic are dropped.

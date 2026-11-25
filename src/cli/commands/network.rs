@@ -89,8 +89,8 @@ pub(crate) fn network_command(command: NetworkCommands, config: Config, json: bo
                 println!("{}", serde_json::json!({"ready": true, "user": user}));
             } else {
                 println!(
-                    "guarded network is active; TAPs are owned by '{user}'. Start an instance with \
-                     `hegn instance start <name>`."
+                    "guarded network is active; TAPs are owned by '{user}'. Start a VM with \
+                     `hegn vm start <name>`."
                 );
             }
             Ok(0)

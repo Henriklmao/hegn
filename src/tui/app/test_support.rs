@@ -20,7 +20,7 @@ pub(super) use crate::config::{Config, Harness};
 pub(super) use crate::project::{GitSummary, Project};
 pub(super) use crate::session::console::TerminalConsole;
 pub(super) use crate::session::snapshot::{SnapshotMeta, SnapshotStore};
-pub(super) use crate::vm::instance::InstanceSummary;
+pub(super) use crate::vm::registry::VmSummary;
 
 use super::App;
 
@@ -31,7 +31,7 @@ pub(super) fn test_app() -> (tempfile::TempDir, App) {
     config.state_dir = dir.path().join("state");
     config.snapshots_dir = dir.path().join("snapshots");
     config.templates_dir = dir.path().join("templates");
-    config.instances_dir = dir.path().join("instances");
+    config.vms_dir = dir.path().join("vms");
     config.profiles_dir = dir.path().join("profiles");
     config.backend = crate::config::BackendKind::Auto;
     config.auto_branch = false;
@@ -81,7 +81,7 @@ impl TerminalConsole for FakeConsole {
         "fake · serial"
     }
 
-    fn instance_name(&self) -> &str {
+    fn vm_name(&self) -> &str {
         "fake"
     }
 }
@@ -157,7 +157,7 @@ impl TerminalConsole for RecordingConsole {
         "recording · serial"
     }
 
-    fn instance_name(&self) -> &str {
+    fn vm_name(&self) -> &str {
         &self.name
     }
 }
@@ -175,29 +175,57 @@ pub(super) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-pub(super) fn fake_instance(app: &App, name: &str, workspace: PathBuf) -> InstanceSummary {
-    InstanceSummary {
+pub(super) fn fake_vm(app: &App, name: &str, workspace: PathBuf) -> VmSummary {
+    VmSummary {
         name: name.into(),
+        harness: Harness::Shell,
+        primary: Some("demo".into()),
+        members: 1,
         project: app.config.projects_root.join("demo"),
         workspace,
-        harness: Harness::Shell,
-        ephemeral: false,
-        source_instance: None,
         created_at: chrono::Utc::now(),
         state: "stopped".into(),
         vm_pid: None,
         serial_log: None,
-        config_path: app.config.instances_dir.join(name).join("hegn.toml"),
+        config_path: app.config.vms_dir.join(name).join("vm.toml"),
         vcpus: 2,
         memory_mib: 2048,
         error: None,
     }
 }
 
-/// Install an instance list and select the matching fake project, so the
-/// project-scoped instance filter has something to work with.
-pub(super) fn install_instances(app: &mut App, instances: Vec<InstanceSummary>) {
-    if let Some(project) = instances.first().map(|instance| instance.project.clone()) {
+/// Register a fake project and assign it to `vm`, then reload the app's
+/// registry snapshot. The project directory must already exist.
+pub(super) fn assign_fake_project(app: &mut App, path: &std::path::Path, vm: &str) {
+    use crate::project::{ProjectEntry, ProjectKind, ProjectRegistry};
+
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let name = canonical
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "demo".into());
+    let mut registry = ProjectRegistry::load(&app.config.state_dir).unwrap();
+    registry
+        .upsert(ProjectEntry {
+            name: name.clone(),
+            path: canonical,
+            vm: None,
+            read_only: false,
+            kind: ProjectKind::External,
+            parent: None,
+            managed: false,
+            hidden: false,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+    registry.assign(&name, vm, false).unwrap();
+    app.refresh_project_entries();
+}
+
+/// Install a VM list and select the matching fake project, so the
+/// project-scoped VM filter has something to work with.
+pub(super) fn install_vms(app: &mut App, vms: Vec<VmSummary>) {
+    if let Some(project) = vms.first().map(|vm| vm.project.clone()) {
         let name = project
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -210,8 +238,8 @@ pub(super) fn install_instances(app: &mut App, instances: Vec<InstanceSummary>) 
         }];
         app.visible = vec![0];
         app.selected = 0;
-        app.instance_project = None;
+        app.vm_project = None;
     }
-    app.instances = instances;
-    app.refresh_instance_filter();
+    app.vms = vms;
+    app.refresh_vm_filter();
 }

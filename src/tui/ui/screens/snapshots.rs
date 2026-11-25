@@ -18,15 +18,15 @@ pub(crate) fn render_snapshots(
     number: usize,
 ) -> Vec<RowHit> {
     let active = app.focus == Focus::Snapshots;
-    let indices: Vec<usize> = if app.screen == Screen::Project {
-        app.project_snapshots.clone()
-    } else {
-        (0..app.snapshots.len()).collect()
+    let indices: Vec<usize> = match app.screen {
+        Screen::Project => app.project_snapshots.clone(),
+        Screen::Vm => app.vm_snapshots.clone(),
+        Screen::Dashboard => (0..app.snapshots.len()).collect(),
     };
-    let selected_index = if app.screen == Screen::Project {
-        app.project_snapshot_selected
-    } else {
-        app.selected_snapshot
+    let selected_index = match app.screen {
+        Screen::Project => app.project_snapshot_selected,
+        Screen::Vm => app.vm_snapshot_selected,
+        Screen::Dashboard => app.selected_snapshot,
     };
     let title = format!(" snapshots ({}) ", indices.len());
     let block = tab_block(title, number, active);
@@ -65,11 +65,15 @@ pub(crate) fn render_snapshots(
             Style::default().fg(TEXT)
         };
         let prefix = if row == offset { " ▾ " } else { "   " };
+        let mut detail = format!("  {}", snapshot.size_label());
+        if snapshot.is_legacy() {
+            detail.push_str("  · legacy");
+        }
         lines.push(Line::from(vec![
             Span::styled(prefix, style.fg(if selected { ON_ACCENT } else { CYAN })),
             Span::styled(truncate(&snapshot.name, 20), style),
             Span::styled(
-                format!("  {}", snapshot.size_label()),
+                detail,
                 if selected {
                     Style::default().fg(ON_ACCENT).bg(CYAN)
                 } else {
@@ -110,10 +114,11 @@ mod tests {
             created_at: chrono::Utc::now(),
             vm_state: "Paused".into(),
             dir: PathBuf::from("/snap/demo"),
-            instance: None,
+            vm: None,
             project: Some(PathBuf::from("/projects/demo")),
             size_bytes: 1024 * 1024,
             note: None,
+            ..crate::session::snapshot::SnapshotMeta::default()
         }];
         app.refresh_project_snapshots();
         let (text, hits) = render(&app);
@@ -128,10 +133,11 @@ mod tests {
             created_at: chrono::Utc::now(),
             vm_state: "Paused".into(),
             dir: PathBuf::from(format!("/snap/{index}")),
-            instance: None,
+            vm: None,
             project: project.map(PathBuf::from),
             size_bytes: 1024,
             note: None,
+            ..crate::session::snapshot::SnapshotMeta::default()
         }
     }
 

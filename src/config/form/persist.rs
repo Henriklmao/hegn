@@ -3,7 +3,7 @@
 use anyhow::Context;
 
 use crate::config::Config;
-use crate::vm::instance_config::InstanceStore;
+use crate::vm::config::VmStore;
 
 use super::state::{ConfigForm, Draft};
 
@@ -11,7 +11,7 @@ use super::state::{ConfigForm, Draft};
 #[derive(Debug, Clone)]
 pub enum Applied {
     Global(Box<Config>),
-    Instance,
+    Vm,
 }
 
 impl ConfigForm {
@@ -26,9 +26,7 @@ impl ConfigForm {
                 .save_to(&self.path)
                 .with_context(|| format!("failed to save {}", self.path.display()))
                 .map(|()| Applied::Global(config.clone())),
-            Draft::Instance(instance) => InstanceStore::new((*self.base).clone())
-                .save(instance)
-                .map(|()| Applied::Instance),
+            Draft::Vm(vm) => VmStore::new(&self.base).save(vm).map(|()| Applied::Vm),
         };
         match result {
             Ok(applied) => {
@@ -55,7 +53,7 @@ mod tests {
     use crate::config::form::ConfigForm;
     use crate::config::form::test_support::{global_config, select};
     use crate::config::form::{ConfigField, ConfigKind};
-    use crate::vm::instance_config::InstanceStore;
+    use crate::vm::config::{VmConfig, VmStore};
 
     #[test]
     fn saving_writes_the_global_config_and_clears_dirty() {
@@ -67,31 +65,31 @@ mod tests {
         let applied = form.save().expect("save succeeds");
         match applied {
             Applied::Global(config) => assert_eq!(config.harness, Harness::Opencode),
-            Applied::Instance => panic!("expected a global config"),
+            Applied::Vm => panic!("expected a global config"),
         }
         assert!(!form.dirty());
         assert_eq!(Config::load_from(&path).unwrap().harness, Harness::Opencode);
     }
 
     #[test]
-    fn instance_form_saves_into_the_instance_store() {
+    fn vm_form_saves_into_the_vm_store() {
         let dir = tempfile::tempdir().unwrap();
         let config = global_config(dir.path());
-        let store = InstanceStore::new(config.clone());
-        let project = dir.path().join("projects/demo");
-        std::fs::create_dir_all(&project).unwrap();
-        let instance = store
-            .create_from_project(&project, Some("demo"), None, false)
-            .unwrap();
+        let store = VmStore::new(&config);
+        let vm = VmConfig {
+            name: "demo".into(),
+            ..VmConfig::from_config(&config, "demo", None)
+        };
+        store.save(&vm).unwrap();
 
-        let mut form = ConfigForm::instance(instance, config);
-        assert_eq!(form.kind, ConfigKind::Instance);
-        assert_eq!(form.instance_name(), Some("demo"));
+        let mut form = ConfigForm::vm(vm, config);
+        assert_eq!(form.kind, ConfigKind::Vm);
+        assert_eq!(form.vm_name(), Some("demo"));
         select(&mut form, ConfigField::Vcpus);
         form.adjust(1);
         form.adjust(1);
         assert!(form.save().is_some());
-        let reloaded = InstanceStore::new(global_config(dir.path()))
+        let reloaded = VmStore::new(&global_config(dir.path()))
             .load("demo")
             .unwrap();
         assert_eq!(reloaded.vcpus, 4);

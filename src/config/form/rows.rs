@@ -1,6 +1,6 @@
 //! Fields, pages and row tables for the settings modal.
 //!
-//! The same field enum covers the global `config.toml` and an instance's
+//! The same field enum covers the global `config.toml` and an VM's
 //! `hegn.toml`; fields that do not apply to the current kind render as `—` and
 //! never appear in the row list.
 
@@ -10,7 +10,7 @@ use crate::config::{Harness, LocalEndpoint};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKind {
     Global,
-    Instance,
+    Vm,
 }
 
 /// Pages (tabs) inside the settings modal.
@@ -52,7 +52,7 @@ pub enum ConfigField {
     KernelImage,
     RootfsImage,
     SharedTag,
-    GuestMount,
+    GuestProjectsBase,
     ReadOnlyWorkspace,
     Network,
     Security,
@@ -62,7 +62,7 @@ pub enum ConfigField {
     ProjectsRoot,
     StateDir,
     SnapshotsDir,
-    InstancesDir,
+    VmsDir,
     TemplatesDir,
     ProfilesDir,
     ExtraPackages,
@@ -70,7 +70,7 @@ pub enum ConfigField {
     LocalEndpoints,
     /// A harness profile template (`profiles/<harness>.toml`).
     Profile(Harness),
-    // Instance-only, read-only context.
+    // VM-only, read-only context.
     Project,
     Workspace,
     RootfsPath,
@@ -113,8 +113,8 @@ impl ConfigField {
             Self::GuestHardening => "Guest hardening",
             Self::KernelImage => "Kernel image",
             Self::RootfsImage => "Rootfs image",
-            Self::SharedTag => "Shared tag",
-            Self::GuestMount => "Guest mount",
+            Self::SharedTag => "Share tag prefix",
+            Self::GuestProjectsBase => "Guest projects base",
             Self::ReadOnlyWorkspace => "Read-only workspace",
             Self::Network => "Network",
             Self::Security => "Security",
@@ -124,7 +124,7 @@ impl ConfigField {
             Self::ProjectsRoot => "Projects root",
             Self::StateDir => "State dir",
             Self::SnapshotsDir => "Snapshots dir",
-            Self::InstancesDir => "Instances dir",
+            Self::VmsDir => "VMs dir",
             Self::TemplatesDir => "Templates dir",
             Self::ProfilesDir => "Profiles dir",
             Self::ExtraPackages => "Extra packages",
@@ -196,7 +196,7 @@ impl ConfigField {
                 | Self::ProjectsRoot
                 | Self::StateDir
                 | Self::SnapshotsDir
-                | Self::InstancesDir
+                | Self::VmsDir
                 | Self::TemplatesDir
                 | Self::ProfilesDir
         )
@@ -234,7 +234,7 @@ const GENERAL_ROWS: &[ConfigRow] = &[
     ConfigRow::Field(ConfigField::RootfsImage),
     ConfigRow::Group("Guest sharing"),
     ConfigRow::Field(ConfigField::SharedTag),
-    ConfigRow::Field(ConfigField::GuestMount),
+    ConfigRow::Field(ConfigField::GuestProjectsBase),
     ConfigRow::Field(ConfigField::GuestHardening),
     ConfigRow::Group("Network & security"),
     ConfigRow::Field(ConfigField::Network),
@@ -248,7 +248,7 @@ const GENERAL_ROWS: &[ConfigRow] = &[
     ConfigRow::Field(ConfigField::ProjectsRoot),
     ConfigRow::Field(ConfigField::StateDir),
     ConfigRow::Field(ConfigField::SnapshotsDir),
-    ConfigRow::Field(ConfigField::InstancesDir),
+    ConfigRow::Field(ConfigField::VmsDir),
     ConfigRow::Field(ConfigField::TemplatesDir),
     ConfigRow::Field(ConfigField::ProfilesDir),
     ConfigRow::Group("Packages"),
@@ -267,7 +267,7 @@ const LOCAL_LLM_ROWS: &[ConfigRow] = &[
 const PROFILE_ROWS: &[ConfigRow] = &[
     ConfigRow::Group("Harness profiles"),
     ConfigRow::Note("Enter opens the profile TOML; missing templates are created"),
-    ConfigRow::Note("host files and skills are copied into a per-instance bundle"),
+    ConfigRow::Note("host files and skills are copied into a per-VM bundle"),
     ConfigRow::Field(ConfigField::Profile(Harness::Opencode)),
     ConfigRow::Field(ConfigField::Profile(Harness::ClaudeCode)),
     ConfigRow::Field(ConfigField::Profile(Harness::Codex)),
@@ -275,22 +275,21 @@ const PROFILE_ROWS: &[ConfigRow] = &[
     ConfigRow::Field(ConfigField::Profile(Harness::PrimeAgent)),
     ConfigRow::Field(ConfigField::Profile(Harness::Aider)),
     ConfigRow::Field(ConfigField::Profile(Harness::GeminiCli)),
-    ConfigRow::Note("CLI: hegn profile show <harness> · hegn skills sync-back <instance>"),
+    ConfigRow::Note("CLI: hegn profile show <harness> · hegn skills sync-back <vm>"),
 ];
 
-const INSTANCE_ROWS: &[ConfigRow] = &[
+const VM_ROWS: &[ConfigRow] = &[
     ConfigRow::Group("Runtime"),
     ConfigRow::Field(ConfigField::Harness),
     ConfigRow::Field(ConfigField::Vcpus),
     ConfigRow::Field(ConfigField::Memory),
-    ConfigRow::Field(ConfigField::AutoBranch),
+    ConfigRow::Field(ConfigField::Security),
     ConfigRow::Group("Guest sharing"),
-    ConfigRow::Field(ConfigField::SharedTag),
-    ConfigRow::Field(ConfigField::GuestMount),
-    ConfigRow::Field(ConfigField::ReadOnlyWorkspace),
+    ConfigRow::Note("share tags come from the global share_tag_prefix"),
+    ConfigRow::Note("membership is managed by `hegn project assign`"),
     ConfigRow::Group("Packages"),
     ConfigRow::Field(ConfigField::ExtraPackages),
-    ConfigRow::Group("Instance (read-only)"),
+    ConfigRow::Group("VM (read-only)"),
     ConfigRow::Field(ConfigField::Project),
     ConfigRow::Field(ConfigField::Workspace),
     ConfigRow::Field(ConfigField::RootfsPath),
@@ -301,7 +300,7 @@ pub fn rows(kind: ConfigKind) -> &'static [ConfigRow] {
     rows_for(kind, ConfigPage::General)
 }
 
-/// Pages available for a file kind. Endpoints are host-wide, so an instance's
+/// Pages available for a file kind. Endpoints are host-wide, so an VM's
 /// config has only the general page.
 pub fn pages(kind: ConfigKind) -> &'static [ConfigPage] {
     match kind {
@@ -310,7 +309,7 @@ pub fn pages(kind: ConfigKind) -> &'static [ConfigPage] {
             ConfigPage::Profiles,
             ConfigPage::LocalLlm,
         ],
-        ConfigKind::Instance => &[ConfigPage::General],
+        ConfigKind::Vm => &[ConfigPage::General],
     }
 }
 
@@ -319,7 +318,7 @@ pub fn rows_for(kind: ConfigKind, page: ConfigPage) -> &'static [ConfigRow] {
         (ConfigKind::Global, ConfigPage::General) => GENERAL_ROWS,
         (ConfigKind::Global, ConfigPage::Profiles) => PROFILE_ROWS,
         (ConfigKind::Global, ConfigPage::LocalLlm) => LOCAL_LLM_ROWS,
-        (ConfigKind::Instance, _) => INSTANCE_ROWS,
+        (ConfigKind::Vm, _) => VM_ROWS,
     }
 }
 
@@ -370,19 +369,16 @@ pub(super) fn endpoints_value(endpoints: &[LocalEndpoint]) -> String {
 mod tests {
     use crate::config::form::ConfigForm;
     use crate::config::form::test_support::global_config;
-    use crate::vm::instance_config::InstanceStore;
+    use crate::vm::config::{VmConfig, VmStore};
 
     #[test]
-    fn instance_form_has_no_endpoint_page() {
+    fn vm_form_has_no_endpoint_page() {
         let dir = tempfile::tempdir().unwrap();
         let config = global_config(dir.path());
-        let store = InstanceStore::new(config.clone());
-        let project = dir.path().join("projects/demo");
-        std::fs::create_dir_all(&project).unwrap();
-        let instance = store
-            .create_from_project(&project, Some("demo"), None, false)
-            .unwrap();
-        let form = ConfigForm::instance(instance, config);
+        let store = VmStore::new(&config);
+        let vm = VmConfig::from_config(&config, "demo", None);
+        store.save(&vm).unwrap();
+        let form = ConfigForm::vm(vm, config);
         assert_eq!(form.pages(), &[super::ConfigPage::General]);
         assert_eq!(form.value(super::ConfigField::LocalEndpoints), "—");
     }

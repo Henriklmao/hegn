@@ -2,17 +2,25 @@
 //!
 //! Every `spawn_*` function moves blocking host work onto a named thread and
 //! reports back over a [`ScanMessage`] channel. Keep the thread boundaries here:
-//! the event loop must stay responsive while a scan, download, clone or VM start
+//! the event loop must stay responsive while a scan, download, fork or VM start
 //! is in flight, and a worker failure must never take the TUI down with it.
+//!
+//! Membership, VM and snapshot mutations go through the same library APIs the
+//! CLI uses (`VmRegistry`, `VmManager`, `ProjectRegistry`, `WorkspaceService`);
+//! the TUI never shells out to `hegn`.
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::agent::provision::{ProvisionEvent, ProvisionPlan, ProvisionWatcher};
 use crate::config::{Config, Harness};
-use crate::project;
+use crate::project::{self, ProjectKind, ProjectRegistry, assign_project, unassign_project};
+use crate::project::{ForkMode, WorkspaceService};
 use crate::tui::app::ToastLevel;
 use crate::tui::messages::ScanMessage;
+use crate::vm::config::{VmConfig, VmStore};
+use crate::vm::registry::VmRegistry;
 
 pub(super) fn spawn_scan(config: Config, tx: mpsc::Sender<ScanMessage>) {
     let thread_tx = tx.clone();
@@ -71,19 +79,29 @@ pub(super) fn spawn_image_download(
     }
 }
 
-pub(super) fn spawn_attach(config: Config, instance: String, tx: mpsc::Sender<ScanMessage>) {
+pub(super) fn spawn_attach_vm(config: Config, vm: String, tx: mpsc::Sender<ScanMessage>) {
     let thread_tx = tx.clone();
     let spawned = std::thread::Builder::new()
         .name("hegn-attach-vm".into())
         .spawn(move || {
-            let registry = crate::vm::instance::InstanceRegistry::new(config);
+            let registry = VmRegistry::new(config);
             let harness = registry
                 .store()
-                .load(&instance)
+                .load(&vm)
                 .map(|config| config.harness)
                 .unwrap_or_default();
+            let warning = registry
+                .manager_by_name(&vm)
+                .ok()
+                .and_then(|manager| manager.membership_warning());
+            if let Some(warning) = warning {
+                let _ = thread_tx.send(ScanMessage::VmsChanged {
+                    note: warning,
+                    level: ToastLevel::Warn,
+                });
+            }
             let result = registry
-                .manager_by_name(&instance)
+                .manager_by_name(&vm)
                 .and_then(|manager| manager.ensure_console());
             match result {
                 Ok(console) => {
@@ -106,108 +124,26 @@ pub(super) fn spawn_attach(config: Config, instance: String, tx: mpsc::Sender<Sc
     }
 }
 
-pub(super) fn spawn_clones(
+pub(super) fn spawn_start_vm(
     config: Config,
-    source: String,
-    count: usize,
-    harness: Harness,
-    start: bool,
-    tx: mpsc::Sender<ScanMessage>,
-) {
-    let thread_tx = tx.clone();
-    let spawned = std::thread::Builder::new()
-        .name("hegn-clone-agents".into())
-        .spawn(move || {
-            let registry = crate::vm::instance::InstanceRegistry::new(config.clone());
-            let source = match registry.resolve(&source) {
-                Ok(source) => source,
-                Err(err) => {
-                    // Clone failures must not tear down the attached VM.
-                    let _ = thread_tx.send(ScanMessage::InstanceError(format!(
-                        "could not create clones: {err}"
-                    )));
-                    return;
-                }
-            };
-            let mut created = 0;
-            let mut failures = Vec::new();
-            let mut warnings = Vec::new();
-            for index in 1..=count {
-                let base = format!("{}-agent", source.name);
-                let name = match registry.unique_name(&format!("{base}-{index}")) {
-                    Ok(name) => name,
-                    Err(err) => {
-                        failures.push(err.to_string());
-                        continue;
-                    }
-                };
-                match registry.clone_from(&source, &name, Some(harness)) {
-                    Ok(outcome) => {
-                        for warning in &outcome.warnings {
-                            if !warnings.iter().any(|existing| existing == warning) {
-                                warnings.push(warning.clone());
-                            }
-                        }
-                        if start
-                            && let Err(err) = registry.manager(outcome.instance.clone()).start()
-                        {
-                            failures.push(format!("{name}: {err}"));
-                        }
-                        created += 1;
-                    }
-                    Err(err) => failures.push(format!("{name}: {err}")),
-                }
-            }
-            let mut note = if failures.is_empty() {
-                format!("created {created} clone(s) for parallel agents")
-            } else {
-                format!(
-                    "created {created} clone(s); {} failed: {}",
-                    failures.len(),
-                    failures.join("; ")
-                )
-            };
-            if !warnings.is_empty() {
-                note.push_str("; warning: ");
-                note.push_str(&warnings.join("; "));
-            }
-            let level = if failures.is_empty() && warnings.is_empty() {
-                ToastLevel::Info
-            } else {
-                ToastLevel::Warn
-            };
-            let _ = thread_tx.send(ScanMessage::InstancesChanged { note, level });
-        });
-    if let Err(err) = spawned {
-        let _ = tx.send(ScanMessage::InstanceError(format!(
-            "could not start the clone thread: {err}"
-        )));
-    }
-}
-
-pub(super) fn spawn_start(
-    config: Config,
-    project: std::path::PathBuf,
-    harness: Harness,
+    vm: String,
+    project: Option<PathBuf>,
     tx: mpsc::Sender<ScanMessage>,
 ) {
     let thread_tx = tx.clone();
     let spawned = std::thread::Builder::new()
         .name("hegn-start-vm".into())
         .spawn(move || {
-            let registry = crate::vm::instance::InstanceRegistry::new(config.clone());
-            let instance = match registry.ensure_for_project(&project, harness) {
-                Ok(instance) => instance,
+            let registry = VmRegistry::new(config.clone());
+            let manager = match registry.manager_by_name(&vm) {
+                Ok(manager) => manager,
                 Err(err) => {
                     let _ = thread_tx.send(ScanMessage::StartFailed(err.to_string()));
                     return;
                 }
             };
-            let workspace = instance.workspace.clone();
-            let auto_branch = instance.auto_branch;
-            let harness = instance.harness;
-            let plan = ProvisionPlan::new(instance.harness, &instance.extra_packages).ok();
-            let manager = registry.manager(instance);
+            let harness = manager.vm().harness;
+            let plan = ProvisionPlan::new(harness, &manager.vm().extra_packages).ok();
             let was_running = manager.is_running();
             let started = if was_running {
                 manager.status().ok()
@@ -220,6 +156,13 @@ pub(super) fn spawn_start(
                     }
                 }
             };
+            let warning = manager.membership_warning();
+            if let Some(warning) = warning {
+                let _ = thread_tx.send(ScanMessage::VmsChanged {
+                    note: warning,
+                    level: ToastLevel::Warn,
+                });
+            }
             if let (Some(report), Some(plan)) = (&started, plan)
                 && let Some(log) = &report.serial_log
             {
@@ -227,14 +170,14 @@ pub(super) fn spawn_start(
             }
             match manager.attach_console() {
                 Ok(console) => {
-                    let branch = if auto_branch && project::read_git_summary(&workspace).is_repo {
-                        Some(
-                            project::create_session_branch(&workspace)
-                                .map_err(|err| err.to_string()),
+                    let branch = project.as_ref().and_then(|project| {
+                        (config.auto_branch && project::read_git_summary(project).is_repo).then(
+                            || {
+                                project::create_session_branch(project)
+                                    .map_err(|err| err.to_string())
+                            },
                         )
-                    } else {
-                        None
-                    };
+                    });
                     let _ = thread_tx.send(ScanMessage::Started {
                         console: Box::new(console),
                         branch,
@@ -254,15 +197,351 @@ pub(super) fn spawn_start(
     }
 }
 
+pub(super) fn spawn_stop_vm(config: Config, vm: String, tx: mpsc::Sender<ScanMessage>) {
+    spawn_lifecycle(config, vm, Lifecycle::Stop, tx);
+}
+
+pub(super) fn spawn_apply_vm(config: Config, vm: String, tx: mpsc::Sender<ScanMessage>) {
+    spawn_lifecycle(config, vm, Lifecycle::Apply, tx);
+}
+
+enum Lifecycle {
+    Stop,
+    Apply,
+}
+
+fn spawn_lifecycle(
+    config: Config,
+    vm: String,
+    operation: Lifecycle,
+    tx: mpsc::Sender<ScanMessage>,
+) {
+    let thread_tx = tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("hegn-vm-lifecycle".into())
+        .spawn(move || {
+            let registry = VmRegistry::new(config);
+            let result = match operation {
+                Lifecycle::Stop => registry.stop(&vm),
+                Lifecycle::Apply => registry
+                    .manager_by_name(&vm)
+                    .and_then(|manager| manager.apply().map(|_| ())),
+            };
+            match result {
+                Ok(()) => {
+                    let note = match operation {
+                        Lifecycle::Stop => format!("VM {vm} stopped"),
+                        Lifecycle::Apply => format!("VM {vm} restarted with the current config"),
+                    };
+                    let _ = thread_tx.send(ScanMessage::VmsChanged {
+                        note,
+                        level: ToastLevel::Info,
+                    });
+                }
+                Err(err) => {
+                    let _ = thread_tx.send(ScanMessage::VmsChanged {
+                        note: format!("VM operation failed: {err:#}"),
+                        level: ToastLevel::Error,
+                    });
+                }
+            }
+        });
+    if let Err(err) = spawned {
+        let _ = tx.send(ScanMessage::VmsChanged {
+            note: format!("could not start the VM thread: {err}"),
+            level: ToastLevel::Error,
+        });
+    }
+}
+
+pub(super) fn spawn_create_vm(
+    config: Config,
+    name: String,
+    harness: Harness,
+    vcpus: u8,
+    memory_mib: u32,
+    packages: Vec<String>,
+    tx: mpsc::Sender<ScanMessage>,
+) {
+    let thread_tx = tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("hegn-create-vm".into())
+        .spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let store = VmStore::new(&config);
+                if store.dir(&name)?.exists() {
+                    anyhow::bail!("VM '{name}' already exists; choose another name");
+                }
+                let mut vm = VmConfig::from_config(&config, &name, Some(harness));
+                vm.vcpus = vcpus;
+                vm.memory_mib = memory_mib;
+                for package in packages {
+                    if !crate::config::safe_package_name(&package) {
+                        anyhow::bail!("invalid package name: {package:?}");
+                    }
+                    if !vm
+                        .extra_packages
+                        .iter()
+                        .any(|existing| existing == &package)
+                    {
+                        vm.extra_packages.push(package);
+                    }
+                }
+                vm.validate()?;
+                store.save(&vm)?;
+                Ok(())
+            })();
+            let (note, level) = match result {
+                Ok(()) => (
+                    format!("created VM {name} — assign projects from its VM screen (v)"),
+                    ToastLevel::Info,
+                ),
+                Err(err) => (format!("create VM failed: {err:#}"), ToastLevel::Error),
+            };
+            let _ = thread_tx.send(ScanMessage::VmsChanged { note, level });
+        });
+    if let Err(err) = spawned {
+        let _ = tx.send(ScanMessage::VmsChanged {
+            note: format!("could not start the VM create thread: {err}"),
+            level: ToastLevel::Error,
+        });
+    }
+}
+
+pub(super) fn spawn_assign_project(
+    config: Config,
+    project: String,
+    path: PathBuf,
+    vm: String,
+    read_only: bool,
+    tx: mpsc::Sender<ScanMessage>,
+) {
+    let thread_tx = tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("hegn-assign-project".into())
+        .spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                // Prefer the picker name so an imported symlink keeps its
+                // registered name; fall back to the path for outside-root
+                // projects that are not under the projects root.
+                let registered = ProjectRegistry::load(&config.state_dir)?
+                    .get(&project)
+                    .is_some();
+                let under_root = config.projects_root.join(&project).is_dir();
+                let selector = if registered || under_root {
+                    project.clone()
+                } else {
+                    path.display().to_string()
+                };
+                assign_project(&config, &selector, &vm, read_only)?;
+                Ok(())
+            })();
+            let (note, level) = match result {
+                Ok(()) => (format!("assigned {project} to VM {vm}"), ToastLevel::Info),
+                Err(err) => (format!("assign failed: {err:#}"), ToastLevel::Error),
+            };
+            let _ = thread_tx.send(ScanMessage::VmsChanged { note, level });
+        });
+    if let Err(err) = spawned {
+        let _ = tx.send(ScanMessage::VmsChanged {
+            note: format!("could not start the assign thread: {err}"),
+            level: ToastLevel::Error,
+        });
+    }
+}
+
+pub(super) fn spawn_unassign_project(
+    config: Config,
+    project: String,
+    tx: mpsc::Sender<ScanMessage>,
+) {
+    let thread_tx = tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("hegn-unassign-project".into())
+        .spawn(move || {
+            let result = unassign_project(&config, &project);
+            let (note, level) = match result {
+                Ok(Some(outcome)) if outcome.was_primary => {
+                    let next = match &outcome.primary {
+                        Some(next) => format!("; /workspace → {next}"),
+                        None => "; no exported members remain".to_string(),
+                    };
+                    (
+                        format!(
+                            "detached {} from VM {}; files untouched{next}",
+                            outcome.project, outcome.vm
+                        ),
+                        ToastLevel::Info,
+                    )
+                }
+                Ok(Some(outcome)) => (
+                    format!(
+                        "detached {} from VM {}; files untouched",
+                        outcome.project, outcome.vm
+                    ),
+                    ToastLevel::Info,
+                ),
+                Ok(None) => (
+                    format!("{project} is not assigned to a VM"),
+                    ToastLevel::Warn,
+                ),
+                Err(err) => (format!("detach failed: {err:#}"), ToastLevel::Error),
+            };
+            let _ = thread_tx.send(ScanMessage::VmsChanged { note, level });
+        });
+    if let Err(err) = spawned {
+        let _ = tx.send(ScanMessage::VmsChanged {
+            note: format!("could not start the detach thread: {err}"),
+            level: ToastLevel::Error,
+        });
+    }
+}
+
+pub(super) fn spawn_set_primary(
+    config: Config,
+    vm: String,
+    project: String,
+    tx: mpsc::Sender<ScanMessage>,
+) {
+    let thread_tx = tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("hegn-vm-primary".into())
+        .spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let store = VmStore::new(&config);
+                let mut config_vm = store.load(&vm)?;
+                let registry = ProjectRegistry::load(&config.state_dir)?;
+                let entry = registry
+                    .get(&project)
+                    .ok_or_else(|| anyhow::anyhow!("unknown project '{project}'"))?;
+                if entry.vm.as_deref() != Some(vm.as_str()) {
+                    anyhow::bail!("project '{project}' is not assigned to VM '{vm}'");
+                }
+                if entry.kind == ProjectKind::Worktree {
+                    anyhow::bail!("project '{project}' is a worktree and rides its parent's share");
+                }
+                config_vm.primary = Some(project.clone());
+                store.save(&config_vm)?;
+                Ok(())
+            })();
+            let (note, level) = match result {
+                Ok(()) => (
+                    format!("VM {vm} primary is now {project}; apply to restart"),
+                    ToastLevel::Info,
+                ),
+                Err(err) => (format!("set primary failed: {err:#}"), ToastLevel::Error),
+            };
+            let _ = thread_tx.send(ScanMessage::VmsChanged { note, level });
+        });
+    if let Err(err) = spawned {
+        let _ = tx.send(ScanMessage::VmsChanged {
+            note: format!("could not start the primary thread: {err}"),
+            level: ToastLevel::Error,
+        });
+    }
+}
+
+pub(super) fn spawn_fork_workspace(
+    config: Config,
+    parent: String,
+    name: String,
+    mode: ForkMode,
+    tx: mpsc::Sender<ScanMessage>,
+) {
+    let thread_tx = tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("hegn-fork-workspace".into())
+        .spawn(move || {
+            let result = (|| -> anyhow::Result<String> {
+                let store = VmStore::new(&config);
+                let mut registry = ProjectRegistry::load(&config.state_dir)?;
+                let service = WorkspaceService::new(&config, &store);
+                let entry = service.fork(&mut registry, &parent, &name, mode, None)?;
+                Ok(entry.path.display().to_string())
+            })();
+            let (note, level) = match result {
+                Ok(path) => {
+                    let verb = match mode {
+                        ForkMode::Clone => "clone",
+                        ForkMode::Worktree => "worktree",
+                    };
+                    (format!("created {verb} {name} at {path}"), ToastLevel::Info)
+                }
+                Err(err) => (format!("fork failed: {err:#}"), ToastLevel::Error),
+            };
+            let _ = thread_tx.send(ScanMessage::VmsChanged { note, level });
+        });
+    if let Err(err) = spawned {
+        let _ = tx.send(ScanMessage::VmsChanged {
+            note: format!("could not start the fork thread: {err}"),
+            level: ToastLevel::Error,
+        });
+    }
+}
+
+pub(super) fn spawn_delete_vm(
+    config: Config,
+    vm: String,
+    delete_files: bool,
+    tx: mpsc::Sender<ScanMessage>,
+) {
+    let thread_tx = tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("hegn-delete-vm".into())
+        .spawn(move || {
+            let result = (|| -> anyhow::Result<String> {
+                let registry = VmRegistry::new(config.clone());
+                let (worktrees, clones) = vm_workspace_entries(&config, &vm)?;
+                let outcome = registry.delete(&vm, delete_files)?;
+                let mut projects = ProjectRegistry::load(&config.state_dir)?;
+                for name in worktrees.iter().chain(clones.iter()) {
+                    projects.remove(name)?;
+                }
+                Ok(match (&outcome.kept_workspace, delete_files) {
+                    (Some(path), _) => {
+                        format!("VM {vm} removed; workspaces kept at {}", path.display())
+                    }
+                    (None, true) => format!("VM {vm} and its managed workspaces deleted"),
+                    (None, false) => format!("VM {vm} removed; files kept"),
+                })
+            })();
+            let (note, level) = match result {
+                Ok(note) => (note, ToastLevel::Info),
+                Err(err) => (format!("delete VM failed: {err:#}"), ToastLevel::Error),
+            };
+            let _ = thread_tx.send(ScanMessage::VmsChanged { note, level });
+        });
+    if let Err(err) = spawned {
+        let _ = tx.send(ScanMessage::VmsChanged {
+            note: format!("could not start the VM delete thread: {err}"),
+            level: ToastLevel::Error,
+        });
+    }
+}
+
+/// Managed clone and worktree entries of a VM, in removal order.
+fn vm_workspace_entries(config: &Config, vm: &str) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let registry = ProjectRegistry::load(&config.state_dir)?;
+    let mut worktrees = Vec::new();
+    let mut clones = Vec::new();
+    for entry in registry.entries() {
+        if entry.vm.as_deref() != Some(vm) {
+            continue;
+        }
+        match entry.kind {
+            ProjectKind::Worktree => worktrees.push(entry.name.clone()),
+            ProjectKind::Clone => clones.push(entry.name.clone()),
+            ProjectKind::External => {}
+        }
+    }
+    Ok((worktrees, clones))
+}
+
 /// Follow the session log while cloud-init installs the harness preset.
 ///
 /// The watcher never owns the console socket; it only reads the relay's log, so
 /// the user can attach immediately and still see the progress notification.
-fn spawn_provision_watch(
-    log: std::path::PathBuf,
-    plan: ProvisionPlan,
-    tx: mpsc::Sender<ScanMessage>,
-) {
+fn spawn_provision_watch(log: PathBuf, plan: ProvisionPlan, tx: mpsc::Sender<ScanMessage>) {
     let spawned = std::thread::Builder::new()
         .name("hegn-provision-watch".into())
         .spawn(move || {
@@ -339,27 +618,361 @@ fn spawn_provision_watch(
 mod tests {
     use super::*;
 
+    fn config(dir: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.projects_root = dir.join("projects");
+        config.state_dir = dir.join("state");
+        config.snapshots_dir = dir.join("snapshots");
+        config.templates_dir = dir.join("templates");
+        config.vms_dir = dir.join("vms");
+        config.profiles_dir = dir.join("profiles");
+        config.kernel_image = dir.join("missing-kernel");
+        config.rootfs_image = dir.join("missing-rootfs");
+        std::fs::create_dir_all(&config.projects_root).unwrap();
+        config
+    }
+
     #[test]
     fn vm_start_runs_off_the_ui_thread_and_reports_failure() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.projects_root = dir.path().join("projects");
-        config.state_dir = dir.path().join("state");
-        config.snapshots_dir = dir.path().join("snapshots");
-        config.templates_dir = dir.path().join("templates");
-        config.instances_dir = dir.path().join("instances");
-        config.profiles_dir = dir.path().join("profiles");
-        config.kernel_image = dir.path().join("missing-kernel");
-        config.rootfs_image = dir.path().join("missing-rootfs");
-        std::fs::create_dir_all(&config.projects_root).unwrap();
+        let config = config(dir.path());
         let project = config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
 
         let (tx, rx) = mpsc::channel();
-        spawn_start(config, project, Harness::Shell, tx);
+        spawn_start_vm(config, "missing".into(), Some(project), tx);
         let message = rx
             .recv_timeout(Duration::from_secs(2))
             .expect("worker did not report a result");
         assert!(matches!(message, ScanMessage::StartFailed(_)));
+    }
+
+    #[test]
+    fn create_vm_reports_success_and_duplicate_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let (tx, rx) = mpsc::channel();
+        spawn_create_vm(
+            config.clone(),
+            "rust".into(),
+            Harness::Shell,
+            2,
+            2048,
+            vec!["git".into()],
+            tx,
+        );
+        let ScanMessage::VmsChanged { note, level } = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker did not report")
+        else {
+            panic!("expected VmsChanged");
+        };
+        assert_eq!(level, ToastLevel::Info, "{note}");
+        let vm = VmStore::new(&config).load("rust").unwrap();
+        assert_eq!(vm.vcpus, 2);
+        assert!(vm.extra_packages.contains(&"git".to_string()));
+
+        let (tx, rx) = mpsc::channel();
+        spawn_create_vm(
+            config,
+            "rust".into(),
+            Harness::Shell,
+            2,
+            2048,
+            Vec::new(),
+            tx,
+        );
+        let ScanMessage::VmsChanged { level, .. } =
+            rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected VmsChanged");
+        };
+        assert_eq!(level, ToastLevel::Error);
+    }
+
+    #[test]
+    fn assign_and_unassign_project_round_trip_through_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let project = config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        VmStore::new(&config)
+            .save(&VmConfig::from_config(
+                &config,
+                "rust",
+                Some(Harness::Shell),
+            ))
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        spawn_assign_project(
+            config.clone(),
+            "demo".into(),
+            project.clone(),
+            "rust".into(),
+            false,
+            tx,
+        );
+        let ScanMessage::VmsChanged { level, note } =
+            rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected VmsChanged");
+        };
+        assert_eq!(level, ToastLevel::Info, "{note}");
+        assert_eq!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("demo")
+                .unwrap()
+                .vm
+                .as_deref(),
+            Some("rust")
+        );
+
+        let (tx, rx) = mpsc::channel();
+        spawn_unassign_project(config.clone(), "demo".into(), tx);
+        let ScanMessage::VmsChanged { level, note } =
+            rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected VmsChanged");
+        };
+        assert_eq!(level, ToastLevel::Info, "{note}");
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("demo")
+                .unwrap()
+                .vm
+                .is_none()
+        );
+    }
+
+    fn register(app_config: &Config, name: &str, path: &std::path::Path, vm: Option<&str>) {
+        let mut registry = ProjectRegistry::load(&app_config.state_dir).unwrap();
+        registry
+            .upsert(crate::project::ProjectEntry {
+                name: name.into(),
+                path: path.canonicalize().unwrap(),
+                vm: None,
+                read_only: false,
+                kind: ProjectKind::External,
+                parent: None,
+                managed: false,
+                hidden: false,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        if let Some(vm) = vm {
+            registry.assign(name, vm, false).unwrap();
+        }
+    }
+
+    fn save_vm(config: &Config, name: &str, primary: Option<&str>) {
+        let mut vm = VmConfig::from_config(config, name, Some(Harness::Shell));
+        vm.primary = primary.map(str::to_string);
+        VmStore::new(config).save(&vm).unwrap();
+    }
+
+    #[test]
+    fn failed_assign_keeps_the_previous_vm_and_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config(dir.path());
+        config.max_projects_per_vm = 1;
+        save_vm(&config, "one", Some("alpha"));
+        save_vm(&config, "full", Some("beta"));
+        for name in ["alpha", "beta"] {
+            let path = config.projects_root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+        }
+        register(
+            &config,
+            "alpha",
+            &config.projects_root.join("alpha"),
+            Some("one"),
+        );
+        register(
+            &config,
+            "beta",
+            &config.projects_root.join("beta"),
+            Some("full"),
+        );
+
+        let (tx, rx) = mpsc::channel();
+        spawn_assign_project(
+            config.clone(),
+            "alpha".into(),
+            config.projects_root.join("alpha"),
+            "full".into(),
+            false,
+            tx,
+        );
+        let ScanMessage::VmsChanged { level, note } =
+            rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected VmsChanged");
+        };
+        assert_eq!(level, ToastLevel::Error, "{note}");
+        let registry = ProjectRegistry::load(&config.state_dir).unwrap();
+        assert_eq!(
+            registry.get("alpha").unwrap().vm.as_deref(),
+            Some("one"),
+            "the failed move must keep the previous VM"
+        );
+        assert_eq!(
+            VmStore::new(&config)
+                .load("one")
+                .unwrap()
+                .primary
+                .as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            VmStore::new(&config)
+                .load("full")
+                .unwrap()
+                .primary
+                .as_deref(),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn detaching_the_primary_hands_workspace_to_the_next_exported_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        save_vm(&config, "rust", Some("alpha"));
+        for name in ["alpha", "beta"] {
+            let path = config.projects_root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            register(&config, name, &path, Some("rust"));
+        }
+
+        let (tx, rx) = mpsc::channel();
+        spawn_unassign_project(config.clone(), "alpha".into(), tx);
+        let ScanMessage::VmsChanged { level, note } =
+            rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected VmsChanged");
+        };
+        assert_eq!(level, ToastLevel::Info, "{note}");
+        assert!(note.contains("beta"), "{note}");
+        assert_eq!(
+            VmStore::new(&config)
+                .load("rust")
+                .unwrap()
+                .primary
+                .as_deref(),
+            Some("beta")
+        );
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("alpha")
+                .unwrap()
+                .vm
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn detaching_the_last_member_clears_the_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        save_vm(&config, "rust", Some("alpha"));
+        let path = config.projects_root.join("alpha");
+        std::fs::create_dir_all(&path).unwrap();
+        register(&config, "alpha", &path, Some("rust"));
+
+        let (tx, rx) = mpsc::channel();
+        spawn_unassign_project(config.clone(), "alpha".into(), tx);
+        let ScanMessage::VmsChanged { level, note } =
+            rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected VmsChanged");
+        };
+        assert_eq!(level, ToastLevel::Info, "{note}");
+        assert!(note.contains("no exported members"), "{note}");
+        assert!(
+            VmStore::new(&config)
+                .load("rust")
+                .unwrap()
+                .primary
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn detaching_a_worktree_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        save_vm(&config, "rust", None);
+        let parent = config.projects_root.join("parser");
+        let worktree = parent.join(".hegn/worktrees/experiment");
+        std::fs::create_dir_all(&worktree).unwrap();
+        register(&config, "parser", &parent, Some("rust"));
+        let mut registry = ProjectRegistry::load(&config.state_dir).unwrap();
+        registry
+            .upsert(crate::project::ProjectEntry {
+                name: "experiment".into(),
+                path: worktree.canonicalize().unwrap(),
+                vm: Some("rust".into()),
+                read_only: false,
+                kind: ProjectKind::Worktree,
+                parent: Some("parser".into()),
+                managed: false,
+                hidden: false,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        spawn_unassign_project(config.clone(), "experiment".into(), tx);
+        let ScanMessage::VmsChanged { level, note } =
+            rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected VmsChanged");
+        };
+        assert_eq!(level, ToastLevel::Error, "{note}");
+        assert!(note.contains("worktree"), "{note}");
+        assert_eq!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("experiment")
+                .unwrap()
+                .vm
+                .as_deref(),
+            Some("rust")
+        );
+    }
+
+    #[test]
+    fn delete_vm_never_deletes_external_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let project = config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let registry = VmRegistry::new(config.clone());
+        registry
+            .ensure_for_project(&project, Harness::Shell)
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        spawn_delete_vm(config.clone(), "demo".into(), true, tx);
+        let ScanMessage::VmsChanged { level, note } =
+            rx.recv_timeout(Duration::from_secs(3)).unwrap()
+        else {
+            panic!("expected VmsChanged");
+        };
+        assert_eq!(level, ToastLevel::Info, "{note}");
+        assert!(project.is_dir(), "external projects must survive");
+        assert!(!config.vms_dir.join("demo").exists());
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("demo")
+                .unwrap()
+                .vm
+                .is_none()
+        );
     }
 }

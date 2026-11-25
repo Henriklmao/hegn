@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// How the instance is selected when a project is opened.
+/// How the VM is selected when a project is opened.
 ///
 /// Both modes require a real Cloud Hypervisor VM. There is no local-shell
 /// fallback: a missing VM is always a hard error.
@@ -50,7 +50,7 @@ impl RootfsFormat {
     }
 }
 
-/// A coding harness that can be launched inside the instance.
+/// A coding harness that can be launched inside the VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[value(rename_all = "kebab-case")]
@@ -274,7 +274,7 @@ impl LocalEndpoint {
         name
     }
 
-    /// URL the guest uses. `host` is the instance's TAP host address.
+    /// URL the guest uses. `host` is the VM's TAP host address.
     pub fn url(&self, host: std::net::Ipv4Addr) -> String {
         format!("http://{host}:{}", self.port)
     }

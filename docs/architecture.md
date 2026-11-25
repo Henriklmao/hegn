@@ -8,8 +8,9 @@ cost and storage figures live in [`resources.md`](resources.md).
 `hegn` is a Linux-only Rust application that runs coding agents inside
 Cloud Hypervisor VMs. The host process never runs project work itself. Every
 terminal, shell and agent session is attached to a real Cloud Hypervisor guest
-serial console. Multiple instances can run at the same time; each one owns its
-configuration, runtime directory, serial log and private root filesystem.
+serial console. Multiple VMs can run at the same time; each one owns its
+configuration, runtime directory, serial log and private root filesystem. A VM
+hosts one or more projects, each exported by its own sandboxed `virtiofsd`.
 
 ---
 
@@ -18,9 +19,9 @@ configuration, runtime directory, serial log and private root filesystem.
 1. **Hardware isolation first.** A missing VM is a hard error. There is no
    host shell, local PTY, container or "temporary" fallback anywhere in the
    codebase.
-2. **Fail closed.** Binaries, images and the project directory are checked
-   before any child process is spawned. Partial failures are cleaned up rather
-   than left running.
+2. **Fail closed.** Binaries, images, the VM profile, the registry and every
+   member directory are checked before any child process is spawned. Partial
+   failures are cleaned up rather than left running.
 3. **No silent bypasses.** Input paths that skip `tirith-core` are visibly
    labelled (`INPUT DIRECT`). Unverified image downloads require an
    explicit flag.
@@ -39,51 +40,55 @@ configuration, runtime directory, serial log and private root filesystem.
 │                                                                            │
 │  hegn CLI / TUI                                                            │
 │    ├── security.rs ── tirith-core (in-memory inspection)                  │
-│    ├── project.rs  ── ~/Projects/hegn (picker + import symlinks)          │
-│    ├── instance.rs  ── lifecycle, lock, session record                     │
+│    ├── project/    ── ~/Projects/hegn picker, registry, forks              │
+│    ├── vm/manager  ── lifecycle, lock, membership, session record          │
+│    │     ├── vm/config      ── vm.toml, VmStore                            │
+│    │     ├── project/registry ── private membership and read-only flags    │
 │    │     ├── cloud_hypervisor.rs ── REST over unix socket                 │
-│    │     ├── virtiofs.rs    ── virtiofsd argv/process                     │
+│    │     ├── virtiofs.rs    ── one sandboxed daemon per exported project   │
 │    │     ├── relay.rs       ── detached serial relay + persistent log     │
-│    │     ├── cloud_init.rs  ── NoCloud seed for official images           │
+│    │     ├── cloud_init.rs  ── NoCloud seed with N mounts + /workspace     │
 │    │     ├── profile.rs     ── profiles + copied skill bundles            │
-│    │     ├── instance_config.rs ── hegn.toml, clones, rootfs copies        │
+│    │     ├── project/workspace ── clones and nested worktrees             │
 │    │     ├── console.rs     ── relay socket + attach bar                  │
-│    │     ├── attach_bar.rs  ── pinned status bar + output gate            │
-│    │     ├── snapshot.rs    ── snapshot metadata                          │
+│    │     ├── snapshot/      ── fingerprint, metadata, restore planning    │
 │    │     └── logs.rs        ── private logs, tail and pruning             │
 │    ├── images.rs ── upstream kernel/rootfs download + SHA-256             │
 │    └── doctor.rs ── shared prerequisite checks                            │
 │                                                                            │
-│  virtiofsd (sandboxed, one project) ◄──── shared project directory         │
+│  virtiofsd (sandboxed, member 0) ◄──── project A directory                 │
+│  virtiofsd (sandboxed, member 1) ◄──── project B directory                 │
 │  Cloud Hypervisor ── /dev/kvm, API/serial sockets, seccomp + Landlock     │
 │        └── guest serial console ── agent / shell                          │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The guest sees exactly one project directory through virtiofsd, plus an optional
-second share containing only the instance's private profile/skill copy. The host
-sees control sockets, logs and metadata. By default the guest also gets a guarded
-TAP device from `hegn network setup`: public HTTP(S) and public DNS only, with
-no route into the host or the local network. `network = "off"` removes the NIC
-entirely.
+The guest sees one mount per exported project below `/projects`, a guest-side
+`/workspace` symlink to the VM's primary project, and an optional share
+containing only the VM's private profile/skill copy. The host sees control
+sockets, logs and metadata. By default the guest also gets a guarded TAP device
+from `hegn network setup`: public HTTP(S) and public DNS only, with no route into
+the host or the local network. `network = "off"` removes the NIC entirely.
 
 ### 2.1 Native virtio-fs and VMM hardening
 
-Cloud Hypervisor implements virtio-fs natively. hegn passes the workspace as
-`--fs tag=<tag>,socket=<virtiofsd socket>` together with
-`--memory size=<MiB>M,shared=on`; no patched VMM build is required.
+Cloud Hypervisor implements virtio-fs natively. hegn passes one
+`--fs tag=<tag>,socket=<virtiofsd socket>` per exported project together with
+`--memory size=<MiB>M,shared=on`; no patched VMM build is required. Tags are
+index-based (`<share_tag_prefix>-<i>`), so the device order is stable even when a
+project is renamed.
 
 The VMM is always launched with seccomp filters and Landlock; there is no
 configuration switch to disable either layer. Landlock restricts the VMM's
 filesystem view to the kernel, the
-disks, the serial socket, the virtio-fs socket and a dedicated snapshot
+disks, the serial socket, the virtio-fs sockets and a dedicated snapshot
 staging directory. When a guarded-network TAP is passed, hegn adds a
-read-only rule for that instance's TAP directory
+read-only rule for that VM's TAP directory
 (`/sys/devices/virtual/net/<tap>`): Cloud Hypervisor checks an existing TAP's
 multiqueue support through that sysfs path before opening it, and its own
 ruleset only grants `/dev/net/tun`. Without the rule the VMM fails with
 `ReadSysfsTunFlags`/`EACCES` while creating virtio-net. Other host interfaces
-and the rest of `/sys` stay invisible to the VMM. `virtiofsd`
+and the rest of `/sys` stay invisible to the VMM. Each `virtiofsd`
 independently runs with `--sandbox=namespace` (or `chroot`) and `--cache=never`.
 A finished snapshot is moved out of the staging directory and its files are
 tightened to `0600`, so the VMM never gets write access to completed
@@ -100,45 +105,53 @@ A running session consists of:
 | Process | Purpose | Lifetime |
 | --- | --- | --- |
 | `hegn` CLI/TUI | UI, orchestration, guardrails, API calls | Foreground; may exit while VM continues |
-| `virtiofsd` | Exports exactly `session.project` under `--sandbox=namespace` (or `chroot`) | Until `instance stop` / restore |
-| `cloud-hypervisor` | KVM VMM | Until `instance stop` / restore / guest exit |
-| `hegn __console-relay` | Serial socket client, persistent log, attach socket | Until the VMM exits or `instance stop` |
+| `virtiofsd` (one per member) | Exports exactly one canonical project directory under `--sandbox=namespace` (or `chroot`) | Until `vm stop` / restore |
+| `cloud-hypervisor` | KVM VMM | Until `vm stop` / restore / guest exit |
+| `hegn __console-relay` | Serial socket client, persistent log, attach socket | Until the VMM exits or `vm stop` |
+| `hegn __autosnapshot` | Detached periodic checkpoint worker | Until `vm stop` / VMM exit |
 
-There is one `virtiofsd`, one `cloud-hypervisor` and one relay per instance. The
-registry in `instance.rs` starts, lists, stops and deletes independent instances.
+There is one `virtiofsd` per exported project, one `cloud-hypervisor` and one
+relay per VM. `VmRegistry` starts, lists, stops and deletes independent VMs; the
+project registry supplies the member list. Worktrees are members but are not
+exported, so they do not add a daemon.
 
 The CLI deliberately lets `virtiofsd`, Cloud Hypervisor and the console relay
 outlive itself. It forgets the `Child` handles only after the session record is
-written; on any error before that point it kills the children and removes the
-run files.
+written; on any error before that point it kills every child started for the VM
+and removes the run files.
 
 ### 3.2 Run directory
 
-Each instance has its own runtime directory below `instances_dir/<name>/run`; the
-legacy single-session `state_dir/run` is only used for pre-multi-instance state:
+Each VM has its own runtime directory below `vms_dir/<name>/run`:
 
 ```text
-<state>/run/
+<vms_dir>/<vm>/run/
   cloud-hypervisor.sock  Cloud Hypervisor REST API socket
   serial.sock            Cloud Hypervisor guest serial socket
   console.sock           relay socket used by the TUI / hegn attach
-  virtiofs.sock          virtiofsd vhost-user socket (project)
+  virtiofs-<i>.sock      virtiofsd vhost-user socket for member i
   profile-virtiofs.sock  virtiofsd vhost-user socket (profile/skill copy)
   cloud-hypervisor.pid   last known VMM pid
   console-relay.pid      last known relay pid
-  virtiofs.pid           last known virtiofsd pid
+  virtiofs-<i>.pid       last known virtiofsd pid for member i
   profile-virtiofs.pid   last known profile virtiofsd pid
+  autosave.pid           last known checkpoint worker pid
   session.json           SessionRecord
+  membership.json        exported members of the running boot
   cloud-hypervisor.log   VMM log
   console-relay.log      relay stderr (startup failures only)
+  autosave.log           checkpoint worker stderr
   hegn.log               lifecycle/start diagnostics (timestamped, mode 0600)
   hegn.lock              flock for lifecycle operations
-  cloud-init.img         per-instance NoCloud seed (no secrets)
+  cloud-init.img         per-VM NoCloud seed (no secrets)
 ```
 
 `run/` is created with mode `0700`. All sockets live inside it; the relay
 socket is additionally `0600`. The cloud-init seed is `0600` and contains only
-public boot configuration.
+public boot configuration. `membership.json` is `0600`, written atomically, and
+lists the tag, path, guest path, read-only flag and kind of every exported
+member. `stop` kills daemons from that manifest, and `attach` compares it with
+the registry.
 
 ### 3.3 Persistent log
 
@@ -150,7 +163,7 @@ public boot configuration.
 The log is created before Cloud Hypervisor starts, mode `0600`, with
 `O_NOFOLLOW | O_CREAT | O_EXCL`. The detached relay is the only client of the
 VMM serial socket and appends every byte to this file. On attach it replays the
-tail of the log and then streams live output, so `instance stop` leaves a
+tail of the log and then streams live output, so `vm stop` leaves a
 complete log for `hegn logs`.
 
 Logs may contain secrets printed by an agent. They are never uploaded, and
@@ -164,13 +177,14 @@ never the log of the running session.
 | --- | --- | --- |
 | `~/.config/hegn/config.toml` | User config | user default |
 | `~/.config/hegn/templates/` | `AGENTS.md` templates | user default |
-| `~/.local/state/hegn/instances/<name>/run/` | Sockets, cloud-init seed, session record, pids (relay, autosave), lock | `0700` |
+| `~/.local/state/hegn/projects.toml` | Private project registry: membership, read-only, kind, lineage | `0600`, lock file beside it |
 | `~/.local/state/hegn/logs/` | Persistent serial logs | `0700`, files `0600` |
 | `~/.local/state/hegn/state.json` | Recent projects / last project | user default |
 | `~/.local/share/hegn/snapshots/` | Completed snapshots (`config.json`, `state.json`, `memory-ranges`, `snapshot.json`) | `0700`, files `0600` |
 | `~/.local/share/hegn/snapshots/.staging/` | The only snapshot path the VMM may write | `0700` |
-| `~/.local/share/hegn/instances/<name>/` | `hegn.toml`, `run/`, private rootfs, clone workspace | `0700` |
-| `~/.local/share/hegn/instances/<name>/hegn.toml` | Per-instance settings | `0600` |
+| `~/.local/share/hegn/vms/<name>/` | `vm.toml`, `run/`, private rootfs, managed workspaces | `0700` |
+| `~/.local/share/hegn/vms/<name>/vm.toml` | Per-VM tool profile and policy | `0600` |
+| `~/.local/share/hegn/vms/<name>/workspaces/<name>/` | hegn-managed clone checkouts | `0700` |
 | `~/.local/share/hegn/images/` | Kernel and rootfs | files `0600` |
 | `~/Projects/hegn/` | Projects and import symlinks | user default |
 
@@ -185,20 +199,22 @@ All state paths can be overridden in `config.toml` or by environment variables
 | --- | --- | --- |
 | `cli/` | Clap command surface, per-command modules, JSON/text output, exit codes | Every TUI operation has a CLI counterpart; no fallback paths |
 | `config/` | Schema, defaults, env overrides, validation, XDG paths, tool lookup; `form/` is the interactive settings editor | Unknown keys rejected; SHA-256 and HTTPS URL validation; log dir `0700`; `virtiofsd` resolved via `PATH` then distribution dirs; writes are validated and installed with an atomic tmp+rename; form edits a validated working copy and never touches disk before `Ctrl-S` |
-| `project/` | Discovery, removal, fuzzy filter, git summaries, create, import, checkpoints | Import only creates a symlink; dangerous targets rejected; discovery skips links to `/`, `$HOME` and root ancestors; deletion is limited to direct children of `projects_root` and never follows import links |
-| `security/` | `tirith-core` integration and hegn workspace rules | Empty commands allowed; off mode disables tirith but still detects and warns about destructive workspace operations |
-| `network/` | Guarded host network: TAP pool reservation, nftables rules, setup marker, privileged setup scripts | Root-only marker; anti-spoof; private/IPv6/guest-to-host drop; HTTP(S)+public DNS allow-list; per-instance `/30` slice; stale reservations reclaimed only when the owning VM is not running; opt-in loopback endpoints are DNATed per TAP with `route_localnet` and cannot write; TAP pool exempted from ufw/firewalld/iptables routed policies because netfilter applies every `forward` base chain |
+| `project/` | Discovery, create, import, git summaries, registry, deletion policy | The registry is private and authoritative; import only creates a symlink; dangerous targets rejected; direct picker entries are deleted only as direct children of `projects_root`, while registry-only External projects outside it require `--delete-files` and are re-validated as safe export sources first; import links are never followed |
+| `project/registry.rs` | Private `<state_dir>/projects.toml`: membership, read-only, kind, lineage, validation | `0600`, `O_NOFOLLOW`, atomic writes, `flock` for writers; unique names and canonical paths; no ancestor/descendant except a named nested worktree; `max_projects_per_vm`; worktrees inherit their parent's VM |
+| `project/workspace.rs` | Clone and worktree forks | Clone is default and lives at `<vms_dir>/<vm>/workspaces/<name>`; clone target verified as a real `.git` directory at the parent HEAD; worktree must be a real `git worktree` inside its writable parent; deletion uses `git worktree remove` or a checked managed path |
+| `security/` | `tirith-core` integration and hegn workspace rules | Empty commands allowed; off mode disables tirith but still detects and warns about destructive workspace operations; every `/projects/*` root and `/workspace` is a workspace root |
+| `network/` | Guarded host network: TAP pool reservation, nftables rules, setup marker, privileged setup scripts | Root-only marker; anti-spoof; private/IPv6/guest-to-host drop; HTTP(S)+public DNS allow-list; per-VM `/30` slice; stale reservations reclaimed only when the owning VM is not running; opt-in loopback endpoints are DNATed per TAP with `route_localnet` and cannot write; TAP pool exempted from ufw/firewalld/iptables routed policies because netfilter applies every `forward` base chain |
 | `vm/hypervisor/` | Typed REST client over `/api/v1` and HTTP framing | Frames responses by `Content-Length`/chunked encoding, accepts bodyless `204`, bounded response sizes, pause/resume/info/snapshot only |
 | `vm/cloud_init/` | NoCloud seed generation, user-data rendering and endpoint env | FAT volume labelled `CIDATA`; serial root autologin; first-boot provisioner and guest network config; no secrets; `0600` and `O_NOFOLLOW` |
-| `vm/rootfs/` | Per-instance disk growth | Extends raw images sparsely and grows qcow2 virtual size in place; `qemu-img` fallback for unsupported layouts |
+| `vm/rootfs/` | Per-VM disk growth | Extends raw images sparsely and grows qcow2 virtual size in place; `qemu-img` fallback for unsupported layouts |
 | `vm/images/` | Upstream asset pins, streaming download, SHA-256 install/verify | HTTPS only, no credentials in the URL, HTTPS-to-HTTP redirects refused; checksum before rename; no overwrite without `--force` |
 | `agent/launch/` | Configurable agent launch commands and terminal integrations | Commands are validated and typed into the guest; `auto` prefers herdr, then tmux, then the current terminal; tmux/herdr run `hegn attach`, never a host agent |
-| `agent/profile/` | Per-harness profile templates, guest payload materialization, skill sync | Source/target/mode/env validation; config files refreshed every start; skills seeded once into a private per-instance copy; a second sandboxed virtiofsd exports only that copy; sync-back copies regular files and skips symlinks/special files |
+| `agent/profile/` | Per-harness profile templates, guest payload materialization, skill sync | Source/target/mode/env validation; config files refreshed every start; skills seeded once into a private per-VM copy; a second sandboxed virtiofsd exports only that copy; sync-back copies regular files and skips symlinks/special files |
 | `agent/provision/` | Harness preset install plans and first-boot script | Preset packages are always unioned; package names validated; only static install commands; waits for DNS, retries apt, emits serial progress stages and verifies the CLI before writing the marker |
-| `vm/virtiofs/` | virtiofsd argv/process construction | Shared dir canonicalized; always sandboxed; `--cache=never` by default; sockets scoped to run dir |
-| `vm/instance_config/` | Per-instance `hegn.toml`, clone/copy workspaces, rootfs copies | Names validated; source project never deleted; git identity copied; clone child output is captured (warnings go to the UI, never the terminal); reflink rootfs with copy fallback |
-| `vm/instance/` | VM lifecycle, registry, lock, session record, status, snapshots | One lifecycle lock per instance; preflight before spawn; hardened VMM argv; cleanup on every error path; registry lists/starts/deletes independent instances |
-| `session/snapshot/` | Snapshot metadata store | Sanitized names; private dirs/files; atomic-ish metadata writes |
+| `vm/virtiofs/` | virtiofsd argv/process construction | One daemon per exported member; shared directory canonicalized; always sandboxed; `--cache=never` by default; indexed sockets scoped to the VM run dir |
+| `vm/config/` | `vm.toml` model and `VmStore` | Version 2; unknown keys rejected; name becomes a path component and is validated; `0600`, `O_NOFOLLOW`, atomic writes; one config per `<vms_dir>/<name>` |
+| `vm/manager/` | VM lifecycle, registry, lock, boot plan, membership manifest, session record, snapshots | One lifecycle lock per VM; registry validation and member preflight before spawn; one `--fs` per exported member; every error path kills all daemons; duplicate cross-VM export refused; explicit rootfs images unique |
+| `session/snapshot/` | Snapshot metadata, v2 boot fingerprint, restore selection | Sanitized names; private dirs/files; atomic metadata writes; legacy snapshots visible but never restored, auto-selected or pruned; manual restore refuses a fingerprint mismatch |
 | `diagnostics/doctor/` | Shared host checks and automatic setup planning for CLI and TUI | Required vs optional checks; `SetupActions` covers directories, default config, profile templates, pinned images and the guarded network; `hegn doctor --fix` and the TUI `s` action are idempotent |
 | `diagnostics/benchmark/` | Measured host cost: process RSS, disk usage, snapshot estimate; boots a VM only when asked | Refuses to delete anything outside its own `hegn-benchmark-*` projects; sparse-aware accounting; JSON output |
 | `session/console/` | Serial transport over the relay socket, tmux-style attach, status bar | Never pretends a VM exists; verifies VMM and relay; bar content sanitized; `--no-bar` for full-screen guests |
@@ -216,48 +232,60 @@ All state paths can be overridden in `config.toml` or by environment variables
 
 ## 5. Lifecycle flows
 
-### 5.1 Boot (`hegn open`, `hegn instance start`, TUI open)
+### 5.1 Boot (`hegn open`, `hegn vm start`, TUI open)
 
-1. Load and validate config and the instance's `hegn.toml`.
-2. Preflight: workspace exists, base kernel/rootfs exist, Cloud Hypervisor and
-   virtiofsd binaries resolve, KVM and Landlock available.
-3. Take the instance's exclusive `run/hegn.lock`. A second lifecycle operation on
-   the same instance fails fast; other instances are independent.
-4. If a stale session exists, clean up its run files and any verified children.
-5. Create the session log (`LogStore::create_session`); prune old logs
-   best-effort. Give the instance a private rootfs copy on first start (reflink or
+1. Resolve the selector: a project to its `vm` assignment, or an explicit VM
+   name. Load `config.toml`, `<vms_dir>/<vm>/vm.toml` and the private registry.
+2. Build the ordered boot plan from `registry.exported_members(vm)`, sorted by
+   canonical path. Validate unique names and paths, nesting, worktree parents,
+   `primary`, `max_projects_per_vm`, and every member's export safety. An empty
+   VM, a missing member or a duplicate export is a hard error.
+3. Preflight every binary, image **and every member directory**; check KVM and
+   Landlock; ensure no other running VM exports the same canonical path; check
+   that an explicit `rootfs_image` is unique.
+4. Take the VM's exclusive `run/hegn.lock`. A second lifecycle operation on the
+   same VM fails fast; other VMs are independent.
+5. If a stale session exists, clean up its run files and any verified children.
+6. Create the session log (`LogStore::create_session`); prune old logs
+   best-effort. Give the VM a private rootfs copy on first start (reflink or
    full copy) and extend it to a 16 GiB sparse virtual size so the first-boot
    package installation has room. qcow2 images get a larger L1 table without
    rewriting existing clusters.
-6. Materialize the harness profile into
-   `<instance>/profile/bundle`: refresh configuration files and environment from
-   the host, keep existing skill copies, and compute the manifest id. Missing
-   optional profile sources only produce a `run/hegn.log` warning.
-7. With `network = "guarded"`, require the root-owned
-   `/run/hegn/network.json` marker and reserve a TAP slice. The instance's
+7. Materialize the harness profile into `<vm>/profile/bundle`: refresh
+   configuration files and environment from the host, keep existing skill
+   copies, and compute the manifest id. Missing optional profile sources only
+   produce a `run/hegn.log` warning. Profile presence is part of the boot
+   fingerprint.
+8. If the newest automatic checkpoint's boot fingerprint matches, restore it.
+   Otherwise log why it was skipped and cold boot.
+9. With `network = "guarded"`, require the root-owned
+   `/run/hegn/network.json` marker and reserve a TAP slice. The VM's
    `network_index` is persisted so later boots and snapshot restores keep the
    same device.
-8. Spawn `virtiofsd` with the canonical project path and wait for its socket.
-   When the profile carries files, skills or environment, spawn a second,
-   equally sandboxed `virtiofsd` for `profile/bundle`.
-9. Write the NoCloud seed when `cloud_init = true`. It enables serial root
-   autologin, mounts the virtio-fs tag at `guest_mount` (`/workspace` by
-   default) and the profile copy at `/run/hegn/profile`, installs the harness
-   preset through a oneshot service (which re-applies the profile on every
-   boot), and (when guarded) configures the TAP address/DNS by MAC match.
-10. Spawn Cloud Hypervisor with an explicit, hardened argv: `--api-socket`,
+10. Write the NoCloud seed when `cloud_init = true`. It enables serial root
+    autologin, renders one mount per exported project below
+    `guest_projects_base` (`/projects` by default), links `/workspace` to the
+    primary project, mounts the profile copy at `/run/hegn/profile`, installs
+    the harness preset through a oneshot service (which re-applies the profile
+    on every boot), and (when guarded) configures the TAP address/DNS by MAC
+    match.
+11. Spawn one sandboxed `virtiofsd` per exported member on its indexed socket
+    (`virtiofs-<i>.sock`), plus the optional profile daemon, and wait for each
+    socket.
+12. Spawn Cloud Hypervisor with an explicit, hardened argv: `--api-socket`,
     `--kernel`, `--disk` (rootfs + optional seed), `--cpus`, `--memory ...
-    shared=on`, one or two `--fs` devices, optional `--net tap=hegnN,mac=...`,
-    `--serial socket=...`, `--console off`, `--seccomp` and `--landlock`.
-11. Spawn the detached relay; it connects to the serial socket and appends to
+    shared=on`, one `--fs` per exported member plus the optional profile
+    device, optional `--net tap=hegnN,mac=...`, `--serial socket=...`,
+    `--console off`, `--seccomp` and `--landlock`.
+13. Spawn the detached relay; it connects to the serial socket and appends to
     the session log. Its stderr goes to `run/console-relay.log`. If the relay or
     the VMM exits before the attach socket exists, the start error names the
     real cause and includes the last log lines instead of blaming the relay.
-12. Wait until `/api/v1/vm.info` reports `Running`.
-13. Write the pid files and `session.json`; release the lock. The children keep
-    running.
+14. Wait until `/api/v1/vm.info` reports `Running`. Write the pid files,
+    `membership.json` and `session.json`; start the autosave worker; release the
+    lock. The children keep running.
 
-On any failure the VMM, relay and daemon are killed and run links are removed,
+On any failure every daemon and the VMM are killed and run links are removed,
 but the session serial log is kept and `run/hegn.log` receives a timestamped
 diagnostic line. The CLI error repeats the `hegn.log` path. A failure to record
 the session tears the VM down instead of leaking an unmanageable process.
@@ -266,11 +294,14 @@ remain available.
 
 ### 5.2 Attach (`hegn attach`, `hegn a`, `hegn open`)
 
-1. Read `session.json`; fail if missing.
+1. Resolve a VM name, or a project name to its VM. Read `session.json`; fail if
+   missing.
 2. Verify the recorded VMM pid is alive **and** still runs the configured
    Cloud Hypervisor binary (`/proc/<pid>/cmdline`).
 3. Verify the recorded relay pid still runs the internal relay command.
-4. If a project argument was given, resolve it and compare canonical paths.
+4. Compare the boot-time `membership.json` with the registry. A difference is a
+   warning, not a repair: the running VM keeps its boot-time shares until
+   `hegn vm apply`.
 5. Connect to `console.sock`. The relay replays the log tail, then forwards
    input and live output.
 6. Enter the alternate screen, reserve the bottom line with DECSTBM, and
@@ -284,11 +315,11 @@ Attach never boots, restarts or repairs a VM.
 ### 5.3 Stop
 
 1. Take `hegn.lock`.
-2. Resolve VMM, relay, project virtiofsd and profile virtiofsd pids from
-   `session.json` / pid files.
+2. Resolve the VMM, relay, autosave worker, every member `virtiofsd` from
+   `membership.json`, and the profile virtiofsd from `session.json` / pid files.
 3. Send `SIGTERM` only when the pid still matches the expected binary/relay
    command, wait up to two seconds, then `SIGKILL` under the same check.
-4. Remove run files. The session log stays.
+4. Remove run files. The session log and every workspace stay.
 
 ### 5.4 Snapshot create / restore
 
@@ -300,23 +331,25 @@ Create:
    `snapshots_dir/.staging/<name>`.
 4. Tighten the files, atomically rename the directory into `snapshots_dir`, and
    record metadata with `SnapshotStore` (the directory holds `config.json`,
-   `state.json` and `memory-ranges`).
+   `state.json` and `memory-ranges`). Metadata records the VM, the exported
+   membership and the `boot_fingerprint` over membership and boot inputs.
 5. Always attempt to resume; if saving metadata fails, remove the snapshot
    directory and resume.
 
 Automatic checkpoints:
 
-1. `start` and `restore` spawn a detached `hegn __autosnapshot --instance <name>`
+1. `start` and `restore` spawn a detached `hegn __autosnapshot --vm <name>`
    worker (`run/autosave.pid`).
 2. Every `snapshot_interval_secs` it verifies the API reports `Running`
    (never resuming a deliberately paused VM), creates a snapshot tagged
-   `autosave`, and prunes older automatic snapshots beyond `snapshot_keep`.
+   `autosave`, and prunes older automatic snapshots beyond `snapshot_keep` for
+   that VM.
 3. The worker exits when the VMM disappears; `stop` and stale-session cleanup
    terminate it by verified pid.
-4. `start` looks up the newest restorable automatic checkpoint for the instance
-   and restores it before a cold boot. Manual snapshots are never selected. A
-   failed auto-resume is recorded in `run/hegn.log` and falls back to a cold
-   boot.
+4. `start` computes the current fingerprint and selects the newest matching
+   automatic checkpoint. A mismatch, a missing member or a changed resource is
+   logged, never restored, and falls back to a cold boot. Manual snapshots and
+   legacy snapshots are never selected.
 
 The cold-boot command line adds a host-backed `--rng src=/dev/urandom` device.
 The cloud seed installs `hegn-maintenance.service`, which reads the host clock
@@ -326,24 +359,33 @@ A restored guest therefore corrects its clock and reseeds without NTP.
 Restore:
 
 1. Validate the snapshot directory and its `config.json`, `state.json` and
-   `memory-ranges` files, plus the project.
-2. Preflight Cloud Hypervisor/virtiofsd before stopping the current VM.
-3. Take `hegn.lock`; terminate the old VMM, relay and both filesystem daemons.
-4. Prepare the profile and inspect the snapshot's embedded `fs` tags. If the
-   snapshot contains the `hegn-profile` device, restart the profile virtiofsd on
-   the same socket; otherwise restore without it. Regenerate the seed, create a
-   new session log, then start Cloud Hypervisor with
-   `--restore source_url=file://<dir>,resume=true`. Restore repeats
-   `--seccomp true` and `--landlock` (with the snapshot-staging and per-TAP
-   sysfs rules) because the restored VMM is a new process.
-5. Start the relay, wait for the API, write the new session record; on failure
-   kill the children and remove the new log. On success, restart the autosave
-   worker so the next restart can use a newer checkpoint.
+   `memory-ranges` files. Reject a legacy snapshot. Refuse a manual restore
+   whose fingerprint differs and name the changed fields; there is no
+   `--force`.
+2. Validate every recorded member path with the same export rules as a boot.
+3. Preflight Cloud Hypervisor/virtiofsd before stopping the current VM.
+4. Take `hegn.lock`; terminate the old VMM, relay and every filesystem daemon.
+5. Re-spawn one sandboxed `virtiofsd` per recorded member on the same indexed
+   sockets, plus the profile daemon when the snapshot recorded it. Regenerate
+   the seed from the recorded membership, create a new session log, then start
+   Cloud Hypervisor with `--restore source_url=file://<dir>,resume=true`.
+   Restore repeats `--seccomp true` and `--landlock` (with the
+   snapshot-staging and per-TAP sysfs rules) because the restored VMM is a new
+   process.
+6. Start the relay, wait for the API, write the new session record and
+   membership manifest; on failure kill the children and remove the new log. On
+   success, restart the autosave worker so the next restart can use a newer
+   checkpoint.
 
-### 5.5 Project create / import
+### 5.5 Project create, import and assignment
 
 Create writes into `projects_root` (default `~/Projects/hegn`), seeds
-`AGENTS.md`/`README.md`, initializes git and records `hegn.toml`.
+`AGENTS.md`/`README.md`, initializes git, and registers a `ProjectEntry` in
+`<state_dir>/projects.toml`. A repo-local `hegn.toml` is optional and is written
+only when presentation settings are edited. With
+`--vm` it assigns the entry immediately; with `--solo` (or an accepted prompt)
+it creates a one-member VM named after the project and assigns it; otherwise the
+project stays unassigned.
 
 Import:
 
@@ -351,15 +393,29 @@ Import:
 2. Canonicalize the source.
 3. Refuse `/`, `$HOME`, the projects root itself, an ancestor of the root, a
    path already inside the root, and any path that overlaps hegn state,
-   snapshots, templates or config.
+   snapshots, VMs, templates, profiles or config.
 4. Validate the picker name (`validate_project_name`).
 5. Refuse an existing picker entry (including a broken symlink).
 6. Create a symlink `projects_root/<name> -> canonical source`.
+7. Register the canonical target and apply the same `--vm`/`--solo` selection.
 
 No project file is moved, copied or rewritten. Discovery resolves the symlink
 and skips links to `/`, `$HOME`, an ancestor of the projects root, or any path
-overlapping hegn state/snapshots/templates/config, so a manually planted link
+overlapping hegn state/snapshots/VMs/templates/config, so a manually planted link
 cannot export the host filesystem or runtime state through virtiofsd.
+
+`project assign` upserts the entry, sets `vm` and `read_only`, saves the VM's
+`primary` when it had none, and validates the whole registry before returning.
+Any failure rolls the registry and primary back. `project unassign` clears the
+assignment, moves the primary to the next exported member when needed, and keeps
+the VM. A running VM is not modified; it warns until `hegn vm apply`.
+
+`project fork` uses `WorkspaceService`: a clone runs `git clone --local` into
+`<vms_dir>/<vm>/workspaces/<name>`, verifies the `.git` directory and HEAD, and
+registers a managed `clone`. A worktree runs `git worktree add` inside the
+parent, verifies it with `git worktree list`, and registers a non-exported
+`worktree` that inherits the parent's VM. Deleting a clone removes only the
+checked managed path; deleting a worktree uses `git worktree remove`.
 
 ### 5.6 Harness profiles and skills
 
@@ -368,15 +424,15 @@ cannot export the host filesystem or runtime state through virtiofsd.
    agent harness into `profiles_dir` and never overwrites an existing file.
 2. On start, `profile::prepare_for_start` loads `profiles/<harness>.toml`,
    validates every package, source, guest target, mode and environment entry,
-   and materializes `<instance>/profile/bundle/`.
+   and materializes `<vm>/profile/bundle/`.
 3. Configuration files are copied fresh on every start. Skills are seeded only
-   when their per-instance copy does not exist; later starts keep the copy so
+   when their per-VM copy does not exist; later starts keep the copy so
    guest-created skills survive reboots and can be synced back.
 4. The bundle carries a tab-separated `manifest`, an `env.sh`, and the copies.
    The host-side mapping (`local.json`) stays outside the exported directory.
 5. A second `virtiofsd` exports only `bundle/` at `/run/hegn/profile`. The
    guest's `/usr/local/sbin/hegn-apply-profile` copies config files, points
-   each skill target at the per-instance copy, and installs `env.sh` in
+   each skill target at the per-VM copy, and installs `env.sh` in
    `/etc/profile.d`. The provisioning oneshot runs it on every boot, before its
    install marker check.
 6. The provisioner grows the root partition/filesystem, waits for guest DNS,
@@ -408,7 +464,11 @@ mismatch. `hegn images status` shows path, presence and size.
 `doctor::run(&config)` performs cheap blocking checks: Cloud Hypervisor,
 virtiofsd, git, lazygit (optional), `/dev/kvm`, Landlock (required when
 enabled), kernel image, rootfs image, projects root, logs dir (optional),
-backend, editor (optional), plus `images::status`.
+backend, editor (optional), plus `images::status`. It also reports four
+optional legacy checks: `legacy instance dirs`, `legacy snapshots`, `legacy
+project keys` and `deprecated config keys`, with a short remediation for each.
+They are informational, are rendered with the `!` marker, never change the exit
+status, and never delete anything.
 
 A bare `virtiofsd_bin` is resolved through `PATH` and then the distribution
 install directories in `config::VIRTIOFSD_FALLBACKS`; the report names the
@@ -450,38 +510,54 @@ These are product requirements, not implementation details.
    children and remove run files; the session serial log is kept for diagnosis.
 3. **Single lifecycle writer.** `start`, `stop` and snapshot restore hold an
    exclusive `flock` on `run/hegn.lock`.
-4. **One workspace per VM.** Only the instance's `workspace` is exported.
-   Normal instances point at the original project; multi-agent clones point at a
-   private clone. virtiofsd canonicalizes the shared directory and always uses a
-   sandbox mode. Cloned instances never share a workspace or a writable rootfs.
-5. **Attach is read/verify, not recovery.** It checks the recorded VMM pid,
-   binary and relay and refuses no-session/dead/mismatched cases.
-6. **Least privilege on disk.** Run/log dirs `0700`; locks, logs, sessions,
-   snapshots and images `0600`; `O_NOFOLLOW` where untrusted names are opened.
-7. **Untrusted output stays untrusted.** Project names, log names and log
-   content are sanitized before terminal rendering. `logs show --raw` is an
-   explicit unsafe opt-in.
-8. **Logs are private but may contain secrets.** No upload/transmission; only
-   hegn's own session logs are pruned; the active log is protected.
-9. **Direct input is visible.** `NORMAL` / `INSERT` and `INPUT DIRECT` labels
-   are mandatory. The project terminal opens in normal mode and forwards
-   nothing; insert mode is inspected by `tirith-core`; `F2` and `hegn attach`
-   hand the terminal directly to the guest as a deliberate user action.
-10. **Images are pinned, not trusted blindly.** HTTPS URL + SHA-256; unverified
+4. **One sandboxed daemon per export.** Every exported project gets its own
+   `virtiofsd`, canonicalized directory and sandbox mode. Multiplicity never
+   comes from exporting a parent. Worktrees are not exported separately. A
+   project path appears at most once in a VM, and two running VMs may not export
+   the same canonical path.
+5. **Membership is host-owned.** `<state_dir>/projects.toml` is private,
+   `O_NOFOLLOW`, atomic and locked for writers. A repo-local `hegn.toml` cannot
+   change membership, read-only status, resources or the tool profile. The
+   registry is never inside an exported directory.
+6. **Nesting is rejected.** No member may be an ancestor or descendant of
+   another, except a `worktree` inside its named parent. That worktree must
+   inherit the parent's VM and cannot be independently assigned.
+7. **Read-only is enforced twice.** `virtiofsd --readonly` plus a guest `ro`
+   mount. It prevents writes, not reads.
+8. **Attach is read/verify, not recovery.** It checks the recorded VMM pid,
+   binary, relay and membership manifest and refuses no-session/dead/mismatched
+   cases. Membership drift only warns until `hegn vm apply`.
+9. **Least privilege on disk.** Run/log dirs `0700`; locks, logs, sessions,
+   registry, `vm.toml`, snapshots and images `0600`; `O_NOFOLLOW` where
+   untrusted names are opened.
+10. **Untrusted output stays untrusted.** Project names, log names and log
+    content are sanitized before terminal rendering. `logs show --raw` is an
+    explicit unsafe opt-in.
+11. **Logs are private but may contain secrets.** No upload/transmission; only
+    hegn's own session logs are pruned; the active log is protected.
+12. **Direct input is visible.** `NORMAL` / `INSERT` and `INPUT DIRECT` labels
+    are mandatory. The project terminal opens in normal mode and forwards
+    nothing; insert mode is inspected by `tirith-core`; `F2` and `hegn attach`
+    hand the terminal directly to the guest as a deliberate user action.
+13. **Images are pinned, not trusted blindly.** HTTPS URL + SHA-256; unverified
     downloads require `--allow-unverified`; existing files require `--force` to
     replace; temporary files never become visible as final images.
-11. **Import never widens the export accidentally.** Symlink only, dangerous
+14. **Import never widens the export accidentally.** Symlink only, dangerous
     ancestors/state paths refused, discovery filters dangerous links.
-12. **No own guest image.** Kernel and rootfs come from upstream Cloud
+15. **No own guest image.** Kernel and rootfs come from upstream Cloud
     Hypervisor releases; CI only refreshes pins and opens a reviewable PR.
-13. **Delete is bounded.** Deleting an instance stops it first and asks twice. A
-    normal instance's source project is never deleted; cloning files are deleted
-    only after explicit confirmation.
+16. **Delete is bounded.** `project delete` removes one registry entry and never
+    a VM or a sibling. `vm delete` unassigns ordinary projects and asks first; a
+    project's source directory is deleted only with an explicit file policy.
+17. **Explicit rootfs images are unique per VM** and checked before boot.
+18. **Projects in one VM are mutually visible.** This is documented, not
+    hidden. The VM is the trust boundary; read-only does not provide secrecy.
 
 ### 6.1 Threat notes
 
-- A malicious agent inside the guest is constrained by KVM plus the single
-  virtiofs export. The guest network is enforced on the host, outside the
+- A malicious agent inside the guest is constrained by KVM plus the VM's
+  `virtiofsd` exports. Every member is readable; read-only members are not
+  writable. The guest network is enforced on the host, outside the
   guest's control: nftables accepts only outbound TCP 80/443 and DNS to public
   resolvers, drops all RFC1918/CGNAT/link-local/multicast destinations, drops
   IPv6 and drops every packet from a TAP addressed to the host. Guest root
@@ -503,7 +579,7 @@ These are product requirements, not implementation details.
   table (including `route_localnet` and the endpoint DNAT set) when the endpoint
   list changes, leaving TAPs and host-firewall exemptions untouched.
 - The only guest-to-host exception is the configured
-  `local_endpoints` list: those TCP ports are DNATed from the instance's own TAP
+  `local_endpoints` list: those TCP ports are DNATed from the VM's own TAP
   host address to `127.0.0.1` and accepted in the input chain, and
   `route_localnet=1` is set only on the TAP interfaces. Ports below 1024 are
   rejected, no arbitrary loopback address is reachable, and the guest cannot
@@ -571,39 +647,48 @@ and `root_device`; the official qcow2 image uses `/dev/vda1`.
 
 ## 8. TUI architecture
 
-- `app.rs` owns all state: projects, selection, focus, modal, instance status,
-  snapshots, terminal scrollback, input mode, toasts and footer hit rectangles.
-- `ui.rs` is a pure renderer. It returns hit rectangles for footer buttons,
-  project/instance/snapshot rows, and the settings modal's rows and `‹ ›`
-  steppers; mouse handling lives in `app.rs`.
-- `config_form.rs` owns settings-modal navigation, inline editing, validation
-  and the save. It edits a working copy and only writes on `Ctrl-S`
-  (`config::save_to` for globals, `InstanceStore::save` for instances).
-- `tui.rs` owns the terminal, the 50 ms tick, crossterm events and effects.
+- `src/tui/app/mod.rs` owns all state: projects, VMs, membership, selection,
+  focus, modal, VM status, snapshots, terminal scrollback, input mode, toasts
+  and footer hit rectangles. Its submodules cover actions, state, modals, keys,
+  mouse, config, project, snapshots, launch, doctor, security, provisioning and
+  the terminal.
+- `src/tui/ui/mod.rs` is a pure renderer, split into `screens/` and `modals/`.
+  It returns hit rectangles for footer buttons, project/VM/snapshot rows, and
+  the settings modal's rows and `‹ ›` steppers; mouse handling lives in
+  `src/tui/app/`.
+- `src/config/form/` owns settings-modal navigation, inline editing, validation
+  and the save (`state.rs`, `edit.rs`, `persist.rs`, `rows.rs`, `parse.rs`). It
+  edits a working copy and only writes on `Ctrl-S` (`config::save_to` for
+  globals, `VmStore::save` for `vm.toml`, project presentation for
+  `hegn.toml`).
+- `src/tui/event_loop.rs` owns the terminal, the 50 ms tick, crossterm events
+  and effects. `effects.rs`, `messages.rs` and `jobs.rs` define effects,
+  messages and background work.
 - Effects that must release or block the terminal (editor, lazygit) or run
-  async work (snapshots, image downloads) are returned to `tui.rs`.
+  async work (snapshots, image downloads) are returned to the event loop.
 - Project scanning and image downloads run on named background threads and
   report through an `mpsc` channel. The UI keeps ticking while a large image
   downloads.
 - The terminal guard restores raw mode, alternate screen, cursor and scroll
   region on normal exit and on panic unwinding.
 
-Modals: create project, import project, doctor, security prompt, confirm,
+Modals: create VM, edit VM, assign project, fork workspace, detach project,
+delete VM, create project, import project, doctor, security prompt, confirm,
 delete project, help and error. Every footer button and every keybinding hint
 drawn inside a modal has an `ActionId` and is clicked through the same
 `handle_action` path as its keybinding. Both invert their colors while
 `MouseEventKind::Moved` reports the pointer inside their rectangle. Destructive
-confirmations (delete instance, delete project, delete/restore snapshot, allow a
+confirmations (delete VM, delete project, delete/restore snapshot, allow a
 flagged command) accept only their explicit key — `Enter` deliberately leaves
 the modal open.
 
 The project delete modal re-reads git status before it opens, shows the project's
-branch, sync state and changed-file counts, and lists the instances that will be
-stopped. `y` unregisters the project and keeps its files (a real directory is
+branch, sync state and changed-file counts, and states that the VM is not
+deleted. `y` unregisters the project and keeps its files (a real directory is
 recorded in the persisted hidden-project list; an import symlink is removed);
-`f` also deletes the project directory. Deletion runs the instance registry
-first, drops the project from the in-memory dashboard immediately, and reloads
-the persisted state so the next scan does not re-add a kept directory.
+`f` also deletes the project directory. Deletion removes the registry entry,
+drops the project from the in-memory dashboard immediately, and reloads the
+persisted state so the next scan does not re-add a kept directory.
 
 The help modal filters its keybinding sections with a case-insensitive query
 entered after `/`; section titles, keys and descriptions all match, and every
@@ -613,16 +698,18 @@ Modals are responsive. `centered` grows small dialogs to the available width
 and height, the help key/description table and the settings label/value rows
 collapse to one column below their narrow thresholds, and overflowing bodies
 get a one-column scrollbar. The renderer returns the track rectangle as a
-`ScrollHit`; `app.rs` turns wheel events, `j`/`k`, arrows, `PgUp`/`PgDn`, clicks
+`ScrollHit`; `src/tui/app/` turns wheel events, `j`/`k`, arrows, `PgUp`/`PgDn`, clicks
 and drags into offset changes, and the thumb inverts while hovered or dragged.
 Long lines are ellipsized by `fit_line` rather than wrapped, so one logical line
 is always one row and the scrollbar offset stays exact.
 
-The dashboard is a project picker plus a compact preview. Entering a project
-does not boot a VM; it opens the dedicated project screen with a folder-style
-title bar, the project path, VM state and four numbered sections: `1`
-instances, `2` snapshots, `3` health, `4` git. The composed page shows
-instances and snapshots on the left and health and git on the right.
+The dashboard is a project picker plus a compact preview. Each project row shows
+its VM badge (or `unassigned`). Entering a project does not boot a VM; it opens
+the project screen with a folder-style title bar, the project path, VM state and
+four numbered sections: `1` VM, `2` snapshots, `3` health, `4` git. The VM
+section shows the tool profile, mount path and sibling projects. `v` opens the
+VM screen with `1` projects (assign/detach/set primary), `2` snapshots, `3`
+tools and `4` health.
 
 The terminal starts as a one-line strip. `i`, `Enter` or a click opens it on the
 right at 55%; pressing a section number expands that section on the left and
@@ -633,34 +720,34 @@ insert mode returns to normal; `Esc` in normal mode returns focus to the section
 headers while keeping the pane open. `←` and the clickable `← all projects`
 breadcrumb return to the dashboard; `Ctrl-B`/`Ctrl-]` do so from every mode and
 the VM keeps running. `F2` releases the TUI and runs the real `hegn attach`
-client instead of a raw in-TUI mode. `F6` opens the project settings editor for
-`hegn.toml` (harness, launch command, terminal integration and auto-launch);
-`Enter` saves and `r` saves and launches immediately, which is how the `tmux`
-and `herdr` integrations are selected without hand-editing TOML.
+client instead of a raw in-TUI mode. `F4` edits global config, `F5` edits
+`vm.toml`, and `F6` edits the project's `hegn.toml` (launch command, terminal
+integration and auto-launch). `Enter` saves and `r` saves and launches
+immediately, which is how the `tmux` and `herdr` integrations are selected
+without hand-editing TOML.
 
-The project instance list is scoped to the open project. Switching projects
-rebuilds the list from the already-loaded instances (no extra disk scan),
-preferring a running instance. Clones created for multi-agent work share the
-source project, so they stay in the list and are attached with one `Enter`.
+The VM section is scoped to the open project's VM. Switching projects rebuilds
+the member list from the registry (no extra disk scan). A fork is another member
+of the same VM, so it appears in the list and is attached with one `Enter`.
 Clone workspace commands (`git clone`, `git config`) capture stdout/stderr
 instead of inheriting the TUI's terminal; git warnings such as an empty
 repository are reported as a warning toast.
 
-The health section reads the host hegn version, VM image readiness, instance
-creation date, the newest project snapshot, the project template, and the last
-`hegn-health` line from the selected instance's serial log. The guest writes
-that line at boot; the host never queries the guest from the renderer. The line
-also carries `provision=` and `mount=` so a failed first-boot provision or a
-missing workspace mount is visible. `hegn doctor` parses the newest line from
-the five newest session logs and warns when provisioning failed, the mount is
-missing, or the report is older than 24 hours.
+The health section reads the host hegn version, VM image readiness, VM creation
+date, the newest VM snapshot, the project template, and the last `hegn-health`
+line from the VM's serial log. The guest writes that line at boot; the host never
+queries the guest from the renderer. The line carries `provision=` and
+`mounts=<ok>/<total>` so a failed first-boot provision or a missing project mount
+is visible. `hegn doctor` parses the newest line from the five newest session
+logs and warns when provisioning failed, a mount is missing, or the report is
+older than 24 hours.
 
 VM starts run on a named worker thread (`hegn-start-vm`) and report through the
 same channel as project scans. The UI therefore keeps drawing an animated
-`STARTING` spinner, the instance note and a toast immediately after Enter;
-`ensure_console`, virtiofsd/Cloud Hypervisor boot, and the optional session
-branch do not block the event loop. Snapshot restore is still on the runtime path and is
-the next candidate for the same treatment.
+`STARTING` spinner, the VM note and a toast immediately after Enter;
+`ensure_console`, all member `virtiofsd` processes, Cloud Hypervisor boot, and
+the optional session branch do not block the event loop. Snapshot restore is
+still on the runtime path and is the next candidate for the same treatment.
 
 ### 8.1 Theming
 
@@ -670,8 +757,6 @@ badges). There is no custom RGB palette and no full-screen background fill, so
 light and dark terminal themes both work. `Color::Reset` is the normal text
 color. Colored backgrounds are limited to small cells: selection bars, footer
 button chips, toast badges and status markers.
-
-
 
 ### 8.2 Attach bar
 
@@ -706,12 +791,17 @@ matters when hegn runs inside tmux and `Ctrl-B` is consumed as the tmux prefix.
 | Delete project | `d` on the dashboard | `hegn project delete` |
 | Restore a kept project | — | `hegn project restore` |
 | Open/attach VM | `Enter` | `hegn open`, `hegn attach` |
-| Stop VM | — | `hegn instance stop` |
-| Status | header/sidebar | `hegn instance status` |
+| Assign project | assign modal | `hegn project assign` |
+| Detach project | project/VM section | `hegn project unassign` |
+| Start/stop VM | VM screen | `hegn vm start`, `hegn vm stop` |
+| Apply membership | VM screen | `hegn vm apply` |
+| Choose primary | VM screen | `hegn vm primary` |
+| Status | header/sidebar | `hegn vm list`, `hegn vm show` |
+| VM settings | `F5` (`vm.toml`) | `hegn vm config` |
 | Snapshots | snapshot panel | `hegn snapshot list/create/restore/delete` |
-| Logs | — | `hegn logs list/path/show/prune` |
+| Logs | — | `hegn logs list/path/show/prune` (`--vm` on list, path and show) |
 | Security check | modal + insert-mode input | `hegn check` |
-| Multi-agent clones | `M` in the project terminal | `hegn instance clone` |
+| Fork workspace | fork modal | `hegn project fork` |
 | Launch agent/command | `L` (uses project settings) | `hegn launch`, `hegn open --command` |
 | Launch in tmux/herdr | `F6` integration → `r` | `hegn launch --integration tmux\|herdr` |
 | Project settings | `F6` (`hegn.toml`) | edit `hegn.toml` |
@@ -741,8 +831,19 @@ needs to recover or audit has a CLI form.
 | Existing image | Refused unless `--force` |
 | API socket missing | `status` reports stopped/unknown; start/attach explain the next step |
 | VM dies during attach | Console loop ends; status updates; no host fallback |
-| Session record write fails | VM and daemon killed; run files and new log removed |
+| Session record write fails | VM and every daemon killed; run files and new log removed |
 | Two lifecycle calls | Second fails on `flock` with a retry hint |
+| VM has no members | Hard error before spawn; `hegn project assign` hint |
+| Member directory missing | Hard error listing every missing member; no partial boot |
+| Duplicate or nested members | Registry validation error before spawn |
+| Two running VMs export the same path | Boot fails and names both VMs |
+| More than `max_projects_per_vm` | Validation error before spawn |
+| One member `virtiofsd` fails | Kill all member daemons, VMM and relay; keep the serial log |
+| Membership changed while running | Attach warns; `hegn vm apply` restarts |
+| Auto-resume fingerprint mismatch | Skip checkpoint, cold boot, log the reason |
+| Manual restore fingerprint mismatch | Refuse and name the changed fields; no `--force` |
+| Legacy v1 instance or snapshot | Ignored, reported by doctor, never deleted |
+| Shared explicit rootfs | Boot fails for the second VM |
 | Import target unsafe | Form/CLI error; no symlink created |
 | Log symlink | Listing skips it; resolution/reads refuse it |
 | Snapshot restore fails | New Cloud Hypervisor process dies; cleanup; old VM already stopped by design (preflight prevents config errors) |
@@ -760,6 +861,16 @@ needs to recover or audit has a CLI form.
 - Cloud-init seed tests open the generated FAT image and verify its label and
   files without a VM.
 - Lifecycle tests assert preflight ordering and cleanup using missing binaries.
+- Registry tests cover assignment uniqueness, duplicate paths, nesting rejection,
+  worktree-parent rules, managed clone paths, hidden projects, atomic writes and
+  lock behaviour.
+- Workspace tests cover clone paths and HEAD verification, worktree containment
+  and `git worktree list` checks, and deletion boundaries.
+- Membership tests cover deterministic ordering, slug dedupe, fingerprint
+  stability and sensitivity, and cross-VM duplicate export refusal.
+- Cloud-init tests cover N mounts, per-member read-only, the `/workspace` symlink
+  and injection-safe names.
+- Snapshot tests cover mismatch skipping, manual refusal and legacy handling.
 - Log tests cover naming, permissions, symlink refusal, tail semantics, prune
   protection and foreign-file preservation.
 - Import tests cover symlink creation, discovery and dangerous targets.
@@ -784,34 +895,26 @@ must not depend on upstream hosting availability.
 hegn config init
 hegn images download
 hegn doctor
-hegn project create first-project --harness opencode
+hegn vm create dev --harness opencode
+hegn project create first-project --vm dev
 hegn open first-project
 ```
 
 ### Add an existing repository
 
 ```bash
-hegn project import ~/code/existing --name existing
+hegn vm create dev --harness opencode
+hegn project import ~/code/existing --name existing --vm dev
 hegn open existing
 ```
 
 or press `h`/`←` in the project list. The original directory is untouched.
 
-### A VM will not start
-
-1. Read the doctor modal (opens automatically) or run `hegn doctor`.
-2. If images are missing: `hegn images download`.
-3. If virtiofsd/Cloud Hypervisor is missing: install it or set the binary path.
-   Distribution packages put `virtiofsd` in `/usr/lib/virtiofsd` (Arch),
-   `/usr/libexec/virtiofsd` (Fedora), `/usr/lib/qemu/virtiofsd` (Debian) or
-   `/usr/libexec/qemu/virtiofsd` (openSUSE); hegn searches those after `PATH`.
-4. If `/dev/kvm` is missing: enable KVM and add your user to the `kvm` group.
-5. If the config is wrong: `hegn config show`, `hegn doctor --json`.
-
 ### Inspect a past session
 
 ```bash
 hegn logs
+hegn logs list --vm dev
 hegn logs show my-project --lines 200
 hegn logs path my-project
 ```
@@ -822,6 +925,7 @@ hegn logs path my-project
 hegn logs prune --keep 20
 hegn snapshot list
 hegn snapshot delete <name>
+hegn vm delete old-vm --yes --delete-files
 ```
 
 ### Audit image pins
@@ -835,7 +939,8 @@ python3 scripts/update_vm_images.py --arch x86_64 --check
 ### Detach vs stop
 
 - `Ctrl-B` in `hegn attach`/`hegn open` only detaches.
-- `hegn instance stop` terminates the VM and virtiofsd; logs remain.
+- `hegn vm stop <vm>` terminates the VMM, relay, every member `virtiofsd` and
+  the autosave worker; logs and workspaces remain.
 
 ---
 
@@ -855,7 +960,7 @@ it. Harness binaries are installed *inside* the guest on first boot by the
 NoCloud provisioner (`src/agent/provision/`): apt packages plus a static per-preset
 installer, retried by a oneshot until `/var/lib/hegn/provisioned` exists. The
 same oneshot re-applies the user's `profiles/<harness>.toml` payload on every
-boot; profile skills live in a per-instance copy (`src/agent/profile/`), never in a
+boot; profile skills live in a per-VM copy (`src/agent/profile/`), never in a
 host mount. The host image is never mutated, and a pre-baked custom rootfs
 remains an explicit opt-in.
 
@@ -910,6 +1015,97 @@ scroll region, and re-reserves the region after RIS/DECSTR. The TUI remains the
 modal, line-intercepted view: `i`/`a` enters insert mode and `Esc` returns to
 normal mode.
 
+### ADR-006: Multiple projects per VM
+
+**Decision:** a VM hosts many projects. Each project is exported by its own
+sandboxed `virtiofsd` and mounted at `/projects/<slug>`; `/workspace` is a
+guest-side symlink to the VM's primary project. Membership changes require a
+restart.
+
+**Why:** toolchains, the harness install and manual package installs are
+expensive to duplicate per project. Multiplicity must not be bought by
+exporting a parent directory: one wide export would give every agent access to
+every sibling project and lose per-project read-only mode.
+
+**Consequence:** a VM can run N `virtiofsd` processes (bounded by
+`max_projects_per_vm`). Cloud-init renders N mounts, the VMM gets N `--fs`
+devices, snapshots must re-spawn all recorded daemons, and guardrails treat
+every `/projects/*` root as workspace. Projects in one VM share a guest user
+and can read each other's files: the VM, not the project, becomes the trust
+boundary. Read-only mode prevents writes, not reads. See
+[`design/multi-project-vms.md`](design/multi-project-vms.md).
+
+### ADR-007: Project-first membership in private state
+
+**Decision:** the project remains the primary user object. A VM is a named
+tool profile and runtime that projects opt into. The project → VM assignment,
+read-only flag and clone lineage live in a private registry under `state_dir`,
+not in the exported project directory. A repo-local `hegn.toml` may only hold
+presentation preferences (`launch`, `integration`, `auto_start`).
+
+**Why:** the registry decides which host directories are exported and whether
+they are writable. A file inside the project is writable by the guest through
+`virtiofsd`; letting it control membership would let an agent widen its own
+export. Keeping membership private is the same principle as host-owned
+nftables rules and TAP reservations.
+
+**Consequence:** the TUI picker stays the home screen and shows a VM badge;
+`hegn vm` and `hegn project assign` become the control surface. The registry
+needs atomic writes and a lock, and unassigned projects need an explicit
+create-or-choose-VM flow.
+
+### ADR-008: Clones by default, worktrees opt-in
+
+**Decision:** parallel workspaces default to self-contained `git clone`
+members of the same VM. A nested git worktree is supported as an explicit
+`--mode worktree` fork only when it lives inside its parent project's exported
+tree.
+
+**Why:** a worktree's `.git` points at `<main>/.git/worktrees/<name>`, outside
+the single exported directory; the guest cannot resolve it, and exporting the
+main repository to fix that lets one agent mutate another's refs, hooks and
+object store. Clones are self-contained and can be read-only, detached or
+deleted independently.
+
+**Consequence:** clones consume a checkout and an object store but no extra
+rootfs or tool install. Worktrees share mutable git state and are documented
+as such; hegn never deletes a worktree implicitly.
+
+### ADR-009: Hard cut to v2
+
+**Decision:** v2 reads a new `vms_dir` and private project registry. Legacy
+`instances_dir` entries and v1 snapshots are ignored, reported by
+`hegn doctor`, and never deleted automatically.
+
+**Why:** the one-project-per-VM fields (`project`, `workspace`, `shared_tag`,
+`guest_mount`, `read_only_workspace`, `ephemeral`) have no faithful v2
+equivalent without inventing a migration policy for clones, snapshots and
+running sessions. Maintaining both execution paths would double the lifecycle,
+snapshot and security surface. Keeping only one path also keeps the security
+invariants auditable.
+
+**Consequence:** upgrading is a deliberate recreate. Global `config.toml`
+still accepts `instances_dir`, `sandboxes_dir`, `shared_tag` and `guest_mount` as
+deprecated aliases with warnings, so startup does not fail; logs remain readable.
+
+### ADR-010: Snapshot boot fingerprint
+
+**Decision:** every snapshot records the VM name, an ordered membership
+manifest and a `boot_fingerprint` over the VMM-affecting configuration
+(members, tags, mounts, read-only flags, vCPUs, memory, rootfs, network slot,
+profile presence). Automatic resume skips a mismatched checkpoint; manual
+restore refuses one.
+
+**Why:** Cloud Hypervisor restore uses the device tree embedded in the
+snapshot. Adding or removing a virtio-fs share after the snapshot cannot be
+reflected by the restore argv, so a "successful" restore would silently leave
+new projects unmounted or removed projects still exported.
+
+**Consequence:** assigning or detaching a project, or changing VM resources,
+makes older snapshots non-resumable and requires a cold boot or
+`hegn vm apply`. Legacy snapshots without a fingerprint are listed as
+non-restorable.
+
 ---
 
 ## 14. Known limitations and future work
@@ -930,8 +1126,15 @@ normal mode.
 - The upstream rootfs is generic; harness-specific package installation is
   recorded but not baked into the downloaded image.
 - The default rootfs is writable and reused between sessions; guest changes
-  persist. Use a per-session copy or overlay image when an ephemeral root is
-  required.
+  persist and are shared by every project in that VM. Use a per-VM custom rootfs
+  when projects need different tool sets.
+- Multiple interactive sessions into one VM require guest `tmux`; the serial
+  relay has one console and there is no vsock session broker.
+- Membership changes require a restart; there is no live virtio-fs hot-plug.
+- Tool changes after first boot are manual in the guest or require
+  `hegn vm rebuild`; there is no guest manifest reconciler.
+- Projects in one VM can read each other's files; use separate VMs for a hard
+  boundary.
 - CI image refresh opens a PR rather than auto-merging, so updates still need a
   human review.
 
@@ -946,16 +1149,19 @@ src/
   shared/        dependency-free fs/process/path/text helpers
   cli/           clap commands, per-command modules, output and resolution
   config/        schema, defaults, env overrides, validation; form/ editor model
-  project/       discovery, removal, import, templates, git helpers
+  project/       discovery, create, import, templates, git helpers
+                 registry.rs private membership and validation
+                 workspace.rs clone/worktree forks
   security/      tirith-core + hegn workspace guardrails
   network/       guarded TAP pool, nftables rules and reservations
-  vm/            hypervisor/ REST client
+  vm/            config/ vm.toml model and store
+                 manager/ lifecycle, boot plan, membership, lock, session
+                 registry.rs VM listing and lookup
+                 hypervisor/ REST client
                  cloud_init/ NoCloud seed generation
                  images/ upstream pins, downloads, SHA-256
                  rootfs/ sparse raw/qcow2 growth
                  virtiofs/ hardened virtiofsd process construction
-                 instance_config/ per-instance config, clones, rootfs copies
-                 instance/ registry, lifecycle, lock, session, report
   agent/         launch/ named commands + integrations
                  profile/ per-harness profiles and skill sync
                  provision/ harness preset installers and first-boot script
@@ -982,6 +1188,8 @@ vendor/
   tirith-core/      patched newest upstream release (RustSec fixes)
 docs/
   architecture.md   this document
+  projects-and-vms.md  projects, VMs and workspaces
+  migration-v2.md   v1 → v2 hard-cut notes
   llm-setup.md      install guide written for LLM agents
   resources.md      host cost, overhead and storage
 README.md           user-facing documentation

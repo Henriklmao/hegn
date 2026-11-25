@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::command::safe_selector;
 use super::integration::Integration;
 
-/// Built-in selector that resolves to the instance's harness executable.
+/// Built-in selector that resolves to the VM's harness executable.
 pub const HARNESS: &str = "harness";
 /// Built-in selector that only opens a maintenance shell.
 pub const SHELL: &str = "shell";

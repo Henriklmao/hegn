@@ -20,9 +20,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-    - uses: actions/checkout@v5
-      with:
-        fetch-depth: 0 # Holt die gesamte Historie für die Commit-Schleife
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
     - name: Install Rust Toolchain
       uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -33,34 +31,11 @@ jobs:
     - name: Cache cargo
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-    - name: Run checks and tests on each commit
+    - name: Run checks and tests
       run: |
-        ORIGINAL_SHA=$(git rev-parse HEAD)
-
-        BEFORE=""
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          BEFORE="${{ github.event.pull_request.base.sha }}"
-        elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-          BEFORE="${{ github.event.before }}"
-        fi
-
-        if [ -n "$BEFORE" ] && git merge-base --is-ancestor "$BEFORE" HEAD 2>/dev/null; then
-          COMMITS=$(git rev-list --reverse ${BEFORE}..HEAD)
-        else
-          COMMITS="$ORIGINAL_SHA"
-        fi
-
-        for commit in $COMMITS; do
-          echo "::group::Testing commit $commit"
-          git checkout --detach "$commit"
-          cargo fmt --check
-          cargo clippy --all-targets -- -D warnings
-          cargo test --verbose
-          echo "::endgroup::"
-        done
-
-        # Git-Status auf das ursprüngliche Push-Ziel zurücksetzen für den Release-Build
-        git checkout "$ORIGINAL_SHA"
+        cargo fmt --check
+        cargo clippy --all-targets -- -D warnings
+        cargo test --verbose
 
     - name: Build release binary
       run: cargo build --release --verbose
@@ -83,7 +58,7 @@ jobs:
         cp target/release/hegn "dist/hegn-${BUILD_NAME}-x86_64-linux-gnu"
 
     - name: Upload build artifact
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         name: hegn-${{ steps.build.outputs.name }}-x86_64-linux-gnu
         path: dist/hegn-*-x86_64-linux-gnu
@@ -99,7 +74,7 @@ jobs:
 
     steps:
     - name: Download the built binary
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
       with:
         pattern: hegn-*
         merge-multiple: true

@@ -1,11 +1,14 @@
 //! Individual host prerequisite checks shared by the doctor report.
 
-use std::path::Path;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Serialize;
 
 use crate::config::{Config, VIRTIOFSD_FALLBACKS};
+use crate::session::snapshot::SnapshotStore;
 use crate::vm::images;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -30,6 +33,20 @@ impl Check {
             required,
             detail: detail.into(),
         }
+    }
+
+    /// One line for the human-readable report.
+    ///
+    /// `✓` is a passing check, `✗` a failed required check and `!` a legacy or
+    /// optional finding. Only `✗` makes the report fail, matching the exit
+    /// status.
+    pub fn line(&self) -> String {
+        let marker = match (self.ok, self.required) {
+            (true, _) => "✓",
+            (false, true) => "✗",
+            (false, false) => "!",
+        };
+        format!("{marker} {:<18} {}", self.name, self.detail)
     }
 }
 
@@ -124,20 +141,19 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
         true,
         config.projects_root.display().to_string(),
     ));
-    let usage =
-        filesystem_usage(&config.instances_dir).or_else(|| filesystem_usage(&config.state_dir));
+    let usage = filesystem_usage(&config.vms_dir).or_else(|| filesystem_usage(&config.state_dir));
     let (disk_ok, disk_detail) = match usage {
         Some((used, total)) if total > 0 => {
             let percent = used.saturating_mul(100) / total;
             (
                 percent < u64::from(config.disk_usage_warn_percent),
                 format!(
-                    "{}% used on the instance filesystem (warn at {}%)",
+                    "{}% used on the VM filesystem (warn at {}%)",
                     percent, config.disk_usage_warn_percent
                 ),
             )
         }
-        _ => (true, "instance filesystem not created yet".to_string()),
+        _ => (true, "VM filesystem not created yet".to_string()),
     };
     checks.push(Check::new("disk space", disk_ok, false, disk_detail));
     let guarded = config.network == crate::config::NetworkMode::Guarded;
@@ -215,7 +231,7 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
         false,
         match &health {
             Some(health) => health.summary(now),
-            None => "no hegn-health line yet (boot an instance)".to_string(),
+            None => "no hegn-health line yet (boot a VM)".to_string(),
         },
     ));
     checks.push(Check::new(
@@ -236,7 +252,366 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
             .or_else(|_| std::env::var("EDITOR"))
             .unwrap_or_else(|_| "$EDITOR is unset".into()),
     ));
+    let data_root = dirs::data_dir().map(|root| root.join("hegn"));
+    checks.extend(legacy_checks(
+        config,
+        data_root.as_deref(),
+        &Config::config_path(),
+    ));
     checks
+}
+
+/// Legacy v1 findings. Every check is informational: v2 ignores this state and
+/// the report never changes or deletes it.
+///
+/// `data_root` is the parent of the default `vms_dir` (usually
+/// `~/.local/share/hegn`). Tests pass a temporary root so no real home path is
+/// inspected. `config_path` is the user's `config.toml`.
+fn legacy_checks(config: &Config, data_root: Option<&Path>, config_path: &Path) -> Vec<Check> {
+    vec![
+        legacy_instance_check(config, data_root),
+        legacy_snapshot_check(config),
+        deprecated_project_keys_check(config),
+        deprecated_config_keys_check(config_path),
+    ]
+}
+
+/// Existing v1 instance directories that v2 ignores.
+///
+/// v1 stored instances next to the snapshot root as `instances` and later
+/// `sandboxes`. The default data directory is checked too, so a custom
+/// `vms_dir` cannot hide the old default directories. A reused `vms_dir` may
+/// also contain v1 instances directly; a v2 VM has `vm.toml`, a v1 instance
+/// has `hegn.toml` instead.
+fn legacy_instance_dirs(config: &Config, data_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut siblings = Vec::new();
+    if let Some(parent) = config.vms_dir.parent() {
+        siblings.push(parent.join("instances"));
+        siblings.push(parent.join("sandboxes"));
+    }
+    if let Some(root) = data_root {
+        siblings.push(root.join("instances"));
+        siblings.push(root.join("sandboxes"));
+    }
+    candidates.extend(siblings.into_iter().filter(|path| {
+        path != &config.vms_dir
+            && !path.starts_with(&config.vms_dir)
+            && !config.vms_dir.starts_with(path)
+    }));
+
+    if let Ok(entries) = fs::read_dir(&config.vms_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_real_dir(&path)
+                && is_regular_file(&path.join(crate::project::PROJECT_META_FILE))
+                && !is_regular_file(&path.join(crate::vm::config::VM_CONFIG_FILE))
+            {
+                candidates.push(path);
+            }
+        }
+    }
+
+    candidates.retain(|path| is_real_dir(path));
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+/// A real directory; symlinks are never legacy state or VMs.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// A regular file; a symlinked marker does not make a directory a v1 instance.
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+fn legacy_instance_check(config: &Config, data_root: Option<&Path>) -> Check {
+    let dirs = legacy_instance_dirs(config, data_root);
+    if dirs.is_empty() {
+        return Check::new(
+            "legacy instance dirs",
+            true,
+            false,
+            "none found (v2 ignores v1 instance directories and never deletes them)",
+        );
+    }
+    let paths = dirs
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Check::new(
+        "legacy instance dirs",
+        false,
+        false,
+        format!(
+            "ignored by v2: {paths}; verify they are unused, then remove them manually \
+             (v2 never starts, restores or deletes them)"
+        ),
+    )
+}
+
+/// Snapshots written by v1 have no boot fingerprint and can never be restored.
+///
+/// The count and names come from the normal [`SnapshotStore`] listing, so the
+/// doctor sees exactly what `hegn snapshot list` sees. Nothing is selected,
+/// restored or deleted here.
+fn legacy_snapshot_check(config: &Config) -> Check {
+    let store = SnapshotStore::new(&config.snapshots_dir);
+    let snapshots = match store.list() {
+        Ok(snapshots) => snapshots,
+        Err(err) => {
+            return Check::new(
+                "legacy snapshots",
+                false,
+                false,
+                format!(
+                    "could not list snapshots in {}: {err}",
+                    config.snapshots_dir.display()
+                ),
+            );
+        }
+    };
+    let legacy = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.is_legacy() && snapshot.legacy_label().is_some())
+        .collect::<Vec<_>>();
+    if legacy.is_empty() {
+        return Check::new(
+            "legacy snapshots",
+            true,
+            false,
+            format!(
+                "none found in {} (legacy snapshots are never restored or auto-deleted)",
+                config.snapshots_dir.display()
+            ),
+        );
+    }
+    let mut names = legacy
+        .iter()
+        .map(|snapshot| snapshot.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort();
+    let names = names.join(", ");
+    let noun = if legacy.len() == 1 {
+        "snapshot"
+    } else {
+        "snapshots"
+    };
+    Check::new(
+        "legacy snapshots",
+        false,
+        false,
+        format!(
+            "{} legacy v1 {noun} (no boot fingerprint; not restorable): {names}; never restored \
+             or auto-deleted, manual cleanup only",
+            legacy.len()
+        ),
+    )
+}
+
+/// Deprecated repo-local keys in the project picker and registry.
+///
+/// `project::deprecated_legacy_keys` follows the same file preference as
+/// `read_meta`: the first readable, valid `hegn.toml` or `.hegn.toml` wins.
+/// Registry-only External projects outside `projects_root` are scanned too, so
+/// an imported project that is not visible in the picker still gets a finding.
+fn deprecated_project_keys_check(config: &Config) -> Check {
+    let mut candidates = Vec::new();
+    let mut scan_error = None;
+    match fs::read_dir(&config.projects_root) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    candidates.push(path);
+                }
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            scan_error = Some(format!(
+                "could not scan {} for deprecated keys: {err}",
+                config.projects_root.display()
+            ));
+        }
+    }
+
+    let mut registry_error = None;
+    match crate::project::ProjectRegistry::load(&config.state_dir) {
+        Ok(registry) => candidates.extend(
+            registry
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind == crate::project::ProjectKind::External)
+                .map(|entry| entry.path.clone()),
+        ),
+        Err(err) => {
+            registry_error = Some(format!(
+                "could not read project registry {}: {err}",
+                config
+                    .state_dir
+                    .join(crate::project::REGISTRY_FILE)
+                    .display()
+            ));
+        }
+    }
+
+    // A picker symlink and its canonical registry path are the same project.
+    let mut unique = std::collections::BTreeMap::new();
+    for path in candidates {
+        unique.entry(project_scan_key(&path)).or_insert(path);
+    }
+    let mut paths = unique.into_values().collect::<Vec<_>>();
+    paths.sort();
+
+    let mut findings = Vec::new();
+    for path in &paths {
+        if !path.is_dir() {
+            continue;
+        }
+        let keys = crate::project::deprecated_legacy_keys(path);
+        if keys.is_empty() {
+            continue;
+        }
+        let file = deprecated_project_meta_file(path).unwrap_or("hegn.toml");
+        findings.push(format!(
+            "{} (`{file}`: {})",
+            path.display(),
+            keys.join(", ")
+        ));
+    }
+    findings.sort();
+
+    let scan_failed = scan_error.is_some();
+    let mut notes = Vec::new();
+    if let Some(error) = scan_error {
+        notes.push(error);
+    }
+    if let Some(error) = registry_error {
+        notes.push(error);
+    }
+    let suffix = if notes.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", notes.join("; "))
+    };
+
+    if findings.is_empty() {
+        return Check::new(
+            "legacy project keys",
+            !scan_failed,
+            false,
+            format!(
+                "none found under {} (harness, packages and template belong in vm.toml){suffix}",
+                config.projects_root.display()
+            ),
+        );
+    }
+    Check::new(
+        "legacy project keys",
+        false,
+        false,
+        format!(
+            "{}; these keys belong in vm.toml or `hegn vm create` now and are ignored for control \
+             in v2{suffix}",
+            findings.join("; ")
+        ),
+    )
+}
+
+/// Canonical path when possible, otherwise an absolute lexical path.
+///
+/// This lets a picker symlink and its registry entry collapse to one scan.
+fn project_scan_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
+/// Which project metadata file `deprecated_legacy_keys` read.
+fn deprecated_project_meta_file(path: &Path) -> Option<&'static str> {
+    for name in [crate::project::PROJECT_META_FILE, ".hegn.toml"] {
+        let file = path.join(name);
+        let Ok(raw) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
+            continue;
+        };
+        if value.as_table().is_some() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Deprecated global keys still present in `config.toml`.
+fn deprecated_config_keys_check(path: &Path) -> Check {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Check::new(
+                "deprecated config keys",
+                true,
+                false,
+                format!("none found ({} does not exist)", path.display()),
+            );
+        }
+        Err(err) => {
+            return Check::new(
+                "deprecated config keys",
+                false,
+                false,
+                format!("could not read {}: {err}", path.display()),
+            );
+        }
+    };
+    let keys = crate::config::deprecated_keys(&raw);
+    if keys.is_empty() {
+        return Check::new(
+            "deprecated config keys",
+            true,
+            false,
+            format!("none found in {}", path.display()),
+        );
+    }
+    let pairs = keys
+        .iter()
+        .map(|key| format!("{key} -> {}", modern_config_key(key)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Check::new(
+        "deprecated config keys",
+        false,
+        false,
+        format!(
+            "{}: {pairs}; rewrite them to the modern names (the deprecated aliases still work)",
+            path.display()
+        ),
+    )
+}
+
+/// Replacement for a key returned by `config::deprecated_keys`.
+///
+/// `config::deprecated::replacement` is private to the config module, so doctor
+/// keeps this small mapping next to the report that names it.
+fn modern_config_key(key: &str) -> &'static str {
+    match key {
+        "instances_dir" | "sandboxes_dir" => "vms_dir",
+        "shared_tag" => "share_tag_prefix",
+        "guest_mount" => "guest_projects_base",
+        _ => "the documented key",
+    }
 }
 
 /// Latest `hegn-health` line from the guest's serial logs.
@@ -507,5 +882,461 @@ mod tests {
         let health = latest_guest_health(&config).expect("health line");
         assert_eq!(health.apt, "1");
         assert!(health.healthy(1_700_000_000));
+    }
+
+    fn isolated_config(dir: &Path) -> Config {
+        Config {
+            projects_root: dir.join("projects"),
+            state_dir: dir.join("state"),
+            snapshots_dir: dir.join("snapshots"),
+            vms_dir: dir.join("data/vms"),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn legacy_instance_dirs_lists_existing_v1_directories_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let data_root = dir.path().join("data");
+
+        assert!(legacy_instance_dirs(&config, Some(&data_root)).is_empty());
+
+        fs::create_dir_all(&config.vms_dir).unwrap();
+        assert!(
+            legacy_instance_dirs(&config, Some(&data_root)).is_empty(),
+            "the active vms_dir is never a legacy directory"
+        );
+
+        fs::create_dir_all(data_root.join("sandboxes")).unwrap();
+        fs::create_dir_all(data_root.join("instances")).unwrap();
+        assert_eq!(
+            legacy_instance_dirs(&config, Some(&data_root)),
+            vec![data_root.join("instances"), data_root.join("sandboxes")]
+        );
+    }
+
+    #[test]
+    fn legacy_instance_dirs_finds_v1_children_inside_a_reused_vms_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let data_root = dir.path().join("data");
+
+        let active = config.vms_dir.join("active");
+        fs::create_dir_all(&active).unwrap();
+        fs::write(active.join("vm.toml"), "version = 2\n").unwrap();
+        let legacy = config.vms_dir.join("old");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("hegn.toml"), "harness = \"opencode\"\n").unwrap();
+        // A stray directory with neither marker is not a v1 instance.
+        fs::create_dir_all(config.vms_dir.join("stray")).unwrap();
+
+        assert_eq!(
+            legacy_instance_dirs(&config, Some(&data_root)),
+            vec![legacy]
+        );
+    }
+
+    #[test]
+    fn legacy_instance_dirs_skips_sibling_candidates_that_are_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = isolated_config(dir.path());
+        let data_root = dir.path().join("data");
+        config.vms_dir = data_root.join("instances/vms");
+        fs::create_dir_all(&config.vms_dir).unwrap();
+        fs::create_dir_all(data_root.join("instances")).unwrap();
+
+        assert!(
+            legacy_instance_dirs(&config, Some(&data_root)).is_empty(),
+            "an ancestor of vms_dir is not a legacy instance directory"
+        );
+    }
+
+    #[test]
+    fn legacy_instance_dirs_skips_symlinked_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let data_root = dir.path().join("data");
+        fs::create_dir_all(&config.vms_dir).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("hegn.toml"), "harness = \"opencode\"\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), config.vms_dir.join("linked")).unwrap();
+
+        assert!(
+            legacy_instance_dirs(&config, Some(&data_root)).is_empty(),
+            "a symlinked v1 instance is not scanned or reported"
+        );
+    }
+
+    #[test]
+    fn legacy_instance_check_states_that_cleanup_is_manual() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let data_root = dir.path().join("data");
+
+        let absent = legacy_instance_check(&config, Some(&data_root));
+        assert!(absent.ok);
+        assert!(!absent.required);
+        assert!(absent.detail.contains("none found"), "{}", absent.detail);
+
+        fs::create_dir_all(data_root.join("instances")).unwrap();
+        let present = legacy_instance_check(&config, Some(&data_root));
+        assert!(!present.ok);
+        assert!(
+            !present.required,
+            "legacy state is a warning, not a failure"
+        );
+        for needle in [
+            "ignored by v2",
+            "remove them manually",
+            "never starts, restores or deletes",
+        ] {
+            assert!(
+                present.detail.contains(needle),
+                "missing {needle:?}: {}",
+                present.detail
+            );
+        }
+        assert!(present.detail.contains("instances"), "{}", present.detail);
+        assert!(present.line().starts_with("! "), "{}", present.line());
+    }
+
+    fn write_legacy_snapshot(root: &Path, name: &str) {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let meta = serde_json::json!({
+            "name": name,
+            "created_at": "2026-01-01T00:00:00Z",
+            "vm_state": "Paused",
+            "dir": dir,
+        });
+        fs::write(
+            dir.join("snapshot.json"),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_current_snapshot(root: &Path, name: &str) {
+        use crate::session::snapshot::{SNAPSHOT_VERSION, SnapshotBoot, SnapshotMeta};
+
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        SnapshotStore::new(root)
+            .save_meta(&SnapshotMeta {
+                name: name.to_string(),
+                dir,
+                version: SNAPSHOT_VERSION,
+                boot_fingerprint: Some("a".repeat(64)),
+                boot: Some(SnapshotBoot::default()),
+                ..SnapshotMeta::default()
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_snapshot_check_reports_count_names_and_manual_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        fs::create_dir_all(&config.snapshots_dir).unwrap();
+
+        let absent = legacy_snapshot_check(&config);
+        assert!(absent.ok);
+        assert!(!absent.required);
+        assert!(absent.detail.contains("none found"), "{}", absent.detail);
+
+        write_legacy_snapshot(&config.snapshots_dir, "old-a");
+        write_legacy_snapshot(&config.snapshots_dir, "old-b");
+        write_current_snapshot(&config.snapshots_dir, "current");
+
+        let present = legacy_snapshot_check(&config);
+        assert!(!present.ok);
+        assert!(!present.required);
+        for needle in [
+            "2 legacy v1 snapshots",
+            "old-a, old-b",
+            "no boot fingerprint",
+            "not restorable",
+            "never restored or auto-deleted",
+            "manual cleanup only",
+        ] {
+            assert!(
+                present.detail.contains(needle),
+                "missing {needle:?}: {}",
+                present.detail
+            );
+        }
+        assert!(
+            !present.detail.contains("current"),
+            "v2 snapshots are not legacy: {}",
+            present.detail
+        );
+        assert!(present.line().starts_with("! "), "{}", present.line());
+
+        let json = serde_json::to_value(&present).unwrap();
+        assert_eq!(json["name"], "legacy snapshots");
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["required"], false);
+        assert!(
+            json["detail"]
+                .as_str()
+                .unwrap()
+                .contains("manual cleanup only")
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_check_lists_a_corrupt_metadata_as_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        fs::create_dir_all(config.snapshots_dir.join("broken")).unwrap();
+        fs::write(
+            config.snapshots_dir.join("broken/snapshot.json"),
+            b"{not json",
+        )
+        .unwrap();
+
+        let check = legacy_snapshot_check(&config);
+        assert!(check.ok, "list skips unreadable entries: {}", check.detail);
+        assert!(check.detail.contains("none found"), "{}", check.detail);
+    }
+
+    #[test]
+    fn deprecated_project_keys_name_the_file_and_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let demo = config.projects_root.join("demo");
+        let other = config.projects_root.join("other");
+        fs::create_dir_all(&demo).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(
+            demo.join("hegn.toml"),
+            "harness = \"opencode\"\npackages = []\n",
+        )
+        .unwrap();
+        fs::write(other.join(".hegn.toml"), "template = \"rust\"\n").unwrap();
+
+        let check = deprecated_project_keys_check(&config);
+        assert!(!check.ok);
+        assert!(!check.required);
+        for needle in [
+            "`hegn.toml`: harness, packages",
+            "`.hegn.toml`: template",
+            "belong in vm.toml",
+            "`hegn vm create`",
+            "ignored for control in v2",
+        ] {
+            assert!(
+                check.detail.contains(needle),
+                "missing {needle:?}: {}",
+                check.detail
+            );
+        }
+        assert!(check.detail.contains(&demo.display().to_string()));
+        assert!(check.detail.contains(&other.display().to_string()));
+        assert!(check.line().starts_with("! "), "{}", check.line());
+
+        let absent = deprecated_project_keys_check(&Config {
+            projects_root: dir.path().join("empty-projects"),
+            ..Config::default()
+        });
+        assert!(absent.ok);
+        assert!(absent.detail.contains("none found"), "{}", absent.detail);
+    }
+
+    fn write_registry(config: &Config, entries: &[(&str, &Path)]) {
+        let mut raw = String::from("version = 2\n");
+        for (name, path) in entries {
+            raw.push_str(&format!(
+                "\n[[project]]\nname = {name:?}\npath = {:?}\nvm = \"demo-vm\"\n\
+                 created_at = \"2026-01-01T00:00:00Z\"\n",
+                path.display().to_string()
+            ));
+        }
+        fs::create_dir_all(&config.state_dir).unwrap();
+        fs::write(config.state_dir.join(crate::project::REGISTRY_FILE), raw).unwrap();
+    }
+
+    #[test]
+    fn registry_only_external_projects_are_scanned_for_deprecated_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let outside = dir.path().join("outside/demo");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("hegn.toml"), "harness = \"opencode\"\n").unwrap();
+        write_registry(&config, &[("demo", &outside)]);
+
+        let check = deprecated_project_keys_check(&config);
+        assert!(!check.ok);
+        assert!(!check.required);
+        assert!(
+            check.detail.contains(&outside.display().to_string()),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("`hegn.toml`: harness"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn picker_and_registry_project_paths_are_scanned_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let demo = config.projects_root.join("demo");
+        fs::create_dir_all(&demo).unwrap();
+        fs::write(demo.join("hegn.toml"), "packages = [\"git\"]\n").unwrap();
+        write_registry(&config, &[("demo", &demo)]);
+
+        let check = deprecated_project_keys_check(&config);
+        let path = demo.display().to_string();
+        assert_eq!(
+            check.detail.matches(&path).count(),
+            1,
+            "the picker and registry entries are one project: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn registry_read_error_is_reported_without_failing_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        fs::create_dir_all(&config.state_dir).unwrap();
+        fs::write(
+            config.state_dir.join(crate::project::REGISTRY_FILE),
+            b"version = [not valid",
+        )
+        .unwrap();
+
+        let check = deprecated_project_keys_check(&config);
+        assert!(check.ok, "a registry read error is informational");
+        assert!(!check.required);
+        assert!(
+            check.detail.contains("could not read project registry"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("none found"), "{}", check.detail);
+    }
+
+    #[test]
+    fn project_keys_in_a_clean_hegn_toml_are_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let project = config.projects_root.join("demo");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("hegn.toml"),
+            "launch = \"opencode\"\nauto_start = true\n",
+        )
+        .unwrap();
+
+        let check = deprecated_project_keys_check(&config);
+        assert!(check.ok);
+        assert!(check.detail.contains("none found"), "{}", check.detail);
+    }
+
+    #[test]
+    fn deprecated_global_config_keys_are_reported_with_modern_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "instances_dir = \"/data/legacy\"\nshared_tag = \"old\"\n",
+        )
+        .unwrap();
+
+        let check = deprecated_config_keys_check(&path);
+        assert!(!check.ok);
+        assert!(!check.required);
+        for needle in [
+            "instances_dir -> vms_dir",
+            "shared_tag -> share_tag_prefix",
+            "deprecated aliases still work",
+        ] {
+            assert!(
+                check.detail.contains(needle),
+                "missing {needle:?}: {}",
+                check.detail
+            );
+        }
+        assert!(check.detail.contains(&path.display().to_string()));
+        assert!(check.line().starts_with("! "), "{}", check.line());
+
+        fs::write(
+            &path,
+            "vms_dir = \"/data/vms\"\nshare_tag_prefix = \"hegn\"\n",
+        )
+        .unwrap();
+        let absent = deprecated_config_keys_check(&path);
+        assert!(absent.ok);
+        assert!(absent.detail.contains("none found"), "{}", absent.detail);
+
+        let missing = deprecated_config_keys_check(&dir.path().join("missing.toml"));
+        assert!(missing.ok);
+        assert!(
+            missing.detail.contains("does not exist"),
+            "{}",
+            missing.detail
+        );
+    }
+
+    #[test]
+    fn legacy_checks_have_stable_json_fields_and_warn_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let config_path = dir.path().join("config.toml");
+        let data_root = dir.path().join("data");
+
+        let checks = legacy_checks(&config, Some(&data_root), &config_path);
+        let names = checks
+            .iter()
+            .map(|check| check.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "legacy instance dirs",
+                "legacy snapshots",
+                "legacy project keys",
+                "deprecated config keys"
+            ]
+        );
+        for check in &checks {
+            assert!(check.ok, "{}: {}", check.name, check.detail);
+            assert!(!check.required);
+            let json = serde_json::to_value(check).unwrap();
+            assert_eq!(json["name"], check.name);
+            assert_eq!(json["ok"], true);
+            assert_eq!(json["required"], false);
+            assert_eq!(json["detail"], check.detail);
+        }
+
+        fs::create_dir_all(data_root.join("instances")).unwrap();
+        fs::write(&config_path, "instances_dir = \"/old\"\n").unwrap();
+        let checks = legacy_checks(&config, Some(&data_root), &config_path);
+        let json = serde_json::to_value(&checks[0]).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["required"], false);
+        assert_eq!(json["name"], "legacy instance dirs");
+        assert!(json["detail"].as_str().unwrap().contains("ignored by v2"));
+    }
+
+    #[test]
+    fn warning_lines_use_a_distinct_marker() {
+        assert!(Check::new("ok", true, true, "d").line().starts_with("✓ "));
+        assert!(
+            Check::new("required", false, true, "d")
+                .line()
+                .starts_with("✗ ")
+        );
+        assert!(
+            Check::new("legacy", false, false, "d")
+                .line()
+                .starts_with("! ")
+        );
     }
 }

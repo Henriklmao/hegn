@@ -21,11 +21,10 @@ pub(super) enum ScanMessage {
         started: bool,
     },
     StartFailed(String),
-    InstancesChanged {
+    VmsChanged {
         note: String,
         level: ToastLevel,
     },
-    InstanceError(String),
     Doctor {
         report: DoctorReport,
         note: Option<String>,
@@ -70,7 +69,7 @@ mod tests {
             "fake · serial"
         }
 
-        fn instance_name(&self) -> &str {
+        fn vm_name(&self) -> &str {
             "fake"
         }
     }
@@ -94,11 +93,11 @@ mod tests {
                 started: true,
             },
             ScanMessage::StartFailed("missing kernel".into()),
-            ScanMessage::InstancesChanged {
-                note: "instances refreshed".into(),
+            ScanMessage::VmsChanged {
+                note: "VMs refreshed".into(),
                 level: ToastLevel::Warn,
             },
-            ScanMessage::InstanceError("unreadable state".into()),
+            ScanMessage::Error("unreadable state".into()),
             ScanMessage::Doctor {
                 report: DoctorReport {
                     ok: true,
@@ -127,7 +126,7 @@ mod tests {
             started,
         } = &messages[1]
         {
-            assert_eq!(console.instance_name(), "fake");
+            assert_eq!(console.vm_name(), "fake");
             assert_eq!(console.label(), "fake · serial");
             assert!(matches!(branch, Some(Ok(name)) if name == "hegn/session-1"));
             assert_eq!(*harness, Harness::Opencode);
@@ -140,8 +139,8 @@ mod tests {
             matches!(&messages[0], ScanMessage::Projects(_)),
             matches!(&messages[1], ScanMessage::Started { .. }),
             matches!(&messages[2], ScanMessage::StartFailed(_)),
-            matches!(&messages[3], ScanMessage::InstancesChanged { .. }),
-            matches!(&messages[4], ScanMessage::InstanceError(_)),
+            matches!(&messages[3], ScanMessage::VmsChanged { .. }),
+            matches!(&messages[4], ScanMessage::Error(_)),
             matches!(&messages[5], ScanMessage::Doctor { .. }),
             matches!(&messages[6], ScanMessage::DownloadProgress(_)),
             matches!(&messages[7], ScanMessage::Provision(_)),

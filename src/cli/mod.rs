@@ -12,8 +12,8 @@ mod resolve;
 mod run;
 
 pub use self::args::{
-    Cli, Commands, ConfigCommands, ImageCommands, InstanceCommands, LogCommands, NetworkCommands,
-    ProfileCommands, ProjectCommands, SkillCommands, SnapshotCommands,
+    Cli, Commands, ConfigCommands, ForkModeArg, ImageCommands, LegacyMappingCommands, LogCommands,
+    NetworkCommands, ProfileCommands, ProjectCommands, SkillCommands, SnapshotCommands, VmCommands,
 };
 pub use self::commands::doctor::check_command_for_test;
 pub use self::resolve::{resolve_project, resolve_project_entry};
@@ -33,7 +33,7 @@ pub(crate) mod test_support {
         config.projects_root = dir.path().join("projects");
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
-        config.instances_dir = dir.path().join("instances");
+        config.vms_dir = dir.path().join("vms");
         config.templates_dir = dir.path().join("templates");
         config.profiles_dir = dir.path().join("profiles");
         config.backend = BackendKind::Auto;

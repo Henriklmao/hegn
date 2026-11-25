@@ -40,26 +40,58 @@ impl Config {
                 self.snapshot_keep
             );
         }
-        if !crate::vm::cloud_init::safe_token(&self.shared_tag) {
-            bail!("shared_tag may only contain ASCII letters, digits, '-', '_' and '.'");
-        }
-        if self.shared_tag == crate::agent::profile::PROFILE_SHARE_TAG {
+        if !(1..=32).contains(&self.max_projects_per_vm) {
             bail!(
-                "shared_tag '{}' is reserved for the harness profile share",
+                "max_projects_per_vm must be between 1 and 32 (got {})",
+                self.max_projects_per_vm
+            );
+        }
+        if self.vms_dir.as_os_str().is_empty() || !self.vms_dir.is_absolute() {
+            bail!("vms_dir must be an absolute path");
+        }
+        if !crate::vm::cloud_init::safe_token(&self.share_tag_prefix) {
+            bail!("share_tag_prefix may only contain ASCII letters, digits, '-', '_' and '.'");
+        }
+        if self.share_tag_prefix == crate::agent::profile::PROFILE_SHARE_TAG {
+            bail!(
+                "share_tag_prefix '{}' is reserved for the harness profile share",
                 crate::agent::profile::PROFILE_SHARE_TAG
             );
         }
-        // virtio-fs tags are limited to 36 bytes including the terminator.
-        if self.shared_tag.len() > 36 {
+        // Every exported project gets `<prefix>-<index>`, and virtio-fs tags
+        // are limited to 36 bytes including the terminator.
+        let widest_index = self.max_projects_per_vm.saturating_sub(1);
+        let required = self.share_tag_prefix.len() + 1 + widest_index.to_string().len();
+        if required > 36 {
             bail!(
-                "shared_tag must be at most 36 bytes (got {})",
-                self.shared_tag.len()
+                "share_tag_prefix must leave room for '-<index>' within 36 bytes \
+                 (got {} bytes and up to index {widest_index})",
+                self.share_tag_prefix.len()
             );
         }
-        if !crate::vm::cloud_init::safe_mount(&self.guest_mount) {
+        if !crate::vm::cloud_init::safe_mount(&self.guest_projects_base) {
             bail!(
-                "guest_mount must be an absolute path with simple components \
+                "guest_projects_base must be an absolute path with simple components \
                  (letters, digits, '/', '-', '_' and '.')"
+            );
+        }
+        if self.guest_projects_base == "/" {
+            bail!("guest_projects_base must not be the filesystem root");
+        }
+        // `/workspace` is the primary-project symlink created in every guest.
+        // Mounting member projects at or below it would shadow or collide with
+        // that symlink, so the directory is reserved.
+        let workspace = crate::security::WORKSPACE_GUEST_PATH;
+        if self.guest_projects_base == workspace
+            || self
+                .guest_projects_base
+                .strip_prefix(workspace)
+                .is_some_and(|rest| rest.starts_with('/'))
+        {
+            bail!(
+                "guest_projects_base {} is reserved for the primary /workspace symlink; \
+                 use /projects or another guest path",
+                self.guest_projects_base
             );
         }
         if !self.root_device.starts_with("/dev/")
@@ -75,7 +107,7 @@ impl Config {
         for (name, path) in [
             ("state_dir", &self.state_dir),
             ("snapshots_dir", &self.snapshots_dir),
-            ("instances_dir", &self.instances_dir),
+            ("vms_dir", &self.vms_dir),
             ("kernel_image", &self.kernel_image),
             ("rootfs_image", &self.rootfs_image),
         ] {
@@ -141,7 +173,7 @@ pub fn validate_local_endpoints(endpoints: &[LocalEndpoint]) -> Result<()> {
             );
         }
         // Ports below 1024 are reserved for privileged host services (SSH,
-        // DNS, …). Exposing those to an instance is never an LLM passthrough.
+        // DNS, …). Exposing those to a VM is never an LLM passthrough.
         if endpoint.port < 1024 {
             bail!(
                 "local endpoint '{}' uses port {}; ports below 1024 are not exposed",
@@ -193,29 +225,29 @@ mod tests {
         config.memory_mib = 12;
         assert!(config.validate().is_err());
         config.memory_mib = 1024;
-        config.guest_mount = "workspace".into();
+        config.guest_projects_base = "workspace".into();
         assert!(config.validate().is_err());
-        config.guest_mount = "/workspace".into();
+        config.guest_projects_base = "/projects".into();
         config.root_device = "vda1".into();
         assert!(config.validate().is_err());
         config.root_device = "/dev/vda1".into();
-        config.shared_tag = "x".repeat(37);
+        config.share_tag_prefix = "x".repeat(37);
         assert!(config.validate().is_err());
-        config.shared_tag = "work space".into();
+        config.share_tag_prefix = "work space".into();
         assert!(config.validate().is_err());
-        config.shared_tag = "workspace".into();
-        config.guest_mount = "/work space".into();
+        config.share_tag_prefix = "workspace".into();
+        config.guest_projects_base = "/work space".into();
         assert!(config.validate().is_err());
-        config.guest_mount = "/workspace".into();
+        config.guest_projects_base = "/projects".into();
         config.kernel_image = PathBuf::from("/images/vmlinux,broken");
         assert!(config.validate().is_err());
         config.kernel_image = PathBuf::from("/images/vmlinux");
-        config.shared_tag = crate::agent::profile::PROFILE_SHARE_TAG.into();
+        config.share_tag_prefix = crate::agent::profile::PROFILE_SHARE_TAG.into();
         assert!(
             config.validate().is_err(),
             "the profile share tag is reserved"
         );
-        config.shared_tag = "workspace".into();
+        config.share_tag_prefix = "workspace".into();
         config.snapshot_interval_secs = 29;
         assert!(config.validate().is_err());
         config.snapshot_interval_secs = 300;
@@ -223,6 +255,26 @@ mod tests {
         assert!(config.validate().is_err());
         config.snapshot_keep = 2;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn guest_projects_base_reserves_the_workspace_symlink() {
+        let mut config = Config::default();
+        for base in ["/workspace", "/workspace/foo", "/workspace/foo/bar"] {
+            config.guest_projects_base = base.into();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("reserved"), "{base}: {err}");
+            assert!(err.contains("/workspace"), "{base}: {err}");
+            assert!(err.contains("primary"), "{base}: {err}");
+        }
+        // safe_mount rejects a trailing slash before the reserved check runs.
+        config.guest_projects_base = "/workspace/".into();
+        assert!(config.validate().is_err());
+
+        for base in ["/projects", "/work", "/workspace2", "/projectsworkspace"] {
+            config.guest_projects_base = base.into();
+            assert!(config.validate().is_ok(), "{base} must remain valid");
+        }
     }
 
     #[test]
@@ -333,8 +385,10 @@ mod tests {
         let mut config = Config::default();
         config.vcpus = 32;
         config.memory_mib = 128;
-        config.shared_tag = "a".repeat(36);
-        config.guest_mount = "/w".into();
+        // With the default 16 projects the widest index is 15, so a prefix may
+        // use 33 of the 36 virtio-fs tag bytes.
+        config.share_tag_prefix = "a".repeat(33);
+        config.guest_projects_base = "/w".into();
         config.root_device = "/dev/vda".into();
         assert!(config.validate().is_ok());
 
@@ -347,13 +401,13 @@ mod tests {
             "memory below 128 MiB is rejected"
         );
         config.memory_mib = 2048;
-        config.shared_tag = "a".repeat(37);
+        config.share_tag_prefix = "a".repeat(34);
         assert!(
             config.validate().is_err(),
-            "tags above 36 bytes are rejected"
+            "a prefix must leave room for '-<index>' within 36 bytes"
         );
-        config.shared_tag = "workspace".into();
-        config.guest_mount = "/".into();
+        config.share_tag_prefix = "workspace".into();
+        config.guest_projects_base = "/".into();
         assert!(
             config.validate().is_err(),
             "the filesystem root is rejected"
@@ -381,6 +435,25 @@ mod tests {
     }
 
     #[test]
+    fn v2_directory_and_project_boundaries_are_enforced() {
+        let mut config = Config::default();
+        config.max_projects_per_vm = 1;
+        assert!(config.validate().is_ok(), "a single-project VM is valid");
+        config.max_projects_per_vm = 32;
+        assert!(config.validate().is_ok());
+        config.max_projects_per_vm = 0;
+        assert!(config.validate().is_err());
+        config.max_projects_per_vm = 33;
+        assert!(config.validate().is_err());
+
+        config.max_projects_per_vm = 16;
+        config.vms_dir = PathBuf::from("relative/vms");
+        assert!(config.validate().is_err(), "vms_dir must be absolute");
+        config.vms_dir = PathBuf::from("/data/vms");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn comma_paths_and_insecure_image_sources_are_rejected() {
         let base = Config::default();
 
@@ -396,11 +469,8 @@ mod tests {
         );
 
         let mut config = base.clone();
-        config.instances_dir = base.instances_dir.join("a,b");
-        assert!(
-            config.validate().is_err(),
-            "instances_dir commas are rejected"
-        );
+        config.vms_dir = base.vms_dir.join("a,b");
+        assert!(config.validate().is_err(), "vms_dir commas are rejected");
 
         let mut config = base.clone();
         config.rootfs_image = base.rootfs_image.join("a,b");

@@ -1,4 +1,4 @@
-//! Filesystem store for profile templates and the per-instance bundle layout.
+//! Filesystem store for profile templates and the per-VM bundle layout.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Harness};
 use crate::shared::text::shell_quote_always as shell_quote;
-use crate::vm::instance_config::InstanceConfig;
+use crate::vm::config::VmConfig;
 
 use super::fs::{ensure_real_dir, remove_path, secure_dir, write_private};
 use super::model::Profile;
@@ -109,8 +109,8 @@ pub(super) struct ProfileLayout {
 }
 
 impl ProfileLayout {
-    pub(super) fn new(config: &Config, instance: &InstanceConfig) -> Result<Self> {
-        let root = instance.dir(&config.instances_dir).join("profile");
+    pub(super) fn new(config: &Config, vm: &VmConfig) -> Result<Self> {
+        let root = vm.dir(&config.vms_dir).join("profile");
         let bundle_dir = root.join(BUNDLE_DIR);
         secure_dir(&root)?;
         secure_dir(&bundle_dir)?;
@@ -224,7 +224,7 @@ mod tests {
     fn config(dir: &Path) -> Config {
         let mut config = Config::default();
         config.profiles_dir = dir.join("profiles");
-        config.instances_dir = dir.join("instances");
+        config.vms_dir = dir.join("vms");
         config.projects_root = dir.join("projects");
         fs::create_dir_all(&config.profiles_dir).unwrap();
         config

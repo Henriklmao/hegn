@@ -45,7 +45,7 @@ contain API keys. Existing profiles are never overwritten.
 ```toml
 # ~/.config/hegn/profiles/opencode.toml
 version = 1
-packages = ["tmux", "gh"]              # extra apt packages for this instance
+packages = ["tmux", "gh"]              # extra apt packages for this VM
 
 [environment]
 OPENAI_API_KEY = "sk-..."              # exported to login shells and the agent
@@ -72,23 +72,23 @@ target = "/root/.agents/skills"
 Both `source` paths and guest `target` paths are validated. Guest targets must be
 under `/root`, `/home`, `/etc`, `/usr/local`, `/opt` or `/workspace`.
 
-A missing source is reported in the instance's `run/hegn.log`. It does not block
+A missing source is reported in the VM's `run/hegn.log`. It does not block
 the start. A default skill directory that does not exist is skipped silently.
 
 ### How profiles reach the guest
 
-On start, hegn copies the profile into `<instances_dir>/<name>/profile/bundle/`.
+On start, hegn copies the profile into `<vms_dir>/<vm>/profile/bundle/`.
 A second, sandboxed `virtiofsd` exports that **copy** to the guest at
 `/run/hegn/profile`.
 
 - Config files and environment variables are applied on every boot.
-- Skills are seeded on the first start. After that they live in the per-instance
+- Skills are seeded on the first start. After that they live in the per-VM
   copy.
 - Added packages are installed on the next boot. The harness installer does not
   run again.
 
 The guest's skill directory links to that copy, **not** to the host directory. A
-compromised guest can therefore change only the throw-away copy, never your real
+compromised guest can therefore change only the per-VM copy, never your real
 skills.
 
 ```bash
@@ -97,7 +97,7 @@ hegn profile show opencode              # effective profile as TOML
 hegn profile path opencode --edit       # edit the template in $EDITOR
 hegn profile init                       # write only missing templates
 
-hegn profile sync my-app                # refresh files/env/skills for next boot
+hegn profile sync dev                   # refresh a VM's files/env/skills for next boot
 ```
 
 ---
@@ -130,8 +130,8 @@ configured agent in a real terminal. Press `L` to launch it again later.
 
 `launch.default` in `config.toml` decides what starts:
 
-- `"harness"` starts the agent of the instance's harness (`opencode`, `claude`,
-  `codex`, `pi`, `gemini`).
+- `"harness"` starts the agent of the VM's harness (`opencode`, `claude`,
+  `codex`, `pi`, `prime-agent`, `aider` or `gemini`).
 - `"shell"` only opens the maintenance shell.
 - Any other value refers to an entry in `[[launch.commands]]`.
 
@@ -181,11 +181,12 @@ integration = "herdr"
 auto_start = true
 ```
 
-`F6` in the project screen edits the same three values (plus the harness used for
-new instances). Use `←`/`→` to cycle a value and `↑`/`↓` to select a row. `Enter`
-saves, and `r` saves and launches the command right away. Choose `tmux` or `herdr`
-here to open an agent in a terminal multiplexer. `auto` keeps the default that
-depends on the host.
+`F6` in the project screen edits the same three values. Use `←`/`→` to cycle a
+value and `↑`/`↓` to select a row. `Enter` saves, and `r` saves and launches the
+command right away. Choose `tmux` or `herdr` here to open an agent in a terminal
+multiplexer. `auto` keeps the default that depends on the host. Harness and
+package choices belong to the VM and are edited with `F5` or
+`hegn vm config <vm> --edit`.
 
 TUI auto-launch waits for the first-boot provisioner. The agent is installed
 before the command is typed.
@@ -200,5 +201,5 @@ hegn open my-app --command opencode        # attach and type one command
 hegn attach my-app --command opencode --no-bar
 ```
 
-`auto_start = false` in a project's `hegn.toml` keeps that project's VM boots
-quiet, even when the global `launch.auto_start` is on.
+`auto_start = false` in a project's `hegn.toml` turns off the automatic launch
+after boot for that project, even when the global `launch.auto_start` is on.

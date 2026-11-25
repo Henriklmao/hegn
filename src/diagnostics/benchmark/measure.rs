@@ -1,4 +1,4 @@
-//! Measurement modes: running instances, one project, or a throwaway project.
+//! Measurement modes: running VMs, one project, or a throwaway project.
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -10,21 +10,23 @@ use serde::Deserialize;
 
 use crate::config::{Config, Harness};
 use crate::project;
-use crate::vm::instance::{InstanceRegistry, same_project};
+use crate::vm::registry::{VmRegistry, same_project};
 
 use super::cleanup::remove_temp_project;
 use super::report::{
-    BenchmarkReport, Cleanup, DiskCost, ProcessCost, SessionCost, human_bytes, print_report,
+    BenchmarkReport, Cleanup, DiskCost, LegacyInstanceDisk, ProcessCost, SessionCost, VmDisk,
+    human_bytes, print_report,
 };
 use super::usage::{
     Usage, cmdline_contains, matches_binary, process_alive, process_tree_usage, usage_excluding,
 };
 use super::{MIB, TEMP_PREFIX};
 
-/// `session.json` written by `hegn instance start`.
+/// `session.json` written by `hegn vm start` (older `hegn instance start`
+/// records still parse).
 ///
-/// The struct is deliberately permissive: instance-scoped sessions gained
-/// fields over time, and `benchmark` must also read records written by older
+/// The struct is deliberately permissive: VM-scoped sessions gained fields
+/// over time, and `benchmark` must also read records written by older
 /// versions.
 #[derive(Debug, Deserialize)]
 struct SessionFile {
@@ -32,8 +34,8 @@ struct SessionFile {
     project: Option<PathBuf>,
     #[serde(default)]
     workspace: Option<PathBuf>,
-    #[serde(default, alias = "sandbox")]
-    instance: Option<String>,
+    #[serde(default, alias = "instance", alias = "sandbox")]
+    vm: Option<String>,
     #[serde(default)]
     harness: Option<String>,
     #[serde(default)]
@@ -43,14 +45,17 @@ struct SessionFile {
     #[serde(default)]
     relay_pid: u32,
     #[serde(default)]
+    virtiofs_pids: Vec<u32>,
+    /// Pre-v2 single-share session.
+    #[serde(default)]
     virtiofs_pid: u32,
 }
 
 /// Measure the current host cost and print or emit the report.
 ///
-/// - no project and no `--clean`: measure every running instance; if nothing
+/// - no project and no `--clean`: measure every running VM; if nothing
 ///   runs and the terminal is interactive, offer to boot a throwaway one;
-/// - `project`: boot that project's instance (or reuse it) and measure it;
+/// - `project`: boot that project's VM (or reuse it) and measure it;
 /// - `clean`: create a temporary project, boot it, measure it, stop and remove
 ///   it again.
 pub fn run(config: &Config, project: Option<&str>, clean: bool, json: bool) -> Result<i32> {
@@ -65,7 +70,7 @@ pub fn run(config: &Config, project: Option<&str>, clean: bool, json: bool) -> R
         return emit(report, json);
     }
     if !json && io::stdin().is_terminal() {
-        let question = "No instance is running. Create a temporary benchmark project, boot a \
+        let question = "No VM is running. Create a temporary benchmark project, boot a \
                         VM and remove both afterwards?";
         if confirm(question)? {
             return measure_temporary(config, json);
@@ -73,7 +78,7 @@ pub fn run(config: &Config, project: Option<&str>, clean: bool, json: bool) -> R
     }
 
     report.notes.push(
-        "no instance running; pass a project name to boot one, or --clean for a throwaway \
+        "no VM running; pass a project name to boot one, or --clean for a throwaway \
          project"
             .to_string(),
     );
@@ -106,43 +111,43 @@ fn confirm(question: &str) -> Result<bool> {
     ))
 }
 
-/// Boot (or reuse) the instance of an existing project and measure it.
+/// Boot (or reuse) the VM of an existing project and measure it.
 fn measure_project(config: &Config, project: &str, json: bool) -> Result<i32> {
     let path = crate::cli::resolve_project(config, project)?;
 
-    // Prefer an instance that is already running for this project, base or
-    // clone; otherwise create/reuse the base instance and start it.
+    // Prefer a VM that is already running for this project, base or clone;
+    // otherwise create/reuse the base VM and start it.
     if let Some((session, _)) = running_sessions(config).into_iter().find(|(session, _)| {
         session
             .project
             .as_ref()
             .is_some_and(|running| same_project(running, &path))
     }) {
-        // Prefer the recorded instance name; legacy records predate it.
-        let mut report = match session.instance.as_deref().filter(|name| !name.is_empty()) {
-            Some(name) => collect_for_instance(config, name),
+        // Prefer the recorded VM name; legacy records predate it.
+        let mut report = match session.vm.as_deref().filter(|name| !name.is_empty()) {
+            Some(name) => collect_for_vm(config, name),
             None => collect_for_project(config, &path),
         };
         report
             .notes
-            .push("the instance was already running; nothing was started".to_string());
+            .push("the VM was already running; nothing was started".to_string());
         return emit(report, json);
     }
 
     let harness = project::read_meta(&path).harness.unwrap_or(config.harness);
-    let registry = InstanceRegistry::new(config.clone());
-    let instance = registry.ensure_for_project(&path, harness)?;
-    registry.manager(instance.clone()).start()?;
+    let registry = VmRegistry::new(config.clone());
+    let vm = registry.ensure_for_project(&path, harness)?;
+    registry.manager(vm.clone())?.start()?;
 
-    let mut report = collect_for_instance(config, &instance.name);
+    let mut report = collect_for_vm(config, &vm.name);
     report.started = true;
     report.notes.push(format!(
-        "instance '{}' started; measured right after the VMM socket came up, so guest RSS \
+        "VM '{}' started; measured right after the VMM socket came up, so guest RSS \
          grows while the guest boots (attach with `hegn attach {}`, stop it with \
-         `hegn instance stop {}`)",
-        instance.name, instance.name, instance.name
+         `hegn vm stop {}`)",
+        vm.name, vm.name, vm.name
     ));
-    note_other_instances(config, &instance.name, &mut report.notes);
+    note_other_vms(config, &vm.name, &mut report.notes);
     emit(report, json)
 }
 
@@ -172,32 +177,36 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
         );
     }
 
-    let registry = InstanceRegistry::new(config.clone());
-    let mut instance = None;
+    let registry = VmRegistry::new(config.clone());
+    let mut vm = None;
     let started = (|| -> Result<BenchmarkReport> {
         let created = registry.ensure_for_project(&path, config.harness)?;
-        // Record the instance before booting: if the start fails, the cleanup
-        // below still has to unregister it.
-        instance = Some(created.clone());
-        registry.manager(created).start()?;
-        let mut report = collect_for_instance(config, &instance.as_ref().unwrap().name);
+        // Record the VM before booting: if the start fails, the cleanup below
+        // still has to unregister it.
+        vm = Some(created.clone());
+        registry.manager(created)?.start()?;
+        let mut report = collect_for_vm(config, &vm.as_ref().unwrap().name);
         report.started = true;
         report.notes.push(
             "measured right after the VMM socket came up, so guest RSS grows while the guest \
-             boots; the instance was stopped and removed after this snapshot"
+             boots; the VM was stopped and removed after this snapshot"
                 .to_string(),
         );
-        note_other_instances(config, &instance.as_ref().unwrap().name, &mut report.notes);
+        note_other_vms(config, &vm.as_ref().unwrap().name, &mut report.notes);
         Ok(report)
     })();
 
-    let stopped = instance
+    let stopped = vm
         .as_ref()
-        .map(|instance| registry.manager(instance.clone()).stop().is_ok())
+        .map(|vm| {
+            registry
+                .manager(vm.clone())
+                .is_ok_and(|manager| manager.stop().is_ok())
+        })
         .unwrap_or(false);
-    let instance_removed = instance
+    let vm_removed = vm
         .as_ref()
-        .map(|instance| registry.delete(&instance.name, true).is_ok())
+        .map(|vm| registry.delete(&vm.name, true).is_ok())
         .unwrap_or(false);
     let removed = match remove_temp_project(config, &path) {
         Ok(()) => true,
@@ -211,22 +220,19 @@ fn measure_temporary(config: &Config, json: bool) -> Result<i32> {
         Ok(mut report) => {
             report.cleanup = Some(Cleanup {
                 project: path.clone(),
-                instance: instance
-                    .as_ref()
-                    .map(|instance| instance.name.clone())
-                    .unwrap_or_default(),
-                instance_stopped: stopped,
+                vm: vm.as_ref().map(|vm| vm.name.clone()).unwrap_or_default(),
+                vm_stopped: stopped,
                 removed,
             });
             if !stopped {
                 report
                     .notes
-                    .push("the temporary instance could not be stopped".to_string());
+                    .push("the temporary VM could not be stopped".to_string());
             }
-            if !instance_removed {
+            if !vm_removed {
                 report
                     .notes
-                    .push("the temporary instance could not be removed".to_string());
+                    .push("the temporary VM could not be removed".to_string());
             }
             if !removed {
                 report.notes.push(format!(
@@ -253,19 +259,26 @@ fn packages_for(harness: Harness) -> Vec<String> {
     harness.packages().iter().map(|p| p.to_string()).collect()
 }
 
-/// Build the report for every running instance without printing anything.
+/// Build the report for every running VM without printing anything.
 pub fn collect(config: &Config) -> BenchmarkReport {
-    collect_with(config, |_, _| true)
+    let data_root = default_data_root();
+    collect_with(config, data_root.as_deref(), |_, _| true)
 }
 
-fn collect_for_instance(config: &Config, name: &str) -> BenchmarkReport {
-    collect_with(config, |session, _| {
-        session.instance.as_deref() == Some(name)
+fn default_data_root() -> Option<PathBuf> {
+    dirs::data_dir().map(|root| root.join("hegn"))
+}
+
+fn collect_for_vm(config: &Config, name: &str) -> BenchmarkReport {
+    let data_root = default_data_root();
+    collect_with(config, data_root.as_deref(), |session, _| {
+        session.vm.as_deref() == Some(name)
     })
 }
 
 fn collect_for_project(config: &Config, project: &Path) -> BenchmarkReport {
-    collect_with(config, |session, _| {
+    let data_root = default_data_root();
+    collect_with(config, data_root.as_deref(), |session, _| {
         session
             .project
             .as_ref()
@@ -273,7 +286,11 @@ fn collect_for_project(config: &Config, project: &Path) -> BenchmarkReport {
     })
 }
 
-fn collect_with(config: &Config, keep: impl Fn(&SessionFile, &Path) -> bool) -> BenchmarkReport {
+fn collect_with(
+    config: &Config,
+    data_root: Option<&Path>,
+    keep: impl Fn(&SessionFile, &Path) -> bool,
+) -> BenchmarkReport {
     let mut notes = Vec::new();
     let sessions = session_costs(config, &mut notes, keep);
     let (vcpus, guest_memory_bytes, process_rss_bytes) = totals(config, &sessions);
@@ -285,21 +302,32 @@ fn collect_with(config: &Config, keep: impl Fn(&SessionFile, &Path) -> bool) -> 
         .unwrap_or(config.memory_mib);
     let (snapshots, snapshot_estimate_bytes) = snapshot_estimate(config, memory_mib);
 
-    let disk = disk_costs(config);
+    let vm_disk = vm_disk_costs(config);
+    let vm_disk_allocated_bytes = vm_disk.iter().map(|vm| vm.allocated_bytes).sum();
+    let disk = disk_costs(config, &vm_disk);
     let disk_allocated_bytes = disk.iter().map(|cost| cost.allocated_bytes).sum();
+    let legacy_instances = legacy_instance_disk(config, data_root);
 
     if sessions.is_empty() {
         notes.push(
-            "no running instance session found; disk usage and the configured guest cost are \
-             reported instead"
+            "no running VM found; disk usage and the configured guest cost are reported \
+             instead"
                 .to_string(),
         );
     } else {
         notes.push(format!(
-            "guest RAM is populated on demand: {} in total across {} instance(es)",
+            "guest RAM is populated on demand: {} in total across {} VM(s)",
             human_bytes(guest_memory_bytes),
             sessions.len()
         ));
+    }
+    if legacy_instances.is_some() {
+        notes.push(
+            "legacy v1 instance directories are not active VMs and are not included in the \
+             disk total; verify they are unused, then remove them manually (hegn never \
+             deletes them)"
+                .to_string(),
+        );
     }
 
     BenchmarkReport {
@@ -314,6 +342,9 @@ fn collect_with(config: &Config, keep: impl Fn(&SessionFile, &Path) -> bool) -> 
         snapshot_estimate_bytes,
         disk,
         disk_allocated_bytes,
+        vm_disk,
+        vm_disk_allocated_bytes,
+        legacy_instances,
         notes,
     }
 }
@@ -341,7 +372,7 @@ fn totals(config: &Config, sessions: &[SessionCost]) -> (u32, u64, u64) {
     (vcpus, memory, rss)
 }
 
-/// The instances that are alive right now.
+/// The VMs that are alive right now.
 fn running_sessions(config: &Config) -> Vec<(SessionFile, PathBuf)> {
     let mut running = Vec::new();
     for path in session_candidates(config) {
@@ -360,14 +391,14 @@ fn running_sessions(config: &Config) -> Vec<(SessionFile, PathBuf)> {
     running
 }
 
-fn note_other_instances(config: &Config, measured: &str, notes: &mut Vec<String>) {
+fn note_other_vms(config: &Config, measured: &str, notes: &mut Vec<String>) {
     let others = running_sessions(config)
         .into_iter()
-        .filter(|(session, _)| session.instance.as_deref() != Some(measured))
+        .filter(|(session, _)| session.vm.as_deref() != Some(measured))
         .count();
     if others > 0 {
         notes.push(format!(
-            "{others} other instance(es) are running; their RAM is not part of this report"
+            "{others} other VM(s) are running; their RAM is not part of this report"
         ));
     }
 }
@@ -409,7 +440,7 @@ fn session_costs(
         if !keep(&session, &path) {
             continue;
         }
-        let (vcpus, memory_mib) = instance_limits(&path, config);
+        let (vcpus, memory_mib) = vm_limits(&path, config);
         costs.push(build_session(&session, config, vcpus, memory_mib, notes));
     }
     costs
@@ -432,12 +463,6 @@ fn build_session(
             session.vm_pid,
             Some(&vm),
             "cloud-hypervisor",
-        ),
-        (
-            "virtiofsd",
-            session.virtiofs_pid,
-            Some(virtiofsd),
-            "virtiofsd",
         ),
         ("console-relay", session.relay_pid, None, "__console-relay"),
     ] {
@@ -465,13 +490,39 @@ fn build_session(
         }
     }
 
+    let mut member_pids = session.virtiofs_pids.clone();
+    if session.virtiofs_pid != 0 {
+        member_pids.push(session.virtiofs_pid);
+    }
+    for (index, pid) in member_pids.into_iter().enumerate() {
+        if pid == 0 {
+            continue;
+        }
+        let role = format!("virtiofsd-{index}");
+        if !matches_binary(pid, virtiofsd, "virtiofsd") {
+            notes.push(format!(
+                "pid {pid} recorded as {role} no longer belongs to that process"
+            ));
+            continue;
+        }
+        match process_tree_usage(pid) {
+            Some((rss_bytes, virtual_bytes)) => processes.push(ProcessCost {
+                role,
+                pid,
+                rss_bytes,
+                virtual_bytes,
+            }),
+            None => notes.push(format!("{role} pid {pid} is not running")),
+        }
+    }
+
     let uptime_secs = session
         .started_at
         .map(|started| (Utc::now() - started).num_seconds().max(0) as u64);
 
     SessionCost {
-        instance: session
-            .instance
+        vm: session
+            .vm
             .clone()
             .or_else(|| {
                 session
@@ -493,17 +544,20 @@ fn build_session(
     }
 }
 
-/// Candidate `session.json` paths: the instance-scoped layout and the legacy
-/// `state_dir/run` layout.
+/// Candidate `session.json` paths for active v2 VMs.
+///
+/// Only `<vms_dir>/<vm>/run/session.json` for directories with a regular
+/// `vm.toml` is accepted. The v1 `state_dir/run` layout and v1 instance
+/// directories are never candidates.
 fn session_candidates(config: &Config) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    let legacy = config.state_dir.join("run").join("session.json");
-    if legacy.is_file() {
-        paths.push(legacy);
-    }
-    if let Ok(entries) = fs::read_dir(&config.instances_dir) {
+    if let Ok(entries) = fs::read_dir(&config.vms_dir) {
         for entry in entries.flatten() {
-            let candidate = entry.path().join("run").join("session.json");
+            let path = entry.path();
+            if !is_v2_vm_dir(&path) {
+                continue;
+            }
+            let candidate = path.join("run").join("session.json");
             if candidate.is_file() {
                 paths.push(candidate);
             }
@@ -513,8 +567,8 @@ fn session_candidates(config: &Config) -> Vec<PathBuf> {
     paths
 }
 
-/// Read per-instance limits from the sibling `hegn.toml`, if there is one.
-fn instance_limits(session: &Path, config: &Config) -> (u8, u32) {
+/// Read per-VM limits from the sibling `vm.toml`, if there is one.
+fn vm_limits(session: &Path, config: &Config) -> (u8, u32) {
     #[derive(Deserialize, Default)]
     struct Limits {
         vcpus: Option<u8>,
@@ -524,7 +578,7 @@ fn instance_limits(session: &Path, config: &Config) -> (u8, u32) {
     let config_file = session
         .parent()
         .and_then(Path::parent)
-        .map(|dir| dir.join(crate::vm::instance_config::CONFIG_FILE));
+        .map(|dir| dir.join(crate::vm::config::VM_CONFIG_FILE));
     let limits = config_file
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|raw| toml::from_str::<Limits>(&raw).ok())
@@ -551,14 +605,14 @@ fn snapshot_estimate(config: &Config, memory_mib: u32) -> (u64, u64) {
     (count, count * u64::from(memory_mib) * MIB)
 }
 
-fn disk_costs(config: &Config) -> Vec<DiskCost> {
+fn disk_costs(config: &Config, vm_disk: &[VmDisk]) -> Vec<DiskCost> {
     let logs = config.logs_dir();
     let mut dirs: Vec<(String, PathBuf, Option<PathBuf>)> = Vec::new();
     if let Some(dir) = config.kernel_image.parent() {
         dirs.push(("images".to_string(), dir.to_path_buf(), None));
     }
     dirs.push(("snapshots".to_string(), config.snapshots_dir.clone(), None));
-    dirs.push(("instances".to_string(), config.instances_dir.clone(), None));
+    dirs.push(("VMs".to_string(), config.vms_dir.clone(), None));
     dirs.push(("logs".to_string(), logs.clone(), None));
     // Session logs live inside the state directory; do not count them twice.
     dirs.push(("state".to_string(), config.state_dir.clone(), Some(logs)));
@@ -566,7 +620,15 @@ fn disk_costs(config: &Config) -> Vec<DiskCost> {
     dirs.into_iter()
         .map(|(name, path, exclude)| {
             let exists = path.is_dir();
-            let usage = if exists {
+            // The VMs row includes only valid v2 VM directories. Legacy v1
+            // children inside vms_dir are reported in their own row instead.
+            let usage = if name == "VMs" {
+                Usage {
+                    allocated: vm_disk.iter().map(|vm| vm.allocated_bytes).sum(),
+                    apparent: vm_disk.iter().map(|vm| vm.apparent_bytes).sum(),
+                    files: vm_disk.iter().map(|vm| vm.files).sum(),
+                }
+            } else if exists {
                 usage_excluding(&path, exclude.as_deref())
             } else {
                 Usage::default()
@@ -583,25 +645,132 @@ fn disk_costs(config: &Config) -> Vec<DiskCost> {
         .collect()
 }
 
+/// Disk usage of every active VM directory below `vms_dir`.
+///
+/// Only real child directories with a regular `vm.toml` are VMs. v1 instance
+/// directories elsewhere are reported separately and never counted here.
+fn vm_disk_costs(config: &Config) -> Vec<VmDisk> {
+    let Ok(entries) = fs::read_dir(&config.vms_dir) else {
+        return Vec::new();
+    };
+    let mut vms = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_v2_vm_dir(&path) {
+            continue;
+        }
+        let usage = usage_excluding(&path, None);
+        vms.push(VmDisk {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            path,
+            allocated_bytes: usage.allocated,
+            apparent_bytes: usage.apparent,
+            files: usage.files,
+        });
+    }
+    vms.sort_by(|left, right| left.name.cmp(&right.name));
+    vms
+}
+
+/// A real directory with a regular `vm.toml` is an active v2 VM.
+fn is_v2_vm_dir(path: &Path) -> bool {
+    is_real_dir(path) && is_regular_file(&path.join(crate::vm::config::VM_CONFIG_FILE))
+}
+
+/// A real directory; symlinks are never VMs or legacy state.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// A regular file; a symlinked marker does not make a directory a VM.
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Existing v1 instance directories that are not active VMs in v2.
+///
+/// v1 stored instances next to the snapshot root as `instances` and later
+/// `sandboxes`. The default data directory is checked too, so a custom
+/// `vms_dir` cannot hide the old default directories. A reused `vms_dir` may
+/// also contain v1 instances directly; a v2 VM has `vm.toml`, a v1 instance
+/// has `hegn.toml` instead.
+fn legacy_instance_dirs(config: &Config, data_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut siblings = Vec::new();
+    if let Some(parent) = config.vms_dir.parent() {
+        siblings.push(parent.join("instances"));
+        siblings.push(parent.join("sandboxes"));
+    }
+    if let Some(root) = data_root {
+        siblings.push(root.join("instances"));
+        siblings.push(root.join("sandboxes"));
+    }
+    candidates.extend(siblings.into_iter().filter(|path| {
+        path != &config.vms_dir
+            && !path.starts_with(&config.vms_dir)
+            && !config.vms_dir.starts_with(path)
+    }));
+
+    if let Ok(entries) = fs::read_dir(&config.vms_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_real_dir(&path)
+                && is_regular_file(&path.join(crate::project::PROJECT_META_FILE))
+                && !is_regular_file(&path.join(crate::vm::config::VM_CONFIG_FILE))
+            {
+                candidates.push(path);
+            }
+        }
+    }
+
+    candidates.retain(|path| is_real_dir(path));
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+/// Combined usage of the v1 instance directories, or `None` when there are
+/// none. This is read-only accounting; benchmark never removes them.
+fn legacy_instance_disk(config: &Config, data_root: Option<&Path>) -> Option<LegacyInstanceDisk> {
+    let paths = legacy_instance_dirs(config, data_root);
+    if paths.is_empty() {
+        return None;
+    }
+    let mut total = Usage::default();
+    for path in &paths {
+        let usage = usage_excluding(path, None);
+        total.allocated += usage.allocated;
+        total.apparent += usage.apparent;
+        total.files += usage.files;
+    }
+    Some(LegacyInstanceDisk {
+        paths,
+        allocated_bytes: total.allocated,
+        apparent_bytes: total.apparent,
+        files: total.files,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn session_candidates_cover_the_instance_layout() {
+    fn session_candidates_cover_the_vm_layout() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            instances_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("vms"),
             ..Config::default()
         };
 
-        fs::create_dir_all(config.instances_dir.join("a/run")).unwrap();
-        fs::write(config.instances_dir.join("a/run/session.json"), b"{}").unwrap();
+        fs::create_dir_all(config.vms_dir.join("a/run")).unwrap();
+        fs::write(config.vms_dir.join("a/vm.toml"), b"version = 2\n").unwrap();
+        fs::write(config.vms_dir.join("a/run/session.json"), b"{}").unwrap();
 
         let candidates = session_candidates(&config);
         assert_eq!(candidates.len(), 1);
-        assert!(candidates[0].ends_with("instances/a/run/session.json"));
+        assert!(candidates[0].ends_with("vms/a/run/session.json"));
     }
 
     #[test]
@@ -610,14 +779,14 @@ mod tests {
         let config = Config {
             state_dir: dir.path().join("state"),
             snapshots_dir: dir.path().join("data/snapshots"),
-            instances_dir: dir.path().join("data/instances"),
+            vms_dir: dir.path().join("data/vms"),
             kernel_image: dir.path().join("data/images/kernel"),
             vcpus: 4,
             memory_mib: 1024,
             ..Config::default()
         };
 
-        let report = collect(&config);
+        let report = collect_with(&config, None, |_, _| true);
         assert!(report.sessions.is_empty());
         assert_eq!(report.vcpus, 4);
         assert_eq!(report.guest_memory_bytes, 1024 * MIB);
@@ -625,9 +794,12 @@ mod tests {
             report
                 .notes
                 .iter()
-                .any(|note| note.contains("no running instance"))
+                .any(|note| note.contains("no running VM"))
         );
         assert!(report.disk.iter().any(|cost| cost.name == "images"));
+        assert!(report.disk.iter().any(|cost| cost.name == "VMs"));
+        assert!(report.vm_disk.is_empty());
+        assert!(report.legacy_instances.is_none());
     }
 
     #[test]
@@ -638,7 +810,7 @@ mod tests {
             ..Config::default()
         };
         let session = |vcpus: u8, memory_mib: u32, rss: u64| SessionCost {
-            instance: "s".into(),
+            vm: "s".into(),
             project: None,
             workspace: None,
             harness: None,
@@ -676,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_limits_prefer_the_instance_config() {
+    fn vm_limits_prefer_the_vm_config() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             vcpus: 2,
@@ -684,67 +856,91 @@ mod tests {
             ..Config::default()
         };
 
-        let run = dir.path().join("instance/run");
+        let run = dir.path().join("vm/run");
         fs::create_dir_all(&run).unwrap();
         fs::write(
-            dir.path().join("instance/hegn.toml"),
+            dir.path().join("vm/vm.toml"),
             b"vcpus = 8\nmemory_mib = 8192\n",
         )
         .unwrap();
 
-        let (vcpus, memory) = instance_limits(&run.join("session.json"), &config);
+        let (vcpus, memory) = vm_limits(&run.join("session.json"), &config);
         assert_eq!((vcpus, memory), (8, 8192));
     }
 
     #[test]
-    fn instance_limits_default_without_or_with_a_broken_config() {
+    fn vm_limits_default_without_or_with_a_broken_config() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             vcpus: 2,
             memory_mib: 2048,
             ..Config::default()
         };
-        let run = dir.path().join("instance/run");
+        let run = dir.path().join("vm/run");
         fs::create_dir_all(&run).unwrap();
         let session = run.join("session.json");
 
-        assert_eq!(instance_limits(&session, &config), (2, 2048));
+        assert_eq!(vm_limits(&session, &config), (2, 2048));
 
-        fs::write(dir.path().join("instance/hegn.toml"), b"not = [valid").unwrap();
-        assert_eq!(instance_limits(&session, &config), (2, 2048));
+        fs::write(dir.path().join("vm/vm.toml"), b"not = [valid").unwrap();
+        assert_eq!(vm_limits(&session, &config), (2, 2048));
 
-        fs::write(dir.path().join("instance/hegn.toml"), b"vcpus = 4\n").unwrap();
-        assert_eq!(instance_limits(&session, &config), (4, 2048));
+        fs::write(dir.path().join("vm/vm.toml"), b"vcpus = 4\n").unwrap();
+        assert_eq!(vm_limits(&session, &config), (4, 2048));
     }
 
     #[test]
-    fn session_candidates_include_the_legacy_layout_in_sorted_order() {
+    fn session_candidates_skip_v1_layouts_with_live_pids() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            instances_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("vms"),
             ..Config::default()
         };
-        for instance in ["b", "a"] {
-            fs::create_dir_all(config.instances_dir.join(instance).join("run")).unwrap();
-            fs::write(
-                config.instances_dir.join(instance).join("run/session.json"),
-                b"{}",
-            )
-            .unwrap();
-        }
+        let session = serde_json::json!({
+            "project": dir.path().join("project"),
+            "instance": "old",
+            "started_at": "2026-01-01T00:00:00Z",
+            "vm_pid": std::process::id(),
+            "relay_pid": 0,
+            "virtiofs_pid": 0,
+        });
+
+        // A v1 instance left inside the reused vms_dir.
+        let v1_child = config.vms_dir.join("old");
+        fs::create_dir_all(v1_child.join("run")).unwrap();
+        fs::write(v1_child.join("hegn.toml"), "harness = \"shell\"\n").unwrap();
+        fs::write(
+            v1_child.join("run/session.json"),
+            serde_json::to_vec(&session).unwrap(),
+        )
+        .unwrap();
+
+        // The legacy single-session layout directly under state_dir.
         fs::create_dir_all(config.state_dir.join("run")).unwrap();
-        fs::write(config.state_dir.join("run/session.json"), b"{}").unwrap();
+        fs::write(
+            config.state_dir.join("run/session.json"),
+            serde_json::to_vec(&session).unwrap(),
+        )
+        .unwrap();
+
+        // A real v2 VM is still discovered.
+        let v2 = config.vms_dir.join("current");
+        fs::create_dir_all(v2.join("run")).unwrap();
+        fs::write(v2.join("vm.toml"), b"version = 2\n").unwrap();
+        fs::write(v2.join("run/session.json"), b"{}").unwrap();
 
         let candidates = session_candidates(&config);
-        assert_eq!(candidates.len(), 3);
-        let mut sorted = candidates.clone();
-        sorted.sort();
-        assert_eq!(candidates, sorted);
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            candidates[0].ends_with("vms/current/run/session.json"),
+            "{candidates:?}"
+        );
         assert!(
             candidates
                 .iter()
-                .any(|path| path.ends_with("instances/a/run/session.json"))
+                .all(|path| !path.ends_with("run/session.json") || path.starts_with(&v2)),
+            "v1 sessions with a live pid are never candidates: {candidates:?}"
         );
     }
 
@@ -753,15 +949,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            instances_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("vms"),
             ..Config::default()
         };
-        fs::create_dir_all(config.instances_dir.join("a/run")).unwrap();
-        fs::write(
-            config.instances_dir.join("a/run/session.json"),
-            b"{not json",
-        )
-        .unwrap();
+        fs::create_dir_all(config.vms_dir.join("a/run")).unwrap();
+        fs::write(config.vms_dir.join("a/vm.toml"), b"version = 2\n").unwrap();
+        fs::write(config.vms_dir.join("a/run/session.json"), b"{not json").unwrap();
 
         let mut notes = Vec::new();
         let costs = session_costs(&config, &mut notes, |_, _| true);
@@ -793,7 +986,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            instances_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("vms"),
             snapshots_dir: dir.path().join("snapshots"),
             kernel_image: dir.path().join("images/kernel"),
             ..Config::default()
@@ -802,7 +995,7 @@ mod tests {
         fs::write(config.logs_dir().join("session-1.log"), vec![0u8; 100]).unwrap();
         fs::write(config.state_dir.join("state.json"), vec![0u8; 10]).unwrap();
 
-        let disk = disk_costs(&config);
+        let disk = disk_costs(&config, &vm_disk_costs(&config));
         let logs = disk.iter().find(|cost| cost.name == "logs").unwrap();
         let state = disk.iter().find(|cost| cost.name == "state").unwrap();
         assert_eq!(logs.files, 1);
@@ -822,17 +1015,18 @@ mod tests {
         let session = SessionFile {
             project: Some(dir.path().join("demo")),
             workspace: None,
-            instance: None,
+            vm: None,
             harness: None,
             started_at: Some(Utc::now() + chrono::Duration::seconds(60)),
             vm_pid: 0,
             relay_pid: 0,
+            virtiofs_pids: Vec::new(),
             virtiofs_pid: 0,
         };
 
         let mut notes = Vec::new();
         let cost = build_session(&session, &config, 4, 512, &mut notes);
-        assert_eq!(cost.instance, "demo");
+        assert_eq!(cost.vm, "demo");
         assert_eq!(cost.uptime_secs, Some(0), "future timestamps clamp to zero");
         assert_eq!(cost.guest_memory_bytes, 512 * MIB);
         assert_eq!(cost.vcpus, 4);
@@ -844,13 +1038,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            instances_dir: dir.path().join("data/instances"),
+            vms_dir: dir.path().join("data/vms"),
             ..Config::default()
         };
-        fs::create_dir_all(config.state_dir.join("run")).unwrap();
+        let vm = config.vms_dir.join("demo");
+        fs::create_dir_all(vm.join("run")).unwrap();
+        fs::write(vm.join("vm.toml"), b"version = 2\n").unwrap();
         let session = serde_json::json!({
             "project": dir.path().join("project"),
-            "instance": "demo",
+            "vm": "demo",
             "harness": "shell",
             "started_at": "2026-01-01T00:00:00Z",
             "vm_pid": std::process::id(),
@@ -858,7 +1054,7 @@ mod tests {
             "relay_pid": 0,
         });
         fs::write(
-            config.state_dir.join("run/session.json"),
+            vm.join("run/session.json"),
             serde_json::to_vec(&session).unwrap(),
         )
         .unwrap();
@@ -866,6 +1062,156 @@ mod tests {
         assert!(
             running_sessions(&config).is_empty(),
             "the test process is not a Cloud Hypervisor"
+        );
+    }
+
+    #[test]
+    fn vm_disk_costs_reports_only_active_vm_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            vms_dir: dir.path().join("vms"),
+            ..Config::default()
+        };
+        for (name, bytes) in [("beta", 200usize), ("alpha", 100)] {
+            let vm = config.vms_dir.join(name);
+            fs::create_dir_all(&vm).unwrap();
+            fs::write(vm.join("vm.toml"), b"version = 2\n").unwrap();
+            fs::write(vm.join("rootfs.raw"), vec![0u8; bytes]).unwrap();
+        }
+        // A stray directory without vm.toml is not a VM.
+        fs::create_dir_all(config.vms_dir.join("stray")).unwrap();
+        fs::write(config.vms_dir.join("vm-registry.toml"), b"not a VM").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("vm.toml"), b"version = 2\n").unwrap();
+        fs::write(outside.path().join("keep"), vec![0u8; 4096]).unwrap();
+        std::os::unix::fs::symlink(outside.path(), config.vms_dir.join("linked")).unwrap();
+
+        let vms = vm_disk_costs(&config);
+        let names = vms.iter().map(|vm| vm.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, ["alpha", "beta"], "sorted and v2 directories only");
+        assert!(vms.iter().all(|vm| vm.files == 2));
+        assert!(
+            vms.iter().all(|vm| vm.path.starts_with(&config.vms_dir)),
+            "only active vms_dir children are VMs"
+        );
+    }
+
+    #[test]
+    fn legacy_instance_disk_is_separate_from_active_vms() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        let config = Config {
+            state_dir: dir.path().join("state"),
+            snapshots_dir: data_root.join("snapshots"),
+            vms_dir: data_root.join("vms"),
+            kernel_image: data_root.join("images/kernel"),
+            ..Config::default()
+        };
+        let active = config.vms_dir.join("demo");
+        fs::create_dir_all(&active).unwrap();
+        fs::write(active.join("vm.toml"), b"version = 2\n").unwrap();
+        fs::write(active.join("rootfs.raw"), vec![0u8; 1024]).unwrap();
+        fs::create_dir_all(data_root.join("instances/old-a")).unwrap();
+        fs::write(
+            data_root.join("instances/old-a/rootfs.raw"),
+            vec![0u8; 2048],
+        )
+        .unwrap();
+        fs::create_dir_all(data_root.join("sandboxes/old-b")).unwrap();
+        fs::write(
+            data_root.join("sandboxes/old-b/rootfs.raw"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+        // A v1 instance left inside the reused vms_dir.
+        let old_child = config.vms_dir.join("old-c");
+        fs::create_dir_all(&old_child).unwrap();
+        fs::write(old_child.join("hegn.toml"), "harness = \"shell\"\n").unwrap();
+        fs::write(old_child.join("rootfs.raw"), vec![0u8; 512]).unwrap();
+
+        let vms = vm_disk_costs(&config);
+        assert_eq!(vms.len(), 1);
+        assert_eq!(vms[0].name, "demo");
+        assert!(
+            vms.iter()
+                .all(|vm| vm.name != "instances" && vm.name != "sandboxes"),
+            "legacy sibling directories are not active VMs"
+        );
+        assert!(
+            vms.iter().all(|vm| vm.name != "old-c"),
+            "a v1 child inside vms_dir is not an active VM"
+        );
+
+        let legacy = legacy_instance_disk(&config, Some(&data_root)).expect("legacy dirs");
+        assert_eq!(
+            legacy.paths,
+            vec![
+                data_root.join("instances"),
+                data_root.join("sandboxes"),
+                old_child.clone()
+            ]
+        );
+        assert_eq!(legacy.files, 4);
+        assert!(legacy.allocated_bytes >= 2048 + 4096 + 512);
+        assert!(legacy.apparent_bytes >= 2048 + 4096 + 512);
+
+        let report = collect_with(&config, Some(&data_root), |_, _| true);
+        assert_eq!(
+            report.vm_disk_allocated_bytes,
+            report
+                .vm_disk
+                .iter()
+                .map(|vm| vm.allocated_bytes)
+                .sum::<u64>()
+        );
+        assert_eq!(report.vm_disk.len(), 1);
+        let vm_disk_total = report
+            .disk
+            .iter()
+            .find(|cost| cost.name == "VMs")
+            .expect("overall VMs row");
+        assert_eq!(
+            vm_disk_total.allocated_bytes, report.vm_disk_allocated_bytes,
+            "the overall VMs row excludes legacy children"
+        );
+        assert_eq!(
+            vm_disk_total.files,
+            report.vm_disk.iter().map(|vm| vm.files).sum::<u64>()
+        );
+        assert!(
+            report
+                .legacy_instances
+                .as_ref()
+                .is_some_and(|legacy| legacy.paths.contains(&old_child)),
+            "the in-vms_dir v1 instance is reported as legacy"
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("not active VMs")
+                    && note.contains("not included in the disk total")),
+            "{:?}",
+            report.notes
+        );
+    }
+
+    #[test]
+    fn legacy_instance_disk_is_absent_without_legacy_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        let config = Config {
+            vms_dir: data_root.join("vms"),
+            ..Config::default()
+        };
+
+        assert!(legacy_instance_disk(&config, Some(&data_root)).is_none());
+        let report = collect_with(&config, Some(&data_root), |_, _| true);
+        assert!(report.legacy_instances.is_none());
+        assert!(
+            !report.notes.iter().any(|note| note.contains("legacy v1")),
+            "{:?}",
+            report.notes
         );
     }
 }

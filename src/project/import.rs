@@ -28,29 +28,15 @@ pub fn import_project(
     name: Option<&str>,
     protected: &[PathBuf],
 ) -> Result<PathBuf> {
-    let source = expand_tilde(source);
-    if !source.exists() {
-        bail!("{} does not exist", source.display());
-    }
-    let source = source
-        .canonicalize()
-        .with_context(|| format!("failed to resolve {}", source.display()))?;
-    if !source.is_dir() {
-        bail!("{} is not a directory", source.display());
-    }
-    if source == Path::new("/") {
-        bail!("refusing to import the filesystem root");
-    }
-    if let Some(home) = dirs::home_dir().and_then(|home| home.canonicalize().ok())
-        && source == home
-    {
-        bail!("refusing to import the home directory");
-    }
+    let source = validate_export_source(source, root, protected)?;
 
     fs::create_dir_all(root).with_context(|| format!("failed to create {}", root.display()))?;
     let root = root
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", root.display()))?;
+    // Re-run the root-dependent checks against the canonical root. Before the
+    // directory existed, `validate_export_source` could only compare against a
+    // lexical path (for example one whose parent is a symlink).
     if source == root {
         bail!("refusing to import the projects root itself");
     }
@@ -65,16 +51,6 @@ pub fn import_project(
             "{} is already inside the projects root; no import needed",
             source.display()
         );
-    }
-    for protected in protected {
-        let protected = absolute_or_canonical(protected);
-        if source.starts_with(&protected) || protected.starts_with(&source) {
-            bail!(
-                "refusing to import {}: it overlaps hegn state at {}",
-                source.display(),
-                protected.display()
-            );
-        }
     }
 
     let name = match name {
@@ -102,6 +78,61 @@ pub fn import_project(
     std::os::unix::fs::symlink(&source, &link)
         .with_context(|| format!("failed to create {}", link.display()))?;
     Ok(link)
+}
+
+/// Resolve a directory and run the export safety checks shared by imports and
+/// the private project registry.
+///
+/// This rejects the filesystem root, the home directory, the projects root
+/// itself, any ancestor of the projects root, and any path overlapping hegn's
+/// private state (`protected`). It deliberately allows directories *inside*
+/// the projects root: those are ordinary picker entries, while imports use
+/// [`import_project`] and refuse to add a second link for them.
+pub(super) fn validate_export_source(
+    source: &Path,
+    root: &Path,
+    protected: &[PathBuf],
+) -> Result<PathBuf> {
+    let source = expand_tilde(source);
+    if !source.exists() {
+        bail!("{} does not exist", source.display());
+    }
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", source.display()))?;
+    if !source.is_dir() {
+        bail!("{} is not a directory", source.display());
+    }
+    if source == Path::new("/") {
+        bail!("refusing to import the filesystem root");
+    }
+    if let Some(home) = dirs::home_dir().and_then(|home| home.canonicalize().ok())
+        && source == home
+    {
+        bail!("refusing to import the home directory");
+    }
+
+    let root = absolute_or_canonical(root);
+    if source == root {
+        bail!("refusing to import the projects root itself");
+    }
+    if root.starts_with(&source) {
+        bail!(
+            "{} is an ancestor of the projects root; import a single project instead",
+            source.display()
+        );
+    }
+    for protected in protected {
+        let protected = absolute_or_canonical(protected);
+        if source.starts_with(&protected) || protected.starts_with(&source) {
+            bail!(
+                "refusing to import {}: it overlaps hegn state at {}",
+                source.display(),
+                protected.display()
+            );
+        }
+    }
+    Ok(source)
 }
 
 #[cfg(test)]
@@ -261,6 +292,27 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(entries, ["nested"], "no import link may be created");
+    }
+
+    #[test]
+    fn import_rejects_an_ancestor_reached_through_a_symlinked_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link_parent = dir.path().join("link-parent");
+        std::os::unix::fs::symlink(&real, &link_parent).unwrap();
+        // `root` does not exist yet and its parent is a symlink, so the
+        // pre-creation check compares only lexical paths.
+        let root = link_parent.join("projects");
+
+        let err = import_project(&root, &real, None, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ancestor"), "{err}");
+        assert!(
+            !real.join("projects").join("real").exists(),
+            "a rejected import must not create the project symlink"
+        );
     }
 
     #[test]

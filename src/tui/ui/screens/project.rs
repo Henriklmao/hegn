@@ -12,7 +12,7 @@ use crate::tui::ui::RenderHits;
 use super::super::theme::{ACCENT, GREEN, MUTED, TEXT, YELLOW, panel_block};
 use super::git::render_git;
 use super::health::render_health;
-use super::instances::render_instances;
+use super::project_vm::render_project_vm;
 use super::projects::branch_color;
 use super::snapshots::render_snapshots;
 use super::terminal::{render_terminal_pane, render_terminal_strip};
@@ -33,6 +33,7 @@ pub(crate) fn render_project_panel(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
+    let vm = app.project_vm_name(&project.path).unwrap_or("unassigned");
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
@@ -40,6 +41,13 @@ pub(crate) fn render_project_panel(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(project.display_path(), Style::default().fg(MUTED)),
+        ]),
+        Line::from(vec![
+            Span::styled(" vm   ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("⬢ {vm}"),
+                Style::default().fg(if vm == "unassigned" { YELLOW } else { TEXT }),
+            ),
         ]),
         Line::from(vec![
             Span::styled(" git  ", Style::default().fg(MUTED)),
@@ -55,17 +63,6 @@ pub(crate) fn render_project_panel(frame: &mut Frame, app: &App, area: Rect) {
                     .last_opened
                     .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
                     .unwrap_or_else(|| "never opened".into()),
-                Style::default().fg(TEXT),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" runs ", Style::default().fg(MUTED)),
-            Span::styled(
-                format!(
-                    "{} inside {}",
-                    app.config.harness.label(),
-                    app.config.guest_mount
-                ),
                 Style::default().fg(TEXT),
             ),
         ]),
@@ -112,16 +109,16 @@ pub(crate) fn render_composed_project(frame: &mut Frame, app: &App, area: Rect) 
         .split(columns[1]);
 
     let mut hits = RenderHits {
-        instances: render_instances(frame, app, left[0], 1),
         snapshots: render_snapshots(frame, app, left[1], 2),
         ..RenderHits::default()
     };
+    render_project_vm(frame, app, left[0], 1);
     render_health(frame, app, right[0], 3);
     render_git(frame, app, right[1], 4);
     hits.sections = vec![
         SectionHit {
             rect: left[0],
-            section: ProjectSection::Instances,
+            section: ProjectSection::Vm,
         },
         SectionHit {
             rect: left[1],
@@ -176,7 +173,7 @@ pub(crate) fn render_section_headers(frame: &mut Frame, app: &App, area: Rect) -
             break;
         }
         let count = match section {
-            ProjectSection::Instances => Some(app.instance_visible.len()),
+            ProjectSection::Vm => None,
             ProjectSection::Snapshots => Some(app.project_snapshots.len()),
             ProjectSection::Health => None,
             ProjectSection::Git => None,
@@ -250,9 +247,7 @@ pub(crate) fn render_section_stack(frame: &mut Frame, app: &App, area: Rect) -> 
     for (index, section) in ProjectSection::ALL.iter().copied().enumerate() {
         let rect = rows[index];
         match section {
-            ProjectSection::Instances => {
-                hits.instances = render_instances(frame, app, rect, section.number());
-            }
+            ProjectSection::Vm => render_project_vm(frame, app, rect, section.number()),
             ProjectSection::Snapshots => {
                 hits.snapshots = render_snapshots(frame, app, rect, section.number());
             }
@@ -272,9 +267,7 @@ pub(crate) fn render_section_expanded(
 ) -> RenderHits {
     let mut hits = RenderHits::default();
     match section {
-        ProjectSection::Instances => {
-            hits.instances = render_instances(frame, app, area, 1);
-        }
+        ProjectSection::Vm => render_project_vm(frame, app, area, 1),
         ProjectSection::Snapshots => {
             hits.snapshots = render_snapshots(frame, app, area, 2);
         }
@@ -296,20 +289,13 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn project_screen_shows_sections_health_git_and_strip() {
+    fn project_screen_shows_vm_sections_health_git_and_strip() {
         let (_dir, mut app) = app();
         app.screen = Screen::Project;
         app.open_project = Some(PathBuf::from("/projects/demo"));
         app.refresh_project_snapshots();
         let (text, hits) = render(&app);
-        for needle in [
-            "instances",
-            "snapshots",
-            "health",
-            "git",
-            "hegn",
-            "terminal",
-        ] {
+        for needle in ["vm", "snapshots", "health", "git", "hegn", "terminal"] {
             assert!(text.contains(needle), "missing {needle} in:\n{text}");
         }
         assert_eq!(hits.sections.len(), 4);
@@ -344,7 +330,7 @@ mod tests {
             "[2]",
             "[3]",
             "[4]",
-            "instances",
+            "vm",
             "snapshots",
             "health",
             "git",

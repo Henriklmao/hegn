@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Arch ships `/usr/lib/virtiofsd`, Fedora/RHEL use `/usr/libexec/virtiofsd`,
 /// Debian/Ubuntu keep it in `/usr/lib/qemu/`, and openSUSE uses
-/// `/usr/libexec/qemu/`. `hegn doctor` and the instance preflight fall back to
+/// `/usr/libexec/qemu/`. `hegn doctor` and the VM preflight fall back to
 /// these after `PATH` so a plain package install works without editing
 /// `virtiofsd_bin`.
 pub const VIRTIOFSD_FALLBACKS: &[&str] = &[

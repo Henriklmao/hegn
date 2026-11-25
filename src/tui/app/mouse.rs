@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
 use crate::config::form::FormOutcome;
+use crate::project::Project;
 
 use super::util::rect_contains;
 use super::*;
@@ -39,6 +40,8 @@ impl App {
                     form.select_delta(-1);
                 } else if let Some(Modal::CreateProject(form)) = self.modal.as_mut() {
                     form.package_cursor = form.package_cursor.saturating_sub(1);
+                } else if let Some(Modal::CreateVm(form)) = self.modal.as_mut() {
+                    form.package_cursor = form.package_cursor.saturating_sub(1);
                 } else if self.modal.is_some() {
                     self.scroll_modal(-3);
                 } else if self.screen == Screen::Project
@@ -54,6 +57,9 @@ impl App {
                 if let Some(Modal::Config(form)) = self.modal.as_mut() {
                     form.select_delta(1);
                 } else if let Some(Modal::CreateProject(form)) = self.modal.as_mut() {
+                    form.package_cursor =
+                        (form.package_cursor + 1).min(form.packages.len().saturating_sub(1));
+                } else if let Some(Modal::CreateVm(form)) = self.modal.as_mut() {
                     form.package_cursor =
                         (form.package_cursor + 1).min(form.packages.len().saturating_sub(1));
                 } else if self.modal.is_some() {
@@ -122,7 +128,7 @@ impl App {
                 {
                     self.focus = Focus::Projects;
                     self.selected = row.index;
-                    self.refresh_instance_filter();
+                    self.refresh_vm_filter();
                     let path = self.selected_project().map(|p| p.path.clone());
                     if let Some(path) = path {
                         let now = Instant::now();
@@ -136,24 +142,25 @@ impl App {
                     }
                 }
                 if let Some(row) = self
-                    .instance_rows
+                    .vm_member_rows
                     .iter()
                     .find(|row| rect_contains(row.rect, pos))
                     .copied()
                 {
-                    self.focus = Focus::Instances;
-                    self.instance_selected = row.index;
+                    self.focus = Focus::Projects;
+                    self.vm_member_selected = row.index;
                     let path = self
-                        .selected_instance()
-                        .map(|instance| instance.config_path.clone());
+                        .vm_members
+                        .get(row.index)
+                        .map(|member| member.path.clone());
                     if let Some(path) = path {
                         let now = Instant::now();
                         let double = self.last_click.as_ref().is_some_and(|(at, p)| {
                             p == &path && now.duration_since(*at) < DOUBLE_CLICK
                         });
-                        self.last_click = Some((now, path));
+                        self.last_click = Some((now, path.clone()));
                         if double {
-                            return self.attach_selected_instance();
+                            return self.open_project_via_member(row.index);
                         }
                     }
                 }
@@ -183,10 +190,35 @@ impl App {
                         self.terminal_focus = false;
                     }
                 }
+                if let Some(hit) = self
+                    .vm_section_hits
+                    .iter()
+                    .find(|hit| rect_contains(hit.rect, pos))
+                    .copied()
+                {
+                    self.focus = hit.section.focus();
+                }
                 Vec::new()
             }
             _ => Vec::new(),
         }
+    }
+
+    fn open_project_via_member(&mut self, index: usize) -> Vec<Effect> {
+        let Some(member) = self.vm_members.get(index).cloned() else {
+            return Vec::new();
+        };
+        let project = Project::load(member.path.clone());
+        if !self
+            .projects
+            .iter()
+            .any(|candidate| candidate.path == member.path)
+        {
+            self.projects.push(project);
+        }
+        let _ = self.store.touch(&member.path);
+        self.enter_project(member.path.clone());
+        self.attach_project_vm()
     }
 
     /// Click inside the settings modal: steppers change a value, a row click
@@ -307,13 +339,25 @@ mod tests {
     }
 
     #[test]
-    fn double_clicking_an_instance_asks_to_attach() {
+    fn double_clicking_a_vm_member_opens_and_attaches_it() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
-        let instance = fake_instance(&app, "demo", inside);
-        install_instances(&mut app, vec![instance]);
-        app.screen = Screen::Project;
-        app.instance_rows = vec![RowHit {
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        app.vms = vec![fake_vm(&app, "rust", project.clone())];
+        assign_fake_project(&mut app, &project, "rust");
+        app.open_vm_screen("rust".into());
+        app.vm_members = vec![crate::project::ProjectEntry {
+            name: "demo".into(),
+            path: project.clone(),
+            vm: Some("rust".into()),
+            read_only: false,
+            kind: crate::project::ProjectKind::External,
+            parent: None,
+            managed: false,
+            hidden: false,
+            created_at: chrono::Utc::now(),
+        }];
+        app.vm_member_rows = vec![RowHit {
             rect: Rect::new(0, 4, 20, 1),
             index: 0,
         }];
@@ -323,9 +367,9 @@ mod tests {
 
         assert!(matches!(
             effects.as_slice(),
-            [Effect::AttachInstance { instance }] if instance == "demo"
+            [Effect::StartVm { vm, .. }] if vm == "rust"
         ));
-        assert_eq!(app.instance.state, InstanceState::Starting);
+        assert_eq!(app.vm.state, VmUiState::Starting);
     }
 
     #[test]
@@ -345,7 +389,7 @@ mod tests {
         assert!(!app.terminal_focus);
 
         app.project_view = ProjectView::Compact;
-        app.focus = Focus::Instances;
+        app.focus = Focus::Vm;
         app.handle_mouse(click(1, 1));
         assert_eq!(app.focus, Focus::Snapshots);
         assert_eq!(app.project_view, ProjectView::Compact);

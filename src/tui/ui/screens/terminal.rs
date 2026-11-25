@@ -16,12 +16,13 @@ pub(crate) fn render_terminal_strip(frame: &mut Frame, app: &App, area: Rect) ->
         return None;
     }
     let selected = app
-        .selected_instance()
-        .map(|instance| (instance.name.clone(), instance.state.clone()));
+        .active_vm_summary()
+        .or_else(|| app.selected_vm())
+        .map(|vm| (vm.name.clone(), vm.state.clone()));
     let selected = selected.or_else(|| {
         app.session
             .as_ref()
-            .map(|session| (session.instance_name().to_string(), "running".to_string()))
+            .map(|session| (session.vm_name().to_string(), "running".to_string()))
     });
     let (text, color) = match selected {
         Some((name, state)) => {
@@ -37,10 +38,7 @@ pub(crate) fn render_terminal_strip(frame: &mut Frame, app: &App, area: Rect) ->
             };
             (format!(" terminal · {name} · {state} · {action} "), color)
         }
-        None => (
-            " terminal · no instance · Enter to start ".to_string(),
-            MUTED,
-        ),
+        None => (" terminal · no VM · Enter to start ".to_string(), MUTED),
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -56,12 +54,13 @@ pub(crate) fn render_terminal_pane(frame: &mut Frame, app: &App, area: Rect) {
     let name = app
         .session
         .as_ref()
-        .map(|session| session.instance_name().to_string())
+        .map(|session| session.vm_name().to_string())
         .or_else(|| {
-            app.selected_instance()
-                .map(|instance| instance.name.clone())
+            app.active_vm_summary()
+                .or_else(|| app.selected_vm())
+                .map(|vm| vm.name.clone())
         })
-        .unwrap_or_else(|| "no instance".into());
+        .unwrap_or_else(|| "no VM".into());
     let mode_label = match app.terminal_mode {
         TerminalMode::Normal => "normal",
         TerminalMode::Insert => "insert",
@@ -106,7 +105,7 @@ pub(crate) fn render_terminal_pane(frame: &mut Frame, app: &App, area: Rect) {
     if app.terminal.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "no console output yet — start an instance with Enter",
+                "no console output yet — start a VM with Enter",
                 Style::default().fg(MUTED),
             ))),
             out,
@@ -182,7 +181,7 @@ mod tests {
     use crate::session::console::TerminalConsole;
     use crate::tui::app::{ProjectView, Screen};
     use crate::tui::ui::test_support::*;
-    use crate::vm::instance::InstanceSummary;
+    use crate::vm::registry::VmSummary;
     use std::path::{Path, PathBuf};
 
     struct FakeConsole {
@@ -210,24 +209,24 @@ mod tests {
             "fake · serial"
         }
 
-        fn instance_name(&self) -> &str {
+        fn vm_name(&self) -> &str {
             "fake"
         }
     }
 
-    fn instance(app: &App, name: &str, state: &str) -> InstanceSummary {
-        InstanceSummary {
+    fn vm(app: &App, name: &str, state: &str) -> VmSummary {
+        VmSummary {
             name: name.into(),
+            harness: Harness::Shell,
+            primary: Some("demo".into()),
+            members: 1,
             project: PathBuf::from("/projects/demo"),
             workspace: PathBuf::from(format!("/workspaces/{name}")),
-            harness: Harness::Shell,
-            ephemeral: false,
-            source_instance: None,
             created_at: chrono::Utc::now(),
             state: state.into(),
             vm_pid: None,
             serial_log: None,
-            config_path: app.config.instances_dir.join(name).join("hegn.toml"),
+            config_path: app.config.vms_dir.join(name).join("hegn.toml"),
             vcpus: 2,
             memory_mib: 2048,
             error: None,
@@ -289,17 +288,14 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_strip_describes_missing_running_and_attached_instances() {
+    fn collapsed_strip_describes_missing_running_and_attached_vms() {
         let (_dir, mut app) = project_app();
         let (text, hits) = render(&app);
         assert!(hits.terminal_strip.is_some());
-        assert!(
-            text.contains("terminal · no instance · Enter to start"),
-            "{text}"
-        );
+        assert!(text.contains("terminal · no VM · Enter to start"), "{text}");
 
-        app.instances = vec![instance(&app, "build", "running")];
-        app.refresh_instance_filter();
+        app.vms = vec![vm(&app, "build", "running")];
+        app.refresh_vm_filter();
         let (text, hits) = render(&app);
         assert!(hits.terminal_strip.is_some());
         assert!(
@@ -327,7 +323,7 @@ mod tests {
         // Note: TerminalBuffer::len() always counts the in-progress line, so
         // the renderer's "no console output yet" branch is currently
         // unreachable. Keep this test focused on the pane chrome.
-        assert!(text.contains("terminal · no instance · normal"), "{text}");
+        assert!(text.contains("terminal · no VM · normal"), "{text}");
 
         let (text, _) = render_sized(&app, 40, 5);
         assert!(text.contains("terminal too small"), "{text}");

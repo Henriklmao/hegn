@@ -20,11 +20,11 @@ pub(super) fn launch_agent(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     spec: LaunchSpec,
-    instance: String,
+    vm: String,
     project: std::path::PathBuf,
 ) -> Result<()> {
     let hegn = std::env::current_exe().context("failed to locate the hegn executable")?;
-    let action = match launch::action(&spec, &instance, &project, &hegn) {
+    let action = match launch::action(&spec, &vm, &project, &hegn) {
         Ok(action) => action,
         Err(err) => {
             app.toast(format!("launch failed: {err}"), ToastLevel::Error);
@@ -54,16 +54,12 @@ pub(super) fn launch_agent(
                 Err(err) => app.toast(format!("launch failed: {err}"), ToastLevel::Error),
             }
         }
-        LaunchAction::External {
-            instance,
-            command,
-            bar,
-        } => {
-            let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
+        LaunchAction::External { vm, command, bar } => {
+            let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
             app.detach_console();
             let result = with_suspended_terminal(terminal, || {
-                let config = registry.resolve(&instance)?;
-                let console = registry.manager(config).attach_console()?;
+                let manager = registry.manager_by_name(&vm)?;
+                let console = manager.attach_console()?;
                 crate::session::console::run_interactive_with_command(
                     console,
                     bar,
@@ -73,9 +69,9 @@ pub(super) fn launch_agent(
             // The external client closed on detach; restore the embedded view so
             // the project screen is not left without a console.
             let reattached = registry
-                .resolve(&instance)
+                .manager_by_name(&vm)
                 .ok()
-                .and_then(|config| registry.manager(config).attach_console().ok());
+                .and_then(|manager| manager.attach_console().ok());
             if let Some(console) = reattached {
                 app.attach_console(Box::new(console));
                 app.project_view = crate::tui::app::ProjectView::Split;

@@ -5,6 +5,10 @@
 //! need the real terminal are wrapped in
 //! [`with_suspended_terminal`](super::terminal::with_suspended_terminal) so raw
 //! mode is restored even when they fail.
+//!
+//! Every host mutation goes through the same library APIs as the CLI
+//! (`VmRegistry`, `VmManager`, `ProjectRegistry`, `WorkspaceService`,
+//! `SnapshotStore`); the TUI never shells out to `hegn`.
 
 use std::io::Stdout;
 use std::path::Path;
@@ -15,12 +19,49 @@ use anyhow::{Context, Result};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+use crate::project::{ProjectKind, ProjectRegistry};
 use crate::tui::App;
 use crate::tui::app::{Effect, ToastLevel};
-use crate::tui::jobs::{spawn_attach, spawn_clones, spawn_image_download, spawn_scan, spawn_start};
+use crate::tui::jobs::{
+    spawn_apply_vm, spawn_assign_project, spawn_attach_vm, spawn_create_vm, spawn_delete_vm,
+    spawn_fork_workspace, spawn_image_download, spawn_scan, spawn_set_primary, spawn_start_vm,
+    spawn_stop_vm, spawn_unassign_project,
+};
 use crate::tui::launch::launch_agent;
 use crate::tui::messages::ScanMessage;
 use crate::tui::terminal::with_suspended_terminal;
+
+/// Delete one dashboard project, routing registry-only External projects through
+/// the domain helper and leaving clone/worktree removal to the VM surfaces.
+pub(super) fn delete_project_entry(
+    config: &crate::config::Config,
+    project: &Path,
+    delete_files: bool,
+) -> anyhow::Result<crate::project::ProjectDeleteOutcome> {
+    let canonical = project.canonicalize().ok();
+    let registry = ProjectRegistry::load(&config.state_dir)?;
+    let entry = canonical
+        .as_deref()
+        .and_then(|path| registry.find_by_path(path))
+        .cloned();
+    match entry {
+        Some(entry) if entry.kind == ProjectKind::External => {
+            crate::project::delete_registered_project(config, &entry, delete_files)
+        }
+        Some(entry) => {
+            anyhow::bail!(
+                "project '{}' is a {}; delete it from the VM/workspace surface",
+                entry.name,
+                match entry.kind {
+                    ProjectKind::Clone => "managed clone",
+                    ProjectKind::Worktree => "worktree",
+                    ProjectKind::External => unreachable!(),
+                }
+            )
+        }
+        None => crate::project::delete_project(config, project, delete_files),
+    }
+}
 
 pub(super) fn handle_effects(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -37,6 +78,7 @@ pub(super) fn handle_effects(
                 app.toast("refreshing projects…", ToastLevel::Info);
                 spawn_scan(app.config.clone(), scan_tx.clone());
             }
+            Effect::RefreshVms => app.refresh_vms(),
             Effect::DownloadImages => {
                 app.toast("downloading VM images…", ToastLevel::Info);
                 spawn_image_download(app.config.clone(), scan_tx.clone(), Vec::new());
@@ -146,37 +188,90 @@ pub(super) fn handle_effects(
                     app.toast(format!("lazygit failed: {err}"), ToastLevel::Error);
                 }
             }
-            Effect::StartProjectInstance { project, harness } => {
-                app.toast("starting VM…", ToastLevel::Info);
-                spawn_start(app.config.clone(), project, harness, scan_tx.clone());
+            Effect::StartVm { vm, project } => {
+                app.toast(format!("starting VM {vm}…"), ToastLevel::Info);
+                spawn_start_vm(app.config.clone(), vm, project, scan_tx.clone());
             }
-            Effect::LaunchAgent {
-                spec,
-                instance,
-                project,
+            Effect::AttachVm { vm } => {
+                app.toast(format!("attaching to VM {vm}…"), ToastLevel::Info);
+                spawn_attach_vm(app.config.clone(), vm, scan_tx.clone());
+            }
+            Effect::ApplyVm { vm } => {
+                app.toast(format!("restarting VM {vm}…"), ToastLevel::Info);
+                spawn_apply_vm(app.config.clone(), vm, scan_tx.clone());
+            }
+            Effect::StopVm { vm } => {
+                app.toast(format!("stopping VM {vm}…"), ToastLevel::Info);
+                spawn_stop_vm(app.config.clone(), vm, scan_tx.clone());
+            }
+            Effect::DeleteVm { vm, delete_files } => {
+                spawn_delete_vm(app.config.clone(), vm, delete_files, scan_tx.clone());
+            }
+            Effect::CreateVm {
+                name,
+                harness,
+                vcpus,
+                memory_mib,
+                packages,
             } => {
-                launch_agent(terminal, app, spec, instance, project)?;
+                app.toast(format!("creating VM {name}…"), ToastLevel::Info);
+                spawn_create_vm(
+                    app.config.clone(),
+                    name,
+                    harness,
+                    vcpus,
+                    memory_mib,
+                    packages,
+                    scan_tx.clone(),
+                );
             }
-            Effect::AttachInstance { instance } => {
-                app.toast(format!("attaching to {instance}…"), ToastLevel::Info);
-                spawn_attach(app.config.clone(), instance, scan_tx.clone());
+            Effect::AssignProject {
+                project,
+                path,
+                vm,
+                read_only,
+            } => {
+                app.toast(format!("assigning {project} to {vm}…"), ToastLevel::Info);
+                spawn_assign_project(
+                    app.config.clone(),
+                    project,
+                    path,
+                    vm,
+                    read_only,
+                    scan_tx.clone(),
+                );
             }
-            Effect::AttachConsole { instance } => {
-                let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
+            Effect::UnassignProject { project } => {
+                app.toast(format!("detaching {project}…"), ToastLevel::Info);
+                spawn_unassign_project(app.config.clone(), project, scan_tx.clone());
+            }
+            Effect::SetVmPrimary { vm, project } => {
+                app.toast(format!("setting {project} as primary…"), ToastLevel::Info);
+                spawn_set_primary(app.config.clone(), vm, project, scan_tx.clone());
+            }
+            Effect::ForkWorkspace { parent, name, mode } => {
+                app.toast(format!("forking {parent}…"), ToastLevel::Info);
+                spawn_fork_workspace(app.config.clone(), parent, name, mode, scan_tx.clone());
+            }
+            Effect::LaunchAgent { spec, vm, project } => {
+                launch_agent(terminal, app, spec, vm, project)?;
+            }
+            Effect::AttachConsole { vm } => {
+                let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
                 // Release the embedded client first. Otherwise the external
                 // attach replaces it in the relay and the TUI keeps a dead
                 // socket when the user comes back.
                 app.pending_launch = None;
                 app.detach_console();
                 let result = with_suspended_terminal(terminal, || {
-                    let config = registry.resolve(&instance)?;
-                    let console = registry.manager(config).ensure_console()?;
+                    let manager = registry.manager_by_name(&vm)?;
+                    let console = manager.ensure_console()?;
                     crate::session::console::run_interactive(console, true)
                 });
                 let reattached = registry
-                    .resolve(&instance)
+                    .manager_by_name(&vm)
                     .ok()
-                    .and_then(|config| registry.manager(config).attach_console().ok());
+                    .and_then(|manager| manager.attach_console().ok());
                 if let Some(console) = reattached {
                     app.attach_console(Box::new(console));
                     app.project_view = crate::tui::app::ProjectView::Split;
@@ -192,102 +287,41 @@ pub(super) fn handle_effects(
                     }
                 }
             }
-            Effect::StopInstance { instance } => {
-                let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
-                app.pending_launch = None;
-                match registry.stop(&instance) {
-                    Ok(()) => {
-                        app.toast(format!("instance {instance} stopped"), ToastLevel::Info);
-                        app.refresh_instances();
-                    }
-                    Err(err) => app.toast(format!("stop failed: {err}"), ToastLevel::Error),
-                }
-            }
-            Effect::DeleteInstance {
-                instance,
-                delete_files,
-            } => {
-                let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
-                match registry.delete(&instance, delete_files) {
-                    Ok(outcome) => {
-                        let message = match outcome.kept_workspace {
-                            Some(path) => format!(
-                                "instance {instance} removed; files kept at {}",
-                                path.display()
-                            ),
-                            None if delete_files => {
-                                format!("instance {instance} and files deleted")
-                            }
-                            None => format!("instance {instance} removed; project files kept"),
-                        };
-                        app.toast(message, ToastLevel::Info);
-                        app.refresh_instances();
-                    }
-                    Err(err) => app.toast(format!("delete failed: {err}"), ToastLevel::Error),
-                }
-            }
             Effect::DeleteProject {
                 project,
                 delete_files,
-            } => match crate::project::delete_project(&app.config, &project, delete_files) {
+            } => match delete_project_entry(&app.config, &project, delete_files) {
                 Ok(outcome) => {
                     app.reload_state();
                     app.forget_project_locally(&project);
-                    app.refresh_instances();
+                    app.refresh_vms();
                     let files = if outcome.files_deleted {
                         "files deleted"
                     } else {
                         "files kept"
                     };
-                    let instances = if outcome.instances.is_empty() {
+                    let vms = if outcome.vms.is_empty() {
                         String::new()
                     } else {
-                        format!(" · removed {}", outcome.instances.join(", "))
+                        format!(" · removed {}", outcome.vms.join(", "))
                     };
                     app.toast(
-                        format!("project {} deleted ({files}){instances}", project.display()),
+                        format!("project {} deleted ({files}){vms}", project.display()),
                         ToastLevel::Info,
                     );
                 }
                 Err(err) => app.toast(format!("delete project failed: {err:#}"), ToastLevel::Error),
             },
-            Effect::CloneInstance {
-                source,
-                count,
-                harness,
-                start,
-            } => {
-                app.toast(format!("creating {count} clone(s)…"), ToastLevel::Info);
-                spawn_clones(
-                    app.config.clone(),
-                    source,
-                    count,
-                    harness,
-                    start,
-                    scan_tx.clone(),
-                );
-            }
-            Effect::RefreshInstances => app.refresh_instances(),
             Effect::RestoreSnapshot(snapshot) => {
-                let registry = crate::vm::instance::InstanceRegistry::new(app.config.clone());
-                let instance = snapshot
-                    .instance
-                    .as_deref()
+                let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
+                let Some(vm) = snapshot
+                    .vm()
                     .and_then(|name| registry.store().load(name).ok())
-                    .or_else(|| {
-                        snapshot
-                            .project
-                            .as_deref()
-                            .and_then(|project| registry.resolve(&project.to_string_lossy()).ok())
-                    });
-                let Some(instance) = instance else {
-                    app.toast(
-                        "restore failed: no instance for snapshot",
-                        ToastLevel::Error,
-                    );
+                else {
+                    app.toast("restore failed: no VM for snapshot", ToastLevel::Error);
                     continue;
                 };
-                let manager = registry.manager(instance);
+                let manager = registry.manager(vm)?;
                 match runtime.block_on(manager.restore_snapshot(&snapshot)) {
                     Ok(()) => match manager.attach_console() {
                         Ok(console) => {
@@ -338,4 +372,149 @@ fn open_lazygit(path: &Path) -> Result<()> {
         anyhow::bail!("lazygit exited with {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::project::{ProjectEntry, ProjectKind, ProjectRegistry};
+
+    fn config(dir: &Path) -> Config {
+        let mut config = Config::default();
+        config.projects_root = dir.join("projects");
+        config.state_dir = dir.join("state");
+        config.snapshots_dir = dir.join("snapshots");
+        config.vms_dir = dir.join("vms");
+        config.templates_dir = dir.join("templates");
+        config.profiles_dir = dir.join("profiles");
+        std::fs::create_dir_all(&config.projects_root).unwrap();
+        config
+    }
+
+    fn register(config: &Config, name: &str, path: &Path, kind: ProjectKind) -> ProjectEntry {
+        let entry = ProjectEntry {
+            name: name.into(),
+            path: path.canonicalize().unwrap(),
+            vm: None,
+            read_only: false,
+            kind,
+            parent: None,
+            managed: matches!(kind, ProjectKind::Clone),
+            hidden: false,
+            created_at: chrono::Utc::now(),
+        };
+        ProjectRegistry::load(&config.state_dir)
+            .unwrap()
+            .upsert(entry.clone())
+            .unwrap();
+        entry
+    }
+
+    #[test]
+    fn outside_keep_files_unregisters_without_touching_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let outside = dir.path().join("code/parser");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("README.md"), b"keep").unwrap();
+        register(&config, "parser", &outside, ProjectKind::External);
+
+        let outcome = delete_project_entry(&config, &outside, false).unwrap();
+
+        assert!(!outcome.files_deleted);
+        assert!(outside.join("README.md").is_file());
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("parser")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn outside_delete_files_removes_the_canonical_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let outside = dir.path().join("code/parser");
+        std::fs::create_dir_all(&outside).unwrap();
+        let canonical = outside.canonicalize().unwrap();
+        register(&config, "parser", &outside, ProjectKind::External);
+
+        let outcome = delete_project_entry(&config, &outside, true).unwrap();
+
+        assert!(outcome.files_deleted);
+        assert!(!canonical.exists());
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("parser")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unsafe_registry_path_is_refused_and_stays_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        register(&config, "root", Path::new("/"), ProjectKind::External);
+
+        let err = delete_project_entry(&config, Path::new("/"), true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("refusing"), "{err}");
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("root")
+                .is_some(),
+            "a refused delete must keep the registry entry"
+        );
+        assert!(Path::new("/").is_dir());
+    }
+
+    #[test]
+    fn picker_delete_keeps_the_existing_keep_files_behaviour() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let picker = config.projects_root.join("demo");
+        std::fs::create_dir_all(&picker).unwrap();
+        std::fs::write(picker.join("README.md"), b"keep").unwrap();
+        register(&config, "demo", &picker, ProjectKind::External);
+
+        let outcome = delete_project_entry(&config, &picker, false).unwrap();
+
+        assert!(!outcome.files_deleted);
+        assert!(picker.join("README.md").is_file());
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("demo")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn clone_registered_paths_are_left_to_the_workspace_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let clone = config.vms_dir.join("rust/workspaces/parser-fix");
+        std::fs::create_dir_all(&clone).unwrap();
+        register(&config, "parser-fix", &clone, ProjectKind::Clone);
+
+        let err = delete_project_entry(&config, &clone, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("VM/workspace surface"), "{err}");
+        assert!(clone.is_dir());
+        assert!(
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .get("parser-fix")
+                .is_some()
+        );
+    }
 }

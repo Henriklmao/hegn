@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Result;
 
 /// Transport used by the terminal view. Implementations must never pretend to
-/// be an instance when no VM is running.
+/// be a VM when none is running.
 pub trait TerminalConsole: Send {
     /// Send bytes to the guest serial port.
     fn send(&mut self, bytes: &[u8]) -> Result<()>;
@@ -15,5 +15,5 @@ pub trait TerminalConsole: Send {
     fn is_exited(&mut self) -> bool;
     fn project(&self) -> &Path;
     fn label(&self) -> &str;
-    fn instance_name(&self) -> &str;
+    fn vm_name(&self) -> &str;
 }

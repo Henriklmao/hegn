@@ -36,7 +36,7 @@ pub fn setup_actions(config: &Config) -> SetupActions {
         create_dirs: !config.projects_root.is_dir()
             || !config.state_dir.is_dir()
             || !config.snapshots_dir.is_dir()
-            || !config.instances_dir.is_dir()
+            || !config.vms_dir.is_dir()
             || !config.templates_dir.is_dir()
             || !config.profiles_dir.is_dir()
             || !config.logs_dir().is_dir(),
@@ -59,7 +59,7 @@ mod tests {
             state_dir: dir.path().join("state"),
             projects_root: dir.path().join("projects"),
             snapshots_dir: dir.path().join("snapshots"),
-            instances_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("instances"),
             templates_dir: dir.path().join("templates"),
             kernel_image: dir.path().join("missing-kernel"),
             rootfs_image: dir.path().join("missing-rootfs"),

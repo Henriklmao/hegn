@@ -356,10 +356,10 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
 }
 
 /// nftables rules. Public HTTP(S) and public DNS only; everything else from a
-/// instance TAP is dropped, including RFC1918, link-local, CGNAT, multicast and
+/// VM TAP is dropped, including RFC1918, link-local, CGNAT, multicast and
 /// all IPv6.
 ///
-/// `endpoints` adds a DNAT from the instance's own TAP host address to the host
+/// `endpoints` adds a DNAT from the VM's own TAP host address to the host
 /// loopback on the same port, plus an input accept for those translated flows.
 /// The rules are static, so changing the list requires re-running setup.
 pub fn nft_rules(endpoints: &[u16]) -> String {

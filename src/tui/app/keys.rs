@@ -1,5 +1,5 @@
-//! Keyboard handling for the dashboard, the project screen, the embedded
-//! terminal and every modal.
+//! Keyboard handling for the dashboard, the project and VM screens, the
+//! embedded terminal and every modal.
 
 use std::path::{Path, PathBuf};
 
@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::Harness;
 use crate::config::form::FormOutcome;
-use crate::project::{self, Project, ProjectMeta};
+use crate::project::{self, Project, ProjectMeta, ProjectRegistry};
 
 use super::*;
 
@@ -24,6 +24,7 @@ impl App {
         match self.screen {
             Screen::Dashboard => self.handle_dashboard_key(key),
             Screen::Project => self.handle_project_key(key),
+            Screen::Vm => self.handle_vm_key(key),
         }
     }
 
@@ -104,7 +105,7 @@ impl App {
                 self.select_next(-5);
                 Vec::new()
             }
-            KeyCode::Enter | KeyCode::Char('o') => self.open_project(),
+            KeyCode::Enter | KeyCode::Char('o') => self.open_selected(),
             KeyCode::Char('c') => {
                 self.modal = Some(Modal::CreateProject(CreateProjectForm::new(
                     self.config.harness,
@@ -119,25 +120,36 @@ impl App {
             KeyCode::Char('g') => self.effect_for_selected(Effect::OpenLazygit),
             KeyCode::Char('r') => {
                 self.refresh_snapshots();
-                vec![Effect::RefreshProjects, Effect::RefreshInstances]
+                self.refresh_project_entries();
+                vec![Effect::RefreshProjects, Effect::RefreshVms]
             }
-            KeyCode::Char('d') => match self.focus {
-                Focus::Instances => self.confirm_delete_instance(),
-                Focus::Snapshots => self.confirm_delete_snapshot(),
-                Focus::Projects | Focus::Health | Focus::Git => self.confirm_delete_project(),
-            },
+            KeyCode::Char('d') if self.focus == Focus::Snapshots => self.confirm_delete_snapshot(),
+            KeyCode::Char('d') => self.confirm_delete_project(),
+            KeyCode::Char('v') => self.open_selected_projects_vm(),
             KeyCode::Char('n') if self.focus == Focus::Snapshots => {
                 self.handle_action(ActionId::NewSnapshot)
             }
-            KeyCode::Char('b') | KeyCode::Char('2') => self.open_project_section(Focus::Instances),
-            KeyCode::Char('s') | KeyCode::Char('3') => self.open_project_section(Focus::Snapshots),
-            KeyCode::Char('p') | KeyCode::Char('1') => {
-                self.focus = Focus::Projects;
+            KeyCode::Char('n') | KeyCode::Char('V') => {
+                self.open_create_vm_form();
                 Vec::new()
             }
-            KeyCode::Char('S') if self.focus == Focus::Instances => self.stop_selected_instance(),
+            KeyCode::Char('a') => self.assign_selected_project(),
+            KeyCode::Char('f') => self.fork_selected_project(),
+            KeyCode::Char('D') => self.confirm_detach_project(),
+            KeyCode::Char('b') | KeyCode::Char('1') => {
+                if self.selected_project().is_some() {
+                    self.open_project_section(Focus::Vm)
+                } else {
+                    Vec::new()
+                }
+            }
+            KeyCode::Char('2') => self.open_project_section(Focus::Snapshots),
+            KeyCode::Char('3') => self.open_project_section(Focus::Health),
+            KeyCode::Char('4') => self.open_project_section(Focus::Git),
+            KeyCode::Char('S') => self.stop_selected_vm(),
+            KeyCode::Char('A') => self.apply_selected_vm(),
             KeyCode::F(4) => self.open_global_config(),
-            KeyCode::F(5) if self.focus == Focus::Instances => self.open_instance_config(),
+            KeyCode::F(5) => self.open_vm_config(),
             KeyCode::Char('t') => {
                 if self.session.is_some() {
                     self.show_session_project();
@@ -149,6 +161,48 @@ impl App {
             }
             _ => Vec::new(),
         }
+    }
+
+    pub(super) fn open_selected_projects_vm(&mut self) -> Vec<Effect> {
+        let Some(project) = self.selected_project().map(|project| project.path.clone()) else {
+            self.toast("no project selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        match self.project_vm_name(&project).map(str::to_string) {
+            Some(vm) => self.open_vm_screen(vm),
+            None => {
+                self.toast(
+                    "the project is unassigned — press a to pick a VM",
+                    ToastLevel::Warn,
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    fn assign_selected_project(&mut self) -> Vec<Effect> {
+        let Some(project) = self.selected_project().map(|project| project.path.clone()) else {
+            self.toast("no project selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        self.open_assign_form(project, None)
+    }
+
+    fn fork_selected_project(&mut self) -> Vec<Effect> {
+        let Some(project) = self.selected_project().map(|project| project.path.clone()) else {
+            self.toast("no project selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        let parent = self.project_entry(&project).map(|entry| entry.name.clone());
+        self.confirm_fork_workspace(parent)
+    }
+
+    pub(super) fn open_create_vm_form(&mut self) {
+        self.modal = Some(Modal::CreateVm(CreateVmForm::new(
+            self.config.harness,
+            self.config.vcpus,
+            self.config.memory_mib,
+        )));
     }
 
     pub(super) fn effect_for_selected(
@@ -181,7 +235,7 @@ impl App {
             && let KeyCode::Char(number @ '1'..='4') = key.code
         {
             let section = match number {
-                '1' => ProjectSection::Instances,
+                '1' => ProjectSection::Vm,
                 '2' => ProjectSection::Snapshots,
                 '3' => ProjectSection::Health,
                 _ => ProjectSection::Git,
@@ -238,31 +292,30 @@ impl App {
                 Vec::new()
             }
             KeyCode::Enter if self.focus == Focus::Snapshots => self.confirm_restore_snapshot(),
-            KeyCode::Enter if self.focus == Focus::Instances => {
-                if self.selected_instance().is_some() {
-                    self.attach_selected_instance()
-                } else {
-                    self.start_project_instance()
-                }
+            KeyCode::Enter if matches!(self.focus, Focus::Vm | Focus::Projects) => {
+                self.attach_project_vm()
             }
             KeyCode::Char('i') | KeyCode::Char('a') | KeyCode::Char('t') => self.open_terminal(),
             KeyCode::Char('L') => self.request_launch(None),
             KeyCode::Char('n') if self.focus == Focus::Snapshots => {
                 self.handle_action(ActionId::NewSnapshot)
             }
-            KeyCode::Char('n') if self.focus == Focus::Instances => self.start_project_instance(),
-            KeyCode::Char('M') => self.open_multi_agent(),
-            KeyCode::Char('S') => self.stop_selected_instance(),
-            KeyCode::Char('d') if self.focus == Focus::Instances => self.confirm_delete_instance(),
+            KeyCode::Char('M') | KeyCode::Char('f') => self.open_fork_workspace(),
+            KeyCode::Char('S') => self.stop_selected_vm(),
+            KeyCode::Char('A') => self.apply_selected_vm(),
             KeyCode::Char('d') if self.focus == Focus::Snapshots => self.confirm_delete_snapshot(),
+            KeyCode::Char('d') if self.focus == Focus::Vm => self.confirm_detach_project(),
+            KeyCode::Char('D') => self.confirm_delete_vm(),
+            KeyCode::Char('v') => self.open_selected_projects_vm(),
             KeyCode::Char('e') => self.effect_for_open_project(Effect::OpenEditor),
             KeyCode::Char('g') => self.effect_for_open_project(Effect::OpenLazygit),
             KeyCode::Char('r') => {
                 self.refresh_snapshots();
-                vec![Effect::RefreshProjects, Effect::RefreshInstances]
+                self.refresh_project_entries();
+                vec![Effect::RefreshProjects, Effect::RefreshVms]
             }
             KeyCode::F(4) => self.open_global_config(),
-            KeyCode::F(5) if self.focus == Focus::Instances => self.open_instance_config(),
+            KeyCode::F(5) => self.open_vm_config(),
             KeyCode::Char('?') | KeyCode::F(1) => {
                 self.modal = Some(Modal::Help(HelpState::default()));
                 Vec::new()
@@ -273,6 +326,201 @@ impl App {
             }
             _ => Vec::new(),
         }
+    }
+
+    pub(super) fn handle_vm_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if crate::session::attach_bar::detach_requested(key) {
+            self.leave_vm();
+            return Vec::new();
+        }
+        if key.code == KeyCode::F(2) {
+            return self.attach_console_external();
+        }
+        if key.code == KeyCode::F(5) {
+            return self.open_vm_config();
+        }
+        if key.code == KeyCode::Left {
+            self.leave_vm();
+            return Vec::new();
+        }
+        if let KeyCode::Char(number @ '1'..='4') = key.code {
+            let section = match number {
+                '1' => VmSection::Projects,
+                '2' => VmSection::Snapshots,
+                '3' => VmSection::Tools,
+                _ => VmSection::Health,
+            };
+            self.focus = section.focus();
+            return Vec::new();
+        }
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.focus_next();
+            return Vec::new();
+        }
+        if key.code == KeyCode::Esc {
+            self.leave_vm();
+            return Vec::new();
+        }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.select_next(1);
+                Vec::new()
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.select_next(-1);
+                Vec::new()
+            }
+            KeyCode::PageDown => {
+                self.select_next(5);
+                Vec::new()
+            }
+            KeyCode::PageUp => {
+                self.select_next(-5);
+                Vec::new()
+            }
+            KeyCode::Enter if self.focus == Focus::Projects => {
+                let Some(member) = self.vm_members.get(self.vm_member_selected).cloned() else {
+                    return Vec::new();
+                };
+                let path = member.path;
+                self.open_project_via_path(path)
+            }
+            KeyCode::Enter if self.focus == Focus::Snapshots => self.confirm_restore_snapshot(),
+            KeyCode::Enter if self.focus == Focus::Tools => self.attach_active_vm(),
+            KeyCode::Char('s') => self.attach_active_vm(),
+            KeyCode::Char('S') => self.stop_selected_vm(),
+            KeyCode::Char('A') => self.apply_selected_vm(),
+            KeyCode::Char('p') => self.set_selected_primary(),
+            KeyCode::Char('a') => self.assign_project_to_open_vm(),
+            KeyCode::Char('f') => self.fork_selected_member(),
+            KeyCode::Char('d') if self.focus == Focus::Projects => self.detach_selected_member(),
+            KeyCode::Char('d') if self.focus == Focus::Snapshots => self.confirm_delete_snapshot(),
+            KeyCode::Char('D') => self.confirm_delete_vm(),
+            KeyCode::Char('n') if self.focus == Focus::Snapshots => {
+                self.handle_action(ActionId::NewSnapshot)
+            }
+            KeyCode::Char('n') => {
+                self.open_create_vm_form();
+                Vec::new()
+            }
+            KeyCode::Char('e') => self.open_vm_config(),
+            KeyCode::Char('r') => {
+                self.refresh_snapshots();
+                vec![Effect::RefreshVms, Effect::RefreshProjects]
+            }
+            KeyCode::F(4) => self.open_global_config(),
+            KeyCode::Char('?') | KeyCode::F(1) => {
+                self.modal = Some(Modal::Help(HelpState::default()));
+                Vec::new()
+            }
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+                vec![Effect::Quit]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn open_project_via_path(&mut self, path: PathBuf) -> Vec<Effect> {
+        let project = Project::load(path.clone());
+        if !self.projects.iter().any(|candidate| candidate.path == path) {
+            self.projects.push(project);
+        }
+        let _ = self.store.touch(&path);
+        self.enter_project(path);
+        self.attach_project_vm()
+    }
+
+    pub(super) fn set_selected_primary(&mut self) -> Vec<Effect> {
+        let Some(vm) = self.vm_open.clone() else {
+            return Vec::new();
+        };
+        let Some(member) = self.vm_members.get(self.vm_member_selected) else {
+            self.toast("no project selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        if member.kind == crate::project::ProjectKind::Worktree {
+            self.toast(
+                "a worktree rides its parent's share and cannot be primary",
+                ToastLevel::Warn,
+            );
+            return Vec::new();
+        }
+        vec![Effect::SetVmPrimary {
+            vm,
+            project: member.name.clone(),
+        }]
+    }
+
+    fn assign_project_to_open_vm(&mut self) -> Vec<Effect> {
+        let Some(vm) = self.vm_open.clone() else {
+            return Vec::new();
+        };
+        let candidates = self.unassigned_project_candidates();
+        if candidates.is_empty() {
+            self.toast(
+                "no unassigned projects; import one with h first",
+                ToastLevel::Warn,
+            );
+            return Vec::new();
+        }
+        self.modal = Some(Modal::AssignProject(AssignProjectForm::for_vm(
+            vm, candidates,
+        )));
+        Vec::new()
+    }
+
+    /// Unassigned registry members plus discovered projects that are not in
+    /// the registry yet. Worktrees inherit their parent's VM.
+    pub(super) fn unassigned_project_candidates(&self) -> Vec<String> {
+        let mut candidates: Vec<String> = self
+            .project_entries
+            .iter()
+            .filter(|entry| {
+                entry.vm.is_none() && entry.kind != crate::project::ProjectKind::Worktree
+            })
+            .map(|entry| entry.name.clone())
+            .collect();
+        for project in &self.projects {
+            let registered = self
+                .project_entries
+                .iter()
+                .any(|entry| crate::vm::same_project(&entry.path, &project.path));
+            if !registered {
+                candidates.push(project.name.clone());
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        candidates
+    }
+
+    pub(super) fn fork_selected_member(&mut self) -> Vec<Effect> {
+        let parent = self
+            .vm_members
+            .get(self.vm_member_selected)
+            .map(|member| member.name.clone());
+        self.confirm_fork_workspace(parent)
+    }
+
+    pub(super) fn detach_selected_member(&mut self) -> Vec<Effect> {
+        let Some(member) = self.vm_members.get(self.vm_member_selected) else {
+            self.toast("no project selected", ToastLevel::Warn);
+            return Vec::new();
+        };
+        if member.kind == crate::project::ProjectKind::Worktree {
+            self.toast(
+                "a worktree inherits its parent's VM and cannot be detached",
+                ToastLevel::Warn,
+            );
+            return Vec::new();
+        }
+        self.modal = Some(Modal::DetachProject(DetachProjectModal {
+            project: member.name.clone(),
+            vm: self.vm_open.clone().unwrap_or_default(),
+            scroll: 0,
+        }));
+        Vec::new()
     }
 
     pub(super) fn handle_project_terminal_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -298,7 +546,7 @@ impl App {
                     self.terminal_mode = TerminalMode::Insert;
                     self.toast("insert mode — Esc returns to normal", ToastLevel::Info);
                 }
-                KeyCode::Char('M') => return self.open_multi_agent(),
+                KeyCode::Char('M') | KeyCode::Char('f') => return self.open_fork_workspace(),
                 KeyCode::Char('L') => return self.request_launch(None),
                 KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.terminal.clear();
@@ -454,57 +702,62 @@ impl App {
                 FormOutcome::OpenFile => vec![Effect::OpenEditor(form.path)],
                 FormOutcome::OpenProfile(harness) => vec![Effect::OpenProfileEditor(harness)],
             },
-            Modal::DeleteInstance(mut modal) => match key.code {
+            Modal::DeleteVm(mut modal) => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => Vec::new(),
                 KeyCode::Char('y') => match modal.stage {
-                    DeleteInstanceStage::Confirm => {
-                        if self.workspace_is_inside_instance(&modal.instance) {
-                            modal.stage = DeleteInstanceStage::Files;
-                            self.modal = Some(Modal::DeleteInstance(modal));
-                            Vec::new()
-                        } else {
-                            vec![Effect::DeleteInstance {
-                                instance: modal.instance.name,
-                                delete_files: false,
-                            }]
-                        }
+                    DeleteVmStage::Confirm => {
+                        modal.stage = DeleteVmStage::Files;
+                        self.modal = Some(Modal::DeleteVm(modal));
+                        Vec::new()
                     }
-                    DeleteInstanceStage::Files => vec![Effect::DeleteInstance {
-                        instance: modal.instance.name,
-                        delete_files: true,
-                    }],
+                    DeleteVmStage::Files => self.delete_vm_effect(modal, true),
                 },
-                KeyCode::Char('n') | KeyCode::Char('k')
-                    if modal.stage == DeleteInstanceStage::Files =>
-                {
-                    vec![Effect::DeleteInstance {
-                        instance: modal.instance.name,
-                        delete_files: false,
-                    }]
+                KeyCode::Char('n') if modal.stage == DeleteVmStage::Files => {
+                    self.delete_vm_effect(modal, false)
                 }
                 KeyCode::Char('n') => Vec::new(),
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.modal = Some(Modal::DeleteInstance(modal));
+                    self.modal = Some(Modal::DeleteVm(modal));
                     self.scroll_modal(1);
                     Vec::new()
                 }
-                KeyCode::Char('k') | KeyCode::Up if modal.stage == DeleteInstanceStage::Confirm => {
-                    self.modal = Some(Modal::DeleteInstance(modal));
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.modal = Some(Modal::DeleteVm(modal));
                     self.scroll_modal(-1);
                     Vec::new()
                 }
                 KeyCode::PageDown => {
-                    self.modal = Some(Modal::DeleteInstance(modal));
+                    self.modal = Some(Modal::DeleteVm(modal));
                     self.scroll_modal_page(1);
                     Vec::new()
                 }
                 KeyCode::PageUp => {
-                    self.modal = Some(Modal::DeleteInstance(modal));
+                    self.modal = Some(Modal::DeleteVm(modal));
                     self.scroll_modal_page(-1);
                     Vec::new()
                 }
                 _ => {
-                    self.modal = Some(Modal::DeleteInstance(modal));
+                    self.modal = Some(Modal::DeleteVm(modal));
+                    Vec::new()
+                }
+            },
+            Modal::DetachProject(modal) => match key.code {
+                KeyCode::Char('y') => vec![Effect::UnassignProject {
+                    project: modal.project,
+                }],
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => Vec::new(),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.modal = Some(Modal::DetachProject(modal));
+                    self.scroll_modal(1);
+                    Vec::new()
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.modal = Some(Modal::DetachProject(modal));
+                    self.scroll_modal(-1);
+                    Vec::new()
+                }
+                _ => {
+                    self.modal = Some(Modal::DetachProject(modal));
                     Vec::new()
                 }
             },
@@ -537,55 +790,91 @@ impl App {
                     Vec::new()
                 }
             },
-            Modal::MultiAgent(mut form) => match key.code {
-                KeyCode::Esc => Vec::new(),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    form.count = form.count.saturating_add(1).min(8);
-                    self.modal = Some(Modal::MultiAgent(form));
+            Modal::CreateVm(mut form) => {
+                if key.code == KeyCode::Esc {
+                    return Vec::new();
+                }
+                match key.code {
+                    KeyCode::Tab => {
+                        form.cycle_focus(false);
+                        self.modal = Some(Modal::CreateVm(form));
+                    }
+                    KeyCode::BackTab => {
+                        form.cycle_focus(true);
+                        self.modal = Some(Modal::CreateVm(form));
+                    }
+                    KeyCode::Enter if form.focus == CreateVmFocus::Create => {
+                        return self.submit_create_vm(form);
+                    }
+                    KeyCode::Enter => {
+                        form.cycle_focus(false);
+                        self.modal = Some(Modal::CreateVm(form));
+                    }
+                    KeyCode::Char(' ') if form.focus == CreateVmFocus::Packages => {
+                        if let Some(package) = form.packages.get_mut(form.package_cursor) {
+                            package.selected = !package.selected;
+                        }
+                        self.modal = Some(Modal::CreateVm(form));
+                    }
+                    _ => {
+                        self.edit_create_vm_form(&mut form, key);
+                        self.modal = Some(Modal::CreateVm(form));
+                    }
+                }
+                Vec::new()
+            }
+            Modal::AssignProject(mut form) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => Vec::new(),
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k') => {
+                    form.cycle(-1);
+                    self.modal = Some(Modal::AssignProject(form));
                     Vec::new()
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    form.count = form.count.saturating_sub(1).max(1);
-                    self.modal = Some(Modal::MultiAgent(form));
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j') => {
+                    form.cycle(1);
+                    self.modal = Some(Modal::AssignProject(form));
                     Vec::new()
                 }
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                    let index = Harness::ALL
-                        .iter()
-                        .position(|harness| *harness == form.harness)
-                        .unwrap_or(0);
-                    let next = if key.code == KeyCode::Left {
-                        (index + Harness::ALL.len() - 1) % Harness::ALL.len()
-                    } else {
-                        (index + 1) % Harness::ALL.len()
-                    };
-                    form.harness = Harness::ALL[next];
-                    self.modal = Some(Modal::MultiAgent(form));
+                KeyCode::Char('r') => {
+                    form.read_only = !form.read_only;
+                    self.modal = Some(Modal::AssignProject(form));
                     Vec::new()
                 }
-                KeyCode::Char(' ') => {
-                    form.start = !form.start;
-                    self.modal = Some(Modal::MultiAgent(form));
-                    Vec::new()
-                }
-                KeyCode::PageDown => {
-                    self.modal = Some(Modal::MultiAgent(form));
-                    self.scroll_modal_page(1);
-                    Vec::new()
-                }
-                KeyCode::PageUp => {
-                    self.modal = Some(Modal::MultiAgent(form));
-                    self.scroll_modal_page(-1);
-                    Vec::new()
-                }
-                KeyCode::Enter => vec![Effect::CloneInstance {
-                    source: form.source,
-                    count: form.count,
-                    harness: form.harness,
-                    start: form.start,
-                }],
+                KeyCode::Enter => self.submit_assign_project(form),
                 _ => {
-                    self.modal = Some(Modal::MultiAgent(form));
+                    self.modal = Some(Modal::AssignProject(form));
+                    Vec::new()
+                }
+            },
+            Modal::ForkWorkspace(mut form) => match key.code {
+                KeyCode::Esc => Vec::new(),
+                KeyCode::Tab | KeyCode::BackTab => {
+                    form.toggle_mode();
+                    self.modal = Some(Modal::ForkWorkspace(form));
+                    Vec::new()
+                }
+                KeyCode::Enter => vec![Effect::ForkWorkspace {
+                    parent: form.parent,
+                    name: form.name,
+                    mode: form.mode,
+                }],
+                KeyCode::Backspace => {
+                    form.name.pop();
+                    self.modal = Some(Modal::ForkWorkspace(form));
+                    Vec::new()
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if form.name.len() < 128 {
+                        form.name.push(c);
+                    }
+                    self.modal = Some(Modal::ForkWorkspace(form));
+                    Vec::new()
+                }
+                _ => {
+                    self.modal = Some(Modal::ForkWorkspace(form));
                     Vec::new()
                 }
             },
@@ -717,6 +1006,132 @@ impl App {
         }
     }
 
+    pub(super) fn submit_create_vm(&mut self, form: CreateVmForm) -> Vec<Effect> {
+        let name = form.name.trim().to_string();
+        if name.is_empty() {
+            let mut form = form;
+            form.error = Some("enter a VM name".into());
+            self.modal = Some(Modal::CreateVm(form));
+            return Vec::new();
+        }
+        vec![Effect::CreateVm {
+            name,
+            harness: form.harness,
+            vcpus: form.vcpus,
+            memory_mib: form.memory_mib,
+            packages: form.selected_packages(),
+        }]
+    }
+
+    fn submit_assign_project(&mut self, form: AssignProjectForm) -> Vec<Effect> {
+        let Some(candidate) = form.selected().map(str::to_string) else {
+            let mut form = form;
+            form.error = Some("no candidate to assign".into());
+            self.modal = Some(Modal::AssignProject(form));
+            return Vec::new();
+        };
+        let (project, vm) = match (form.project.clone(), form.vm.clone()) {
+            (Some(project), None) => (project, candidate),
+            (None, Some(vm)) => (candidate, vm),
+            (Some(project), Some(vm)) => (project, vm),
+            (None, None) => {
+                let mut form = form;
+                form.error = Some("select a VM and a project".into());
+                self.modal = Some(Modal::AssignProject(form));
+                return Vec::new();
+            }
+        };
+        let path = self
+            .project_entry_by_name(&project)
+            .map(|entry| entry.path.clone())
+            .or_else(|| {
+                self.projects
+                    .iter()
+                    .find(|candidate| candidate.name == project)
+                    .map(|candidate| candidate.path.clone())
+            })
+            .unwrap_or_else(|| self.config.projects_root.join(&project));
+        vec![Effect::AssignProject {
+            project,
+            path,
+            vm,
+            read_only: form.read_only,
+        }]
+    }
+
+    fn project_entry_by_name(&self, name: &str) -> Option<&crate::project::ProjectEntry> {
+        self.project_entries.iter().find(|entry| entry.name == name)
+    }
+
+    fn edit_create_vm_form(&self, form: &mut CreateVmForm, key: KeyEvent) {
+        match form.focus {
+            CreateVmFocus::Name => match key.code {
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    form.name.push(c)
+                }
+                KeyCode::Backspace => {
+                    form.name.pop();
+                }
+                _ => {}
+            },
+            CreateVmFocus::Harness => {
+                let harnesses = Harness::ALL;
+                let index = harnesses
+                    .iter()
+                    .position(|h| *h == form.harness)
+                    .unwrap_or(0);
+                match key.code {
+                    KeyCode::Left => {
+                        form.harness = harnesses[(index + harnesses.len() - 1) % harnesses.len()];
+                    }
+                    KeyCode::Right | KeyCode::Char(' ') => {
+                        form.harness = harnesses[(index + 1) % harnesses.len()];
+                    }
+                    _ => {}
+                }
+            }
+            CreateVmFocus::Vcpus => match key.code {
+                KeyCode::Left | KeyCode::Char('h') => {
+                    form.vcpus = form.vcpus.saturating_sub(1).max(1)
+                }
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
+                    form.vcpus = form.vcpus.saturating_add(1).min(32);
+                }
+                _ => {}
+            },
+            CreateVmFocus::Memory => match key.code {
+                KeyCode::Left | KeyCode::Char('h') => {
+                    form.memory_mib = form.memory_mib.saturating_sub(256).max(128);
+                }
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
+                    form.memory_mib = form.memory_mib.saturating_add(256).min(262_144);
+                }
+                _ => {}
+            },
+            CreateVmFocus::Packages => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    form.package_cursor = form
+                        .package_cursor
+                        .checked_sub(1)
+                        .unwrap_or(form.packages.len().saturating_sub(1));
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    form.package_cursor = (form.package_cursor + 1) % form.packages.len().max(1);
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(package) = form.packages.get_mut(form.package_cursor) {
+                        package.selected = !package.selected;
+                    }
+                }
+                _ => {}
+            },
+            CreateVmFocus::Create => {}
+        }
+    }
+
     pub(super) fn edit_create_form(&self, form: &mut CreateProjectForm, key: KeyEvent) {
         match form.focus {
             CreateFocus::Name => match key.code {
@@ -783,7 +1198,6 @@ impl App {
         ) {
             Ok(path) => {
                 let meta = ProjectMeta {
-                    harness: Some(form.harness),
                     packages: form.selected_packages(),
                     template: template.map(|path| path.display().to_string()),
                     ..ProjectMeta::default()
@@ -796,6 +1210,23 @@ impl App {
                 }
                 let loaded = Project::load(path.clone());
                 self.add_project(loaded);
+                // Register the new project so it can be assigned to a VM.
+                if let Ok(mut registry) = ProjectRegistry::load(&self.config.state_dir)
+                    && let Ok(canonical) = path.canonicalize()
+                {
+                    let _ = registry.upsert(crate::project::ProjectEntry {
+                        name: form.name.trim().to_string(),
+                        path: canonical,
+                        vm: None,
+                        read_only: false,
+                        kind: crate::project::ProjectKind::External,
+                        parent: None,
+                        managed: false,
+                        hidden: false,
+                        created_at: chrono::Utc::now(),
+                    });
+                    self.refresh_project_entries();
+                }
                 self.toast(format!("created {}", path.display()), ToastLevel::Info);
             }
             Err(err) => {
@@ -871,6 +1302,22 @@ mod tests {
     use super::*;
     use crate::tui::app::test_support::*;
 
+    fn project_with_vm(app: &mut App) -> PathBuf {
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        app.vms = vec![fake_vm(app, "rust", project.clone())];
+        assign_fake_project(app, &project, "rust");
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path: project.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+        project
+    }
+
     #[test]
     fn search_mode_edits_filter_and_escape_leaves_it() {
         let (_dir, mut app) = test_app();
@@ -896,7 +1343,7 @@ mod tests {
     fn tab_toggles_project_sections() {
         let (_dir, mut app) = test_app();
         app.screen = Screen::Project;
-        app.focus = Focus::Instances;
+        app.focus = Focus::Vm;
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Snapshots);
         app.handle_key(key(KeyCode::Tab));
@@ -904,14 +1351,14 @@ mod tests {
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Git);
         app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.focus, Focus::Instances);
+        assert_eq!(app.focus, Focus::Vm);
     }
 
     #[test]
     fn number_keys_jump_to_project_sections() {
         let (_dir, mut app) = test_app();
         app.screen = Screen::Project;
-        app.focus = Focus::Instances;
+        app.focus = Focus::Vm;
         app.handle_key(key(KeyCode::Char('2')));
         assert_eq!(app.focus, Focus::Snapshots);
         app.handle_key(key(KeyCode::Char('3')));
@@ -919,26 +1366,78 @@ mod tests {
         app.handle_key(key(KeyCode::Char('4')));
         assert_eq!(app.focus, Focus::Git);
         app.handle_key(key(KeyCode::Char('1')));
-        assert_eq!(app.focus, Focus::Instances);
+        assert_eq!(app.focus, Focus::Vm);
+    }
+
+    #[test]
+    fn vm_screen_keys_cycle_its_sections() {
+        let (_dir, mut app) = test_app();
+        app.vms = vec![fake_vm(&app, "rust", app.config.projects_root.join("demo"))];
+        app.open_vm_screen("rust".into());
+        assert_eq!(app.focus, Focus::Projects);
+        app.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(app.focus, Focus::Snapshots);
+        app.handle_key(key(KeyCode::Char('3')));
+        assert_eq!(app.focus, Focus::Tools);
+        app.handle_key(key(KeyCode::Char('4')));
+        assert_eq!(app.focus, Focus::Health);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Projects);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Dashboard);
+    }
+
+    #[test]
+    fn vm_screen_snapshot_section_uses_n_for_snapshots() {
+        let (_dir, mut app) = test_app();
+        app.vms = vec![fake_vm(&app, "rust", app.config.projects_root.join("demo"))];
+        app.open_vm_screen("rust".into());
+        app.focus = Focus::Snapshots;
+        let effects = app.handle_key(key(KeyCode::Char('n')));
+        assert!(effects.is_empty());
+        assert!(app.modal.is_none(), "n must not open create-VM here");
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("hegn snapshot create"))
+        );
+    }
+
+    #[test]
+    fn vm_screen_actions_emit_vm_effects() {
+        let (_dir, mut app) = test_app();
+        app.vms = vec![fake_vm(&app, "rust", app.config.projects_root.join("demo"))];
+        app.open_vm_screen("rust".into());
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('s'))).as_slice(),
+            [Effect::AttachVm { vm }] if vm == "rust"
+        ));
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('S'))).as_slice(),
+            [Effect::StopVm { vm }] if vm == "rust"
+        ));
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('A'))).as_slice(),
+            [Effect::ApplyVm { vm }] if vm == "rust"
+        ));
     }
 
     #[test]
     fn enter_never_confirms_a_deletion() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
-        app.focus = Focus::Instances;
-        let instance = fake_instance(&app, "demo", inside);
-        install_instances(&mut app, vec![instance]);
-        app.handle_key(key(KeyCode::Char('d')));
+        let inside = app.config.vms_dir.join("demo").join("workspace");
+        let vm = fake_vm(&app, "demo", inside);
+        app.vms = vec![vm];
+        app.focus = Focus::Vm;
+        app.confirm_delete_vm();
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             app.modal,
-            Some(Modal::DeleteInstance(
-                crate::tui::app::DeleteInstanceModal {
-                    stage: crate::tui::app::DeleteInstanceStage::Confirm,
-                    ..
-                }
-            ))
+            Some(Modal::DeleteVm(DeleteVmModal {
+                stage: DeleteVmStage::Confirm,
+                ..
+            }))
         ));
 
         app.handle_key(key(KeyCode::Char('y')));
@@ -946,12 +1445,10 @@ mod tests {
         assert!(effects.is_empty(), "Enter must not delete files");
         assert!(matches!(
             app.modal,
-            Some(Modal::DeleteInstance(
-                crate::tui::app::DeleteInstanceModal {
-                    stage: crate::tui::app::DeleteInstanceStage::Files,
-                    ..
-                }
-            ))
+            Some(Modal::DeleteVm(DeleteVmModal {
+                stage: DeleteVmStage::Files,
+                ..
+            }))
         ));
     }
 
@@ -983,6 +1480,26 @@ mod tests {
     }
 
     #[test]
+    fn create_vm_modal_emits_a_create_effect() {
+        let (_dir, mut app) = test_app();
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(app.modal, Some(Modal::CreateVm(_))));
+        for c in "rust".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        // Tab through package selection to the create button.
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Tab));
+        }
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::CreateVm { name, .. }] if name == "rust"
+        ));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
     fn create_project_modal_creates_directory() {
         let (_dir, mut app) = test_app();
         app.handle_key(key(KeyCode::Char('c')));
@@ -1000,7 +1517,6 @@ mod tests {
         assert!(path.join("AGENTS.md").is_file());
         assert!(app.projects.iter().any(|p| p.path == path));
         let meta = project::read_meta(&path);
-        assert_eq!(meta.harness, Some(Harness::Shell));
         assert!(meta.template.is_none());
     }
 
@@ -1105,16 +1621,18 @@ mod tests {
     }
 
     #[test]
-    fn multi_agent_is_reachable_from_the_project_terminal() {
-        let (_dir, mut app) = test_app();
-        app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
+    fn fork_workspace_is_reachable_from_the_project_terminal() {
+        let (dir, mut app) = test_app();
+        let project = project_with_vm(&mut app);
+        app.attach_console(Box::new(FakeConsole::new(project)));
         assert_eq!(app.screen, Screen::Project);
         let effects = app.handle_key(key(KeyCode::Char('M')));
         assert!(effects.is_empty());
         match &app.modal {
-            Some(Modal::MultiAgent(form)) => assert_eq!(form.source, "fake"),
-            other => panic!("expected multi-agent form, got {other:?}"),
+            Some(Modal::ForkWorkspace(form)) => assert_eq!(form.parent, "demo"),
+            other => panic!("expected fork form, got {other:?}"),
         }
+        let _ = dir;
     }
 
     #[test]
@@ -1148,58 +1666,36 @@ mod tests {
     }
 
     #[test]
-    fn instance_focus_and_delete_double_confirmation() {
+    fn vm_focus_and_delete_double_confirmation() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
-        app.focus = Focus::Instances;
-        let instance = fake_instance(&app, "demo", inside);
-        install_instances(&mut app, vec![instance]);
+        let inside = app.config.vms_dir.join("demo").join("workspace");
+        app.focus = Focus::Vm;
+        let vm = fake_vm(&app, "demo", inside);
+        app.vms = vec![vm];
+        app.confirm_delete_vm();
 
-        app.handle_key(key(KeyCode::Char('d')));
-        assert!(matches!(
-            app.modal,
-            Some(Modal::DeleteInstance(
-                crate::tui::app::DeleteInstanceModal {
-                    stage: crate::tui::app::DeleteInstanceStage::Confirm,
-                    ..
-                }
-            ))
-        ));
-        // First confirmation moves to the file question.
         app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(
             app.modal,
-            Some(Modal::DeleteInstance(
-                crate::tui::app::DeleteInstanceModal {
-                    stage: crate::tui::app::DeleteInstanceStage::Files,
-                    ..
-                }
-            ))
+            Some(Modal::DeleteVm(DeleteVmModal {
+                stage: DeleteVmStage::Files,
+                ..
+            }))
         ));
         let effects = app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::DeleteInstance {
-                instance,
+            [Effect::DeleteVm {
+                vm,
                 delete_files: true
-            }] if instance == "demo"
+            }] if vm == "demo"
         ));
     }
 
     #[test]
     fn projects_focus_delete_opens_the_project_delete_modal() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
-        let instance = fake_instance(&app, "demo", inside);
-        install_instances(&mut app, vec![instance]);
-        app.projects = vec![Project {
-            name: "demo".into(),
-            path: app.config.projects_root.join("demo"),
-            git: GitSummary::default(),
-            last_opened: None,
-        }];
-        app.visible = vec![0];
-        app.selected = 0;
+        let project = project_with_vm(&mut app);
         app.focus = Focus::Projects;
 
         app.handle_key(key(KeyCode::Char('d')));
@@ -1207,11 +1703,12 @@ mod tests {
             panic!("expected a project delete confirmation");
         };
         assert_eq!(modal.project.name, "demo");
-        assert_eq!(modal.instances, vec!["demo".to_string()]);
+        assert_eq!(modal.vms, vec!["rust".to_string()]);
+        assert_eq!(modal.project.path, project);
     }
 
     #[test]
-    fn project_delete_without_a_vm_does_not_need_an_instance() {
+    fn project_delete_without_a_vm_does_not_need_a_vm() {
         let (_dir, mut app) = test_app();
         app.projects = vec![Project {
             name: "empty".into(),
@@ -1221,14 +1718,14 @@ mod tests {
         }];
         app.visible = vec![0];
         app.selected = 0;
-        app.instances.clear();
+        app.vms.clear();
         app.focus = Focus::Projects;
 
         app.handle_key(key(KeyCode::Char('d')));
         let Some(Modal::DeleteProject(modal)) = &app.modal else {
             panic!("expected a project delete confirmation");
         };
-        assert!(modal.instances.is_empty());
+        assert!(modal.vms.is_empty());
     }
 
     #[test]
@@ -1322,45 +1819,56 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('2')));
         assert_eq!(app.screen, Screen::Project);
-        assert_eq!(app.focus, Focus::Instances);
+        assert_eq!(app.focus, Focus::Snapshots);
     }
 
     #[test]
     fn keeping_files_emits_a_keep_effect() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
-        app.focus = Focus::Instances;
-        let instance = fake_instance(&app, "demo", inside);
-        install_instances(&mut app, vec![instance]);
-        app.handle_key(key(KeyCode::Char('d')));
+        let inside = app.config.vms_dir.join("demo").join("workspace");
+        app.focus = Focus::Vm;
+        let vm = fake_vm(&app, "demo", inside);
+        app.vms = vec![vm];
+        app.confirm_delete_vm();
         app.handle_key(key(KeyCode::Char('y')));
         let effects = app.handle_key(key(KeyCode::Char('n')));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::DeleteInstance {
-                instance,
+            [Effect::DeleteVm {
+                vm,
                 delete_files: false
-            }] if instance == "demo"
+            }] if vm == "demo"
         ));
     }
 
     #[test]
-    fn stop_shortcut_only_works_with_instance_focus() {
+    fn stop_shortcut_only_works_with_vm_focus() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
-        let instance = fake_instance(&app, "demo", inside);
-        install_instances(&mut app, vec![instance]);
+        let inside = app.config.vms_dir.join("demo").join("workspace");
+        app.vms = vec![fake_vm(&app, "demo", inside)];
         app.focus = Focus::Projects;
         let effects = app.handle_key(key(KeyCode::Char('S')));
         assert!(
             effects.is_empty(),
-            "S must not stop an instance from projects"
+            "S must not stop a VM from the dashboard picker"
         );
-        app.focus = Focus::Instances;
+        app.focus = Focus::Vm;
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path: app.config.projects_root.join("demo"),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        assign_fake_project(&mut app, &project, "demo");
+        app.refresh_vm_filter();
         let effects = app.handle_key(key(KeyCode::Char('S')));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::StopInstance { instance }] if instance == "demo"
+            [Effect::StopVm { vm }] if vm == "demo"
         ));
     }
 
@@ -1369,7 +1877,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
         app.project_view = ProjectView::Split;
-        app.focus = Focus::Instances;
+        app.focus = Focus::Vm;
         app.handle_key(key(KeyCode::Char('2')));
         assert_eq!(app.project_view, ProjectView::Section);
         assert_eq!(app.focus, Focus::Snapshots);
@@ -1430,32 +1938,29 @@ mod tests {
     }
 
     #[test]
-    fn delete_instance_cancel_keys_emit_nothing() {
+    fn delete_vm_cancel_keys_emit_nothing() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
-        app.focus = Focus::Instances;
-        let instance = fake_instance(&app, "demo", inside);
-        install_instances(&mut app, vec![instance]);
+        let inside = app.config.vms_dir.join("demo").join("workspace");
+        app.vms = vec![fake_vm(&app, "demo", inside)];
+        app.confirm_delete_vm();
 
         app.handle_key(key(KeyCode::Char('d')));
         let effects = app.handle_key(key(KeyCode::Esc));
         assert!(effects.is_empty());
         assert!(app.modal.is_none());
 
-        app.handle_key(key(KeyCode::Char('d')));
+        app.confirm_delete_vm();
         let effects = app.handle_key(key(KeyCode::Char('n')));
         assert!(effects.is_empty());
         assert!(app.modal.is_none());
     }
 
     #[test]
-    fn delete_instance_escape_at_the_files_question_keeps_the_instance() {
+    fn delete_vm_escape_at_the_files_question_keeps_the_vm() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
-        app.focus = Focus::Instances;
-        let instance = fake_instance(&app, "demo", inside);
-        install_instances(&mut app, vec![instance]);
-        app.handle_key(key(KeyCode::Char('d')));
+        let inside = app.config.vms_dir.join("demo").join("workspace");
+        app.vms = vec![fake_vm(&app, "demo", inside)];
+        app.confirm_delete_vm();
         app.handle_key(key(KeyCode::Char('y')));
 
         let effects = app.handle_key(key(KeyCode::Esc));
@@ -1465,51 +1970,6 @@ mod tests {
             "the last chance must not delete: {effects:?}"
         );
         assert!(app.modal.is_none());
-    }
-
-    #[test]
-    fn deleting_an_instance_outside_the_instance_dir_skips_the_file_question() {
-        let (dir, mut app) = test_app();
-        let outside = dir.path().join("host-workspace");
-        std::fs::create_dir_all(&outside).unwrap();
-        app.focus = Focus::Instances;
-        let instance = fake_instance(&app, "demo", outside);
-        install_instances(&mut app, vec![instance]);
-
-        app.handle_key(key(KeyCode::Char('d')));
-        let effects = app.handle_key(key(KeyCode::Char('y')));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::DeleteInstance {
-                instance,
-                delete_files: false
-            }] if instance == "demo"
-        ));
-        assert!(app.modal.is_none());
-    }
-
-    #[test]
-    fn delete_instance_files_stage_k_and_n_keep_the_files() {
-        for cancel in ['k', 'n'] {
-            let (_dir, mut app) = test_app();
-            let inside = app.config.instances_dir.join("demo").join("workspace");
-            app.focus = Focus::Instances;
-            let instance = fake_instance(&app, "demo", inside);
-            install_instances(&mut app, vec![instance]);
-            app.handle_key(key(KeyCode::Char('d')));
-            app.handle_key(key(KeyCode::Char('y')));
-
-            let effects = app.handle_key(key(KeyCode::Char(cancel)));
-
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::DeleteInstance {
-                    instance,
-                    delete_files: false
-                }] if instance == "demo"
-            ));
-        }
     }
 
     #[test]

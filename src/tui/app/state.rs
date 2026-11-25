@@ -1,15 +1,19 @@
-//! Dashboard and instance state: loading project lists, filters, selection and
-//! the periodic poll.
+//! Dashboard and VM state: loading project lists, filters, selection and the
+//! periodic poll.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::config::Config;
-use crate::project::{self, GitSummary, Project, ProjectMeta};
+use crate::project::{
+    self, GitSummary, Project, ProjectEntry, ProjectKind, ProjectMeta, ProjectRegistry,
+};
 use crate::security::SecurityEngine;
 use crate::session::snapshot::SnapshotStore;
 use crate::session::state::StateStore;
 use crate::session::terminal::TerminalBuffer;
-use crate::vm::instance::InstanceSummary;
+use crate::vm::VmPaths;
+use crate::vm::registry::VmSummary;
 
 use super::util::clamp_index;
 use super::*;
@@ -20,10 +24,13 @@ impl App {
         let snapshots = SnapshotStore::new(&config.snapshots_dir)
             .list()
             .unwrap_or_default();
-        let instances = crate::vm::instance::InstanceRegistry::new(config.clone())
+        let vms = crate::vm::registry::VmRegistry::new(config.clone())
             .summaries()
             .unwrap_or_default();
-        let instance = InstanceStatus::from_config(&config);
+        let project_entries = ProjectRegistry::load(&config.state_dir)
+            .map(|registry| registry.entries().to_vec())
+            .unwrap_or_default();
+        let vm = VmStatus::from_config(&config);
         let security_engine = SecurityEngine::new(config.security);
         Self {
             config,
@@ -36,24 +43,33 @@ impl App {
             focus: Focus::Projects,
             screen: Screen::Dashboard,
             open_project: None,
+            vm_open: None,
             project_view: ProjectView::Compact,
             terminal_focus: false,
             section_hits: Vec::new(),
+            vm_section_hits: Vec::new(),
             terminal_hit: None,
             terminal_strip_hit: None,
             modal: None,
-            instance,
+            vm,
+            attached_vm: None,
             health: None,
             snapshots,
             selected_snapshot: 0,
             project_snapshots: Vec::new(),
             project_snapshot_selected: 0,
+            vm_snapshots: Vec::new(),
+            vm_snapshot_selected: 0,
             snapshot_rows: Vec::new(),
-            instances,
-            instance_visible: Vec::new(),
-            instance_selected: 0,
-            instance_project: None,
-            instance_rows: Vec::new(),
+            project_entries,
+            vms,
+            vm_visible: Vec::new(),
+            vm_selected: 0,
+            vm_project: None,
+            vm_rows: Vec::new(),
+            vm_members: Vec::new(),
+            vm_member_selected: 0,
+            vm_member_rows: Vec::new(),
             project_rows: Vec::new(),
             project_meta: ProjectMeta::default(),
             session: None,
@@ -96,17 +112,18 @@ impl App {
         let previous = self.selected_project().map(|p| p.path.clone());
         self.projects = projects;
         self.loading = false;
+        self.refresh_project_entries();
+        self.merge_registry_projects();
         self.refresh_filter();
         let preferred = previous.or_else(|| self.store.state().last_project.clone());
         if let Some(path) = preferred
             && let Some(index) = self
                 .visible
                 .iter()
-                .position(|&i| self.projects[i].path == path)
+                .position(|&i| crate::vm::same_project(&self.projects[i].path, &path))
         {
             self.selected = index;
         }
-        self.refresh_instance_filter();
     }
 
     pub fn add_project(&mut self, project: Project) {
@@ -125,33 +142,257 @@ impl App {
             .sort_by_key(|project| project.name.to_lowercase());
         self.loading = false;
         self.query.clear();
+        self.refresh_project_entries();
+        self.merge_registry_projects();
         self.refresh_filter();
         if let Some(index) = self
             .visible
             .iter()
-            .position(|&i| self.projects[i].path == path)
+            .position(|&i| crate::vm::same_project(&self.projects[i].path, &path))
         {
             self.selected = index;
         }
-        self.refresh_instance_filter();
     }
 
-    /// Read the last `hegn-health` line from the selected instance's log.
+    /// Reload the private project registry (assignment and membership).
+    pub fn refresh_project_entries(&mut self) {
+        self.project_entries = ProjectRegistry::load(&self.config.state_dir)
+            .map(|registry| registry.entries().to_vec())
+            .unwrap_or_default();
+    }
+
+    /// Merge registry-only External projects that discovery cannot see.
+    ///
+    /// `hegn project assign ~/code/parser --vm rust` registers a project outside
+    /// the projects root without creating a picker link. Those rows still belong
+    /// in the dashboard, deduped by canonical path against discovery.
+    pub fn merge_registry_projects(&mut self) {
+        let opened = self.store.state().opened_at();
+        let root = self
+            .config
+            .projects_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.config.projects_root.clone());
+        for entry in self.project_entries.clone() {
+            if entry.kind != ProjectKind::External || entry.hidden {
+                continue;
+            }
+            let path = entry.path.clone();
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if canonical.starts_with(&root) {
+                continue;
+            }
+            if self
+                .projects
+                .iter()
+                .any(|project| crate::vm::same_project(&project.path, &canonical))
+            {
+                continue;
+            }
+            let mut project = Project::load(canonical.clone());
+            project.name = entry.name.clone();
+            project.last_opened = opened.get(&canonical).copied();
+            self.projects.push(project);
+        }
+    }
+
+    /// Registry entry for a project path, tolerating a symlinked projects root.
+    pub fn project_entry(&self, path: &std::path::Path) -> Option<&ProjectEntry> {
+        self.project_entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .or_else(|| {
+                self.project_entries
+                    .iter()
+                    .find(|entry| crate::vm::same_project(&entry.path, path))
+            })
+    }
+
+    /// Name of the VM a project is assigned to.
+    pub fn project_vm_name(&self, path: &std::path::Path) -> Option<&str> {
+        self.project_entry(path)
+            .and_then(|entry| entry.vm.as_deref())
+    }
+
+    /// Summary of the VM a project is assigned to.
+    pub fn project_vm(&self, path: &std::path::Path) -> Option<&VmSummary> {
+        let name = self.project_vm_name(path)?;
+        self.vms.iter().find(|summary| summary.name == name)
+    }
+
+    /// VM of the open project, the open VM screen, or the selected project.
+    pub fn active_vm_name(&self) -> Option<String> {
+        if self.screen == Screen::Vm {
+            return self.vm_open.clone();
+        }
+        let project = self
+            .active_project()
+            .map(|project| project.path.clone())
+            .or_else(|| self.open_project.clone())?;
+        self.project_vm_name(&project).map(str::to_string)
+    }
+
+    pub fn active_vm_summary(&self) -> Option<&VmSummary> {
+        self.active_vm_name()
+            .and_then(|name| self.vms.iter().find(|summary| summary.name == name))
+            .or_else(|| self.selected_vm())
+            .or_else(|| self.vms.first())
+    }
+
+    /// VM badge shown next to a dashboard project row.
+    pub fn project_vm_badge(&self, path: &std::path::Path) -> String {
+        match self.project_vm_name(path) {
+            Some(name) => {
+                let members = self
+                    .vms
+                    .iter()
+                    .find(|summary| summary.name == name)
+                    .map(|summary| summary.members)
+                    .unwrap_or(0);
+                if members > 1 {
+                    format!("⬢ {name} · {members}p")
+                } else {
+                    format!("⬢ {name}")
+                }
+            }
+            None => "unassigned".to_string(),
+        }
+    }
+
+    /// Guest paths of every exported member of a VM.
+    ///
+    /// Uses the boot plan when the registry is valid; otherwise falls back to
+    /// the deterministic `<guest_projects_base>/<slug>` mapping so the TUI can
+    /// still show a path for a broken membership.
+    pub fn vm_guest_paths(&self, vm: &str) -> HashMap<String, String> {
+        let store = crate::vm::config::VmStore::new(&self.config);
+        let Ok(registry) = ProjectRegistry::load(&self.config.state_dir) else {
+            return HashMap::new();
+        };
+        if let Ok(config) = store.load(vm) {
+            let paths = VmPaths::from_vm(&self.config, &config);
+            if let Ok(plan) = crate::vm::manager::BootPlan::build(
+                &self.config,
+                &config,
+                &store,
+                &registry,
+                &paths,
+            ) {
+                return plan
+                    .members
+                    .into_iter()
+                    .map(|member| (member.name, member.guest_path))
+                    .collect();
+            }
+        }
+        registry
+            .exported_members(vm)
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    format!(
+                        "{}/{}",
+                        self.config.guest_projects_base,
+                        crate::vm::manager::slugify(&entry.name)
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// Guest path of one project, when it is an exported member.
+    pub fn project_guest_path(&self, path: &std::path::Path) -> Option<String> {
+        let entry = self.project_entry(path)?;
+        let vm = entry.vm.as_deref()?;
+        self.vm_guest_paths(vm).remove(&entry.name)
+    }
+
+    /// Newest snapshot owned by `vm`.
+    pub fn newest_snapshot_for_vm(
+        &self,
+        vm: &str,
+    ) -> Option<&crate::session::snapshot::SnapshotMeta> {
+        self.snapshots
+            .iter()
+            .filter(|snapshot| snapshot.vm() == Some(vm))
+            .max_by_key(|snapshot| snapshot.created_at)
+    }
+
+    /// Open the reusable VM screen.
+    pub fn open_vm_screen(&mut self, name: String) -> Vec<Effect> {
+        if !self.vms.iter().any(|summary| summary.name == name) {
+            self.toast(format!("unknown VM {name}"), ToastLevel::Warn);
+            return Vec::new();
+        }
+        self.vm_open = Some(name);
+        self.screen = Screen::Vm;
+        self.focus = Focus::Projects;
+        self.terminal_focus = false;
+        self.refresh_vm_members();
+        self.refresh_vm_snapshots();
+        Vec::new()
+    }
+
+    /// Load the member list of [`App::vm_open`].
+    pub fn refresh_vm_members(&mut self) {
+        let Some(vm) = self.vm_open.clone() else {
+            self.vm_members.clear();
+            self.vm_member_selected = 0;
+            return;
+        };
+        self.vm_members = ProjectRegistry::load(&self.config.state_dir)
+            .map(|registry| {
+                registry
+                    .members(&vm)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if self.vm_member_selected >= self.vm_members.len() {
+            self.vm_member_selected = self.vm_members.len().saturating_sub(1);
+        }
+    }
+
+    /// Rebuild the VM-scoped snapshot list.
+    pub fn refresh_vm_snapshots(&mut self) {
+        let Some(vm) = self.vm_open.clone() else {
+            self.vm_snapshots.clear();
+            self.vm_snapshot_selected = 0;
+            return;
+        };
+        self.vm_snapshots = self
+            .snapshots
+            .iter()
+            .enumerate()
+            .filter(|(_, snapshot)| snapshot.vm() == Some(vm.as_str()))
+            .map(|(index, _)| index)
+            .collect();
+        if self.vm_snapshot_selected >= self.vm_snapshots.len() {
+            self.vm_snapshot_selected = self.vm_snapshots.len().saturating_sub(1);
+        }
+    }
+
+    /// Read the last `hegn-health` line from the active VM's log.
     ///
     /// The guest writes it at boot; the host never queries the guest from the
     /// renderer. A missing or stale line is shown as `not checked`.
     pub fn refresh_health(&mut self) {
-        let Some(instance) = self.selected_instance() else {
+        let serial = self
+            .active_vm_summary()
+            .and_then(|summary| summary.serial_log.clone())
+            .or_else(|| {
+                self.selected_vm()
+                    .and_then(|summary| summary.serial_log.clone())
+            });
+        let Some(path) = serial else {
             self.health = None;
             return;
         };
-        let Some(path) = instance.serial_log.as_deref() else {
-            self.health = None;
-            return;
-        };
-        let bytes = crate::session::logs::tail_bytes(path, 200).unwrap_or_default();
+        let bytes = crate::session::logs::tail_bytes(&path, 200).unwrap_or_default();
         let text = String::from_utf8_lossy(&bytes);
-        self.health = InstanceHealth::parse(&text);
+        self.health = VmHealth::parse(&text);
     }
 
     pub fn refresh_filter(&mut self) {
@@ -161,7 +402,7 @@ impl App {
         } else if self.selected >= self.visible.len() {
             self.selected = self.visible.len() - 1;
         }
-        self.refresh_instance_filter();
+        self.refresh_vm_filter();
     }
 
     pub fn selected_project(&self) -> Option<&Project> {
@@ -180,13 +421,19 @@ impl App {
                 // Clone consoles record their private workspace as the session
                 // project. Map it back to the original project for the chrome.
                 let project_path = self
-                    .instances
+                    .project_entries
                     .iter()
-                    .find(|instance| {
-                        crate::vm::instance::same_project(&instance.workspace, path)
-                            || crate::vm::instance::same_project(&instance.project, path)
-                    })
-                    .map(|instance| instance.project.clone())?;
+                    .find(|entry| crate::vm::same_project(&entry.path, path))
+                    .map(|entry| entry.path.clone())
+                    .or_else(|| {
+                        self.vms
+                            .iter()
+                            .find(|vm| {
+                                crate::vm::same_project(&vm.workspace, path)
+                                    || crate::vm::same_project(&vm.project, path)
+                            })
+                            .map(|vm| vm.project.clone())
+                    })?;
                 self.projects
                     .iter()
                     .find(|project| project.path == project_path)
@@ -195,44 +442,40 @@ impl App {
         }
     }
 
-    pub fn selected_instance(&self) -> Option<&InstanceSummary> {
-        self.instance_visible
-            .get(self.instance_selected)
-            .and_then(|&index| self.instances.get(index))
+    pub fn selected_vm(&self) -> Option<&VmSummary> {
+        self.vm_visible
+            .get(self.vm_selected)
+            .and_then(|&index| self.vms.get(index))
     }
 
-    /// Rebuild the instance list so it only contains instances for the project
-    /// selected in the project list. Multi-agent clones share their source
-    /// project, so they stay visible and are one `Enter` away.
-    ///
-    /// The previous selection is preserved while the project stays the same;
-    /// switching projects selects a running instance when one exists.
-    pub fn refresh_instance_filter(&mut self) {
-        let selected = self
-            .selected_instance()
-            .map(|instance| instance.name.clone());
-        self.refresh_instance_filter_named(selected);
+    /// Rebuild the VM list so it only contains the VM of the project selected
+    /// in the project list.
+    pub fn refresh_vm_filter(&mut self) {
+        let selected = self.selected_vm().map(|vm| vm.name.clone());
+        self.refresh_vm_filter_named(selected);
     }
 
     /// Rebuild the filter while preserving `selected` by name. The name must be
-    /// captured before [`App::instances`] is replaced: the visible indices point
+    /// captured before [`App::vms`] is replaced: the visible indices point
     /// into the old vector.
-    pub(super) fn refresh_instance_filter_named(&mut self, selected: Option<String>) {
+    pub(super) fn refresh_vm_filter_named(&mut self, selected: Option<String>) {
         let project = self
             .active_project()
             .map(|project| project.path.clone())
             .or_else(|| self.open_project.clone());
-        let project_changed = self.instance_project != project;
-        self.instance_project = project.clone();
+        let project_changed = self.vm_project != project;
+        self.vm_project = project.clone();
 
-        self.instance_visible = match project {
-            Some(project) => self
-                .instances
+        let vm = project
+            .as_deref()
+            .and_then(|project| self.project_vm_name(project))
+            .map(str::to_string);
+        self.vm_visible = match vm {
+            Some(vm) => self
+                .vms
                 .iter()
                 .enumerate()
-                .filter(|(_, instance)| {
-                    crate::vm::instance::same_project(&instance.project, &project)
-                })
+                .filter(|(_, summary)| summary.name == vm)
                 .map(|(index, _)| index)
                 .collect(),
             None => Vec::new(),
@@ -241,55 +484,58 @@ impl App {
         if !project_changed
             && let Some(name) = selected
             && let Some(index) = self
-                .instance_visible
+                .vm_visible
                 .iter()
-                .position(|&index| self.instances[index].name == name)
+                .position(|&index| self.vms[index].name == name)
         {
-            self.instance_selected = index;
+            self.vm_selected = index;
             return;
         }
-        if project_changed {
-            self.instance_selected = self
-                .instance_visible
-                .iter()
-                .position(|&index| self.instances[index].state == "running")
-                .unwrap_or(0);
-        } else {
-            self.instance_selected = self
-                .instance_selected
-                .min(self.instance_visible.len().saturating_sub(1));
-        }
+        self.vm_selected = 0;
     }
 
-    /// Refresh the instance list from disk/process state. Cheap enough for the
-    /// UI tick; it only reads files and `/proc`.
-    pub fn refresh_instances(&mut self) {
-        let selected = self
-            .selected_instance()
-            .map(|instance| instance.name.clone());
-        let registry = crate::vm::instance::InstanceRegistry::new(self.config.clone());
-        if let Ok(instances) = registry.summaries() {
-            self.instances = instances;
+    /// Refresh the VM list from disk/process state. Cheap enough for the UI
+    /// tick; it only reads files and `/proc`.
+    pub fn refresh_vms(&mut self) {
+        let selected = self.selected_vm().map(|vm| vm.name.clone());
+        let selected_project = self.selected_project().map(|project| project.path.clone());
+        let registry = crate::vm::registry::VmRegistry::new(self.config.clone());
+        if let Ok(vms) = registry.summaries() {
+            self.vms = vms;
         }
-        self.refresh_instance_filter_named(selected);
-        let selected = self.selected_instance().cloned();
-        if let Some(summary) = selected {
-            self.instance.vcpus = summary.vcpus;
-            self.instance.memory_mib = summary.memory_mib;
+        self.refresh_project_entries();
+        self.merge_registry_projects();
+        self.refresh_filter();
+        if let Some(path) = selected_project
+            && let Some(index) = self
+                .visible
+                .iter()
+                .position(|&i| crate::vm::same_project(&self.projects[i].path, &path))
+        {
+            self.selected = index;
+        }
+        self.refresh_vm_filter_named(selected);
+        self.refresh_vm_members();
+        self.refresh_project_snapshots();
+        self.refresh_vm_snapshots();
+        let active = self.active_vm_summary().cloned();
+        if let Some(summary) = active {
+            self.vm.vcpus = summary.vcpus;
+            self.vm.memory_mib = summary.memory_mib;
             // Do not overwrite the optimistic Starting state while the attach
             // thread is still booting; it would re-enable double starts.
-            if self.instance.state != InstanceState::Starting {
-                self.instance.state = match summary.state.as_str() {
-                    "running" => InstanceState::Running,
-                    "paused" => InstanceState::Paused,
-                    _ => InstanceState::Stopped,
+            if self.vm.state != VmUiState::Starting {
+                self.vm.state = match summary.state.as_str() {
+                    "running" => VmUiState::Running,
+                    "paused" => VmUiState::Paused,
+                    _ => VmUiState::Stopped,
                 };
             }
-        } else if self.session.is_none() && self.instance.state != InstanceState::Starting {
-            self.instance.state = InstanceState::Stopped;
-            self.instance.started_at = None;
-            self.instance.note = None;
-            self.instance.socket = None;
+        } else if self.session.is_none() && self.vm.state != VmUiState::Starting {
+            self.vm.state = VmUiState::Stopped;
+            self.vm.started_at = None;
+            self.vm.note = None;
+            self.vm.socket = None;
         }
         self.refresh_health();
     }
@@ -299,12 +545,21 @@ impl App {
             self.focus = Focus::Projects;
             return;
         }
+        if self.screen == Screen::Vm {
+            self.focus = match self.focus {
+                Focus::Projects => Focus::Snapshots,
+                Focus::Snapshots => Focus::Tools,
+                Focus::Tools => Focus::Health,
+                Focus::Health => Focus::Projects,
+                Focus::Vm | Focus::Git => Focus::Projects,
+            };
+            return;
+        }
         self.focus = match self.focus {
-            Focus::Projects => Focus::Instances,
-            Focus::Instances => Focus::Snapshots,
+            Focus::Projects | Focus::Vm => Focus::Snapshots,
             Focus::Snapshots => Focus::Health,
             Focus::Health => Focus::Git,
-            Focus::Git => Focus::Instances,
+            Focus::Git | Focus::Tools => Focus::Vm,
         };
         if self.project_view == ProjectView::Section {
             self.project_section();
@@ -314,34 +569,50 @@ impl App {
     pub fn select_next(&mut self, delta: isize) {
         match self.focus {
             Focus::Projects => {
+                if self.screen == Screen::Vm {
+                    if self.vm_members.is_empty() {
+                        return;
+                    }
+                    let max = self.vm_members.len() - 1;
+                    self.vm_member_selected = clamp_index(self.vm_member_selected, delta, max);
+                    return;
+                }
                 if self.visible.is_empty() {
                     return;
                 }
                 let max = self.visible.len() - 1;
                 self.selected = clamp_index(self.selected, delta, max);
-                self.refresh_instance_filter();
+                self.refresh_vm_filter();
             }
-            Focus::Instances => {
-                if self.instance_visible.is_empty() {
-                    return;
-                }
-                let max = self.instance_visible.len() - 1;
-                self.instance_selected = clamp_index(self.instance_selected, delta, max);
-            }
+            Focus::Vm | Focus::Tools => {}
             Focus::Snapshots => {
-                let len = if self.screen == Screen::Project {
-                    self.project_snapshots.len()
+                let (selected, len, screen) = if self.screen == Screen::Vm {
+                    (
+                        self.vm_snapshot_selected,
+                        self.vm_snapshots.len(),
+                        Screen::Vm,
+                    )
+                } else if self.screen == Screen::Project {
+                    (
+                        self.project_snapshot_selected,
+                        self.project_snapshots.len(),
+                        Screen::Project,
+                    )
                 } else {
-                    self.snapshots.len()
+                    (
+                        self.selected_snapshot,
+                        self.snapshots.len(),
+                        Screen::Dashboard,
+                    )
                 };
                 if len == 0 {
                     return;
                 }
-                if self.screen == Screen::Project {
-                    self.project_snapshot_selected =
-                        clamp_index(self.project_snapshot_selected, delta, len - 1);
-                } else {
-                    self.selected_snapshot = clamp_index(self.selected_snapshot, delta, len - 1);
+                let next = clamp_index(selected, delta, len - 1);
+                match screen {
+                    Screen::Vm => self.vm_snapshot_selected = next,
+                    Screen::Project => self.project_snapshot_selected = next,
+                    Screen::Dashboard => self.selected_snapshot = next,
                 }
             }
             Focus::Health | Focus::Git => {}
@@ -372,7 +643,7 @@ impl App {
     pub fn poll(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         if self.tick.is_multiple_of(40) {
-            self.refresh_instances();
+            self.refresh_vms();
         }
         let mut closed = false;
         if let Some(session) = &mut self.session {
@@ -385,8 +656,8 @@ impl App {
         }
         if closed && !self.session_closed_reported {
             self.session_closed_reported = true;
-            self.instance.state = InstanceState::Stopped;
-            self.instance.started_at = None;
+            self.vm.state = VmUiState::Stopped;
+            self.vm.started_at = None;
             self.toast("session exited", ToastLevel::Info);
         }
         if self
@@ -402,8 +673,32 @@ impl App {
         self.tick
     }
 
+    /// Terminal window title. The project screen shows `project · vm` once a
+    /// VM is assigned, matching the header.
+    pub fn window_title(&self) -> String {
+        match self.screen {
+            Screen::Vm => match &self.vm_open {
+                Some(vm) => format!("hegn — {vm}"),
+                None => "hegn".to_string(),
+            },
+            Screen::Project => {
+                let project = self.active_project();
+                match (project, self.active_vm_name()) {
+                    (Some(project), Some(vm)) => format!("hegn — {} · {vm}", project.name),
+                    (Some(project), None) => format!("hegn — {}", project.name),
+                    _ => "hegn".to_string(),
+                }
+            }
+            Screen::Dashboard => "hegn".to_string(),
+        }
+    }
+
     pub fn project_section(&self) -> ProjectSection {
         ProjectSection::from_focus(self.focus)
+    }
+
+    pub fn vm_section(&self) -> VmSection {
+        VmSection::from_focus(self.focus)
     }
 
     pub fn project_git(&self) -> Option<&GitSummary> {
@@ -460,19 +755,17 @@ mod tests {
     }
 
     #[test]
-    fn instance_list_is_scoped_to_the_selected_project_and_includes_clones() {
+    fn vm_list_is_scoped_to_the_selected_projects_vm() {
         let (_dir, mut app) = test_app();
         let demo = app.config.projects_root.join("demo");
         let other = app.config.projects_root.join("other");
+        std::fs::create_dir_all(&demo).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
 
-        let mut base = fake_instance(&app, "demo", demo.join("workspace"));
+        let mut base = fake_vm(&app, "demo", demo.clone());
         base.project = demo.clone();
-        let mut clone = fake_instance(&app, "demo-1", demo.join("clone-1"));
-        clone.project = demo.clone();
-        clone.ephemeral = true;
-        clone.source_instance = Some("demo".into());
-        let mut other_instance = fake_instance(&app, "other", other.join("workspace"));
-        other_instance.project = other.clone();
+        let mut other_vm = fake_vm(&app, "other", other.clone());
+        other_vm.project = other.clone();
 
         let demo_project = Project {
             name: "demo".into(),
@@ -486,36 +779,27 @@ mod tests {
             ..demo_project.clone()
         };
         app.set_projects(vec![demo_project, other_project]);
-        app.instances = vec![base, clone, other_instance];
+        app.vms = vec![base, other_vm];
 
         app.selected = app
             .visible
             .iter()
             .position(|&index| app.projects[index].path == demo)
             .unwrap();
-        app.refresh_instance_filter();
-        assert_eq!(app.instance_visible.len(), 2);
-        let names: Vec<&str> = app
-            .instance_visible
-            .iter()
-            .map(|&index| app.instances[index].name.as_str())
-            .collect();
-        assert_eq!(names, ["demo", "demo-1"]);
-        assert!(
-            app.instance_visible
-                .iter()
-                .any(|&index| app.instances[index].ephemeral),
-            "multi-agent clones must be attachable from the list"
-        );
+        assign_fake_project(&mut app, &demo, "demo");
+        app.refresh_vm_filter();
+        assert_eq!(app.vm_visible.len(), 1);
+        assert_eq!(app.selected_vm().unwrap().name, "demo");
 
         app.selected = app
             .visible
             .iter()
             .position(|&index| app.projects[index].path == other)
             .unwrap();
-        app.refresh_instance_filter();
-        assert_eq!(app.instance_visible.len(), 1);
-        assert_eq!(app.selected_instance().unwrap().name, "other");
+        assign_fake_project(&mut app, &other, "other");
+        app.refresh_vm_filter();
+        assert_eq!(app.vm_visible.len(), 1);
+        assert_eq!(app.selected_vm().unwrap().name, "other");
     }
 
     #[test]
@@ -548,81 +832,27 @@ mod tests {
     }
 
     #[test]
-    fn switching_projects_selects_the_running_instance() {
+    fn refreshing_vms_keeps_the_selection_by_name() {
         let (_dir, mut app) = test_app();
         let demo = app.config.projects_root.join("demo");
-        let other = app.config.projects_root.join("other");
-        let mut base = fake_instance(&app, "demo", demo.join("workspace"));
+        std::fs::create_dir_all(&demo).unwrap();
+        let mut base = fake_vm(&app, "demo", demo.clone());
         base.project = demo.clone();
-        base.state = "stopped".into();
-        let mut running = fake_instance(&app, "other", other.join("workspace"));
-        running.project = other.clone();
-        running.state = "running".into();
 
-        let demo_project = Project {
+        app.set_projects(vec![Project {
             name: "demo".into(),
             path: demo.clone(),
             git: GitSummary::default(),
             last_opened: None,
-        };
-        let other_project = Project {
-            name: "other".into(),
-            path: other.clone(),
-            ..demo_project.clone()
-        };
-        app.set_projects(vec![demo_project, other_project]);
-        app.instances = vec![base, running];
-
-        app.selected = app
-            .visible
-            .iter()
-            .position(|&index| app.projects[index].path == demo)
-            .unwrap();
-        app.refresh_instance_filter();
-        assert_eq!(app.selected_instance().unwrap().name, "demo");
-
-        app.selected = app
-            .visible
-            .iter()
-            .position(|&index| app.projects[index].path == other)
-            .unwrap();
-        app.refresh_instance_filter();
-        assert_eq!(app.instance_selected, 0);
-        assert_eq!(
-            app.selected_instance().unwrap().name,
-            "other",
-            "a running instance is preferred after switching projects"
-        );
-    }
-
-    #[test]
-    fn refreshing_instances_keeps_the_selection_by_name() {
-        let (_dir, mut app) = test_app();
-        let demo = app.config.projects_root.join("demo");
-        let mut base = fake_instance(&app, "demo", demo.join("workspace"));
-        base.project = demo.clone();
-        let mut clone = fake_instance(&app, "demo-1", demo.join("clone-1"));
-        clone.project = demo.clone();
-        clone.ephemeral = true;
-        clone.source_instance = Some("demo".into());
-
-        app.set_projects(vec![Project {
-            name: "demo".into(),
-            path: demo,
-            git: GitSummary::default(),
-            last_opened: None,
         }]);
-        app.instances = vec![base, clone];
-        app.refresh_instance_filter();
-        assert_eq!(app.selected_instance().unwrap().name, "demo");
-        app.instance_selected = 1;
-        assert_eq!(app.selected_instance().unwrap().name, "demo-1");
+        app.vms = vec![base];
+        assign_fake_project(&mut app, &demo, "demo");
+        app.refresh_vm_filter();
+        assert_eq!(app.selected_vm().unwrap().name, "demo");
 
-        // A background refresh can reorder the registry; the selection follows
-        // the instance name, not the vector index.
-        app.instances.reverse();
-        app.refresh_instance_filter_named(Some("demo-1".into()));
-        assert_eq!(app.selected_instance().unwrap().name, "demo-1");
+        app.vms.reverse();
+        app.refresh_vm_filter_named(Some("demo".into()));
+        assert_eq!(app.selected_vm().unwrap().name, "demo");
     }
 
     #[test]
@@ -650,7 +880,7 @@ mod tests {
                 integration: crate::agent::launch::Integration::External,
                 bar: true,
             },
-            instance: "demo".into(),
+            vm: "demo".into(),
             project: PathBuf::from("/projects/demo"),
             since,
             provision_seen,
@@ -668,9 +898,9 @@ mod tests {
             false,
             false,
         ));
-        let (spec, instance, _project) = app.take_due_launch().expect("grace elapsed");
+        let (spec, vm, _project) = app.take_due_launch().expect("grace elapsed");
         assert_eq!(spec.command, "opencode");
-        assert_eq!(instance, "demo");
+        assert_eq!(vm, "demo");
         assert!(app.pending_launch.is_none(), "a release is consumed once");
 
         // A cloud image must not race cloud-init/provisioning.
@@ -715,7 +945,7 @@ mod tests {
         log.set_exited(true);
 
         app.poll();
-        assert_eq!(app.instance.state, InstanceState::Stopped);
+        assert_eq!(app.vm.state, VmUiState::Stopped);
         assert!(app.terminal.len() >= 2);
         assert!(
             app.toast
@@ -734,16 +964,104 @@ mod tests {
     #[test]
     fn refresh_does_not_clear_the_starting_state() {
         let (_dir, mut app) = test_app();
-        app.instance.state = InstanceState::Starting;
-        app.refresh_instances();
-        assert_eq!(app.instance.state, InstanceState::Starting);
+        app.vm.state = VmUiState::Starting;
+        app.refresh_vms();
+        assert_eq!(app.vm.state, VmUiState::Starting);
     }
 
     #[test]
-    fn instance_status_reflects_config() {
+    fn vm_status_reflects_config() {
         let (_dir, app) = test_app();
-        assert_eq!(app.instance.state, InstanceState::Stopped);
-        assert_eq!(app.instance.backend, "cloud-hypervisor");
-        assert_eq!(app.instance.vcpus, app.config.vcpus);
+        assert_eq!(app.vm.state, VmUiState::Stopped);
+        assert_eq!(app.vm.backend, "cloud-hypervisor");
+        assert_eq!(app.vm.vcpus, app.config.vcpus);
+    }
+
+    #[test]
+    fn window_title_shows_project_and_vm_once_assigned() {
+        let (_dir, mut app) = test_app();
+        assert_eq!(app.window_title(), "hegn");
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        app.vms = vec![fake_vm(&app, "rust", project.clone())];
+        assign_fake_project(&mut app, &project, "rust");
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path: project.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+        app.screen = Screen::Project;
+        app.open_project = Some(project);
+        assert_eq!(app.window_title(), "hegn — demo · rust");
+    }
+
+    #[test]
+    fn registry_only_outside_projects_appear_with_vm_badge_and_open() {
+        let (_dir, mut app) = test_app();
+        let outside = app
+            .config
+            .projects_root
+            .parent()
+            .unwrap()
+            .join("code/parser");
+        std::fs::create_dir_all(&outside).unwrap();
+        let canonical = outside.canonicalize().unwrap();
+        let mut registry = ProjectRegistry::load(&app.config.state_dir).unwrap();
+        registry
+            .upsert(ProjectEntry {
+                name: "parser".into(),
+                path: canonical.clone(),
+                vm: None,
+                read_only: false,
+                kind: ProjectKind::External,
+                parent: None,
+                managed: false,
+                hidden: false,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        registry.assign("parser", "rust", false).unwrap();
+        app.vms = vec![fake_vm(&app, "rust", canonical.clone())];
+
+        app.set_projects(Vec::new());
+
+        let index = app
+            .projects
+            .iter()
+            .position(|project| project.name == "parser")
+            .expect("outside registry project is merged into the picker");
+        assert_eq!(app.project_vm_badge(&app.projects[index].path), "⬢ rust");
+        app.selected = app
+            .visible
+            .iter()
+            .position(|&visible| visible == index)
+            .expect("merged project is visible");
+        app.open_project();
+        assert_eq!(app.screen, Screen::Project);
+        assert_eq!(app.open_project.as_deref(), Some(canonical.as_path()));
+    }
+
+    #[test]
+    fn vm_badges_and_preview_fields_resolve_registry_assignments() {
+        let (_dir, mut app) = test_app();
+        let demo = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&demo).unwrap();
+        let mut summary = fake_vm(&app, "rust", demo.clone());
+        summary.members = 2;
+        summary.harness = crate::config::Harness::Opencode;
+        summary.state = "running".into();
+        app.vms = vec![summary];
+        assign_fake_project(&mut app, &demo, "rust");
+
+        assert_eq!(app.project_vm_name(&demo), Some("rust"));
+        assert_eq!(app.project_vm_badge(&demo), "⬢ rust · 2p");
+        assert_eq!(
+            app.project_vm_badge(&app.config.projects_root.join("other")),
+            "unassigned"
+        );
+        assert!(app.project_guest_path(&demo).is_some());
     }
 }

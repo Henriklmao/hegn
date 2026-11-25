@@ -199,9 +199,7 @@ impl LogStore {
                 .into_iter()
                 .next()
                 .map(|entry| entry.path)
-                .context(
-                    "no serial logs yet; start a VM with `hegn open` or `hegn instance start`",
-                ),
+                .context("no serial logs yet; start a VM with `hegn open` or `hegn vm start`"),
         }
     }
 }

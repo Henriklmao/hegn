@@ -1,5 +1,5 @@
 //! VM lifecycle from the UI side: starting and attaching consoles, failures and
-//! the parts of instance deletion that need a confirmation.
+//! the confirmations that precede destructive VM operations.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -11,29 +11,32 @@ use super::*;
 
 impl App {
     pub(super) fn open_terminal(&mut self) -> Vec<Effect> {
+        if self.screen == Screen::Vm {
+            return self.attach_active_vm();
+        }
         if self.open_project.is_none() && self.session.is_none() {
             self.project_view = ProjectView::Split;
             self.terminal_focus = true;
             self.terminal_mode = TerminalMode::Insert;
             return Vec::new();
         }
-        let selected = self
-            .selected_instance()
-            .map(|instance| instance.name.clone());
-        if let Some(name) = selected {
+        let vm = self
+            .active_vm_name()
+            .or_else(|| self.session.as_ref().map(|s| s.vm_name().to_string()));
+        if let Some(name) = vm.clone() {
             if self
                 .session
                 .as_ref()
-                .is_some_and(|session| session.instance_name() == name)
+                .is_some_and(|session| session.vm_name() == name)
             {
                 self.project_view = ProjectView::Split;
                 self.terminal_focus = true;
                 self.terminal_mode = TerminalMode::Insert;
                 return Vec::new();
             }
-            self.attach_selected_instance()
+            self.attach_vm(&name)
         } else {
-            self.start_project_instance()
+            self.start_project_vm()
         }
     }
 
@@ -48,31 +51,46 @@ impl App {
     }
 
     pub(super) fn attach_console_external(&mut self) -> Vec<Effect> {
-        let instance = self
-            .selected_instance()
-            .map(|instance| instance.name.clone())
-            .or_else(|| {
-                self.session
-                    .as_ref()
-                    .map(|session| session.instance_name().to_string())
-            });
-        let Some(instance) = instance else {
-            self.toast("no instance selected", ToastLevel::Warn);
+        let vm = self
+            .active_vm_name()
+            .or_else(|| self.session.as_ref().map(|s| s.vm_name().to_string()));
+        let Some(vm) = vm else {
+            self.toast("no VM selected", ToastLevel::Warn);
             return Vec::new();
         };
-        vec![Effect::AttachConsole { instance }]
+        vec![Effect::AttachConsole { vm }]
     }
 
-    pub(super) fn attach_selected_instance(&mut self) -> Vec<Effect> {
-        let Some(instance) = self.selected_instance().cloned() else {
-            self.toast("no instance selected", ToastLevel::Warn);
-            return Vec::new();
-        };
-        if self.instance.state == InstanceState::Starting {
+    /// Attach the VM of the open project or the VM screen.
+    pub(super) fn attach_active_vm(&mut self) -> Vec<Effect> {
+        if self.screen == Screen::Vm {
+            let Some(vm) = self.vm_open.clone() else {
+                self.toast("no VM selected", ToastLevel::Warn);
+                return Vec::new();
+            };
+            if self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.vm_name() == vm)
+            {
+                self.project_view = ProjectView::Split;
+                self.terminal_focus = true;
+                self.terminal_mode = TerminalMode::Insert;
+                return Vec::new();
+            }
+            return self.attach_vm(&vm);
+        }
+        self.attach_project_vm()
+    }
+
+    /// Start/attach one VM by name and prepare the embedded terminal.
+    pub(super) fn attach_vm(&mut self, name: &str) -> Vec<Effect> {
+        if self.vm.state == VmUiState::Starting {
             self.toast("a VM is already starting…", ToastLevel::Warn);
             return Vec::new();
         }
         self.session = None;
+        self.attached_vm = None;
         self.pending_launch = None;
         self.provision_running = false;
         self.provision_ready_seen = false;
@@ -81,65 +99,55 @@ impl App {
         self.input.clear();
         self.terminal_mode = TerminalMode::Normal;
         self.session_closed_reported = false;
-        self.instance.state = InstanceState::Starting;
-        self.instance.started_at = None;
-        self.instance.note = Some(format!("attaching to instance {}", instance.name));
-        self.enter_project(instance.project.clone());
-        self.project_view = ProjectView::Split;
-        self.terminal_focus = true;
-        vec![Effect::AttachInstance {
-            instance: instance.name,
+        self.vm.state = VmUiState::Starting;
+        self.vm.started_at = None;
+        self.vm.note = Some(format!("attaching to VM {name}"));
+        vec![Effect::AttachVm {
+            vm: name.to_string(),
         }]
     }
 
-    pub(super) fn stop_selected_instance(&mut self) -> Vec<Effect> {
-        let Some(instance) = self.selected_instance().cloned() else {
-            self.toast("no instance selected", ToastLevel::Warn);
+    pub(super) fn stop_selected_vm(&mut self) -> Vec<Effect> {
+        let Some(vm) = self
+            .active_vm_name()
+            .or_else(|| self.selected_vm().map(|vm| vm.name.clone()))
+        else {
+            self.toast("no VM selected", ToastLevel::Warn);
             return Vec::new();
         };
-        vec![Effect::StopInstance {
-            instance: instance.name,
-        }]
+        vec![Effect::StopVm { vm }]
     }
 
-    pub(super) fn confirm_delete_instance(&mut self) -> Vec<Effect> {
-        let Some(instance) = self.selected_instance().cloned() else {
-            self.toast("no instance selected", ToastLevel::Warn);
+    pub(super) fn apply_selected_vm(&mut self) -> Vec<Effect> {
+        let Some(vm) = self
+            .active_vm_name()
+            .or_else(|| self.selected_vm().map(|vm| vm.name.clone()))
+        else {
+            self.toast("no VM selected", ToastLevel::Warn);
             return Vec::new();
         };
-        self.modal = Some(Modal::DeleteInstance(DeleteInstanceModal {
-            instance,
-            stage: DeleteInstanceStage::Confirm,
-            error: None,
-            scroll: 0,
-        }));
-        Vec::new()
+        vec![Effect::ApplyVm { vm }]
     }
 
     /// Ask before removing a project from the dashboard.
     ///
-    /// The modal shows git state (so uncommitted work is visible) and the
-    /// instances that will be stopped and deleted. `y` unregisters the project
-    /// and keeps its files; `f` also deletes the project directory.
+    /// The modal shows git state (so uncommitted work is visible) and the VM
+    /// that will lose the project (unassigned, never deleted). `y` unregisters
+    /// the project and keeps its files; `f` also deletes the project directory.
     pub(super) fn confirm_delete_project(&mut self) -> Vec<Effect> {
         let Some(project) = self.selected_project().cloned() else {
             self.toast("no project selected", ToastLevel::Warn);
             return Vec::new();
         };
         let git = project::read_git_summary(&project.path);
-        let instances = self
-            .instances
-            .iter()
-            .filter(|instance| {
-                crate::vm::instance::same_project(&instance.project, &project.path)
-                    || crate::vm::instance::same_project(&instance.workspace, &project.path)
-            })
-            .map(|instance| instance.name.clone())
-            .collect();
+        let vms = self
+            .project_vm_name(&project.path)
+            .map(|vm| vec![vm.to_string()])
+            .unwrap_or_default();
         self.modal = Some(Modal::DeleteProject(DeleteProjectModal {
             project,
             git,
-            instances,
+            vms,
             scroll: 0,
         }));
         Vec::new()
@@ -161,32 +169,41 @@ impl App {
         }]
     }
 
-    /// Boot the project's default instance.
+    /// Boot the selected project's VM.
     ///
     /// This only *requests* the VM start; the terminal loop owns the runtime and
-    /// performs the boot. A missing VM is a hard error, never a local shell.
-    pub(super) fn start_project_instance(&mut self) -> Vec<Effect> {
-        if self.instance.state == InstanceState::Starting {
+    /// performs the boot. A missing VM assignment is a hard prompt, never a
+    /// local shell.
+    pub(super) fn start_project_vm(&mut self) -> Vec<Effect> {
+        if self.vm.state == VmUiState::Starting {
             self.toast("a VM is already starting…", ToastLevel::Warn);
             return Vec::new();
         }
-        let Some(project) = self.selected_project().cloned() else {
+        if self.screen == Screen::Vm {
+            return self.attach_active_vm();
+        }
+        let Some(project) = self
+            .active_project()
+            .cloned()
+            .or_else(|| self.selected_project().cloned())
+        else {
             self.toast("no project selected", ToastLevel::Warn);
             return Vec::new();
         };
+        let Some(vm) = self.project_vm_name(&project.path).map(str::to_string) else {
+            return self.open_assign_form(project.path, None);
+        };
 
-        let attached_to_project = self.session.as_ref().is_some_and(|session| {
-            crate::vm::instance::same_project(session.project(), &project.path)
-        });
-        if attached_to_project && self.session_active() {
+        let attached_to_vm = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.vm_name() == vm);
+        if attached_to_vm && self.session_active() {
             self.enter_project(project.path);
             self.project_view = ProjectView::Split;
             self.terminal_focus = true;
             return Vec::new();
         }
-
-        let meta = project::read_meta(&project.path);
-        let harness = meta.harness.unwrap_or(self.config.harness);
 
         if let Err(err) = self.store.touch(&project.path) {
             self.toast(
@@ -196,6 +213,7 @@ impl App {
         }
 
         self.session = None;
+        self.attached_vm = None;
         self.pending_launch = None;
         self.provision_running = false;
         self.provision_ready_seen = false;
@@ -204,18 +222,18 @@ impl App {
         self.input.clear();
         self.terminal_mode = TerminalMode::Normal;
         self.session_closed_reported = false;
-        self.instance.state = InstanceState::Starting;
-        self.instance.started_at = None;
-        self.instance.note = Some(format!(
-            "booting Cloud Hypervisor VM for {}",
+        self.vm.state = VmUiState::Starting;
+        self.vm.started_at = None;
+        self.vm.note = Some(format!(
+            "booting Cloud Hypervisor VM {vm} for {}",
             project.display_path()
         ));
         self.enter_project(project.path.clone());
         self.project_view = ProjectView::Split;
         self.terminal_focus = true;
-        vec![Effect::StartProjectInstance {
-            project: project.path,
-            harness,
+        vec![Effect::StartVm {
+            vm,
+            project: Some(project.path),
         }]
     }
 
@@ -230,26 +248,24 @@ impl App {
 
     /// Install a console for a successfully started/attached VM.
     pub fn attach_console(&mut self, console: Box<dyn TerminalConsole>) {
-        self.instance.state = InstanceState::Running;
-        self.instance.backend = "cloud-hypervisor";
-        self.instance.note = Some(format!(
+        let vm_name = console.vm_name().to_string();
+        self.vm.state = VmUiState::Running;
+        self.vm.backend = "cloud-hypervisor";
+        self.vm.note = Some(format!(
             "{} in {}",
             console.label(),
             console.project().display()
         ));
-        self.instance.started_at = Some(Instant::now());
-        self.instance.socket = Some(
+        self.vm.started_at = Some(Instant::now());
+        self.vm.socket = Some(
             self.config
-                .instances_dir
-                .join(console.instance_name())
+                .vms_dir
+                .join(&vm_name)
                 .join("run/cloud-hypervisor.sock"),
         );
-        if let Some(index) = self
-            .instance_visible
-            .iter()
-            .position(|&index| self.instances[index].name == console.instance_name())
-        {
-            self.instance_selected = index;
+        self.attached_vm = Some(vm_name.clone());
+        if let Some(index) = self.vms.iter().position(|vm| vm.name == vm_name) {
+            self.vm_selected = index;
         }
         let project = console.project().to_path_buf();
         self.session = Some(console);
@@ -265,7 +281,7 @@ impl App {
             "attached — normal mode, press i or a to type",
             ToastLevel::Info,
         );
-        self.refresh_instances();
+        self.refresh_vms();
     }
 
     /// Report a hard VM start/attach failure. No host fallback is attempted.
@@ -275,12 +291,13 @@ impl App {
     pub fn fail_start(&mut self, error: impl Into<String>) {
         let error = error.into();
         self.session = None;
+        self.attached_vm = None;
         self.pending_launch = None;
         self.provision_running = false;
         self.provision_ready_seen = false;
-        self.instance.state = InstanceState::Failed;
-        self.instance.started_at = None;
-        self.instance.note = Some(error.clone());
+        self.vm.state = VmUiState::Failed;
+        self.vm.started_at = None;
+        self.vm.note = Some(error.clone());
         self.toast(format!("VM start failed: {error}"), ToastLevel::Error);
         self.modal = Some(Modal::Doctor(DoctorModal::with_error(
             crate::diagnostics::doctor::run(&self.config),
@@ -296,6 +313,22 @@ impl App {
     }
 }
 
+impl App {
+    /// Delete the selected VM after its two-stage confirmation.
+    pub(super) fn delete_vm_effect(
+        &mut self,
+        modal: DeleteVmModal,
+        delete_files: bool,
+    ) -> Vec<Effect> {
+        let name = modal.vm.name.clone();
+        self.toast(format!("deleting VM {name}…"), ToastLevel::Info);
+        vec![Effect::DeleteVm {
+            vm: name,
+            delete_files,
+        }]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,14 +337,24 @@ mod tests {
     #[test]
     fn f2_requests_the_real_attach_client() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
-        let instance = fake_instance(&app, "demo", inside);
-        install_instances(&mut app, vec![instance]);
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        app.vms = vec![fake_vm(&app, "demo", project.clone())];
+        assign_fake_project(&mut app, &project, "demo");
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path: project.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
+        app.open_project = Some(project);
         app.screen = Screen::Project;
         let effects = app.handle_key(key(KeyCode::F(2)));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::AttachConsole { instance }] if instance == "demo"
+            [Effect::AttachConsole { vm }] if vm == "demo"
         ));
     }
 
@@ -323,7 +366,7 @@ mod tests {
         app.detach_console();
         assert!(app.session.is_none());
         assert_eq!(app.terminal_mode, TerminalMode::Normal);
-        assert_eq!(app.instance.state, InstanceState::Running);
+        assert_eq!(app.vm.state, VmUiState::Running);
     }
 
     #[test]
@@ -331,40 +374,43 @@ mod tests {
         let (_dir, mut app) = test_app();
         app.fail_start("missing VM assets");
         assert!(app.session.is_none());
-        assert_eq!(app.instance.state, InstanceState::Failed);
+        assert_eq!(app.vm.state, VmUiState::Failed);
         assert!(!app.session_active());
         assert!(app.toast.as_ref().unwrap().text.contains("VM start failed"));
     }
 
     #[test]
-    fn starting_a_project_instance_resets_the_terminal_mode() {
+    fn starting_a_project_vm_resets_the_terminal_mode() {
         let (_dir, mut app) = test_app();
-        let mut project = fake_project("demo");
-        project.path = app.config.projects_root.join("demo");
-        std::fs::create_dir_all(&project.path).unwrap();
-        app.set_projects(vec![project.clone()]);
+        let project = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        app.vms = vec![fake_vm(&app, "rust", project.clone())];
+        assign_fake_project(&mut app, &project, "rust");
+        app.projects = vec![Project {
+            name: "demo".into(),
+            path: project.clone(),
+            git: GitSummary::default(),
+            last_opened: None,
+        }];
+        app.visible = vec![0];
+        app.selected = 0;
         app.screen = Screen::Project;
-        app.focus = Focus::Instances;
+        app.focus = Focus::Vm;
         app.terminal_mode = TerminalMode::Raw;
-        let effects = app.start_project_instance();
+        let effects = app.start_project_vm();
         assert_eq!(
             app.terminal_mode,
             TerminalMode::Normal,
             "the terminal mode must reset for each VM"
         );
-        assert_eq!(app.instance.state, InstanceState::Starting);
+        assert_eq!(app.vm.state, VmUiState::Starting);
         assert!(app.session.is_none());
         match effects.as_slice() {
-            [
-                Effect::StartProjectInstance {
-                    project: p,
-                    harness,
-                },
-            ] => {
-                assert_eq!(p, &project.path);
-                assert_eq!(*harness, app.config.harness);
+            [Effect::StartVm { vm, project: p }] => {
+                assert_eq!(p.as_deref(), Some(project.as_path()));
+                assert_eq!(vm, "rust");
             }
-            other => panic!("expected StartProjectInstance, got {other:?}"),
+            other => panic!("expected StartVm, got {other:?}"),
         }
     }
 
@@ -372,9 +418,9 @@ mod tests {
     fn a_second_start_is_rejected_while_the_first_is_booting() {
         let (_dir, mut app) = test_app();
         app.screen = Screen::Project;
-        app.focus = Focus::Instances;
-        app.instance.state = InstanceState::Starting;
-        let effects = app.start_project_instance();
+        app.focus = Focus::Vm;
+        app.vm.state = VmUiState::Starting;
+        let effects = app.start_project_vm();
         assert!(effects.is_empty());
         assert!(
             app.toast
@@ -388,8 +434,9 @@ mod tests {
         let (_dir, mut app) = test_app();
         app.attach_console(Box::new(FakeConsole::new("/projects/demo")));
         assert_eq!(app.screen, Screen::Project);
-        assert_eq!(app.instance.state, InstanceState::Running);
+        assert_eq!(app.vm.state, VmUiState::Running);
         assert!(app.session_active());
+        assert_eq!(app.attached_vm.as_deref(), Some("fake"));
     }
 
     #[test]
@@ -405,45 +452,30 @@ mod tests {
     }
 
     #[test]
-    fn attaching_selects_the_matching_instance_and_starts_in_normal_mode() {
+    fn attaching_selects_the_matching_vm_and_starts_in_normal_mode() {
         let (_dir, mut app) = test_app();
         let demo = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&demo).unwrap();
-        // Persist both instances so the registry refresh in `enter_project`
-        // keeps the selection instead of emptying the list.
-        let store = crate::vm::instance_config::InstanceStore::new(app.config.clone());
-        for (name, workspace) in [
-            ("demo", demo.join("workspace")),
-            ("demo-1", demo.join("clone-1")),
-        ] {
-            store
-                .save(&crate::vm::instance_config::InstanceConfig {
-                    name: name.into(),
-                    project: demo.clone(),
-                    workspace,
-                    harness: Harness::Shell,
-                    ..crate::vm::instance_config::InstanceConfig::default()
-                })
-                .unwrap();
-        }
-        let mut first = fake_instance(&app, "demo", demo.join("workspace"));
-        first.project = demo.clone();
-        let mut clone = fake_instance(&app, "demo-1", demo.join("clone-1"));
-        clone.project = demo.clone();
-        install_instances(&mut app, vec![first, clone]);
+        // Persist the VM and its registry membership so the registry refresh
+        // in `enter_project` keeps the selection instead of emptying the list.
+        crate::vm::registry::VmRegistry::new(app.config.clone())
+            .ensure_for_project(&demo, Harness::Shell)
+            .unwrap();
+        let vm = fake_vm(&app, "demo", demo.clone());
+        install_vms(&mut app, vec![vm]);
         app.terminal_mode = TerminalMode::Insert;
 
         let log = ConsoleLog::default();
-        app.attach_console(log.console_named(demo, "demo-1"));
+        app.attach_console(log.console_named(demo, "demo"));
 
         assert_ne!(
-            app.instance.state,
-            InstanceState::Starting,
+            app.vm.state,
+            VmUiState::Starting,
             "a successful attach is no longer booting"
         );
-        assert_eq!(app.instance.backend, "cloud-hypervisor");
-        assert!(app.instance.started_at.is_some());
-        assert_eq!(app.selected_instance().unwrap().name, "demo-1");
+        assert_eq!(app.vm.backend, "cloud-hypervisor");
+        assert!(app.vm.started_at.is_some());
+        assert_eq!(app.selected_vm().unwrap().name, "demo");
         assert_eq!(app.terminal_mode, TerminalMode::Normal);
         assert!(app.terminal_focus);
     }
@@ -451,12 +483,12 @@ mod tests {
     #[test]
     fn attaching_is_rejected_while_another_vm_is_booting() {
         let (_dir, mut app) = test_app();
-        let inside = app.config.instances_dir.join("demo").join("workspace");
-        let instance = fake_instance(&app, "demo", inside);
-        install_instances(&mut app, vec![instance]);
-        app.instance.state = InstanceState::Starting;
+        let inside = app.config.vms_dir.join("demo").join("workspace");
+        let vm = fake_vm(&app, "demo", inside);
+        install_vms(&mut app, vec![vm]);
+        app.vm.state = VmUiState::Starting;
 
-        let effects = app.attach_selected_instance();
+        let effects = app.attach_vm("demo");
 
         assert!(effects.is_empty());
         assert!(app.session.is_none());
@@ -472,7 +504,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         app.fail_start("boom");
         assert!(app.session.is_none());
-        assert_eq!(app.instance.state, InstanceState::Failed);
+        assert_eq!(app.vm.state, VmUiState::Failed);
         assert!(!app.session_active());
     }
 }

@@ -1,4 +1,4 @@
-//! Global, instance and project settings modals.
+//! Global, VM and project settings modals.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -412,18 +412,8 @@ pub(crate) fn render_project_config(
     area: Rect,
 ) -> (Vec<FooterHit>, Option<ScrollHit>) {
     let marker = |row: usize| if form.row == row { "›" } else { " " };
-    let global_harness = app.config.harness;
-    let harness_value = match form.harness {
-        Some(harness) => harness.label().to_string(),
-        None => format!("global default ({})", global_harness.label()),
-    };
     let launch_value = match &form.launch {
-        Some(name) if name == crate::agent::launch::HARNESS => {
-            format!(
-                "harness ({})",
-                form.harness.unwrap_or(global_harness).label()
-            )
-        }
+        Some(name) if name == crate::agent::launch::HARNESS => "harness".to_string(),
         Some(name) => name.clone(),
         None => match &app.config.launch.default {
             Some(default) => format!("global default ({default})"),
@@ -472,8 +462,8 @@ pub(crate) fn render_project_config(
         "Project  {}\nFile     {}\n\n\
          {} Launch command   {}\n\
          {} Integration      {}\n\
-         {} Auto-launch      {}\n\
-         {} Harness          {}\n\n\
+         {} Auto-launch      {}\n\n\
+         Presentation only: the harness and tools live in the VM's vm.toml.\n\
          ↑/↓ row · ←/→ value · Enter save · r save + launch\n\
          {}\n\
          Inside tmux, Ctrl-B is the tmux prefix — Ctrl-] detaches hegn.",
@@ -487,8 +477,6 @@ pub(crate) fn render_project_config(
         integration_value,
         marker(2),
         auto_start_value,
-        marker(3),
-        harness_value,
         availability.join(" · "),
     );
     if let Some(error) = &form.error {
@@ -531,10 +519,9 @@ mod tests {
     use super::*;
     use crate::tui::app::{Modal, Screen};
     use crate::tui::ui::test_support::*;
-    use std::path::PathBuf;
 
     #[test]
-    fn project_settings_modal_lists_launch_integration_and_harness() {
+    fn project_settings_modal_lists_launch_and_integration() {
         let (_dir, mut app) = app();
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
@@ -554,6 +541,7 @@ mod tests {
         assert!(text.contains("project settings"), "{text}");
         assert!(text.contains("Launch command"), "{text}");
         assert!(text.contains("herdr"), "{text}");
+        assert!(text.contains("Presentation only"), "{text}");
         assert!(text.contains("Save + launch"), "{text}");
         assert!(
             hits.footer
@@ -667,25 +655,24 @@ mod tests {
     }
 
     #[test]
-    fn instance_config_modal_marks_read_only_context() {
+    fn vm_config_modal_marks_read_only_context() {
         let (_dir, mut app) = app();
-        let instance = crate::vm::instance_config::InstanceConfig {
+        let vm = crate::vm::config::VmConfig {
             name: "demo".into(),
-            project: PathBuf::from("/projects/demo"),
-            workspace: PathBuf::from("/projects/demo"),
-            ..crate::vm::instance_config::InstanceConfig::default()
+            primary: Some("demo".into()),
+            ..crate::vm::config::VmConfig::default()
         };
-        app.modal = Some(Modal::Config(crate::config::form::ConfigForm::instance(
-            instance,
+        app.modal = Some(Modal::Config(crate::config::form::ConfigForm::vm(
+            vm,
             app.config.clone(),
         )));
         let (text, hits) = render(&app);
-        assert!(text.contains("instance 'demo' settings"), "{text}");
+        assert!(text.contains("VM 'demo' settings"), "{text}");
         assert!(text.contains("read-only"), "{text}");
-        assert!(text.contains("/projects/demo"), "{text}");
+        assert!(text.contains("demo"), "{text}");
         assert!(
             hits.config.iter().any(|row| row.rect.height == 1),
-            "instance settings must be clickable"
+            "vm settings must be clickable"
         );
     }
 }

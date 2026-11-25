@@ -3,6 +3,10 @@
 A **session** is your connection to a running VM. Attaching and detaching never
 stop the VM. Every session also writes a log that you can read later.
 
+One VM has one serial console. Starting or attaching any member starts or
+attaches the whole VM. For several agents in one VM, run guest `tmux`; separate
+VMs are the isolated alternative.
+
 - [Session branches](#session-branches)
 - [Attaching like tmux](#attaching-like-tmux)
 - [The attach bar](#the-attach-bar)
@@ -13,41 +17,51 @@ stop the VM. Every session also writes a log that you can read later.
 
 ## Session branches
 
-With `auto_branch = true` (the default), hegn checks out a branch named
-`agent/hegn-session-<timestamp>` on the host once the VM has booted. Each session
-therefore has its own branch, and the agent's commits end up there instead of on
-your main branch. `hegn open --no-branch` skips this step.
+With `auto_branch = true` (the default), `hegn open <project>` checks out a branch
+named `agent/hegn-session-<timestamp>` in that project on the host once the VM
+has booted. Each opened project therefore gets its own branch, and the agent's
+commits end up there instead of on your main branch. With `auto_branch = false`,
+`hegn open` creates no branch automatically. `hegn open --no-branch` forces the
+branch off for one run.
 
 The setting lives in `config.toml` (see [Configuration](configuration.md)).
+`hegn attach` never creates a branch, because it does not open a project.
 
 ---
 
 ## Attaching like tmux
 
 ```bash
-hegn attach          # attach to the single running VM
-hegn a my-app        # attach, but only if the running VM belongs to my-app
+hegn attach          # attach to the only running VM
+hegn a dev           # attach to VM dev
+hegn attach parser   # attach to the VM that hosts project parser
 hegn attach --no-bar # give full-screen guest programs the whole terminal
 ```
 
-`hegn attach` never boots or restarts a VM. It fails when no instance is running.
+`hegn attach` never boots or restarts a VM. It fails when no VM is running. A
+selector may be a VM name or a project name; `hegn open <project>` boots the
+project's VM if needed and also prints the project's guest path.
 
-If several VMs run at the same time, pass the instance name (or a project name
-that identifies exactly one base instance). Without an argument, `attach` only
-connects when exactly one instance is running.
+If several VMs run at the same time, pass the VM name (or a project that names
+exactly one VM). Without an argument, `attach` only connects when exactly one VM
+is running.
 
-Detach with `Ctrl-B`, or with `Ctrl-]` when hegn runs inside tmux. In tmux,
-`Ctrl-B` is tmux's own prefix key, so hegn's detach key is `Ctrl-]` there. Both
-keys are shown in the bar.
+Detach with `Ctrl-B` or `Ctrl-]`. Inside tmux, `Ctrl-B` is tmux's own prefix key,
+so use `Ctrl-]` there. Both keys are shown in the bar.
 
 Detaching leaves the VM running.
+
+If the registry changed while the VM was running, attach prints a warning. The
+running VM keeps the shares it booted with. Run `hegn vm apply <vm>` to restart
+with the new membership; that kills running agents.
 
 ---
 
 ## The attach bar
 
 The bottom line of the terminal is reserved for a status bar. It shows the
-project, the harness, the VM process ID, the log file and the input mode:
+project (or the VM's primary project), the harness, the VM process ID, the log
+file and the input mode:
 
 ```
  hegn ▸ my-app · OpenCode · pid 4242 · log session-…-my-app-4242.log   INPUT DIRECT · Ctrl-B/Ctrl-] detach
@@ -72,19 +86,23 @@ row.
 Every VM session writes its serial output to:
 
 ```text
-~/.local/state/hegn/logs/session-<timestamp>-<project>-<pid>.log
+<state_dir>/logs/session-<timestamp>-<project>-<pid>.log
 ```
 
-The log is created with private permissions and is kept for the whole VM
-lifetime. Stopping the VM does not erase the boot log.
+The log is created with private permissions. Stopping the VM does not delete it;
+only `hegn logs prune` removes old logs.
 
 ```bash
 hegn logs                       # list, newest first
+hegn logs list --vm dev         # only logs from dev's member projects
 hegn logs path my-app           # absolute path (newest by default)
 hegn logs show --lines 120      # tail with ANSI/control sequences stripped
 hegn logs show --raw            # exact bytes; only for trusted logs
 hegn logs prune --keep 20       # only hegn's session-*.log files
 ```
+
+`--vm` is accepted by `logs list`, `logs path` and `logs show`. The old
+`--instance` spelling is accepted as a hidden alias.
 
 Logs can contain secrets that an agent printed. So:
 
@@ -97,22 +115,27 @@ A log is not truncated while the VM is running. Retention is based on the count
 (default 50). Run `hegn logs prune` whenever you like. Pruning never touches the
 log of the currently running session.
 
+Logs from v1 are ordinary files and remain readable. They are diagnostics, not
+state; hegn does not migrate or delete them.
+
 ---
 
 ## Start diagnostics
 
-If a start fails, the details are in the instance's run directory:
+If a start fails, the details are in the VM's run directory:
 
 ```bash
-# <instances_dir> defaults to ~/.local/share/hegn/instances
-cat ~/.local/share/hegn/instances/<name>/run/hegn.log             # lifecycle and start errors
-cat ~/.local/share/hegn/instances/<name>/run/cloud-hypervisor.log # VMM log
-cat ~/.local/share/hegn/instances/<name>/run/console-relay.log    # relay stderr
+# <vms_dir> defaults to ~/.local/share/hegn/vms
+cat ~/.local/share/hegn/vms/<vm>/run/hegn.log             # lifecycle and start errors
+cat ~/.local/share/hegn/vms/<vm>/run/cloud-hypervisor.log # VMM log
+cat ~/.local/share/hegn/vms/<vm>/run/console-relay.log    # relay stderr
+cat ~/.local/share/hegn/vms/<vm>/run/autosave.log         # automatic checkpoint errors
 hegn logs list                  # serial logs, including failed starts
 hegn logs show <name>           # VMM API and guest output
 ```
 
 The error message in the CLI includes the path of `hegn.log` and the last lines of
 the VMM or relay log. A boot failure is therefore not reported as a generic relay
-error. Serial logs of failed starts are kept, so the Cloud Hypervisor messages
-that caused the failure stay available. See also [Troubleshooting](troubleshooting.md).
+error. If one member's `virtiofsd` fails, every daemon started for that VM is
+killed and the serial log is kept, so the Cloud Hypervisor messages that caused
+the failure stay available. See also [Troubleshooting](troubleshooting.md).

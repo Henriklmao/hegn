@@ -2,7 +2,7 @@
 //! `TestBackend`.
 //!
 //! The renderer is split at screen and modal boundaries: [`header`] owns the
-//! top bar, [`screens`] the dashboard and project layouts, [`modals`] the
+//! top bar, [`screens`] the dashboard, project and VM layouts, [`modals`] the
 //! overlay dialogs, and [`widgets`]/[`text`]/[`theme`] the shared building
 //! blocks. This module only wires them together in [`draw`].
 
@@ -13,6 +13,7 @@ use ratatui::widgets::Block;
 
 use crate::tui::app::{
     App, ConfigStepHit, ConfigTabHit, FooterHit, RowHit, Screen, ScrollHit, SectionHit,
+    VmSectionHit,
 };
 
 mod header;
@@ -29,10 +30,14 @@ mod widgets;
 pub struct UiHits {
     pub footer: Vec<FooterHit>,
     pub projects: Vec<RowHit>,
-    pub instances: Vec<RowHit>,
+    pub vms: Vec<RowHit>,
+    /// Project rows inside the VM screen.
+    pub vm_members: Vec<RowHit>,
     pub snapshots: Vec<RowHit>,
     /// Clickable project section headers/panels.
     pub sections: Vec<SectionHit>,
+    /// Clickable VM section headers/panels.
+    pub vm_sections: Vec<VmSectionHit>,
     /// Clickable terminal pane and collapsed terminal strip.
     pub terminal: Option<Rect>,
     pub terminal_strip: Option<Rect>,
@@ -81,12 +86,13 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
             let rows = screens::dashboard::render_dashboard(frame, app, chunks[1]);
             RenderHits {
                 projects: rows.0,
-                instances: rows.1,
+                vms: rows.1,
                 snapshots: rows.2,
                 ..RenderHits::default()
             }
         }
         Screen::Project => screens::project::render_project(frame, app, chunks[1]),
+        Screen::Vm => screens::vm::render_vm(frame, app, chunks[1]),
     };
     let mut footer = screens::footer::render_footer(frame, app, chunks[2]);
     let mut config = Vec::new();
@@ -106,9 +112,11 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
     UiHits {
         footer,
         projects: hits.projects,
-        instances: hits.instances,
+        vms: hits.vms,
+        vm_members: hits.vm_members,
         snapshots: hits.snapshots,
         sections: hits.sections,
+        vm_sections: hits.vm_sections,
         terminal: hits.terminal,
         terminal_strip: hits.terminal_strip,
         config,
@@ -121,9 +129,11 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
 #[derive(Default)]
 pub(crate) struct RenderHits {
     pub(crate) projects: Vec<RowHit>,
-    pub(crate) instances: Vec<RowHit>,
+    pub(crate) vms: Vec<RowHit>,
+    pub(crate) vm_members: Vec<RowHit>,
     pub(crate) snapshots: Vec<RowHit>,
     pub(crate) sections: Vec<SectionHit>,
+    pub(crate) vm_sections: Vec<VmSectionHit>,
     pub(crate) terminal: Option<Rect>,
     pub(crate) terminal_strip: Option<Rect>,
 }
@@ -132,7 +142,7 @@ pub(crate) struct RenderHits {
 mod tests {
     use crate::config::Harness;
     use crate::config::form::ConfigForm;
-    use crate::tui::app::{CreateProjectForm, HelpState, Modal};
+    use crate::tui::app::{CreateProjectForm, CreateVmForm, HelpState, Modal};
     use crate::tui::ui::test_support::*;
 
     #[test]
@@ -150,6 +160,8 @@ mod tests {
             app.modal = Some(Modal::Help(HelpState::default()));
             let _ = render_sized(&app, width, height);
             app.modal = Some(Modal::CreateProject(CreateProjectForm::new(Harness::Shell)));
+            let _ = render_sized(&app, width, height);
+            app.modal = Some(Modal::CreateVm(CreateVmForm::new(Harness::Shell, 2, 2048)));
             let _ = render_sized(&app, width, height);
             app.modal = Some(Modal::Config(ConfigForm::global(
                 app.config.clone(),

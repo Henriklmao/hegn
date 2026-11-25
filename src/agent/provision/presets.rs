@@ -49,7 +49,7 @@ impl Stage {
     }
 }
 
-/// Everything the guest provisioner needs for one instance.
+/// Everything the guest provisioner needs for one VM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionPlan {
     pub harness: Harness,

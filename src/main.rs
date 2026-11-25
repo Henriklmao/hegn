@@ -17,8 +17,8 @@ fn main() -> ExitCode {
     }
     // The detached periodic-snapshot worker uses the same private re-exec
     // mechanism as the console relay.
-    if hegn::vm::instance::autosave::requested() {
-        return match hegn::vm::instance::autosave::run_from_current_args() {
+    if hegn::vm::manager::autosave::requested() {
+        return match hegn::vm::manager::autosave::run_from_current_args() {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("hegn autosnapshot: {err:#}");

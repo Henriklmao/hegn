@@ -69,9 +69,9 @@ impl App {
             Some(Modal::Doctor(modal)) => Some(modal.scroll),
             Some(Modal::Security(prompt)) => Some(prompt.scroll),
             Some(Modal::Confirm(prompt)) => Some(prompt.scroll),
-            Some(Modal::DeleteInstance(modal)) => Some(modal.scroll),
+            Some(Modal::DeleteVm(modal)) => Some(modal.scroll),
             Some(Modal::DeleteProject(modal)) => Some(modal.scroll),
-            Some(Modal::MultiAgent(form)) => Some(form.scroll),
+            Some(Modal::DetachProject(modal)) => Some(modal.scroll),
             Some(Modal::Error { scroll, .. }) => Some(*scroll),
             _ => None,
         }
@@ -83,9 +83,9 @@ impl App {
             Some(Modal::Doctor(modal)) => modal.scroll = offset,
             Some(Modal::Security(prompt)) => prompt.scroll = offset,
             Some(Modal::Confirm(prompt)) => prompt.scroll = offset,
-            Some(Modal::DeleteInstance(modal)) => modal.scroll = offset,
+            Some(Modal::DeleteVm(modal)) => modal.scroll = offset,
             Some(Modal::DeleteProject(modal)) => modal.scroll = offset,
-            Some(Modal::MultiAgent(form)) => form.scroll = offset,
+            Some(Modal::DetachProject(modal)) => modal.scroll = offset,
             Some(Modal::Error { scroll, .. }) => *scroll = offset,
             _ => {}
         }
@@ -127,6 +127,13 @@ impl App {
                 if rows > 1 {
                     form.package_cursor = relative * (rows - 1) / span;
                     form.focus = CreateFocus::Packages;
+                }
+            }
+            Some(Modal::CreateVm(form)) => {
+                let rows = form.packages.len();
+                if rows > 1 {
+                    form.package_cursor = relative * (rows - 1) / span;
+                    form.focus = CreateVmFocus::Packages;
                 }
             }
             _ => {

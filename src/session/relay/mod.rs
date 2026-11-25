@@ -22,7 +22,7 @@
 mod args;
 mod server;
 
-/// Hidden first argument used to start the relay from [`crate::vm::instance`].
+/// Hidden first argument used to start the relay from [`crate::vm::manager`].
 pub const INTERNAL_ARG: &str = "__console-relay";
 
 pub use args::{RelayArgs, process_matches_relay, requested, run_from_current_args};

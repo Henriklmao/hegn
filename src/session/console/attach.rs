@@ -120,7 +120,7 @@ pub fn run_interactive_with_command(
     let harness = console.harness().to_string();
     let pid = console.pid();
     let log = console.serial_log().map(Path::to_path_buf);
-    let instance = console.instance_name().to_string();
+    let vm = console.vm_name().to_string();
     let (cols, rows) = guard.size();
     let mut status = bar.then(|| {
         StatusBar::new(
@@ -216,12 +216,12 @@ pub fn run_interactive_with_command(
     drop(guard);
     result?;
     let project = sanitize_label(&project);
-    let instance = sanitize_label(&instance);
+    let vm = sanitize_label(&vm);
     if vm_exited {
         println!("Serial console closed: the VM for {project} exited.");
     } else {
         println!(
-            "Detached from {project}. The VM keeps running; re-attach with `hegn attach {instance}`."
+            "Detached from {project}. The VM keeps running; re-attach with `hegn attach {vm}`."
         );
     }
     if let Some(log) = &log {

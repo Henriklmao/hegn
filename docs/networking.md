@@ -54,7 +54,7 @@ sudo hegn network teardown               # remove taps and rules
 `hegn doctor --fix` runs the setup for you and asks for `sudo` or `pkexec`. It
 prints the exact command before the password prompt, so you can read it first.
 
-`hegn instance start` is fail-closed. With `network = "guarded"`, it refuses to
+`hegn vm start` is fail-closed. With `network = "guarded"`, it refuses to
 boot unless `/run/hegn/network.json` exists and was written by root.
 
 The marker file is only a receipt. Setup writes it only when the live nftables
@@ -87,8 +87,7 @@ firewall, and after upgrading from a hegn version whose marker is older.
 
 Tools like Ollama, LM Studio, llama.cpp and vLLM usually listen on the host's
 loopback address (`127.0.0.1`). Inside the guest, `127.0.0.1` means the guest
-itself. So hegn can expose selected host ports on the TAP address of each
-instance:
+itself. So hegn can expose selected host ports on the TAP address of each VM:
 
 ```toml
 [[local_endpoints]]
@@ -106,7 +105,7 @@ guest then uses `http://10.213.0.<n>:11434`.
 After you change the list, run `sudo hegn network reload`. This replaces only the
 nftables rules. The TAP pool and running guests are not touched. A full
 `sudo hegn network setup` also works. Until the root-owned marker matches,
-`hegn instance start` fails with a hint.
+`hegn vm start` fails with a hint.
 
 A full setup recreates any TAP whose owner does not match `--user`. The guest's
 link on that TAP is interrupted. This prevents a previous local user from keeping
@@ -114,7 +113,8 @@ attach rights.
 
 With `cloud_init = true`, the URLs are exported in the guest through
 `/etc/profile.d/hegn-endpoints.sh`. Each endpoint is also available as
-`HEGN_ENDPOINT_<NAME>`. `hegn instance status` shows the guest URLs.
+`HEGN_ENDPOINT_<NAME>`. `hegn vm start`, `restart` and `apply` print the guest
+endpoint URLs in their start report.
 
 ---
 

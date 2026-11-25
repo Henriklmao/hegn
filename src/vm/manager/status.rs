@@ -1,4 +1,4 @@
-//! Instance inspection: status reports, VM info and pause/resume controls.
+//! VM inspection: status reports, VM info and pause/resume controls.
 
 use anyhow::Result;
 
@@ -6,12 +6,12 @@ use crate::network;
 use crate::session::relay;
 use crate::vm::hypervisor::{CloudHypervisorClient, VmInfo, VmState};
 
-use super::super::process::{ensure_socket, hegn_binary, process_matches};
-use super::super::session::InstanceReport;
-use super::super::util::{endpoint_urls, profile_bundle_dir};
-use super::InstanceManager;
+use super::VmManager;
+use super::process::{ensure_socket, hegn_binary, process_matches};
+use super::session::VmReport;
+use super::util::{endpoint_urls, profile_bundle_dir};
 
-impl InstanceManager {
+impl VmManager {
     /// Pause the guest (used before snapshot creation).
     pub async fn pause(&self) -> Result<()> {
         let paths = self.paths();
@@ -25,19 +25,24 @@ impl InstanceManager {
         CloudHypervisorClient::new(&paths.api_socket).resume().await
     }
 
-    pub async fn instance_info(&self) -> Result<VmInfo> {
+    pub async fn vm_info(&self) -> Result<VmInfo> {
         let paths = self.paths();
         ensure_socket(&paths.api_socket)?;
         CloudHypervisorClient::new(&paths.api_socket).info().await
     }
 
-    pub fn status(&self) -> Result<InstanceReport> {
+    pub fn status(&self) -> Result<VmReport> {
         let paths = self.paths();
         let session = self.session();
-        let virtiofs_running = session
+        let membership = self.membership();
+        let virtiofs_pids: Vec<u32> = session
             .as_ref()
-            .map(|s| process_matches(s.virtiofs_pid, &self.config.virtiofsd_bin))
-            .unwrap_or(false);
+            .map(|session| session.virtiofs_pids.clone())
+            .unwrap_or_default();
+        let virtiofs_running = !virtiofs_pids.is_empty()
+            && virtiofs_pids
+                .iter()
+                .all(|pid| process_matches(*pid, &self.config.virtiofsd_bin));
         let profile_virtiofs_running = session
             .as_ref()
             .filter(|s| s.profile_virtiofs_pid != 0)
@@ -93,24 +98,52 @@ impl InstanceManager {
             );
         }
 
-        Ok(InstanceReport {
+        let members = membership
+            .as_ref()
+            .map(|manifest| manifest.members.len())
+            .or_else(|| session.as_ref().map(|session| session.membership.len()))
+            .unwrap_or(0);
+        let primary_path = membership
+            .as_ref()
+            .and_then(|manifest| {
+                manifest
+                    .members
+                    .iter()
+                    .find(|member| member.name == manifest.primary)
+                    .map(|member| member.path.clone())
+            })
+            .or_else(|| {
+                crate::project::ProjectRegistry::load(&self.config.state_dir)
+                    .ok()
+                    .and_then(|registry| {
+                        let exported = registry.exported_members(&self.vm.name);
+                        exported
+                            .iter()
+                            .find(|entry| self.vm.primary.as_deref() == Some(entry.name.as_str()))
+                            .or_else(|| exported.first())
+                            .map(|entry| entry.path.clone())
+                    })
+            });
+        Ok(VmReport {
             state,
             backend: "cloud-hypervisor".into(),
-            instance: self.instance.name.clone(),
-            project: session
-                .as_ref()
-                .map(|s| s.project.clone())
-                .or_else(|| Some(self.instance.project.clone())),
-            workspace: self.instance.workspace.clone(),
-            vcpus: self.instance.vcpus,
-            memory_mib: self.instance.memory_mib,
+            vm: self.vm.name.clone(),
+            primary: self.vm.primary.clone(),
+            members,
+            project: primary_path.or_else(|| {
+                session
+                    .as_ref()
+                    .map(|session| session.project.clone())
+                    .filter(|path| !path.as_os_str().is_empty())
+            }),
+            vcpus: self.vm.vcpus,
+            memory_mib: self.vm.memory_mib,
             api_socket: paths.api_socket,
             serial_socket: paths.serial_socket,
             console_socket: paths.console_socket,
-            virtiofs_socket: paths.virtiofs_socket,
             virtiofs_running,
-            profile_share: profile_bundle_dir(&self.config, &self.instance)
-                .filter(|dir| dir.is_dir()),
+            virtiofs_pids,
+            profile_share: profile_bundle_dir(&self.config, &self.vm).filter(|dir| dir.is_dir()),
             profile_virtiofs_pid: session
                 .as_ref()
                 .map(|s| s.profile_virtiofs_pid)
@@ -119,11 +152,10 @@ impl InstanceManager {
             relay_running,
             vm_pid: session.as_ref().map(|s| s.vm_pid),
             relay_pid: session.as_ref().map(|s| s.relay_pid),
-            virtiofs_pid: session.as_ref().map(|s| s.virtiofs_pid),
             started_at: session.as_ref().map(|s| s.started_at),
             serial_log: session.as_ref().and_then(|s| s.serial_log.clone()),
             local_endpoints: self
-                .instance
+                .vm
                 .network_index
                 .map(|index| endpoint_urls(&self.config, network::host_ip(index)))
                 .unwrap_or_default(),
@@ -157,26 +189,27 @@ mod tests {
 
     use super::*;
     use crate::config::Harness;
-    use crate::vm::instance::SessionRecord;
-    use crate::vm::instance::test_support::{config_with_assets, instance_for, manager};
+    use crate::vm::config::VmConfig;
+    use crate::vm::manager::SessionRecord;
+    use crate::vm::manager::test_support::{config_with_assets, manager, manager_for};
 
-    fn write_session(manager: &InstanceManager, vm_pid: u32) {
+    fn write_session(manager: &VmManager, vm_pid: u32) {
         let paths = manager.paths();
         paths.ensure().unwrap();
-        let project = manager.instance().project.clone();
         let record = SessionRecord {
-            project: project.clone(),
-            workspace: project,
-            instance: manager.instance().name.clone(),
+            project: manager.paths().run_dir,
+            workspace: std::path::PathBuf::new(),
+            vm: manager.vm().name.clone(),
             harness: Harness::Shell,
             started_at: Utc::now(),
             vm_pid,
             vm_binary: None,
             relay_pid: 0,
-            virtiofs_pid: 0,
+            virtiofs_pids: vec![0],
             profile_virtiofs_pid: 0,
             boot_args: String::new(),
             serial_log: None,
+            membership: Vec::new(),
         };
         std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
     }
@@ -187,6 +220,7 @@ mod tests {
         let manager = manager(config_with_assets(dir.path()), dir.path());
         let report = manager.status().unwrap();
         assert_eq!(report.state, "stopped");
+        assert_eq!(report.vm, "demo");
         assert!(!report.virtiofs_running);
         assert!(!report.relay_running);
         assert_eq!(report.project, Some(dir.path().join("project")));
@@ -201,6 +235,7 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["state"], "stopped");
         assert_eq!(json["backend"], "cloud-hypervisor");
+        assert_eq!(json["vm"], "demo");
     }
 
     #[test]
@@ -254,7 +289,7 @@ mod tests {
         for err in [
             runtime.block_on(manager.pause()).unwrap_err(),
             runtime.block_on(manager.resume()).unwrap_err(),
-            runtime.block_on(manager.instance_info()).unwrap_err(),
+            runtime.block_on(manager.vm_info()).unwrap_err(),
         ] {
             let err = err.to_string();
             assert!(err.contains("no Cloud Hypervisor API socket"), "{err}");
@@ -296,20 +331,19 @@ mod tests {
             name: "ollama".into(),
             port: 11434,
         }];
-        let mut instance = instance_for(&dir.path().join("project"));
-        instance.network_index = Some(2);
-        let manager = InstanceManager::new(config, instance);
+        let manager = manager(config.clone(), dir.path());
+        let mut vm = manager.vm().clone();
+        vm.network_index = Some(2);
+        let manager = crate::vm::manager::VmManager::new(config, vm).unwrap();
 
         let report = manager.status().unwrap();
         assert_eq!(report.local_endpoints, vec!["http://10.213.0.9:11434"]);
 
-        let mut instance = manager.instance().clone();
-        instance.network_index = None;
-        let manager = InstanceManager::new(manager_config(&dir), instance);
+        let manager = manager_for(
+            crate::vm::manager::test_support::config_with_assets(dir.path()),
+            &dir.path().join("project"),
+        );
         assert!(manager.status().unwrap().local_endpoints.is_empty());
-    }
-
-    fn manager_config(dir: &tempfile::TempDir) -> crate::config::Config {
-        config_with_assets(dir.path())
+        let _ = VmConfig::default();
     }
 }

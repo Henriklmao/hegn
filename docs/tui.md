@@ -5,6 +5,7 @@ every key and explains what each screen does.
 
 - [Dashboard](#dashboard)
 - [Project screen](#project-screen)
+- [VM screen](#vm-screen)
 - [Help](#help-modal)
 - [Snapshots](#snapshot-panel)
 - [Terminal](#terminal-guest-serial-console)
@@ -19,23 +20,38 @@ it. Keyboard input clears the hover state.
 
 ## Dashboard
 
-The dashboard is a project picker with a short preview of the selected project.
-It never boots a VM.
+The dashboard is a project picker with a preview of the selected project. It
+never boots a VM.
+
+Each project row shows a VM badge: `⬢ <vm>` when the project is assigned, or
+`unassigned` when it is not. A VM badge also shows the member count once a VM
+hosts more than one project, for example `⬢ dev · 3p`.
+
+The preview shows the selected project's VM state, harness, member count, newest
+snapshot and guest mount path. For an unassigned project it shows the last time
+it was opened and how to assign it.
 
 | Key | Action |
 | --- | --- |
 | `↑`/`↓`, `j`/`k` | Move the selection |
-| `Enter` / `o` | Open the project screen (does not boot) |
+| `Enter` / `o` | Open the project screen and attach its VM |
 | `/` | Fuzzy-filter projects |
-| `b` / `2` | Open the project screen on instances |
-| `s` / `3` | Open the project screen on snapshots |
+| `1` / `b` | Open the project screen on the VM section |
+| `2` / `3` / `4` | Open the project screen on snapshots / health / git |
+| `v` | Open the project's VM screen |
 | `c` | Create a project |
 | `h` / `←` | Import an existing directory (symlink, no copy) |
+| `a` | Assign the selected project to a VM |
+| `f` | Fork the selected project (clone or worktree) |
+| `D` | Detach the selected project from its VM |
+| `n` / `V` | Create a VM |
 | `d` | Delete a project. Shows the git status first, then asks whether to delete the files too. |
+| `S` / `A` | Stop / apply (restart) the selected project's VM |
 | `F4` | Global settings editor (mouse supported, `Ctrl-S` saves) |
+| `F5` | VM settings editor for the selected project's `vm.toml` |
 | `e` | Open the selected project in `$EDITOR` |
 | `g` | Open the selected project in lazygit |
-| `r` | Refresh projects and instances |
+| `r` | Refresh projects and VMs |
 | `F3` | Doctor modal (host checks, image download) |
 | `?` / `F1` | Help |
 | `q` | Quit |
@@ -44,10 +60,10 @@ It never boots a VM.
 
 ## Project screen
 
-The title bar shows `hegn ▸ <project>`, the path and the VM state. The page has
-four numbered sections:
+The title bar shows `hegn ▸ <project> · <vm>`, the project path and the VM state.
+The page has four numbered sections:
 
-1. instances,
+1. VM (state, tool profile, mount path, sibling projects),
 2. snapshots,
 3. health,
 4. git.
@@ -56,22 +72,24 @@ The terminal is a single line until you open it.
 
 | Key | Action |
 | --- | --- |
-| `1` / `2` / `3` / `4` | Instances / snapshots / health / git |
+| `1` / `2` / `3` / `4` | VM / snapshots / health / git |
 | `Tab` | Cycle through the sections |
 | `↑`/`↓`, `j`/`k` | Move inside the focused section |
-| `Enter` (instances) | Attach to the selected instance, or boot the default one |
+| `Enter` (VM) | Attach the VM, starting it if needed |
 | `Enter` (snapshots) | Restore the selected snapshot |
-| `i` / `a` / `t` | Open or focus the terminal (starts an instance if needed) |
+| `v` | Open the VM screen (projects, snapshots, tools, health) |
+| `i` / `a` / `t` | Open or focus the terminal (starts the VM if needed) |
 | `L` | Launch the configured agent or command in its terminal integration |
-| `Esc` | Insert → normal. Normal → section headers (the pane stays at 55%). |
+| `Esc` | Section view → split view; again back to the dashboard |
 | `←` | Back to the dashboard (the VM keeps running) |
 | `F2` | Leave the TUI and start the real `hegn attach` client |
 | `Ctrl-B` / `Ctrl-]` | Back to the dashboard from any mode |
-| `n` | New instance (instances section) or new snapshot (snapshots section) |
-| `M` | Create multi-agent clones for this project |
-| `S` | Stop the selected instance |
-| `d` | Delete the selected instance or snapshot |
-| `F5` | Instance settings editor |
+| `n` | New snapshot (snapshots section) |
+| `M` / `f` | Fork the project into a clone or worktree |
+| `S` / `A` | Stop / apply (restart) the VM |
+| `d` | Detach the project (VM section) or delete the selected snapshot (snapshots section) |
+| `D` | Delete the VM |
+| `F5` | VM settings editor (`vm.toml`) |
 | `F6` | Project settings (`hegn.toml`): launch command, integration, auto-launch |
 | `e` / `g` | Editor / lazygit for the project |
 | `F4` | Global settings editor |
@@ -81,17 +99,75 @@ Opening the terminal moves it to the right and takes 55% of the width. Pressing 
 section number expands that section and shrinks the terminal to 30%. All four
 sections stay visible, and the ones you did not select collapse into a single
 header row. Focusing the terminal again restores 55%. The collapsed strip shows
-the selected instance and whether it is running.
+the attached VM and whether it is running.
 
-Destructive actions are never confirmed with `Enter`. Deleting an instance,
-snapshot or project, and allowing a flagged command, requires the explicit `y`
-key (or `a` for the security prompt). Pressing `Enter` keeps the confirmation
-open.
+The VM section shows the primary marker, read-only status and sibling projects.
+`Enter` attaches; the terminal title and header carry `project · vm`.
+
+Destructive actions are never confirmed with `Enter`. Deleting a VM, snapshot or
+project, restoring a snapshot, and allowing a flagged command require an explicit
+key: `y` for most prompts, `a` for the security prompt. Pressing `Enter` keeps the
+confirmation open.
 
 The project delete dialog first shows the branch, the sync state and the number
-of changed files. `y` removes the project from the dashboard and keeps its files.
+of changed files. `y` removes the project from the dashboard and keeps its files;
 `f` also deletes the directory. An imported project only loses its symlink. Its
-original directory is never touched.
+original directory is never touched. The project's VM is never deleted here.
+
+---
+
+## VM screen
+
+Press `v` on the dashboard or the project screen to open the VM screen. It has
+four numbered sections:
+
+1. Projects (members, kind, read-only and primary markers),
+2. snapshots,
+3. tools (harness, resources, extra packages, provisioning state),
+4. health.
+
+| Key | Action |
+| --- | --- |
+| `1` / `2` / `3` / `4` | Projects / snapshots / tools / health |
+| `Tab` | Cycle through the sections |
+| `↑`/`↓`, `j`/`k` | Move inside the focused section |
+| `Enter` (projects) | Open the member project and attach the VM |
+| `Enter` (snapshots) | Restore the selected snapshot |
+| `Enter` (tools) | Attach the VM |
+| `s` | Attach the VM, starting it if needed |
+| `S` / `A` | Stop / apply (restart) the VM |
+| `p` | Make the selected project the primary (`/workspace`) |
+| `a` | Assign an unassigned project to this VM |
+| `f` | Fork the selected project into a clone or worktree |
+| `d` (projects) | Detach the selected project; the VM and other members stay |
+| `d` (snapshots) | Delete the selected snapshot |
+| `D` | Delete the VM |
+| `n` (snapshots) | New snapshot |
+| `n` | Create another VM |
+| `F5` / `e` | Edit this VM's `vm.toml` |
+| `F4` | Global settings editor |
+| `F2` | External attach |
+| `r` | Refresh VMs, projects and snapshots |
+| `Esc` / `←` | Back to the dashboard |
+| `?` / `F1` | Help |
+
+Creating a VM (`n` on the dashboard, or `n` outside the snapshots section here)
+opens a form for name, harness, vCPUs, memory and extra packages. Editing an
+existing VM uses `F5` or `e`, which opens `vm.toml` in the settings editor.
+
+Assigning a project opens a candidate list and a read-only toggle. Forking opens
+the fork modal: `Tab` toggles between the isolated clone default and the nested
+worktree, `Enter` creates it, and `Esc` cancels. Detaching asks for confirmation
+and never deletes project files.
+
+Deleting a VM asks twice. The first confirmation names the harness and member
+count and states that external projects are unassigned, never deleted. The
+second offers `y` to delete files (the VM directory and managed workspaces) or
+`n` to keep files (unassign every project and leave the VM directory in place).
+`Esc` cancels.
+
+There is no separate VM list screen. Projects are the dashboard rows, and the VM
+screen lists the members of one VM.
 
 ---
 
@@ -146,7 +222,7 @@ and then to the section headers. The pane stays open.
 | `L` | Launch the configured agent or command |
 | `Esc` | Insert → normal. Normal → section headers. |
 | `←` | Return to the dashboard (the VM keeps running) |
-| `M` | Create multi-agent clones for the open project |
+| `M` / `f` | Fork the open project into a clone or worktree |
 | `Enter` | In insert mode: check the command with `tirith-core`, then send it |
 | `F2` | Leave the TUI and start the real `hegn attach` client |
 | `Ctrl-B` / `Ctrl-]` | Return to the dashboard from any mode |
@@ -176,8 +252,8 @@ downloads the pinned images, and applies the guarded network through `sudo` or
 the background, and a notification in the bottom-right corner shows the progress.
 The same work is available from the command line as `hegn doctor --fix`.
 
-Optional tools (lazygit, `$EDITOR`) never make the report fail. hegn does not
-install them.
+Optional findings are marked `!`. That includes lazygit, `$EDITOR` and the legacy
+v1 checks. They never make the report fail, and no legacy state is deleted.
 
 ---
 

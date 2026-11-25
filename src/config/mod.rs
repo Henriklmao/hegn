@@ -10,6 +10,7 @@
 pub mod form;
 
 mod defaults;
+mod deprecated;
 mod env;
 mod paths;
 mod tools;
@@ -17,6 +18,7 @@ mod types;
 mod validate;
 
 pub use self::defaults::DEFAULT_AGENTS_MD;
+pub use self::deprecated::deprecated_keys;
 pub use self::tools::{CLOUD_HYPERVISOR_FALLBACKS, CLOUD_HYPERVISOR_STATIC, VIRTIOFSD_FALLBACKS};
 pub use self::types::{
     BackendKind, Harness, LocalEndpoint, NetworkMode, RootfsFormat, SecurityMode, VirtiofsSandbox,
@@ -35,6 +37,10 @@ use crate::agent::launch::LaunchConfig;
 
 use self::tools::{alternate_cloud_hypervisor_name, resolve_binary};
 
+/// One warning replacing both the generic deprecation notice and a validation
+/// failure for the legacy `guest_mount = "/workspace"` default.
+const GUEST_MOUNT_MIGRATION_WARNING: &str = r#"warning: legacy guest_mount = "/workspace" is reserved for the primary /workspace symlink; using guest_projects_base = "/projects" instead. Set guest_projects_base explicitly to silence this warning."#;
+
 /// User configuration, loaded from `~/.config/hegn/config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -46,10 +52,10 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Snapshot metadata and memory files. Defaults to `~/.local/share/hegn/snapshots`.
     pub snapshots_dir: PathBuf,
-    /// Per-instance configuration, runtime and cloned workspaces.
-    /// Defaults to `~/.local/share/hegn/instances`.
-    #[serde(alias = "sandboxes_dir")]
-    pub instances_dir: PathBuf,
+    /// Per-VM configuration, runtime and cloned workspaces.
+    /// Defaults to `~/.local/share/hegn/vms`.
+    #[serde(alias = "instances_dir", alias = "sandboxes_dir")]
+    pub vms_dir: PathBuf,
     /// Directory containing project templates (`agents.md`, language skeletons).
     pub templates_dir: PathBuf,
     /// Directory containing per-harness profile templates
@@ -82,16 +88,24 @@ pub struct Config {
     pub vcpus: u8,
     /// Guest memory in MiB.
     pub memory_mib: u32,
-    /// Hard ceiling for per-instance root filesystem growth, in GiB. Sparse
+    /// Hard ceiling for per-VM root filesystem growth, in GiB. Sparse
     /// images only consume host space when the guest writes, but a runaway
     /// guest must not be able to fill the host filesystem.
     pub max_rootfs_gib: u32,
-    /// Warn in `hegn doctor` when the filesystem holding the instances is
+    /// Warn in `hegn doctor` when the filesystem holding the VMs is
     /// fuller than this percentage.
     pub disk_usage_warn_percent: u8,
-    /// virtiofs tag; mounted at `guest_mount` inside the guest.
-    pub shared_tag: String,
-    pub guest_mount: String,
+    /// Prefix for the per-project virtio-fs tags. Each exported project gets
+    /// `<share_tag_prefix>-<index>`, so the prefix must leave room for the
+    /// suffix within the 36-byte virtio-fs tag limit.
+    #[serde(alias = "shared_tag")]
+    pub share_tag_prefix: String,
+    /// Guest directory below which project shares are mounted.
+    #[serde(alias = "guest_mount")]
+    pub guest_projects_base: String,
+    /// Hard ceiling for exported projects per VM. Each member is one
+    /// virtio-fs device and one `virtiofsd` process.
+    pub max_projects_per_vm: u32,
     pub virtiofs_sandbox: VirtiofsSandbox,
     pub backend: BackendKind,
     /// Harness launched when a project is opened.
@@ -105,16 +119,17 @@ pub struct Config {
     pub local_endpoints: Vec<LocalEndpoint>,
     /// Extra packages installed while creating a VM template.
     pub extra_packages: Vec<String>,
-    /// Create `agent/hegn-session-<timestamp>` before launching.
+    /// Create `agent/hegn-session-<timestamp>` when `hegn open` attaches.
+    /// `--no-branch` is the only force-off flag.
     pub auto_branch: bool,
     /// Keep a rolling automatic snapshot of a running VM so it can be resumed
     /// instead of cold booted.
     pub periodic_snapshots: bool,
     /// Seconds between automatic snapshots. Must be at least 30.
     pub snapshot_interval_secs: u64,
-    /// Number of automatic snapshots kept per instance. Older ones are pruned.
+    /// Number of automatic snapshots kept per VM. Older ones are pruned.
     pub snapshot_keep: u32,
-    /// Restore the newest automatic snapshot when starting an instance instead
+    /// Restore the newest automatic snapshot when starting a VM instead
     /// of cold booting it.
     pub auto_resume: bool,
     pub security: SecurityMode,
@@ -126,13 +141,31 @@ impl Config {
     /// Selected environment variables override the file so `hegn` can be
     /// exercised in CI without touching the user's real directories:
     /// `HEGN_PROJECTS_ROOT`, `HEGN_STATE_DIR`, `HEGN_SNAPSHOTS_DIR`,
-    /// `HEGN_INSTANCES_DIR`,
+    /// `HEGN_VMS_DIR` (with the deprecated `HEGN_INSTANCES_DIR` fallback),
     /// `HEGN_TEMPLATES_DIR`, `HEGN_CLOUD_HYPERVISOR_BIN`, `HEGN_VIRTIOFSD_BIN`,
     /// `HEGN_KERNEL_IMAGE` and `HEGN_ROOTFS_IMAGE`.
+    ///
+    /// Deprecated keys (`instances_dir`, `shared_tag`, `guest_mount`) still
+    /// parse, but each one used in the file prints a warning to stderr. The
+    /// legacy `guest_mount = "/workspace"` form is migrated to the new default
+    /// with a single specific warning instead of the generic deprecation one.
     pub fn load() -> Result<Self> {
         let path = Self::config_path();
         let mut config = if path.exists() {
-            Self::load_from(&path)?
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read config {}", path.display()))?;
+            let (config, migrated) = Self::parse_with_migration(&path, &raw)?;
+            for key in deprecated_keys(&raw) {
+                if migrated && key == "guest_mount" {
+                    continue;
+                }
+                let replacement = self::deprecated::replacement(key);
+                eprintln!("warning: config key `{key}` is deprecated; use `{replacement}` instead");
+            }
+            if migrated {
+                eprintln!("{GUEST_MOUNT_MIGRATION_WARNING}");
+            }
+            config
         } else {
             Self::default()
         };
@@ -145,9 +178,30 @@ impl Config {
     pub fn load_from(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        let config: Self = toml::from_str(&raw)
+        Self::parse_at(path, &raw)
+    }
+
+    fn parse_at(path: &Path, raw: &str) -> Result<Self> {
+        Ok(Self::parse_with_migration(path, raw)?.0)
+    }
+
+    /// Parse `raw` and migrate the legacy `guest_mount = "/workspace"` form.
+    ///
+    /// `/workspace` is reserved for the primary-project symlink, but older
+    /// hegn versions used it as the default projects base. A file that still
+    /// says `guest_mount = "/workspace"` therefore means the old default, not
+    /// a request to mount projects below the symlink, and is rewritten to the
+    /// current default. An explicit `guest_projects_base = "/workspace"` is not
+    /// migrated and still fails validation.
+    fn parse_with_migration(path: &Path, raw: &str) -> Result<(Self, bool)> {
+        let mut config: Self = toml::from_str(raw)
             .with_context(|| format!("failed to parse config {}", path.display()))?;
-        Ok(config)
+        let migrated = config.guest_projects_base == crate::security::WORKSPACE_GUEST_PATH
+            && deprecated_keys(raw).contains(&"guest_mount");
+        if migrated {
+            config.guest_projects_base = crate::security::DEFAULT_GUEST_PROJECTS_BASE.to_string();
+        }
+        Ok((config, migrated))
     }
 
     /// Create runtime and config directories. Safe to call repeatedly.
@@ -155,7 +209,7 @@ impl Config {
         for dir in [
             &self.state_dir,
             &self.snapshots_dir,
-            &self.instances_dir,
+            &self.vms_dir,
             &self.profiles_dir,
         ] {
             if let Ok(metadata) = fs::symlink_metadata(dir)
@@ -356,7 +410,7 @@ root_device = "/dev/vda"
         let mut config = Config::default();
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
-        config.instances_dir = dir.path().join("instances");
+        config.vms_dir = dir.path().join("vms");
         config.templates_dir = dir.path().join("templates");
         config.profiles_dir = dir.path().join("profiles");
         config.projects_root = dir.path().join("projects");
@@ -437,6 +491,7 @@ root_device = "/dev/vda"
         let mut config = Config::default();
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
+        config.vms_dir = dir.path().join("vms");
         config.templates_dir = dir.path().join("templates");
         config.profiles_dir = dir.path().join("profiles");
         config.projects_root = dir.path().join("projects");
@@ -462,6 +517,7 @@ root_device = "/dev/vda"
         let mut config = Config::default();
         config.state_dir = link;
         config.snapshots_dir = dir.path().join("snapshots");
+        config.vms_dir = dir.path().join("vms");
         config.templates_dir = dir.path().join("templates");
         config.profiles_dir = dir.path().join("profiles");
         config.projects_root = dir.path().join("projects");
@@ -497,6 +553,82 @@ root_device = "/dev/vda"
         config.vcpus = 0;
         assert!(config.save_to(&path).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"vcpus = 4\n");
+    }
+
+    #[test]
+    fn legacy_keys_still_parse_through_aliases() {
+        let (_dir, path) = temp_config(
+            r#"
+instances_dir = "/data/legacy-instances"
+shared_tag = "legacy-tag"
+guest_mount = "/legacy-workspace"
+"#,
+        );
+        let raw = fs::read_to_string(&path).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.vms_dir, PathBuf::from("/data/legacy-instances"));
+        assert_eq!(config.share_tag_prefix, "legacy-tag");
+        assert_eq!(config.guest_projects_base, "/legacy-workspace");
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            deprecated_keys(&raw),
+            vec!["instances_dir", "shared_tag", "guest_mount"]
+        );
+    }
+
+    #[test]
+    fn legacy_guest_mount_workspace_migrates_to_the_new_default() {
+        let (_dir, path) = temp_config("guest_mount = \"/workspace\"\n");
+        let raw = fs::read_to_string(&path).unwrap();
+        let config = Config::load_from(&path).unwrap();
+
+        assert_eq!(config.guest_projects_base, "/projects");
+        assert!(config.validate().is_ok());
+        assert_eq!(deprecated_keys(&raw), vec!["guest_mount"]);
+    }
+
+    #[test]
+    fn new_guest_projects_base_workspace_is_not_migrated() {
+        let (_dir, path) = temp_config("guest_projects_base = \"/workspace\"\n");
+        let raw = fs::read_to_string(&path).unwrap();
+        let config = Config::load_from(&path).unwrap();
+
+        assert_eq!(config.guest_projects_base, "/workspace");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("reserved"), "{err}");
+        assert!(deprecated_keys(&raw).is_empty());
+    }
+
+    #[test]
+    fn new_guest_projects_base_is_not_rewritten() {
+        let (_dir, path) = temp_config("guest_projects_base = \"/custom-base\"\n");
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.guest_projects_base, "/custom-base");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn workspace_migration_warning_names_the_old_and_new_values() {
+        assert_eq!(
+            GUEST_MOUNT_MIGRATION_WARNING,
+            r#"warning: legacy guest_mount = "/workspace" is reserved for the primary /workspace symlink; using guest_projects_base = "/projects" instead. Set guest_projects_base explicitly to silence this warning."#
+        );
+    }
+
+    #[test]
+    fn new_keys_parse_without_deprecation_warnings() {
+        let (_dir, path) = temp_config(
+            r#"
+vms_dir = "/data/vms"
+share_tag_prefix = "hegn-prj"
+guest_projects_base = "/projects"
+max_projects_per_vm = 4
+"#,
+        );
+        let raw = fs::read_to_string(&path).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.max_projects_per_vm, 4);
+        assert!(deprecated_keys(&raw).is_empty());
     }
 
     #[test]

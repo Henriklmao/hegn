@@ -1,0 +1,16 @@
+# gitleaks configuration for hegn.
+#
+# `vendor/tirith-core` is a vendored copy of the tirith security scanner. Its
+# source and assets intentionally contain credential *detection patterns* and
+# test fixtures (AWS/GitLab/npm token shapes, private-key headers, curl auth
+# headers). They are signatures, not live credentials.
+#
+# `target/` contains build artifacts derived from those sources (generated
+# rule explanations, rmeta files) and must never be scanned as source.
+
+[allowlist]
+description = "Vendored tirith detection rules/assets and Cargo build artifacts"
+paths = [
+  '''^target/''',
+  '''^vendor/tirith-core/''',
+]

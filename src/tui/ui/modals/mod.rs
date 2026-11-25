@@ -10,14 +10,16 @@ use super::ModalHits;
 use super::screens::footer::FooterDef;
 use super::theme::{RED, YELLOW};
 
+mod assign;
 mod config;
 mod create;
+mod create_vm;
 mod delete;
 mod doctor;
+mod fork;
 mod help;
 mod import;
 mod message;
-mod multi_agent;
 mod security;
 
 pub(crate) fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) -> ModalHits {
@@ -115,12 +117,24 @@ pub(crate) fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Re
                 ..ModalHits::default()
             }
         }
+        Modal::CreateVm(form) => {
+            let (footer, scroll) = create_vm::render_create_vm_form(frame, app, form, area);
+            ModalHits {
+                footer,
+                scroll,
+                ..ModalHits::default()
+            }
+        }
         Modal::ImportProject(form) => {
             ModalHits::buttons(import::render_import_form(frame, app, form, area))
         }
-        Modal::DeleteInstance(modal) => delete::render_delete_instance(frame, app, modal, area),
+        Modal::AssignProject(form) => assign::render_assign_project(frame, app, form, area),
+        Modal::DetachProject(modal) => assign::render_detach_project(frame, app, modal, area),
+        Modal::ForkWorkspace(form) => {
+            ModalHits::buttons(fork::render_fork_workspace(frame, app, form, area))
+        }
+        Modal::DeleteVm(modal) => delete::render_delete_vm(frame, app, modal, area),
         Modal::DeleteProject(modal) => delete::render_delete_project(frame, app, modal, area),
-        Modal::MultiAgent(form) => multi_agent::render_multi_agent(frame, app, form, area),
         Modal::ProjectConfig(form) => {
             let (footer, scroll) = config::render_project_config(frame, app, form, area);
             ModalHits {

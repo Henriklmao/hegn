@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{BackendKind, Config, Harness, NetworkMode, RootfsFormat, SecurityMode};
 use crate::shared::math::cycle_value;
-use crate::vm::instance_config::{CONFIG_FILE, InstanceConfig};
+use crate::vm::config::{VM_CONFIG_FILE, VmConfig};
 
 use super::rows::{
     ConfigField, ConfigKind, ConfigPage, ConfigRow, FieldKind, endpoints_value, first_field,
@@ -35,7 +35,7 @@ pub enum FormOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Draft {
     Global(Box<Config>),
-    Instance(Box<InstanceConfig>),
+    Vm(Box<VmConfig>),
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +56,7 @@ pub struct ConfigForm {
     pub status: Option<String>,
     pub(super) draft: Draft,
     pub(super) original: Draft,
-    /// Global config the instance belongs to; used for derived paths and saving.
+    /// Global config the VM belongs to; used for derived paths and saving.
     pub(super) base: Box<Config>,
     page: ConfigPage,
     selected: usize,
@@ -77,17 +77,11 @@ impl ConfigForm {
         )
     }
 
-    /// Open the editor for an existing instance.
-    pub fn instance(instance: InstanceConfig, base: Config) -> Self {
-        let path = base.instances_dir.join(&instance.name).join(CONFIG_FILE);
-        let title = format!("instance '{}' settings", instance.name);
-        Self::build(
-            ConfigKind::Instance,
-            title,
-            path,
-            Draft::Instance(Box::new(instance)),
-            base,
-        )
+    /// Open the editor for an existing VM.
+    pub fn vm(vm: VmConfig, base: Config) -> Self {
+        let path = base.vms_dir.join(&vm.name).join(VM_CONFIG_FILE);
+        let title = format!("VM '{}' settings", vm.name);
+        Self::build(ConfigKind::Vm, title, path, Draft::Vm(Box::new(vm)), base)
     }
 
     fn build(kind: ConfigKind, title: String, path: PathBuf, draft: Draft, base: Config) -> Self {
@@ -176,9 +170,9 @@ impl ConfigForm {
         self.draft != self.original
     }
 
-    pub fn instance_name(&self) -> Option<&str> {
+    pub fn vm_name(&self) -> Option<&str> {
         match &self.draft {
-            Draft::Instance(instance) => Some(instance.name.as_str()),
+            Draft::Vm(vm) => Some(vm.name.as_str()),
             Draft::Global(_) => None,
         }
     }
@@ -203,8 +197,8 @@ impl ConfigForm {
                 ConfigField::GuestHardening => on_off(config.guest_credential_hardening),
                 ConfigField::KernelImage => config.kernel_image.display().to_string(),
                 ConfigField::RootfsImage => config.rootfs_image.display().to_string(),
-                ConfigField::SharedTag => config.shared_tag.clone(),
-                ConfigField::GuestMount => config.guest_mount.clone(),
+                ConfigField::SharedTag => config.share_tag_prefix.clone(),
+                ConfigField::GuestProjectsBase => config.guest_projects_base.clone(),
                 ConfigField::Network => config.network.label().to_string(),
                 ConfigField::Security => config.security.label().to_string(),
                 ConfigField::Backend => config.backend.label().to_string(),
@@ -215,7 +209,7 @@ impl ConfigForm {
                 ConfigField::ProjectsRoot => config.projects_root.display().to_string(),
                 ConfigField::StateDir => config.state_dir.display().to_string(),
                 ConfigField::SnapshotsDir => config.snapshots_dir.display().to_string(),
-                ConfigField::InstancesDir => config.instances_dir.display().to_string(),
+                ConfigField::VmsDir => config.vms_dir.display().to_string(),
                 ConfigField::TemplatesDir => config.templates_dir.display().to_string(),
                 ConfigField::ProfilesDir => config.profiles_dir.display().to_string(),
                 ConfigField::ExtraPackages => list_value(&config.extra_packages),
@@ -223,26 +217,18 @@ impl ConfigForm {
                 ConfigField::Profile(harness) => self.profile_value(harness),
                 _ => "—".to_string(),
             },
-            Draft::Instance(instance) => match field {
-                ConfigField::Harness => instance.harness.label().to_string(),
-                ConfigField::Vcpus => instance.vcpus.to_string(),
-                ConfigField::Memory => instance.memory_mib.to_string(),
-                ConfigField::AutoBranch => on_off(instance.auto_branch),
-                ConfigField::Security => instance.security.label().to_string(),
-                ConfigField::SharedTag => instance.shared_tag.clone(),
-                ConfigField::GuestMount => instance.guest_mount.clone(),
-                ConfigField::ReadOnlyWorkspace => on_off(instance.read_only_workspace),
-                ConfigField::ExtraPackages => list_value(&instance.extra_packages),
-                ConfigField::Project => instance.project.display().to_string(),
-                ConfigField::Workspace => instance.workspace.display().to_string(),
-                ConfigField::RootfsPath => {
-                    let rootfs = instance
-                        .rootfs_image
-                        .clone()
-                        .unwrap_or_else(|| instance.rootfs_path(&self.base));
-                    rootfs.display().to_string()
-                }
-                ConfigField::NetworkIndex => match instance.network_index {
+            Draft::Vm(vm) => match field {
+                ConfigField::Harness => vm.harness.label().to_string(),
+                ConfigField::Vcpus => vm.vcpus.to_string(),
+                ConfigField::Memory => vm.memory_mib.to_string(),
+                ConfigField::Security => vm.security.label().to_string(),
+                ConfigField::SharedTag => self.base.share_tag_prefix.clone(),
+                ConfigField::GuestProjectsBase => self.base.guest_projects_base.clone(),
+                ConfigField::ExtraPackages => list_value(&vm.extra_packages),
+                ConfigField::Project => vm.primary.clone().unwrap_or_else(|| "—".into()),
+                ConfigField::Workspace => "managed in projects.toml".into(),
+                ConfigField::RootfsPath => vm.rootfs_path(&self.base).display().to_string(),
+                ConfigField::NetworkIndex => match vm.network_index {
                     Some(index) => format!("TAP {index}"),
                     None => "assigned on first start".to_string(),
                 },
@@ -256,7 +242,7 @@ impl ConfigForm {
     fn profile_value(&self, harness: Harness) -> String {
         let config = match &self.draft {
             Draft::Global(config) => config.as_ref(),
-            Draft::Instance(_) => self.base.as_ref(),
+            Draft::Vm(_) => self.base.as_ref(),
         };
         let path = crate::agent::profile::ProfileStore::new(config).path(harness);
         if path.is_file() {
@@ -523,13 +509,12 @@ impl ConfigForm {
                 }
                 _ => {}
             },
-            Draft::Instance(instance) => match field {
+            Draft::Vm(vm) => match field {
                 ConfigField::Harness => {
-                    instance.harness = cycle_value(&Harness::ALL, &instance.harness, dir.into())
+                    vm.harness = cycle_value(&Harness::ALL, &vm.harness, dir.into())
                 }
                 ConfigField::Security => {
-                    instance.security =
-                        cycle_value(&SecurityMode::ALL, &instance.security, dir.into())
+                    vm.security = cycle_value(&SecurityMode::ALL, &vm.security, dir.into())
                 }
                 _ => {}
             },
@@ -552,8 +537,8 @@ impl ConfigForm {
                 config.snapshot_interval_secs as i64
             }
             (Draft::Global(config), ConfigField::SnapshotKeep) => i64::from(config.snapshot_keep),
-            (Draft::Instance(instance), ConfigField::Vcpus) => i64::from(instance.vcpus),
-            (Draft::Instance(instance), ConfigField::Memory) => i64::from(instance.memory_mib),
+            (Draft::Vm(vm), ConfigField::Vcpus) => i64::from(vm.vcpus),
+            (Draft::Vm(vm), ConfigField::Memory) => i64::from(vm.memory_mib),
             _ => return Ok(()),
         };
         let next = (current + i64::from(dir.signum()) * step).clamp(min, max);
@@ -574,8 +559,8 @@ impl ConfigForm {
             (Draft::Global(config), ConfigField::SnapshotKeep) => {
                 config.snapshot_keep = value as u32
             }
-            (Draft::Instance(instance), ConfigField::Vcpus) => instance.vcpus = value as u8,
-            (Draft::Instance(instance), ConfigField::Memory) => instance.memory_mib = value as u32,
+            (Draft::Vm(vm), ConfigField::Vcpus) => vm.vcpus = value as u8,
+            (Draft::Vm(vm), ConfigField::Memory) => vm.memory_mib = value as u32,
             _ => anyhow::bail!("{} is not a number", field.label()),
         }
         Ok(())
@@ -590,10 +575,6 @@ impl ConfigForm {
             }
             (Draft::Global(config), ConfigField::PeriodicSnapshots) => config.periodic_snapshots,
             (Draft::Global(config), ConfigField::AutoResume) => config.auto_resume,
-            (Draft::Instance(instance), ConfigField::AutoBranch) => instance.auto_branch,
-            (Draft::Instance(instance), ConfigField::ReadOnlyWorkspace) => {
-                instance.read_only_workspace
-            }
             _ => false,
         }
     }
@@ -609,10 +590,6 @@ impl ConfigForm {
                 config.periodic_snapshots = value
             }
             (Draft::Global(config), ConfigField::AutoResume) => config.auto_resume = value,
-            (Draft::Instance(instance), ConfigField::AutoBranch) => instance.auto_branch = value,
-            (Draft::Instance(instance), ConfigField::ReadOnlyWorkspace) => {
-                instance.read_only_workspace = value
-            }
             _ => anyhow::bail!("{} is not a toggle", field.label()),
         }
         Ok(())

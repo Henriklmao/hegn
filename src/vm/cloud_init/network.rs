@@ -1,7 +1,7 @@
 //! Guest endpoint environment derived from the network lease.
 //!
 //! Local endpoints are reachable from the guest through the host side of the
-//! per-instance network, so the generated shell snippet exports the same
+//! per-VM network, so the generated shell snippet exports the same
 //! variables for every login shell.
 
 use crate::config::LocalEndpoint;
@@ -32,7 +32,7 @@ mod tests {
     fn lease() -> Lease {
         Lease {
             index: 0,
-            instance: "demo".into(),
+            vm: "demo".into(),
             tap: tap_name(0),
             mac: mac(0),
             host_ip: host_ip(0),

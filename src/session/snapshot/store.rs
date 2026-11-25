@@ -189,6 +189,18 @@ impl SnapshotStore {
 
     /// List all snapshots, newest first. Invalid entries are skipped.
     pub fn list(&self) -> Result<Vec<SnapshotMeta>> {
+        self.list_matching(|_| true)
+    }
+
+    /// Snapshots that belong to one VM, newest first.
+    ///
+    /// Files written before the `vm` rename still match through the
+    /// `instance` serde alias. Snapshots without any owner are not included.
+    pub fn list_for_vm(&self, vm: &str) -> Result<Vec<SnapshotMeta>> {
+        self.list_matching(|snapshot| snapshot.vm() == Some(vm))
+    }
+
+    fn list_matching(&self, keep: impl Fn(&SnapshotMeta) -> bool) -> Result<Vec<SnapshotMeta>> {
         if !self.root.exists() {
             return Ok(Vec::new());
         }
@@ -200,6 +212,9 @@ impl SnapshotStore {
             }
             let name = entry.file_name().to_string_lossy().into_owned();
             if let Ok(mut meta) = self.load(&name) {
+                if !keep(&meta) {
+                    continue;
+                }
                 if meta.size_bytes == 0 {
                     meta.size_bytes = dir_size(&meta.dir);
                 }
@@ -210,31 +225,43 @@ impl SnapshotStore {
         Ok(snapshots)
     }
 
-    /// Newest restorable automatic snapshot for `instance`.
+    /// Restorable automatic snapshots for `vm`, newest first.
     ///
-    /// Only snapshots tagged with [`AUTOSAVE_NOTE`] are considered: a manual
-    /// checkpoint must never be loaded just because hegn restarts.
-    pub fn latest_autosave(&self, instance: &str) -> Result<Option<SnapshotMeta>> {
-        Ok(self.list()?.into_iter().find(|snapshot| {
-            snapshot.note.as_deref() == Some(AUTOSAVE_NOTE)
-                && snapshot.instance.as_deref() == Some(instance)
-                && snapshot.is_restorable()
-        }))
+    /// Legacy v1 checkpoints and snapshots whose VMM files are gone are
+    /// excluded up front: they can never be resumed, and they are never
+    /// pruned automatically. The caller still has to compare the recorded
+    /// boot fingerprint with the current plan.
+    pub fn autosaves_for(&self, vm: &str) -> Result<Vec<SnapshotMeta>> {
+        Ok(self
+            .list_for_vm(vm)?
+            .into_iter()
+            .filter(|snapshot| {
+                snapshot.note.as_deref() == Some(AUTOSAVE_NOTE) && snapshot.is_restorable()
+            })
+            .collect())
     }
 
-    /// Delete automatic snapshots beyond `keep` for one instance.
+    /// Newest restorable automatic snapshot for `vm`.
     ///
-    /// Manual snapshots and other instances' checkpoints are never touched.
-    /// Returns the removed names.
-    pub fn prune_autosaves(&self, instance: &str, keep: u32) -> Result<Vec<String>> {
+    /// Only snapshots tagged with [`AUTOSAVE_NOTE`] are considered: a manual
+    /// checkpoint must never be loaded just because hegn restarts. Legacy
+    /// snapshots are never returned.
+    pub fn latest_autosave(&self, vm: &str) -> Result<Option<SnapshotMeta>> {
+        Ok(self.autosaves_for(vm)?.into_iter().next())
+    }
+
+    /// Delete automatic snapshots beyond `keep` for one VM.
+    ///
+    /// Manual snapshots, other VMs' checkpoints and legacy v1 snapshots are
+    /// never touched. Returns the removed names.
+    pub fn prune_autosaves(&self, vm: &str, keep: u32) -> Result<Vec<String>> {
         let keep = keep.max(1) as usize;
         let mut removed = Vec::new();
         for snapshot in self
-            .list()?
+            .list_for_vm(vm)?
             .into_iter()
             .filter(|snapshot| {
-                snapshot.note.as_deref() == Some(AUTOSAVE_NOTE)
-                    && snapshot.instance.as_deref() == Some(instance)
+                snapshot.note.as_deref() == Some(AUTOSAVE_NOTE) && !snapshot.is_legacy()
             })
             .skip(keep)
         {
@@ -260,17 +287,69 @@ impl SnapshotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RootfsFormat;
+    use crate::project::ProjectKind;
+    use crate::session::snapshot::{
+        SNAPSHOT_VERSION, SnapshotBoot, SnapshotMember, compute_fingerprint,
+    };
+
+    fn recorded_membership() -> Vec<SnapshotMember> {
+        vec![SnapshotMember {
+            name: "demo".into(),
+            path: PathBuf::from("/workspace/demo"),
+            tag: "hegn-prj-0".into(),
+            guest_path: "/projects/demo".into(),
+            read_only: false,
+            kind: ProjectKind::External,
+        }]
+    }
+
+    fn recorded_boot() -> SnapshotBoot {
+        SnapshotBoot {
+            vcpus: 2,
+            memory_mib: 2048,
+            rootfs_path: PathBuf::from("/vms/demo/rootfs.qcow2"),
+            rootfs_format: RootfsFormat::Qcow2,
+            network_index: None,
+            profile_share: false,
+            primary: Some("demo".into()),
+        }
+    }
 
     fn meta(name: &str, paths: &SnapshotPaths) -> SnapshotMeta {
+        let membership = recorded_membership();
+        let boot = recorded_boot();
         SnapshotMeta {
             name: name.into(),
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: paths.final_dir.clone(),
-            instance: Some("demo".into()),
+            vm: Some("demo".into()),
             project: Some(PathBuf::from("/workspace/demo")),
             size_bytes: 0,
             note: None,
+            version: SNAPSHOT_VERSION,
+            boot_fingerprint: Some(compute_fingerprint(&membership, &boot)),
+            membership,
+            boot: Some(boot),
+        }
+    }
+
+    /// Metadata written by hegn v1: no version, fingerprint or membership.
+    fn legacy_meta(name: &str, paths: &SnapshotPaths) -> SnapshotMeta {
+        SnapshotMeta {
+            name: name.into(),
+            created_at: Utc::now(),
+            vm_state: "Paused".into(),
+            dir: paths.final_dir.clone(),
+            vm: Some("demo".into()),
+            project: None,
+            size_bytes: 0,
+            note: Some(AUTOSAVE_NOTE.into()),
+            version: 1,
+            boot_fingerprint: None,
+            membership: Vec::new(),
+            boot: None,
         }
     }
 
@@ -401,7 +480,7 @@ mod tests {
         write_snapshot_files(&foreign);
         let mut foreign_meta = meta("autosave-foreign", &foreign);
         foreign_meta.note = Some(AUTOSAVE_NOTE.into());
-        foreign_meta.instance = Some("other".into());
+        foreign_meta.vm = Some("other".into());
         store.save_meta(&foreign_meta).unwrap();
 
         assert_eq!(
@@ -412,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn pruning_keeps_the_newest_autosaves_per_instance() {
+    fn pruning_keeps_the_newest_autosaves_per_vm() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(dir.path());
         for (index, offset) in [("auto-old", 0), ("auto-new", 20)] {
@@ -485,10 +564,11 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: outside.clone(),
-            instance: Some("demo".into()),
+            vm: Some("demo".into()),
             project: None,
             size_bytes: 0,
             note: None,
+            ..SnapshotMeta::default()
         };
         fs::write(
             entry.join("snapshot.json"),
@@ -513,10 +593,11 @@ mod tests {
             created_at: Utc::now(),
             vm_state: "Paused".into(),
             dir: store.root().join("a,b"),
-            instance: Some("demo".into()),
+            vm: Some("demo".into()),
             project: None,
             size_bytes: 0,
             note: None,
+            ..SnapshotMeta::default()
         };
         fs::write(
             entry.join("snapshot.json"),
@@ -588,5 +669,92 @@ mod tests {
         fs::write(dir.path().join("nested/state.json"), b"0123456789").unwrap();
 
         assert_eq!(dir_size(dir.path()), 5);
+    }
+
+    #[test]
+    fn legacy_autosaves_are_listed_but_never_selected_or_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let legacy = store.prepare("legacy-auto").unwrap();
+        write_snapshot_files(&legacy);
+        let mut legacy = legacy_meta("legacy-auto", &legacy);
+        legacy.created_at = Utc::now() - chrono::Duration::seconds(60);
+        store.save_meta(&legacy).unwrap();
+
+        // A legacy checkpoint is visible but marked and never resumable.
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].is_legacy());
+        assert!(listed[0].legacy_label().is_some());
+        assert!(store.autosaves_for("demo").unwrap().is_empty());
+        assert!(store.latest_autosave("demo").unwrap().is_none());
+
+        // Retention must not delete it, even when `keep` is one and a newer
+        // autosave exists.
+        let fresh = store.prepare("fresh-auto").unwrap();
+        write_snapshot_files(&fresh);
+        let mut fresh = meta("fresh-auto", &fresh);
+        fresh.note = Some(AUTOSAVE_NOTE.into());
+        store.save_meta(&fresh).unwrap();
+        assert_eq!(
+            store.prune_autosaves("demo", 1).unwrap(),
+            Vec::<String>::new()
+        );
+        assert!(store.load("legacy-auto").is_ok());
+    }
+
+    #[test]
+    fn snapshots_are_filtered_per_vm_and_accept_the_instance_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        for (name, owner) in [("mine", "demo"), ("other", "rust")] {
+            let paths = store.prepare(name).unwrap();
+            let mut m = meta(name, &paths);
+            m.vm = Some(owner.into());
+            store.save_meta(&m).unwrap();
+        }
+
+        let mine = store.list_for_vm("demo").unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].name, "mine");
+        assert_eq!(store.list().unwrap().len(), 2);
+
+        // Rewrite one file with the pre-v2 spelling; it must still match.
+        let path = store.root().join("mine/snapshot.json");
+        let raw = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            raw.replace("\"vm\": \"demo\"", "\"instance\": \"demo\""),
+        )
+        .unwrap();
+        assert_eq!(store.list_for_vm("demo").unwrap().len(), 1);
+        assert_eq!(
+            store.latest_autosave("demo").unwrap(),
+            None,
+            "manual snapshots are not auto-resume candidates"
+        );
+    }
+
+    #[test]
+    fn autosave_selection_is_newest_first_per_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        for (name, owner, offset) in [
+            ("old", "demo", 0),
+            ("new", "demo", 10),
+            ("other", "rust", 20),
+        ] {
+            let paths = store.prepare(name).unwrap();
+            write_snapshot_files(&paths);
+            let mut m = meta(name, &paths);
+            m.vm = Some(owner.into());
+            m.note = Some(AUTOSAVE_NOTE.into());
+            m.created_at = Utc::now() + chrono::Duration::seconds(offset);
+            store.save_meta(&m).unwrap();
+        }
+        let candidates = store.autosaves_for("demo").unwrap();
+        let names: Vec<&str> = candidates.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["new", "old"]);
+        assert_eq!(store.latest_autosave("demo").unwrap().unwrap().name, "new");
     }
 }

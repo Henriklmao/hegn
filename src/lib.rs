@@ -1,4 +1,4 @@
-//! hegn — Cloud Hypervisor instance manager for agentic coding workflows.
+//! hegn — Cloud Hypervisor VM manager for agentic coding workflows.
 //!
 //! The crate is organised by domain. Every domain owns one directory and
 //! re-exports its public surface from its `mod.rs`:
