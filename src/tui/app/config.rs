@@ -39,11 +39,8 @@ impl App {
     pub(super) fn open_vm_config(&mut self) -> Vec<Effect> {
         let Some(vm) = self
             .active_vm_name()
-            .or_else(|| {
-                self.selected_instance()
-                    .map(|instance| instance.name.clone())
-            })
-            .or_else(|| self.instances.first().map(|instance| instance.name.clone()))
+            .or_else(|| self.selected_vm().map(|vm| vm.name.clone()))
+            .or_else(|| self.vms.first().map(|vm| vm.name.clone()))
         else {
             self.toast("select a VM first", ToastLevel::Warn);
             return Vec::new();
@@ -303,7 +300,7 @@ mod tests {
     fn selected_project_app(app: &mut App) -> std::path::PathBuf {
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
-        app.instances = vec![fake_instance(app, "rust", project.clone())];
+        app.vms = vec![fake_vm(app, "rust", project.clone())];
         assign_fake_project(app, &project, "rust");
         app.projects = vec![Project {
             name: "demo".into(),
@@ -436,7 +433,7 @@ mod tests {
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
         app.focus = Focus::Vm;
-        app.instances = vec![fake_instance(&app, "demo", inside.clone())];
+        app.vms = vec![fake_vm(&app, "demo", inside.clone())];
         assign_fake_project(&mut app, &project, "demo");
         let stored = crate::vm::config::VmConfig {
             name: "demo".into(),
@@ -542,7 +539,7 @@ mod tests {
                 ..crate::vm::config::VmConfig::default()
             })
             .unwrap();
-        app.instances = vec![fake_instance(&app, "demo", inside)];
+        app.vms = vec![fake_vm(&app, "demo", inside)];
         assign_fake_project(&mut app, &project, "demo");
         app.focus = Focus::Vm;
 

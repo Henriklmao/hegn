@@ -999,12 +999,12 @@ pub struct App {
     pub snapshot_rows: Vec<RowHit>,
     /// Private project registry entries, refreshed with the project scan.
     pub project_entries: Vec<ProjectEntry>,
-    pub instances: Vec<VmSummary>,
-    /// Indices into [`App::instances`] for the selected project.
-    pub instance_visible: Vec<usize>,
-    pub instance_selected: usize,
-    pub(super) instance_project: Option<PathBuf>,
-    pub instance_rows: Vec<RowHit>,
+    pub vms: Vec<VmSummary>,
+    /// Indices into [`App::vms`] for the selected project.
+    pub vm_visible: Vec<usize>,
+    pub vm_selected: usize,
+    pub(super) vm_project: Option<PathBuf>,
+    pub vm_rows: Vec<RowHit>,
     /// Projects assigned to [`App::vm_open`].
     pub vm_members: Vec<ProjectEntry>,
     pub vm_member_selected: usize,

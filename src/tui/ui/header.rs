@@ -1,4 +1,4 @@
-//! Top status bar: logo, open project, instance state and backend.
+//! Top status bar: logo, open project, VM state and backend.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
@@ -145,7 +145,7 @@ mod tests {
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
         app.projects[0].path = project.clone();
-        app.instances = vec![crate::vm::registry::VmSummary {
+        app.vms = vec![crate::vm::registry::VmSummary {
             name: "rust".into(),
             harness: crate::config::Harness::Shell,
             primary: Some("demo".into()),

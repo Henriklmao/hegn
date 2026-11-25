@@ -196,7 +196,7 @@ mod tests {
         }];
         app.visible = vec![0];
         app.selected = 0;
-        app.instances = vec![fake_instance(&app, "rust", project.clone())];
+        app.vms = vec![fake_vm(&app, "rust", project.clone())];
         assign_fake_project(&mut app, &project, "rust");
         save_snapshot(&app, "before-upgrade", Some(project.clone()), Some("rust"));
         app.open_project = Some(project);
@@ -230,7 +230,7 @@ mod tests {
         }];
         app.visible = vec![0];
         app.selected = 0;
-        app.instances = vec![fake_instance(&app, "rust", demo.clone())];
+        app.vms = vec![fake_vm(&app, "rust", demo.clone())];
         assign_fake_project(&mut app, &demo, "rust");
         app.open_project = Some(demo.clone());
         app.screen = Screen::Project;
@@ -245,9 +245,9 @@ mod tests {
     #[test]
     fn vm_screen_snapshots_are_scoped_to_the_open_vm() {
         let (_dir, mut app) = test_app();
-        app.instances = vec![
-            fake_instance(&app, "rust", app.config.projects_root.join("demo")),
-            fake_instance(&app, "go", app.config.projects_root.join("other")),
+        app.vms = vec![
+            fake_vm(&app, "rust", app.config.projects_root.join("demo")),
+            fake_vm(&app, "go", app.config.projects_root.join("other")),
         ];
         save_snapshot(&app, "rust-one", None, Some("rust"));
         save_snapshot(&app, "go-one", None, Some("go"));

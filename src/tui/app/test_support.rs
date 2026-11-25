@@ -175,7 +175,7 @@ pub(super) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-pub(super) fn fake_instance(app: &App, name: &str, workspace: PathBuf) -> VmSummary {
+pub(super) fn fake_vm(app: &App, name: &str, workspace: PathBuf) -> VmSummary {
     VmSummary {
         name: name.into(),
         harness: Harness::Shell,
@@ -222,10 +222,10 @@ pub(super) fn assign_fake_project(app: &mut App, path: &std::path::Path, vm: &st
     app.refresh_project_entries();
 }
 
-/// Install an instance list and select the matching fake project, so the
+/// Install a VM list and select the matching fake project, so the
 /// project-scoped VM filter has something to work with.
-pub(super) fn install_instances(app: &mut App, instances: Vec<VmSummary>) {
-    if let Some(project) = instances.first().map(|instance| instance.project.clone()) {
+pub(super) fn install_vms(app: &mut App, vms: Vec<VmSummary>) {
+    if let Some(project) = vms.first().map(|vm| vm.project.clone()) {
         let name = project
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -238,8 +238,8 @@ pub(super) fn install_instances(app: &mut App, instances: Vec<VmSummary>) {
         }];
         app.visible = vec![0];
         app.selected = 0;
-        app.instance_project = None;
+        app.vm_project = None;
     }
-    app.instances = instances;
-    app.refresh_instance_filter();
+    app.vms = vms;
+    app.refresh_vm_filter();
 }

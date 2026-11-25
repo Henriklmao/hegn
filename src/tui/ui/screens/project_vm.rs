@@ -143,7 +143,7 @@ mod tests {
             .unwrap();
         registry.assign("demo", "rust", false).unwrap();
         app.refresh_project_entries();
-        app.instances = vec![crate::vm::registry::VmSummary {
+        app.vms = vec![crate::vm::registry::VmSummary {
             name: "rust".into(),
             harness: crate::config::Harness::Opencode,
             primary: Some("demo".into()),

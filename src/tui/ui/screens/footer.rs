@@ -855,7 +855,7 @@ mod tests {
     #[test]
     fn vm_footer_tracks_the_focused_section() {
         let (_dir, mut app) = app();
-        app.instances = vec![summary(&app, "rust", "running")];
+        app.vms = vec![summary(&app, "rust", "running")];
         app.open_vm_screen("rust".into());
         for action in [
             ActionId::Open,

@@ -36,7 +36,7 @@ impl App {
             }
             self.attach_vm(&name)
         } else {
-            self.start_project_instance()
+            self.start_project_vm()
         }
     }
 
@@ -107,11 +107,11 @@ impl App {
         }]
     }
 
-    pub(super) fn stop_selected_instance(&mut self) -> Vec<Effect> {
-        let Some(vm) = self.active_vm_name().or_else(|| {
-            self.selected_instance()
-                .map(|instance| instance.name.clone())
-        }) else {
+    pub(super) fn stop_selected_vm(&mut self) -> Vec<Effect> {
+        let Some(vm) = self
+            .active_vm_name()
+            .or_else(|| self.selected_vm().map(|vm| vm.name.clone()))
+        else {
             self.toast("no VM selected", ToastLevel::Warn);
             return Vec::new();
         };
@@ -119,10 +119,10 @@ impl App {
     }
 
     pub(super) fn apply_selected_vm(&mut self) -> Vec<Effect> {
-        let Some(vm) = self.active_vm_name().or_else(|| {
-            self.selected_instance()
-                .map(|instance| instance.name.clone())
-        }) else {
+        let Some(vm) = self
+            .active_vm_name()
+            .or_else(|| self.selected_vm().map(|vm| vm.name.clone()))
+        else {
             self.toast("no VM selected", ToastLevel::Warn);
             return Vec::new();
         };
@@ -174,7 +174,7 @@ impl App {
     /// This only *requests* the VM start; the terminal loop owns the runtime and
     /// performs the boot. A missing VM assignment is a hard prompt, never a
     /// local shell.
-    pub(super) fn start_project_instance(&mut self) -> Vec<Effect> {
+    pub(super) fn start_project_vm(&mut self) -> Vec<Effect> {
         if self.vm.state == VmUiState::Starting {
             self.toast("a VM is already starting…", ToastLevel::Warn);
             return Vec::new();
@@ -264,12 +264,8 @@ impl App {
                 .join("run/cloud-hypervisor.sock"),
         );
         self.attached_vm = Some(vm_name.clone());
-        if let Some(index) = self
-            .instances
-            .iter()
-            .position(|instance| instance.name == vm_name)
-        {
-            self.instance_selected = index;
+        if let Some(index) = self.vms.iter().position(|vm| vm.name == vm_name) {
+            self.vm_selected = index;
         }
         let project = console.project().to_path_buf();
         self.session = Some(console);
@@ -343,7 +339,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
-        app.instances = vec![fake_instance(&app, "demo", project.clone())];
+        app.vms = vec![fake_vm(&app, "demo", project.clone())];
         assign_fake_project(&mut app, &project, "demo");
         app.projects = vec![Project {
             name: "demo".into(),
@@ -384,11 +380,11 @@ mod tests {
     }
 
     #[test]
-    fn starting_a_project_instance_resets_the_terminal_mode() {
+    fn starting_a_project_vm_resets_the_terminal_mode() {
         let (_dir, mut app) = test_app();
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
-        app.instances = vec![fake_instance(&app, "rust", project.clone())];
+        app.vms = vec![fake_vm(&app, "rust", project.clone())];
         assign_fake_project(&mut app, &project, "rust");
         app.projects = vec![Project {
             name: "demo".into(),
@@ -401,7 +397,7 @@ mod tests {
         app.screen = Screen::Project;
         app.focus = Focus::Vm;
         app.terminal_mode = TerminalMode::Raw;
-        let effects = app.start_project_instance();
+        let effects = app.start_project_vm();
         assert_eq!(
             app.terminal_mode,
             TerminalMode::Normal,
@@ -424,7 +420,7 @@ mod tests {
         app.screen = Screen::Project;
         app.focus = Focus::Vm;
         app.vm.state = VmUiState::Starting;
-        let effects = app.start_project_instance();
+        let effects = app.start_project_vm();
         assert!(effects.is_empty());
         assert!(
             app.toast
@@ -456,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn attaching_selects_the_matching_instance_and_starts_in_normal_mode() {
+    fn attaching_selects_the_matching_vm_and_starts_in_normal_mode() {
         let (_dir, mut app) = test_app();
         let demo = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&demo).unwrap();
@@ -465,8 +461,8 @@ mod tests {
         crate::vm::registry::VmRegistry::new(app.config.clone())
             .ensure_for_project(&demo, Harness::Shell)
             .unwrap();
-        let instance = fake_instance(&app, "demo", demo.clone());
-        install_instances(&mut app, vec![instance]);
+        let vm = fake_vm(&app, "demo", demo.clone());
+        install_vms(&mut app, vec![vm]);
         app.terminal_mode = TerminalMode::Insert;
 
         let log = ConsoleLog::default();
@@ -479,7 +475,7 @@ mod tests {
         );
         assert_eq!(app.vm.backend, "cloud-hypervisor");
         assert!(app.vm.started_at.is_some());
-        assert_eq!(app.selected_instance().unwrap().name, "demo");
+        assert_eq!(app.selected_vm().unwrap().name, "demo");
         assert_eq!(app.terminal_mode, TerminalMode::Normal);
         assert!(app.terminal_focus);
     }
@@ -488,8 +484,8 @@ mod tests {
     fn attaching_is_rejected_while_another_vm_is_booting() {
         let (_dir, mut app) = test_app();
         let inside = app.config.vms_dir.join("demo").join("workspace");
-        let instance = fake_instance(&app, "demo", inside);
-        install_instances(&mut app, vec![instance]);
+        let vm = fake_vm(&app, "demo", inside);
+        install_vms(&mut app, vec![vm]);
         app.vm.state = VmUiState::Starting;
 
         let effects = app.attach_vm("demo");

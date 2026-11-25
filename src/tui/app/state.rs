@@ -24,7 +24,7 @@ impl App {
         let snapshots = SnapshotStore::new(&config.snapshots_dir)
             .list()
             .unwrap_or_default();
-        let instances = crate::vm::registry::VmRegistry::new(config.clone())
+        let vms = crate::vm::registry::VmRegistry::new(config.clone())
             .summaries()
             .unwrap_or_default();
         let project_entries = ProjectRegistry::load(&config.state_dir)
@@ -62,11 +62,11 @@ impl App {
             vm_snapshot_selected: 0,
             snapshot_rows: Vec::new(),
             project_entries,
-            instances,
-            instance_visible: Vec::new(),
-            instance_selected: 0,
-            instance_project: None,
-            instance_rows: Vec::new(),
+            vms,
+            vm_visible: Vec::new(),
+            vm_selected: 0,
+            vm_project: None,
+            vm_rows: Vec::new(),
             vm_members: Vec::new(),
             vm_member_selected: 0,
             vm_member_rows: Vec::new(),
@@ -217,7 +217,7 @@ impl App {
     /// Summary of the VM a project is assigned to.
     pub fn project_vm(&self, path: &std::path::Path) -> Option<&VmSummary> {
         let name = self.project_vm_name(path)?;
-        self.instances.iter().find(|summary| summary.name == name)
+        self.vms.iter().find(|summary| summary.name == name)
     }
 
     /// VM of the open project, the open VM screen, or the selected project.
@@ -234,9 +234,9 @@ impl App {
 
     pub fn active_vm_summary(&self) -> Option<&VmSummary> {
         self.active_vm_name()
-            .and_then(|name| self.instances.iter().find(|summary| summary.name == name))
-            .or_else(|| self.selected_instance())
-            .or_else(|| self.instances.first())
+            .and_then(|name| self.vms.iter().find(|summary| summary.name == name))
+            .or_else(|| self.selected_vm())
+            .or_else(|| self.vms.first())
     }
 
     /// VM badge shown next to a dashboard project row.
@@ -244,7 +244,7 @@ impl App {
         match self.project_vm_name(path) {
             Some(name) => {
                 let members = self
-                    .instances
+                    .vms
                     .iter()
                     .find(|summary| summary.name == name)
                     .map(|summary| summary.members)
@@ -321,7 +321,7 @@ impl App {
 
     /// Open the reusable VM screen.
     pub fn open_vm_screen(&mut self, name: String) -> Vec<Effect> {
-        if !self.instances.iter().any(|summary| summary.name == name) {
+        if !self.vms.iter().any(|summary| summary.name == name) {
             self.toast(format!("unknown VM {name}"), ToastLevel::Warn);
             return Vec::new();
         }
@@ -383,7 +383,7 @@ impl App {
             .active_vm_summary()
             .and_then(|summary| summary.serial_log.clone())
             .or_else(|| {
-                self.selected_instance()
+                self.selected_vm()
                     .and_then(|summary| summary.serial_log.clone())
             });
         let Some(path) = serial else {
@@ -402,7 +402,7 @@ impl App {
         } else if self.selected >= self.visible.len() {
             self.selected = self.visible.len() - 1;
         }
-        self.refresh_instance_filter();
+        self.refresh_vm_filter();
     }
 
     pub fn selected_project(&self) -> Option<&Project> {
@@ -426,13 +426,13 @@ impl App {
                     .find(|entry| crate::vm::same_project(&entry.path, path))
                     .map(|entry| entry.path.clone())
                     .or_else(|| {
-                        self.instances
+                        self.vms
                             .iter()
-                            .find(|instance| {
-                                crate::vm::same_project(&instance.workspace, path)
-                                    || crate::vm::same_project(&instance.project, path)
+                            .find(|vm| {
+                                crate::vm::same_project(&vm.workspace, path)
+                                    || crate::vm::same_project(&vm.project, path)
                             })
-                            .map(|instance| instance.project.clone())
+                            .map(|vm| vm.project.clone())
                     })?;
                 self.projects
                     .iter()
@@ -442,39 +442,37 @@ impl App {
         }
     }
 
-    pub fn selected_instance(&self) -> Option<&VmSummary> {
-        self.instance_visible
-            .get(self.instance_selected)
-            .and_then(|&index| self.instances.get(index))
+    pub fn selected_vm(&self) -> Option<&VmSummary> {
+        self.vm_visible
+            .get(self.vm_selected)
+            .and_then(|&index| self.vms.get(index))
     }
 
     /// Rebuild the VM list so it only contains the VM of the project selected
     /// in the project list.
-    pub fn refresh_instance_filter(&mut self) {
-        let selected = self
-            .selected_instance()
-            .map(|instance| instance.name.clone());
-        self.refresh_instance_filter_named(selected);
+    pub fn refresh_vm_filter(&mut self) {
+        let selected = self.selected_vm().map(|vm| vm.name.clone());
+        self.refresh_vm_filter_named(selected);
     }
 
     /// Rebuild the filter while preserving `selected` by name. The name must be
-    /// captured before [`App::instances`] is replaced: the visible indices point
+    /// captured before [`App::vms`] is replaced: the visible indices point
     /// into the old vector.
-    pub(super) fn refresh_instance_filter_named(&mut self, selected: Option<String>) {
+    pub(super) fn refresh_vm_filter_named(&mut self, selected: Option<String>) {
         let project = self
             .active_project()
             .map(|project| project.path.clone())
             .or_else(|| self.open_project.clone());
-        let project_changed = self.instance_project != project;
-        self.instance_project = project.clone();
+        let project_changed = self.vm_project != project;
+        self.vm_project = project.clone();
 
         let vm = project
             .as_deref()
             .and_then(|project| self.project_vm_name(project))
             .map(str::to_string);
-        self.instance_visible = match vm {
+        self.vm_visible = match vm {
             Some(vm) => self
-                .instances
+                .vms
                 .iter()
                 .enumerate()
                 .filter(|(_, summary)| summary.name == vm)
@@ -486,26 +484,24 @@ impl App {
         if !project_changed
             && let Some(name) = selected
             && let Some(index) = self
-                .instance_visible
+                .vm_visible
                 .iter()
-                .position(|&index| self.instances[index].name == name)
+                .position(|&index| self.vms[index].name == name)
         {
-            self.instance_selected = index;
+            self.vm_selected = index;
             return;
         }
-        self.instance_selected = 0;
+        self.vm_selected = 0;
     }
 
     /// Refresh the VM list from disk/process state. Cheap enough for the UI
     /// tick; it only reads files and `/proc`.
     pub fn refresh_vms(&mut self) {
-        let selected = self
-            .selected_instance()
-            .map(|instance| instance.name.clone());
+        let selected = self.selected_vm().map(|vm| vm.name.clone());
         let selected_project = self.selected_project().map(|project| project.path.clone());
         let registry = crate::vm::registry::VmRegistry::new(self.config.clone());
-        if let Ok(instances) = registry.summaries() {
-            self.instances = instances;
+        if let Ok(vms) = registry.summaries() {
+            self.vms = vms;
         }
         self.refresh_project_entries();
         self.merge_registry_projects();
@@ -518,7 +514,7 @@ impl App {
         {
             self.selected = index;
         }
-        self.refresh_instance_filter_named(selected);
+        self.refresh_vm_filter_named(selected);
         self.refresh_vm_members();
         self.refresh_project_snapshots();
         self.refresh_vm_snapshots();
@@ -586,7 +582,7 @@ impl App {
                 }
                 let max = self.visible.len() - 1;
                 self.selected = clamp_index(self.selected, delta, max);
-                self.refresh_instance_filter();
+                self.refresh_vm_filter();
             }
             Focus::Vm | Focus::Tools => {}
             Focus::Snapshots => {
@@ -759,17 +755,17 @@ mod tests {
     }
 
     #[test]
-    fn instance_list_is_scoped_to_the_selected_projects_vm() {
+    fn vm_list_is_scoped_to_the_selected_projects_vm() {
         let (_dir, mut app) = test_app();
         let demo = app.config.projects_root.join("demo");
         let other = app.config.projects_root.join("other");
         std::fs::create_dir_all(&demo).unwrap();
         std::fs::create_dir_all(&other).unwrap();
 
-        let mut base = fake_instance(&app, "demo", demo.clone());
+        let mut base = fake_vm(&app, "demo", demo.clone());
         base.project = demo.clone();
-        let mut other_instance = fake_instance(&app, "other", other.clone());
-        other_instance.project = other.clone();
+        let mut other_vm = fake_vm(&app, "other", other.clone());
+        other_vm.project = other.clone();
 
         let demo_project = Project {
             name: "demo".into(),
@@ -783,7 +779,7 @@ mod tests {
             ..demo_project.clone()
         };
         app.set_projects(vec![demo_project, other_project]);
-        app.instances = vec![base, other_instance];
+        app.vms = vec![base, other_vm];
 
         app.selected = app
             .visible
@@ -791,9 +787,9 @@ mod tests {
             .position(|&index| app.projects[index].path == demo)
             .unwrap();
         assign_fake_project(&mut app, &demo, "demo");
-        app.refresh_instance_filter();
-        assert_eq!(app.instance_visible.len(), 1);
-        assert_eq!(app.selected_instance().unwrap().name, "demo");
+        app.refresh_vm_filter();
+        assert_eq!(app.vm_visible.len(), 1);
+        assert_eq!(app.selected_vm().unwrap().name, "demo");
 
         app.selected = app
             .visible
@@ -801,9 +797,9 @@ mod tests {
             .position(|&index| app.projects[index].path == other)
             .unwrap();
         assign_fake_project(&mut app, &other, "other");
-        app.refresh_instance_filter();
-        assert_eq!(app.instance_visible.len(), 1);
-        assert_eq!(app.selected_instance().unwrap().name, "other");
+        app.refresh_vm_filter();
+        assert_eq!(app.vm_visible.len(), 1);
+        assert_eq!(app.selected_vm().unwrap().name, "other");
     }
 
     #[test]
@@ -840,7 +836,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         let demo = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&demo).unwrap();
-        let mut base = fake_instance(&app, "demo", demo.clone());
+        let mut base = fake_vm(&app, "demo", demo.clone());
         base.project = demo.clone();
 
         app.set_projects(vec![Project {
@@ -849,14 +845,14 @@ mod tests {
             git: GitSummary::default(),
             last_opened: None,
         }]);
-        app.instances = vec![base];
+        app.vms = vec![base];
         assign_fake_project(&mut app, &demo, "demo");
-        app.refresh_instance_filter();
-        assert_eq!(app.selected_instance().unwrap().name, "demo");
+        app.refresh_vm_filter();
+        assert_eq!(app.selected_vm().unwrap().name, "demo");
 
-        app.instances.reverse();
-        app.refresh_instance_filter_named(Some("demo".into()));
-        assert_eq!(app.selected_instance().unwrap().name, "demo");
+        app.vms.reverse();
+        app.refresh_vm_filter_named(Some("demo".into()));
+        assert_eq!(app.selected_vm().unwrap().name, "demo");
     }
 
     #[test]
@@ -987,7 +983,7 @@ mod tests {
         assert_eq!(app.window_title(), "hegn");
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
-        app.instances = vec![fake_instance(&app, "rust", project.clone())];
+        app.vms = vec![fake_vm(&app, "rust", project.clone())];
         assign_fake_project(&mut app, &project, "rust");
         app.projects = vec![Project {
             name: "demo".into(),
@@ -1028,7 +1024,7 @@ mod tests {
             })
             .unwrap();
         registry.assign("parser", "rust", false).unwrap();
-        app.instances = vec![fake_instance(&app, "rust", canonical.clone())];
+        app.vms = vec![fake_vm(&app, "rust", canonical.clone())];
 
         app.set_projects(Vec::new());
 
@@ -1053,11 +1049,11 @@ mod tests {
         let (_dir, mut app) = test_app();
         let demo = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&demo).unwrap();
-        let mut summary = fake_instance(&app, "rust", demo.clone());
+        let mut summary = fake_vm(&app, "rust", demo.clone());
         summary.members = 2;
         summary.harness = crate::config::Harness::Opencode;
         summary.state = "running".into();
-        app.instances = vec![summary];
+        app.vms = vec![summary];
         assign_fake_project(&mut app, &demo, "rust");
 
         assert_eq!(app.project_vm_name(&demo), Some("rust"));

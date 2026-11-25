@@ -27,7 +27,7 @@ pub(crate) fn render_vm_tools(frame: &mut Frame, app: &App, area: Rect, number: 
         );
         return;
     };
-    let summary = app.instances.iter().find(|summary| summary.name == name);
+    let summary = app.vms.iter().find(|summary| summary.name == name);
     let harness = summary
         .map(|summary| summary.harness)
         .unwrap_or(app.config.harness);

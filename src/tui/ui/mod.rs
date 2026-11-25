@@ -30,7 +30,7 @@ mod widgets;
 pub struct UiHits {
     pub footer: Vec<FooterHit>,
     pub projects: Vec<RowHit>,
-    pub instances: Vec<RowHit>,
+    pub vms: Vec<RowHit>,
     /// Project rows inside the VM screen.
     pub vm_members: Vec<RowHit>,
     pub snapshots: Vec<RowHit>,
@@ -86,7 +86,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
             let rows = screens::dashboard::render_dashboard(frame, app, chunks[1]);
             RenderHits {
                 projects: rows.0,
-                instances: rows.1,
+                vms: rows.1,
                 snapshots: rows.2,
                 ..RenderHits::default()
             }
@@ -112,7 +112,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
     UiHits {
         footer,
         projects: hits.projects,
-        instances: hits.instances,
+        vms: hits.vms,
         vm_members: hits.vm_members,
         snapshots: hits.snapshots,
         sections: hits.sections,
@@ -129,7 +129,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> UiHits {
 #[derive(Default)]
 pub(crate) struct RenderHits {
     pub(crate) projects: Vec<RowHit>,
-    pub(crate) instances: Vec<RowHit>,
+    pub(crate) vms: Vec<RowHit>,
     pub(crate) vm_members: Vec<RowHit>,
     pub(crate) snapshots: Vec<RowHit>,
     pub(crate) sections: Vec<SectionHit>,

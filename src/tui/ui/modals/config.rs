@@ -1,4 +1,4 @@
-//! Global, instance and project settings modals.
+//! Global, VM and project settings modals.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -672,7 +672,7 @@ mod tests {
         assert!(text.contains("demo"), "{text}");
         assert!(
             hits.config.iter().any(|row| row.rect.height == 1),
-            "instance settings must be clickable"
+            "vm settings must be clickable"
         );
     }
 }

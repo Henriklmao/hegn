@@ -207,7 +207,7 @@ impl App {
                 }
             }
             ActionId::StartVm | ActionId::Shell => self.attach_active_vm(),
-            ActionId::StopVm => self.stop_selected_instance(),
+            ActionId::StopVm => self.stop_selected_vm(),
             ActionId::ApplyVm => self.apply_selected_vm(),
             ActionId::DeleteVm => self.confirm_delete_vm(),
             ActionId::AssignProject => match self.screen {
@@ -448,7 +448,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
-        app.instances = vec![fake_instance(&app, "rust", project.clone())];
+        app.vms = vec![fake_vm(&app, "rust", project.clone())];
         assign_fake_project(&mut app, &project, "rust");
         app.projects = vec![Project {
             name: "demo".into(),
@@ -472,11 +472,7 @@ mod tests {
     #[test]
     fn vm_footer_actions_attach_stop_and_apply() {
         let (_dir, mut app) = test_app();
-        app.instances = vec![fake_instance(
-            &app,
-            "rust",
-            app.config.projects_root.join("demo"),
-        )];
+        app.vms = vec![fake_vm(&app, "rust", app.config.projects_root.join("demo"))];
         app.open_vm_screen("rust".into());
 
         assert!(matches!(

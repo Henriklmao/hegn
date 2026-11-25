@@ -155,7 +155,7 @@ mod tests {
         if let Some(row) = app.projects.get_mut(0) {
             row.path = project.clone();
         }
-        app.instances = vec![crate::vm::registry::VmSummary {
+        app.vms = vec![crate::vm::registry::VmSummary {
             name: "rust".into(),
             harness: crate::config::Harness::Opencode,
             primary: Some("demo".into()),

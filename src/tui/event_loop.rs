@@ -50,7 +50,7 @@ pub(super) fn run_loop(
         })?;
         app.footer_hits = hits.footer;
         app.project_rows = hits.projects;
-        app.instance_rows = hits.instances;
+        app.vm_rows = hits.vms;
         app.vm_member_rows = hits.vm_members;
         app.snapshot_rows = hits.snapshots;
         app.section_hits = hits.sections;
@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_scan_applies_projects_instance_changes_and_errors() {
+    fn drain_scan_applies_projects_vm_changes_and_errors() {
         let (_dir, mut app) = test_app();
         let (tx, rx) = mpsc::channel();
         let demo = project(&app);

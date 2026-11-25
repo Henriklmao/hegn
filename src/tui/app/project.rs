@@ -50,7 +50,7 @@ impl App {
         self.focus = Focus::Vm;
         self.terminal_mode = TerminalMode::Normal;
         self.refresh_project_entries();
-        self.refresh_instance_filter();
+        self.refresh_vm_filter();
         self.refresh_snapshots();
     }
 
@@ -113,7 +113,7 @@ impl App {
         let candidates: Vec<String> = match vm {
             Some(vm) => vec![vm],
             None => self
-                .instances
+                .vms
                 .iter()
                 .map(|summary| summary.name.clone())
                 .collect(),
@@ -206,8 +206,8 @@ impl App {
     pub(super) fn confirm_delete_vm(&mut self) -> Vec<Effect> {
         let Some(vm) = self
             .active_vm_summary()
-            .or_else(|| self.selected_instance())
-            .or_else(|| self.instances.first())
+            .or_else(|| self.selected_vm())
+            .or_else(|| self.vms.first())
             .cloned()
         else {
             self.toast("no VM selected", ToastLevel::Warn);
@@ -555,7 +555,7 @@ mod tests {
             git: GitSummary::default(),
             last_opened: None,
         }]);
-        app.instances = vec![fake_instance(&app, "rust", project.clone())];
+        app.vms = vec![fake_vm(&app, "rust", project.clone())];
         assign_fake_project(&mut app, &project, "rust");
 
         let effects = app.open_selected();
@@ -578,11 +578,7 @@ mod tests {
             git: GitSummary::default(),
             last_opened: None,
         }]);
-        app.instances = vec![fake_instance(
-            &app,
-            "rust",
-            app.config.projects_root.join("demo"),
-        )];
+        app.vms = vec![fake_vm(&app, "rust", app.config.projects_root.join("demo"))];
 
         let effects = app.open_selected();
         assert!(effects.is_empty());

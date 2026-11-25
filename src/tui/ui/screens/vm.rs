@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn vm_screen_renders_all_four_sections_and_tools() {
         let (_dir, mut app) = app();
-        app.instances = vec![summary(&app)];
+        app.vms = vec![summary(&app)];
         app.open_vm_screen("rust".into());
         assert_eq!(app.screen, Screen::Vm);
 

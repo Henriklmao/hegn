@@ -19,7 +19,7 @@ impl App {
         // Clones export their private workspace; project-level launch settings
         // live next to the original project.
         let meta_project = self
-            .instances
+            .vms
             .iter()
             .find(|candidate| candidate.name == vm)
             .map(|candidate| candidate.project.as_path())
@@ -132,7 +132,7 @@ mod tests {
         let (dir, mut app) = test_app();
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
-        app.instances = vec![fake_instance(&app, "rust", project.clone())];
+        app.vms = vec![fake_vm(&app, "rust", project.clone())];
         assign_fake_project(&mut app, &project, "rust");
         app.projects = vec![Project {
             name: "demo".into(),

@@ -174,7 +174,7 @@ mod tests {
         let path = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&path).unwrap();
         app.projects[0].path = path.clone();
-        app.instances = vec![crate::vm::registry::VmSummary {
+        app.vms = vec![crate::vm::registry::VmSummary {
             name: "rust".into(),
             harness: crate::config::Harness::Shell,
             primary: Some("demo".into()),

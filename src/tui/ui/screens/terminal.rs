@@ -17,8 +17,8 @@ pub(crate) fn render_terminal_strip(frame: &mut Frame, app: &App, area: Rect) ->
     }
     let selected = app
         .active_vm_summary()
-        .or_else(|| app.selected_instance())
-        .map(|instance| (instance.name.clone(), instance.state.clone()));
+        .or_else(|| app.selected_vm())
+        .map(|vm| (vm.name.clone(), vm.state.clone()));
     let selected = selected.or_else(|| {
         app.session
             .as_ref()
@@ -57,8 +57,8 @@ pub(crate) fn render_terminal_pane(frame: &mut Frame, app: &App, area: Rect) {
         .map(|session| session.vm_name().to_string())
         .or_else(|| {
             app.active_vm_summary()
-                .or_else(|| app.selected_instance())
-                .map(|instance| instance.name.clone())
+                .or_else(|| app.selected_vm())
+                .map(|vm| vm.name.clone())
         })
         .unwrap_or_else(|| "no VM".into());
     let mode_label = match app.terminal_mode {
@@ -214,7 +214,7 @@ mod tests {
         }
     }
 
-    fn instance(app: &App, name: &str, state: &str) -> VmSummary {
+    fn vm(app: &App, name: &str, state: &str) -> VmSummary {
         VmSummary {
             name: name.into(),
             harness: Harness::Shell,
@@ -288,14 +288,14 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_strip_describes_missing_running_and_attached_instances() {
+    fn collapsed_strip_describes_missing_running_and_attached_vms() {
         let (_dir, mut app) = project_app();
         let (text, hits) = render(&app);
         assert!(hits.terminal_strip.is_some());
         assert!(text.contains("terminal · no VM · Enter to start"), "{text}");
 
-        app.instances = vec![instance(&app, "build", "running")];
-        app.refresh_instance_filter();
+        app.vms = vec![vm(&app, "build", "running")];
+        app.refresh_vm_filter();
         let (text, hits) = render(&app);
         assert!(hits.terminal_strip.is_some());
         assert!(

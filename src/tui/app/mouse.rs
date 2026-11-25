@@ -128,7 +128,7 @@ impl App {
                 {
                     self.focus = Focus::Projects;
                     self.selected = row.index;
-                    self.refresh_instance_filter();
+                    self.refresh_vm_filter();
                     let path = self.selected_project().map(|p| p.path.clone());
                     if let Some(path) = path {
                         let now = Instant::now();
@@ -343,7 +343,7 @@ mod tests {
         let (_dir, mut app) = test_app();
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
-        app.instances = vec![fake_instance(&app, "rust", project.clone())];
+        app.vms = vec![fake_vm(&app, "rust", project.clone())];
         assign_fake_project(&mut app, &project, "rust");
         app.open_vm_screen("rust".into());
         app.vm_members = vec![crate::project::ProjectEntry {

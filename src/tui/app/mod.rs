@@ -8,7 +8,7 @@
 //! The split keeps one concern per submodule:
 //!
 //! * [`types`] holds the data model, including [`App`].
-//! * [`state`] loads projects and instances and drives selection and polling.
+//! * [`state`] loads projects and VMs and drives selection and polling.
 //! * [`keys`] and [`mouse`] translate input into state transitions.
 //! * [`actions`] dispatches footer buttons and clickable hints.
 //! * [`project`], [`config`], [`terminal`], [`launch`], [`snapshots`],

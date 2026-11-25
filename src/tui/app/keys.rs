@@ -146,7 +146,7 @@ impl App {
             KeyCode::Char('2') => self.open_project_section(Focus::Snapshots),
             KeyCode::Char('3') => self.open_project_section(Focus::Health),
             KeyCode::Char('4') => self.open_project_section(Focus::Git),
-            KeyCode::Char('S') => self.stop_selected_instance(),
+            KeyCode::Char('S') => self.stop_selected_vm(),
             KeyCode::Char('A') => self.apply_selected_vm(),
             KeyCode::F(4) => self.open_global_config(),
             KeyCode::F(5) => self.open_vm_config(),
@@ -301,7 +301,7 @@ impl App {
                 self.handle_action(ActionId::NewSnapshot)
             }
             KeyCode::Char('M') | KeyCode::Char('f') => self.open_fork_workspace(),
-            KeyCode::Char('S') => self.stop_selected_instance(),
+            KeyCode::Char('S') => self.stop_selected_vm(),
             KeyCode::Char('A') => self.apply_selected_vm(),
             KeyCode::Char('d') if self.focus == Focus::Snapshots => self.confirm_delete_snapshot(),
             KeyCode::Char('d') if self.focus == Focus::Vm => self.confirm_detach_project(),
@@ -388,7 +388,7 @@ impl App {
             KeyCode::Enter if self.focus == Focus::Snapshots => self.confirm_restore_snapshot(),
             KeyCode::Enter if self.focus == Focus::Tools => self.attach_active_vm(),
             KeyCode::Char('s') => self.attach_active_vm(),
-            KeyCode::Char('S') => self.stop_selected_instance(),
+            KeyCode::Char('S') => self.stop_selected_vm(),
             KeyCode::Char('A') => self.apply_selected_vm(),
             KeyCode::Char('p') => self.set_selected_primary(),
             KeyCode::Char('a') => self.assign_project_to_open_vm(),
@@ -1305,7 +1305,7 @@ mod tests {
     fn project_with_vm(app: &mut App) -> PathBuf {
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
-        app.instances = vec![fake_instance(app, "rust", project.clone())];
+        app.vms = vec![fake_vm(app, "rust", project.clone())];
         assign_fake_project(app, &project, "rust");
         app.projects = vec![Project {
             name: "demo".into(),
@@ -1372,11 +1372,7 @@ mod tests {
     #[test]
     fn vm_screen_keys_cycle_its_sections() {
         let (_dir, mut app) = test_app();
-        app.instances = vec![fake_instance(
-            &app,
-            "rust",
-            app.config.projects_root.join("demo"),
-        )];
+        app.vms = vec![fake_vm(&app, "rust", app.config.projects_root.join("demo"))];
         app.open_vm_screen("rust".into());
         assert_eq!(app.focus, Focus::Projects);
         app.handle_key(key(KeyCode::Char('2')));
@@ -1394,11 +1390,7 @@ mod tests {
     #[test]
     fn vm_screen_snapshot_section_uses_n_for_snapshots() {
         let (_dir, mut app) = test_app();
-        app.instances = vec![fake_instance(
-            &app,
-            "rust",
-            app.config.projects_root.join("demo"),
-        )];
+        app.vms = vec![fake_vm(&app, "rust", app.config.projects_root.join("demo"))];
         app.open_vm_screen("rust".into());
         app.focus = Focus::Snapshots;
         let effects = app.handle_key(key(KeyCode::Char('n')));
@@ -1414,11 +1406,7 @@ mod tests {
     #[test]
     fn vm_screen_actions_emit_vm_effects() {
         let (_dir, mut app) = test_app();
-        app.instances = vec![fake_instance(
-            &app,
-            "rust",
-            app.config.projects_root.join("demo"),
-        )];
+        app.vms = vec![fake_vm(&app, "rust", app.config.projects_root.join("demo"))];
         app.open_vm_screen("rust".into());
 
         assert!(matches!(
@@ -1439,8 +1427,8 @@ mod tests {
     fn enter_never_confirms_a_deletion() {
         let (_dir, mut app) = test_app();
         let inside = app.config.vms_dir.join("demo").join("workspace");
-        let instance = fake_instance(&app, "demo", inside);
-        app.instances = vec![instance];
+        let vm = fake_vm(&app, "demo", inside);
+        app.vms = vec![vm];
         app.focus = Focus::Vm;
         app.confirm_delete_vm();
         app.handle_key(key(KeyCode::Enter));
@@ -1682,8 +1670,8 @@ mod tests {
         let (_dir, mut app) = test_app();
         let inside = app.config.vms_dir.join("demo").join("workspace");
         app.focus = Focus::Vm;
-        let instance = fake_instance(&app, "demo", inside);
-        app.instances = vec![instance];
+        let vm = fake_vm(&app, "demo", inside);
+        app.vms = vec![vm];
         app.confirm_delete_vm();
 
         app.handle_key(key(KeyCode::Char('y')));
@@ -1730,7 +1718,7 @@ mod tests {
         }];
         app.visible = vec![0];
         app.selected = 0;
-        app.instances.clear();
+        app.vms.clear();
         app.focus = Focus::Projects;
 
         app.handle_key(key(KeyCode::Char('d')));
@@ -1839,8 +1827,8 @@ mod tests {
         let (_dir, mut app) = test_app();
         let inside = app.config.vms_dir.join("demo").join("workspace");
         app.focus = Focus::Vm;
-        let instance = fake_instance(&app, "demo", inside);
-        app.instances = vec![instance];
+        let vm = fake_vm(&app, "demo", inside);
+        app.vms = vec![vm];
         app.confirm_delete_vm();
         app.handle_key(key(KeyCode::Char('y')));
         let effects = app.handle_key(key(KeyCode::Char('n')));
@@ -1857,7 +1845,7 @@ mod tests {
     fn stop_shortcut_only_works_with_vm_focus() {
         let (_dir, mut app) = test_app();
         let inside = app.config.vms_dir.join("demo").join("workspace");
-        app.instances = vec![fake_instance(&app, "demo", inside)];
+        app.vms = vec![fake_vm(&app, "demo", inside)];
         app.focus = Focus::Projects;
         let effects = app.handle_key(key(KeyCode::Char('S')));
         assert!(
@@ -1876,7 +1864,7 @@ mod tests {
         let project = app.config.projects_root.join("demo");
         std::fs::create_dir_all(&project).unwrap();
         assign_fake_project(&mut app, &project, "demo");
-        app.refresh_instance_filter();
+        app.refresh_vm_filter();
         let effects = app.handle_key(key(KeyCode::Char('S')));
         assert!(matches!(
             effects.as_slice(),
@@ -1953,7 +1941,7 @@ mod tests {
     fn delete_vm_cancel_keys_emit_nothing() {
         let (_dir, mut app) = test_app();
         let inside = app.config.vms_dir.join("demo").join("workspace");
-        app.instances = vec![fake_instance(&app, "demo", inside)];
+        app.vms = vec![fake_vm(&app, "demo", inside)];
         app.confirm_delete_vm();
 
         app.handle_key(key(KeyCode::Char('d')));
@@ -1971,7 +1959,7 @@ mod tests {
     fn delete_vm_escape_at_the_files_question_keeps_the_vm() {
         let (_dir, mut app) = test_app();
         let inside = app.config.vms_dir.join("demo").join("workspace");
-        app.instances = vec![fake_instance(&app, "demo", inside)];
+        app.vms = vec![fake_vm(&app, "demo", inside)];
         app.confirm_delete_vm();
         app.handle_key(key(KeyCode::Char('y')));
 
