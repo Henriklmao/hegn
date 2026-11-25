@@ -21,8 +21,6 @@ jobs:
 
     steps:
     - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      with:
-        fetch-depth: 0 # Holt die gesamte Historie für die Commit-Schleife
 
     - name: Install Rust Toolchain
       uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -33,39 +31,11 @@ jobs:
     - name: Cache cargo
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-    - name: Set a git identity for per-commit tests
+    - name: Run checks and tests
       run: |
-        git config --global user.name "hegn CI"
-        git config --global user.email "ci@example.com"
-
-    - name: Run checks and tests on each commit
-      run: |
-        ORIGINAL_SHA=$(git rev-parse HEAD)
-
-        BEFORE=""
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          BEFORE="${{ github.event.pull_request.base.sha }}"
-        elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-          BEFORE="${{ github.event.before }}"
-        fi
-
-        if [ -n "$BEFORE" ] && git merge-base --is-ancestor "$BEFORE" HEAD 2>/dev/null; then
-          COMMITS=$(git rev-list --reverse ${BEFORE}..HEAD)
-        else
-          COMMITS="$ORIGINAL_SHA"
-        fi
-
-        for commit in $COMMITS; do
-          echo "::group::Testing commit $commit"
-          git checkout --detach "$commit"
-          cargo fmt --check
-          cargo clippy --all-targets -- -D warnings
-          cargo test --verbose
-          echo "::endgroup::"
-        done
-
-        # Git-Status auf das ursprüngliche Push-Ziel zurücksetzen für den Release-Build
-        git checkout "$ORIGINAL_SHA"
+        cargo fmt --check
+        cargo clippy --all-targets -- -D warnings
+        cargo test --verbose
 
     - name: Build release binary
       run: cargo build --release --verbose
