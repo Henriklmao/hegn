@@ -68,7 +68,10 @@ hegn validates membership before it spawns anything:
   exported separately; it rides the parent's share,
 - every exported path passes the import safety checks: not `/`, `$HOME`,
   `projects_root`, an ancestor of it, or anything overlapping hegn's state,
-  snapshots, VMs, templates, profiles or config,
+  snapshots, VMs, templates, profiles or config. Managed clones are the explicit
+  exception: they must live at `<vms_dir>/<vm>/workspaces/<name>`, and registry
+  validation enforces that exact location instead of the general protected-path
+  check,
 - `max_projects_per_vm` bounds the number of exports, each of which is one
   `virtiofsd` process and one virtio-fs device,
 - an explicit `rootfs_image` must be unique across VMs.
