@@ -14,7 +14,8 @@ use crate::vm::registry::{VmRegistry, same_project};
 
 use super::cleanup::remove_temp_project;
 use super::report::{
-    BenchmarkReport, Cleanup, DiskCost, ProcessCost, SessionCost, human_bytes, print_report,
+    BenchmarkReport, Cleanup, DiskCost, LegacyInstanceDisk, ProcessCost, SessionCost, VmDisk,
+    human_bytes, print_report,
 };
 use super::usage::{
     Usage, cmdline_contains, matches_binary, process_alive, process_tree_usage, usage_excluding,
@@ -68,7 +69,7 @@ pub fn run(config: &Config, project: Option<&str>, clean: bool, json: bool) -> R
         return emit(report, json);
     }
     if !json && io::stdin().is_terminal() {
-        let question = "No instance is running. Create a temporary benchmark project, boot a \
+        let question = "No VM is running. Create a temporary benchmark project, boot a \
                         VM and remove both afterwards?";
         if confirm(question)? {
             return measure_temporary(config, json);
@@ -76,7 +77,7 @@ pub fn run(config: &Config, project: Option<&str>, clean: bool, json: bool) -> R
     }
 
     report.notes.push(
-        "no instance running; pass a project name to boot one, or --clean for a throwaway \
+        "no VM running; pass a project name to boot one, or --clean for a throwaway \
          project"
             .to_string(),
     );
@@ -128,7 +129,7 @@ fn measure_project(config: &Config, project: &str, json: bool) -> Result<i32> {
         };
         report
             .notes
-            .push("the instance was already running; nothing was started".to_string());
+            .push("the VM was already running; nothing was started".to_string());
         return emit(report, json);
     }
 
@@ -257,17 +258,26 @@ fn packages_for(harness: Harness) -> Vec<String> {
     harness.packages().iter().map(|p| p.to_string()).collect()
 }
 
-/// Build the report for every running instance without printing anything.
+/// Build the report for every running VM without printing anything.
 pub fn collect(config: &Config) -> BenchmarkReport {
-    collect_with(config, |_, _| true)
+    let data_root = default_data_root();
+    collect_with(config, data_root.as_deref(), |_, _| true)
+}
+
+fn default_data_root() -> Option<PathBuf> {
+    dirs::data_dir().map(|root| root.join("hegn"))
 }
 
 fn collect_for_vm(config: &Config, name: &str) -> BenchmarkReport {
-    collect_with(config, |session, _| session.vm.as_deref() == Some(name))
+    let data_root = default_data_root();
+    collect_with(config, data_root.as_deref(), |session, _| {
+        session.vm.as_deref() == Some(name)
+    })
 }
 
 fn collect_for_project(config: &Config, project: &Path) -> BenchmarkReport {
-    collect_with(config, |session, _| {
+    let data_root = default_data_root();
+    collect_with(config, data_root.as_deref(), |session, _| {
         session
             .project
             .as_ref()
@@ -275,7 +285,11 @@ fn collect_for_project(config: &Config, project: &Path) -> BenchmarkReport {
     })
 }
 
-fn collect_with(config: &Config, keep: impl Fn(&SessionFile, &Path) -> bool) -> BenchmarkReport {
+fn collect_with(
+    config: &Config,
+    data_root: Option<&Path>,
+    keep: impl Fn(&SessionFile, &Path) -> bool,
+) -> BenchmarkReport {
     let mut notes = Vec::new();
     let sessions = session_costs(config, &mut notes, keep);
     let (vcpus, guest_memory_bytes, process_rss_bytes) = totals(config, &sessions);
@@ -289,11 +303,14 @@ fn collect_with(config: &Config, keep: impl Fn(&SessionFile, &Path) -> bool) -> 
 
     let disk = disk_costs(config);
     let disk_allocated_bytes = disk.iter().map(|cost| cost.allocated_bytes).sum();
+    let vm_disk = vm_disk_costs(config);
+    let vm_disk_allocated_bytes = vm_disk.iter().map(|vm| vm.allocated_bytes).sum();
+    let legacy_instances = legacy_instance_disk(config, data_root);
 
     if sessions.is_empty() {
         notes.push(
-            "no running VM session found; disk usage and the configured guest cost are \
-             reported instead"
+            "no running VM found; disk usage and the configured guest cost are reported \
+             instead"
                 .to_string(),
         );
     } else {
@@ -302,6 +319,14 @@ fn collect_with(config: &Config, keep: impl Fn(&SessionFile, &Path) -> bool) -> 
             human_bytes(guest_memory_bytes),
             sessions.len()
         ));
+    }
+    if legacy_instances.is_some() {
+        notes.push(
+            "legacy v1 instance directories are not active VMs and are not included in the \
+             disk total; verify they are unused, then remove them manually (hegn never \
+             deletes them)"
+                .to_string(),
+        );
     }
 
     BenchmarkReport {
@@ -316,6 +341,9 @@ fn collect_with(config: &Config, keep: impl Fn(&SessionFile, &Path) -> bool) -> 
         snapshot_estimate_bytes,
         disk,
         disk_allocated_bytes,
+        vm_disk,
+        vm_disk_allocated_bytes,
+        legacy_instances,
         notes,
     }
 }
@@ -369,7 +397,7 @@ fn note_other_instances(config: &Config, measured: &str, notes: &mut Vec<String>
         .count();
     if others > 0 {
         notes.push(format!(
-            "{others} other instance(es) are running; their RAM is not part of this report"
+            "{others} other VM(s) are running; their RAM is not part of this report"
         ));
     }
 }
@@ -580,7 +608,7 @@ fn disk_costs(config: &Config) -> Vec<DiskCost> {
         dirs.push(("images".to_string(), dir.to_path_buf(), None));
     }
     dirs.push(("snapshots".to_string(), config.snapshots_dir.clone(), None));
-    dirs.push(("instances".to_string(), config.vms_dir.clone(), None));
+    dirs.push(("VMs".to_string(), config.vms_dir.clone(), None));
     dirs.push(("logs".to_string(), logs.clone(), None));
     // Session logs live inside the state directory; do not count them twice.
     dirs.push(("state".to_string(), config.state_dir.clone(), Some(logs)));
@@ -603,6 +631,79 @@ fn disk_costs(config: &Config) -> Vec<DiskCost> {
             }
         })
         .collect()
+}
+
+/// Disk usage of every active VM directory below `vms_dir`.
+///
+/// Only direct child directories are VMs. v1 instance directories elsewhere
+/// are reported separately and never counted here.
+fn vm_disk_costs(config: &Config) -> Vec<VmDisk> {
+    let Ok(entries) = fs::read_dir(&config.vms_dir) else {
+        return Vec::new();
+    };
+    let mut vms = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        let usage = usage_excluding(&path, None);
+        vms.push(VmDisk {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            path,
+            allocated_bytes: usage.allocated,
+            apparent_bytes: usage.apparent,
+            files: usage.files,
+        });
+    }
+    vms.sort_by(|left, right| left.name.cmp(&right.name));
+    vms
+}
+
+/// Existing v1 instance directories that are not active VMs in v2.
+///
+/// v1 stored instances next to the snapshot root as `instances` and later
+/// `sandboxes`. The default data directory is checked too, so a custom
+/// `vms_dir` cannot hide the old default directories.
+fn legacy_instance_dirs(config: &Config, data_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(parent) = config.vms_dir.parent() {
+        candidates.push(parent.join("instances"));
+        candidates.push(parent.join("sandboxes"));
+    }
+    if let Some(root) = data_root {
+        candidates.push(root.join("instances"));
+        candidates.push(root.join("sandboxes"));
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates.retain(|path| path.is_dir() && !path.starts_with(&config.vms_dir));
+    candidates
+}
+
+/// Combined usage of the v1 instance directories, or `None` when there are
+/// none. This is read-only accounting; benchmark never removes them.
+fn legacy_instance_disk(config: &Config, data_root: Option<&Path>) -> Option<LegacyInstanceDisk> {
+    let paths = legacy_instance_dirs(config, data_root);
+    if paths.is_empty() {
+        return None;
+    }
+    let mut total = Usage::default();
+    for path in &paths {
+        let usage = usage_excluding(path, None);
+        total.allocated += usage.allocated;
+        total.apparent += usage.apparent;
+        total.files += usage.files;
+    }
+    Some(LegacyInstanceDisk {
+        paths,
+        allocated_bytes: total.allocated,
+        apparent_bytes: total.apparent,
+        files: total.files,
+    })
 }
 
 #[cfg(test)]
@@ -639,7 +740,7 @@ mod tests {
             ..Config::default()
         };
 
-        let report = collect(&config);
+        let report = collect_with(&config, None, |_, _| true);
         assert!(report.sessions.is_empty());
         assert_eq!(report.vcpus, 4);
         assert_eq!(report.guest_memory_bytes, 1024 * MIB);
@@ -650,6 +751,9 @@ mod tests {
                 .any(|note| note.contains("no running VM"))
         );
         assert!(report.disk.iter().any(|cost| cost.name == "images"));
+        assert!(report.disk.iter().any(|cost| cost.name == "VMs"));
+        assert!(report.vm_disk.is_empty());
+        assert!(report.legacy_instances.is_none());
     }
 
     #[test]
@@ -885,6 +989,119 @@ mod tests {
         assert!(
             running_sessions(&config).is_empty(),
             "the test process is not a Cloud Hypervisor"
+        );
+    }
+
+    #[test]
+    fn vm_disk_costs_reports_only_active_vm_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            vms_dir: dir.path().join("vms"),
+            ..Config::default()
+        };
+        for (name, bytes) in [("beta", 200usize), ("alpha", 100)] {
+            let vm = config.vms_dir.join(name);
+            fs::create_dir_all(&vm).unwrap();
+            fs::write(vm.join("rootfs.raw"), vec![0u8; bytes]).unwrap();
+        }
+        fs::write(config.vms_dir.join("vm-registry.toml"), b"not a VM").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("keep"), vec![0u8; 4096]).unwrap();
+        std::os::unix::fs::symlink(outside.path(), config.vms_dir.join("linked")).unwrap();
+
+        let vms = vm_disk_costs(&config);
+        let names = vms.iter().map(|vm| vm.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, ["alpha", "beta"], "sorted and directories only");
+        assert!(vms.iter().all(|vm| vm.files == 1));
+        assert!(
+            vms.iter().all(|vm| vm.path.starts_with(&config.vms_dir)),
+            "only active vms_dir children are VMs"
+        );
+    }
+
+    #[test]
+    fn legacy_instance_disk_is_separate_from_active_vms() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        let config = Config {
+            state_dir: dir.path().join("state"),
+            snapshots_dir: data_root.join("snapshots"),
+            vms_dir: data_root.join("vms"),
+            kernel_image: data_root.join("images/kernel"),
+            ..Config::default()
+        };
+        let active = config.vms_dir.join("demo");
+        fs::create_dir_all(&active).unwrap();
+        fs::write(active.join("rootfs.raw"), vec![0u8; 1024]).unwrap();
+        fs::create_dir_all(data_root.join("instances/old-a")).unwrap();
+        fs::write(
+            data_root.join("instances/old-a/rootfs.raw"),
+            vec![0u8; 2048],
+        )
+        .unwrap();
+        fs::create_dir_all(data_root.join("sandboxes/old-b")).unwrap();
+        fs::write(
+            data_root.join("sandboxes/old-b/rootfs.raw"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+
+        let vms = vm_disk_costs(&config);
+        assert_eq!(vms.len(), 1);
+        assert_eq!(vms[0].name, "demo");
+        assert!(
+            vms.iter()
+                .all(|vm| vm.name != "instances" && vm.name != "sandboxes"),
+            "legacy directories are not active VMs"
+        );
+
+        let legacy = legacy_instance_disk(&config, Some(&data_root)).expect("legacy dirs");
+        assert_eq!(
+            legacy.paths,
+            vec![data_root.join("instances"), data_root.join("sandboxes")]
+        );
+        assert_eq!(legacy.files, 2);
+        assert!(legacy.allocated_bytes >= 2048 + 4096);
+        assert!(legacy.apparent_bytes >= 2048 + 4096);
+
+        let report = collect_with(&config, Some(&data_root), |_, _| true);
+        assert_eq!(
+            report.vm_disk_allocated_bytes,
+            report
+                .vm_disk
+                .iter()
+                .map(|vm| vm.allocated_bytes)
+                .sum::<u64>()
+        );
+        assert_eq!(report.vm_disk.len(), 1);
+        assert!(report.legacy_instances.is_some());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("not active VMs")
+                    && note.contains("not included in the disk total")),
+            "{:?}",
+            report.notes
+        );
+    }
+
+    #[test]
+    fn legacy_instance_disk_is_absent_without_legacy_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        let config = Config {
+            vms_dir: data_root.join("vms"),
+            ..Config::default()
+        };
+
+        assert!(legacy_instance_disk(&config, Some(&data_root)).is_none());
+        let report = collect_with(&config, Some(&data_root), |_, _| true);
+        assert!(report.legacy_instances.is_none());
+        assert!(
+            !report.notes.iter().any(|note| note.contains("legacy v1")),
+            "{:?}",
+            report.notes
         );
     }
 }
