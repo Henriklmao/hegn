@@ -7,6 +7,7 @@ problems are solved by `hegn doctor --fix`.
 - [A project is not mounted](#a-project-is-not-mounted)
 - [Landlock is not active](#landlock-is-not-active)
 - [The guest has no network](#the-guest-has-no-network)
+- [Legacy v1 checks](#legacy-v1-checks)
 - [Where to find logs](#where-to-find-logs)
 
 ---
@@ -78,6 +79,25 @@ sudo hegn network setup --user "$USER"
 ```
 
 The full explanation is in [Networking](networking.md#troubleshooting-the-guest-has-no-network).
+
+---
+
+## Legacy v1 checks
+
+`hegn doctor` has four optional legacy findings:
+
+| Check | What it reports |
+| --- | --- |
+| `legacy instance dirs` | v1 instance directories that v2 ignores |
+| `legacy snapshots` | snapshots without a boot fingerprint; not restorable |
+| `legacy project keys` | `harness`, `packages` or `template` in a repo `hegn.toml` |
+| `deprecated config keys` | `instances_dir`, `shared_tag`, `guest_mount` and old aliases |
+
+These checks are marked `!` when they find something. They never make
+`hegn doctor` fail and never delete anything. Read the remediation line, verify
+the old state is unused, then remove it or rewrite the keys yourself. `hegn vm
+list` shows only active v2 VMs; `hegn snapshot list` marks legacy entries as
+`legacy`.
 
 ---
 

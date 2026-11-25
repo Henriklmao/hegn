@@ -194,16 +194,28 @@ host total                  421.3 MiB
 DISK           ALLOCATED    APPARENT   FILES  PATH
 images           2.1 GiB     2.2 GiB       4  /home/you/.local/share/hegn/images
 snapshots            0 B         0 B       0  /home/you/.local/share/hegn/snapshots
+VMs              1.9 GiB     2.0 GiB      12  /home/you/.local/share/hegn/vms
+  dev            1.9 GiB     2.0 GiB      12  /home/you/.local/share/hegn/vms/dev
 logs           116.0 KiB   105.2 KiB       4  /home/you/.local/state/hegn/logs
 state          184.0 KiB     4.1 MiB      16  /home/you/.local/state/hegn
-vms                    -           -       -  /home/you/.local/share/hegn/vms
-disk total       2.1 GiB
+legacy v1      300.0 MiB   320.0 MiB      42  /home/you/.local/share/hegn/instances
+disk total       4.0 GiB
 
 Notes:
 - guest RAM is populated on demand: 2 vCPU, 2.0 GiB configured
 ```
 
-A VM with several projects shows one `virtiofsd` row per member.
+The `VMs` row is the active `vms_dir`. Each valid v2 VM below it gets a subrow
+with its own name, allocated/apparent bytes and file count. A v1 instance
+directory is reported separately as `legacy v1`, with one or more paths, because
+it is not an active VM. `disk total` sums the active rows only; legacy v1 is
+excluded and hegn never removes it. A VM with several projects shows one
+`virtiofsd` row per member in the process section.
+
+For scripts, `--json` reports `sessions[]` (each with `vm`),
+`vm_disk[]` (per-VM usage), `vm_disk_allocated_bytes` (sum of active VMs),
+`legacy_instances` (paths and bytes, or `null`), and for `--clean` a `cleanup`
+object with `vm`, `vm_stopped` and `removed`.
 
 What the columns mean:
 

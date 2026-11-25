@@ -464,10 +464,11 @@ mismatch. `hegn images status` shows path, presence and size.
 `doctor::run(&config)` performs cheap blocking checks: Cloud Hypervisor,
 virtiofsd, git, lazygit (optional), `/dev/kvm`, Landlock (required when
 enabled), kernel image, rootfs image, projects root, logs dir (optional),
-backend, editor (optional), plus `images::status`. It also reports legacy v1
-instance directories, snapshot directories without a boot fingerprint, and
-obsolete repo `hegn.toml` keys, with a short remediation for each. Nothing
-legacy is deleted.
+backend, editor (optional), plus `images::status`. It also reports four
+optional legacy checks: `legacy instance dirs`, `legacy snapshots`, `legacy
+project keys` and `deprecated config keys`, with a short remediation for each.
+They are informational, are rendered with the `!` marker, never change the exit
+status, and never delete anything.
 
 A bare `virtiofsd_bin` is resolved through `PATH` and then the distribution
 install directories in `config::VIRTIOFSD_FALLBACKS`; the report names the

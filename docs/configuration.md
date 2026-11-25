@@ -111,8 +111,9 @@ The old one-project-per-VM keys still parse as aliases:
 | `guest_mount` | `guest_projects_base` |
 
 hegn prints a warning to stderr for each deprecated key found in `config.toml`.
-Read the values correctly, but rewrite the file with the new names. `vms_dir`
-must be an absolute path and must not contain a comma.
+`hegn doctor` also lists them as the optional `deprecated config keys` check
+(marked `!`). Read the values correctly, but rewrite the file with the new
+names. `vms_dir` must be an absolute path and must not contain a comma.
 
 `share_tag_prefix` must leave room for `-<index>` within the 36-byte virtio-fs
 tag limit and must not be the reserved profile tag `hegn-profile`.

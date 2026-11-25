@@ -262,6 +262,10 @@ hegn doctor --json       # machine-readable, one object per check
 logs` is optional. If `landlock` fails, the kernel is too old — do not disable
 the sandbox; report the kernel version.
 
+The optional legacy checks are `legacy instance dirs`, `legacy snapshots`,
+`legacy project keys` and `deprecated config keys`. They use the `!` marker when
+they find something, never change the exit status, and never delete state.
+
 ---
 
 ## Step 6 — Smoke test inside a real VM
