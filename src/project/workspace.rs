@@ -783,6 +783,22 @@ fn resolve_worktree_target(parent: &Path, name: &str, target: Option<&Path>) -> 
             parent.display()
         );
     }
+    // A worktree inside `.git` (the parent's own metadata or a nested repo's)
+    // would put tracked state somewhere git never expects a working tree.
+    let inside_git_metadata = resolved
+        .strip_prefix(parent)
+        .map(|relative| {
+            relative
+                .components()
+                .any(|component| component.as_os_str() == ".git")
+        })
+        .unwrap_or(false);
+    if inside_git_metadata {
+        bail!(
+            "worktree target {} must not live inside a .git directory",
+            resolved.display()
+        );
+    }
     Ok(resolved)
 }
 
@@ -1159,6 +1175,68 @@ mod tests {
         assert!(fixture.registry.get("wt").is_none());
         assert!(!parent.join(".hegn").exists());
         assert!(parent.join("README.md").is_file());
+    }
+
+    #[test]
+    fn worktree_rejects_targets_inside_git_metadata() {
+        let mut fixture = Fixture::new();
+        let parent = fixture.parent();
+        let service = WorkspaceService::new(&fixture.config, &fixture.vms);
+        let git_dir = parent.join(".git");
+        assert!(git_dir.is_dir());
+
+        let err = service
+            .fork_worktree(&mut fixture.registry, "parser", "wt", Some(&git_dir))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("must not live inside a .git directory"),
+            "{err}"
+        );
+
+        let err = service
+            .fork_worktree(
+                &mut fixture.registry,
+                "parser",
+                "wt",
+                Some(&git_dir.join("wt")),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("must not live inside a .git directory"),
+            "{err}"
+        );
+
+        // A nested repository's gitdir is refused as well.
+        let nested = parent.join("vendor/repo");
+        fs::create_dir_all(&nested).unwrap();
+        git_ok(&nested, &["init", "--quiet"]);
+        let err = service
+            .fork_worktree(
+                &mut fixture.registry,
+                "parser",
+                "wt",
+                Some(&nested.join(".git/wt")),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("must not live inside a .git directory"),
+            "{err}"
+        );
+
+        assert!(fixture.registry.get("wt").is_none());
+        assert!(!git_dir.join("wt").exists());
+        assert!(!nested.join(".git/wt").exists());
+
+        // An ordinary target inside the parent still works.
+        let inside = parent.join("experiments/inside-ok");
+        let worktree = service
+            .fork_worktree(&mut fixture.registry, "parser", "inside-ok", Some(&inside))
+            .unwrap();
+        assert_eq!(worktree.path, inside);
+        assert!(is_real_worktree(&parent, &worktree.path));
     }
 
     #[test]

@@ -403,10 +403,7 @@ impl ProjectRegistry {
             // display; it is not a worktree and is never nested in it. Only an
             // external project has no parent to name.
             if entry.kind == ProjectKind::External && entry.parent.is_some() {
-                bail!(
-                    "external project '{}' may only name a parent when it is a clone or worktree",
-                    entry.name
-                );
+                bail!("external project '{}' must not name a parent", entry.name);
             }
         }
         Ok(())
