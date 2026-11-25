@@ -144,7 +144,7 @@ pub fn delete_project(
     Ok(ProjectDeleteOutcome {
         files_deleted,
         // Removing a project never removes a VM.
-        instances: Vec::new(),
+        vms: Vec::new(),
     })
 }
 
@@ -178,7 +178,7 @@ pub fn delete_registered_project(
         forget_registered_project(config, &entry.path)?;
         return Ok(ProjectDeleteOutcome {
             files_deleted: false,
-            instances: Vec::new(),
+            vms: Vec::new(),
         });
     }
 
@@ -239,7 +239,7 @@ pub fn delete_registered_project(
     forget_registered_project(config, &canonical)?;
     Ok(ProjectDeleteOutcome {
         files_deleted: true,
-        instances: Vec::new(),
+        vms: Vec::new(),
     })
 }
 
@@ -534,7 +534,7 @@ mod tests {
 
         let outcome = delete_project(&config, &project, false).unwrap();
         assert!(!outcome.files_deleted);
-        assert!(outcome.instances.is_empty());
+        assert!(outcome.vms.is_empty());
         assert!(project.join("README.md").is_file());
 
         let store = crate::session::state::StateStore::load(config.state_dir.join("state.json"));
@@ -586,7 +586,7 @@ mod tests {
 
         let outcome = delete_project(&config, &project, true).unwrap();
         assert!(
-            outcome.instances.is_empty(),
+            outcome.vms.is_empty(),
             "deleting a project never deletes a VM"
         );
         assert!(outcome.files_deleted);

@@ -300,10 +300,10 @@ pub(super) fn handle_effects(
                     } else {
                         "files kept"
                     };
-                    let vms = if outcome.instances.is_empty() {
+                    let vms = if outcome.vms.is_empty() {
                         String::new()
                     } else {
-                        format!(" · removed {}", outcome.instances.join(", "))
+                        format!(" · removed {}", outcome.vms.join(", "))
                     };
                     app.toast(
                         format!("project {} deleted ({files}){vms}", project.display()),

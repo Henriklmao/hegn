@@ -8,7 +8,7 @@
 //! - [`registry`] — the private project-to-VM registry
 //! - [`create`] — creating a seeded project directory
 //! - [`import`] — importing existing directories as symlinks
-//! - [`delete`] — removing projects and their instances
+//! - [`delete`] — removing projects and their VMs
 //! - [`workspace`] — clone and worktree forks of a project
 
 mod assign;

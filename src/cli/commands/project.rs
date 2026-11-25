@@ -707,7 +707,7 @@ fn delete_registered_external(
                 "name": entry.name,
                 "kind": "external",
                 "files_deleted": outcome.files_deleted,
-                "instances": outcome.instances,
+                "vms": outcome.vms,
             }))?
         );
     } else if outcome.files_deleted {
@@ -832,7 +832,7 @@ fn delete_external_picker_entry(
                 "project": picker,
                 "kind": entry.kind,
                 "files_deleted": outcome.files_deleted,
-                "instances": outcome.instances,
+                "vms": outcome.vms,
             }))?
         );
     } else {

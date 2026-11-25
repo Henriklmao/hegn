@@ -110,6 +110,6 @@ pub struct ProjectDeleteOutcome {
     /// True when a real project directory was deleted. Import links and
     /// kept directories leave the original files on disk.
     pub files_deleted: bool,
-    /// Instances that were stopped and removed with the project.
-    pub instances: Vec<String>,
+    /// VMs that were stopped and removed with the project.
+    pub vms: Vec<String>,
 }
