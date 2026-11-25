@@ -33,6 +33,11 @@ jobs:
     - name: Cache cargo
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+    - name: Set a git identity for per-commit tests
+      run: |
+        git config --global user.name "hegn CI"
+        git config --global user.email "ci@example.com"
+
     - name: Run checks and tests on each commit
       run: |
         ORIGINAL_SHA=$(git rev-parse HEAD)
