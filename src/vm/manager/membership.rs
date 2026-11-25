@@ -5,6 +5,7 @@
 //! changed while the VM was running, and a future restore can reject a
 //! snapshot whose device tree no longer matches.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -14,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::project::ProjectKind;
+use crate::security::GuestWorkspacePolicy;
 
 use super::plan::BootPlan;
 
@@ -140,6 +142,74 @@ impl MembershipManifest {
             .map(|member| member.path.as_path())
             .collect()
     }
+
+    /// Derive the guest workspace roots from the recorded membership.
+    ///
+    /// `base` is the configured `guest_projects_base` the VM was booted with.
+    /// Each recorded `guest_path` must be exactly `<base>/<slug>`; a manifest
+    /// written under a different base is rejected instead of classifying a
+    /// live VM against paths it does not mount. `/workspace` always follows the
+    /// recorded primary member and inherits its read-only flag.
+    ///
+    /// The manifest does not store slugs separately, so the slug is the single
+    /// component below `base`. Nested or foreign paths and an empty or unknown
+    /// primary are hard errors: a running VM must never fall back to a policy
+    /// that guards the wrong roots.
+    pub fn workspace_policy(&self, base: &str) -> Result<GuestWorkspacePolicy> {
+        if self.members.is_empty() {
+            bail!(
+                "membership manifest for VM '{}' records no exported members",
+                self.vm
+            );
+        }
+        let mut policy = GuestWorkspacePolicy::new(base).with_context(|| {
+            format!(
+                "invalid guest projects base {base:?} for VM '{}' membership",
+                self.vm
+            )
+        })?;
+        let base = policy.base().to_string();
+        let prefix = format!("{base}/");
+        let mut names = HashSet::new();
+        let mut primary_slug = None;
+        for member in &self.members {
+            if !names.insert(member.name.as_str()) {
+                bail!(
+                    "membership manifest for VM '{}' records duplicate project '{}'",
+                    self.vm,
+                    member.name
+                );
+            }
+            let slug = member
+                .guest_path
+                .strip_prefix(&prefix)
+                .filter(|slug| !slug.is_empty() && !slug.contains('/'))
+                .with_context(|| {
+                    format!(
+                        "membership member '{}' guest path {} is not a direct mount below {base}",
+                        member.name, member.guest_path
+                    )
+                })?;
+            policy.add_member(slug, member.read_only).with_context(|| {
+                format!(
+                    "invalid guest workspace membership for project '{}'",
+                    member.name
+                )
+            })?;
+            if member.name == self.primary {
+                primary_slug = Some(slug.to_string());
+            }
+        }
+        let primary = primary_slug.with_context(|| {
+            format!(
+                "membership manifest for VM '{}' names primary project '{}' which is not an \
+                 exported member",
+                self.vm, self.primary
+            )
+        })?;
+        policy.set_primary(&primary)?;
+        Ok(policy)
+    }
 }
 
 #[cfg(test)]
@@ -218,5 +288,112 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no VM membership manifest"), "{err}");
+    }
+
+    #[test]
+    fn workspace_policy_matches_recorded_members_and_primary() {
+        let policy = manifest().workspace_policy("/projects").unwrap();
+        assert_eq!(policy.base(), "/projects");
+        assert_eq!(policy.primary(), Some("parser"));
+        assert_eq!(
+            policy.roots(),
+            vec!["/projects/cli", "/projects/parser", "/workspace"]
+        );
+        assert!(policy.contains("/projects/parser/src"));
+        assert!(policy.contains("/projects/cli/.env"));
+        assert!(policy.is_read_only_root("/projects/cli"));
+        assert!(!policy.is_read_only_root("/projects/parser"));
+        assert!(!policy.is_read_only_root("/workspace"));
+        assert!(!policy.contains("/projects/parser-other"));
+        assert!(!policy.contains("/projects/parser2"));
+        assert!(!policy.contains("/projects"));
+    }
+
+    #[test]
+    fn workspace_policy_follows_a_read_only_primary() {
+        let mut manifest = manifest();
+        manifest.primary = "cli".into();
+        let policy = manifest.workspace_policy("/projects").unwrap();
+        assert_eq!(policy.primary(), Some("cli"));
+        assert!(policy.is_read_only_root("/workspace"));
+        assert!(policy.is_read_only_root("/workspace/src"));
+    }
+
+    #[test]
+    fn workspace_policy_rejects_an_empty_manifest() {
+        let mut manifest = manifest();
+        manifest.members.clear();
+        let err = manifest
+            .workspace_policy("/projects")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no exported members"), "{err}");
+    }
+
+    #[test]
+    fn workspace_policy_rejects_an_unknown_or_legacy_primary() {
+        let mut unknown = manifest();
+        unknown.primary = "missing".into();
+        let err = unknown
+            .workspace_policy("/projects")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an exported member"), "{err}");
+        assert!(err.contains("missing"), "{err}");
+
+        let mut legacy = manifest();
+        legacy.primary = String::new();
+        let err = legacy
+            .workspace_policy("/projects")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an exported member"), "{err}");
+    }
+
+    #[test]
+    fn workspace_policy_rejects_foreign_nested_and_duplicate_members() {
+        for guest_path in [
+            "/elsewhere/parser",
+            "/projects",
+            "/projects/",
+            "/projects/nested/parser",
+            "/projects/parser/..",
+        ] {
+            let mut manifest = manifest();
+            manifest.members[0].guest_path = guest_path.into();
+            let err = manifest
+                .workspace_policy("/projects")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not a direct mount"), "{guest_path:?}: {err}");
+        }
+
+        let mut duplicate_slug = manifest();
+        duplicate_slug.members[1].guest_path = "/projects/parser".into();
+        let err = format!(
+            "{:#}",
+            duplicate_slug.workspace_policy("/projects").unwrap_err()
+        );
+        assert!(
+            err.contains("duplicate") || err.contains("Duplicate"),
+            "{err}"
+        );
+
+        let mut duplicate_name = manifest();
+        duplicate_name.members[1].name = "parser".into();
+        let err = duplicate_name
+            .workspace_policy("/projects")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate project"), "{err}");
+    }
+
+    #[test]
+    fn workspace_policy_rejects_a_manifest_written_under_another_base() {
+        let err = manifest()
+            .workspace_policy("/legacy-workspace")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a direct mount"), "{err}");
     }
 }
