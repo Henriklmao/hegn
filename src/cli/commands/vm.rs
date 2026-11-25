@@ -203,6 +203,7 @@ pub(crate) fn vm_command(command: VmCommands, config: Config, json: bool) -> Res
             }
             if !yes
                 && !confirm(
+                    json,
                     &format!(
                         "Delete the private rootfs of VM '{}'? Guest-installed tools are lost.",
                         vm.name
@@ -353,6 +354,7 @@ pub(crate) fn vm_command(command: VmCommands, config: Config, json: bool) -> Res
             let vm = registry.store().load(&name)?;
             if !yes
                 && !confirm(
+                    json,
                     &format!(
                         "Delete VM '{}'? Its projects are unassigned, never deleted.",
                         vm.name
@@ -604,10 +606,13 @@ pub(crate) fn only_running_vm(registry: &VmRegistry) -> Result<VmConfig> {
 }
 
 /// Ask a yes/no question on a terminal. Non-interactive callers must pass the
-/// command's explicit confirmation flag.
-pub(crate) fn confirm(question: &str, hint: &str) -> Result<bool> {
+/// command's explicit confirmation flag; `--json` is always non-interactive.
+pub(crate) fn confirm(json: bool, question: &str, hint: &str) -> Result<bool> {
     use std::io::BufRead;
 
+    if json {
+        bail!("confirmation required; pass {hint} in non-interactive mode");
+    }
     if !std::io::stdin().is_terminal() {
         bail!("confirmation required; pass {hint} in non-interactive mode");
     }
@@ -622,8 +627,8 @@ pub(crate) fn confirm(question: &str, hint: &str) -> Result<bool> {
 }
 
 /// Shared by `project delete`, which also needs a file policy flag.
-pub(crate) fn prompt_yes(question: &str) -> Result<bool> {
-    confirm(question, "--yes and a file policy flag")
+pub(crate) fn prompt_yes(json: bool, question: &str) -> Result<bool> {
+    confirm(json, question, "--yes and a file policy flag")
 }
 
 /// Prefix a guest command with a `cd` into an exported project directory.
@@ -745,6 +750,30 @@ mod tests {
             guest_cwd_command("/projects/a b", Some("printf '%s' \"x\"")),
             "cd '/projects/a b' && printf '%s' \"x\""
         );
+    }
+
+    #[test]
+    fn vm_delete_without_yes_fails_closed_in_json_mode() {
+        let (_dir, config) = config();
+        VmStore::new(&config)
+            .save(&VmConfig::from_config(
+                &config,
+                "rust",
+                Some(Harness::Shell),
+            ))
+            .unwrap();
+        let err = vm_command(
+            VmCommands::Delete {
+                name: "rust".into(),
+                yes: false,
+                delete_files: false,
+            },
+            config,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--yes"), "{err}");
     }
 
     #[test]

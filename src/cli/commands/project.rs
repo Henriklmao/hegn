@@ -498,10 +498,13 @@ fn select_vm_for_new_project(
         ));
     }
     if should_prompt(json) {
-        if prompt_yes(&format!(
-            "Create a one-member VM named '{}' for this project?",
-            entry.name
-        ))? {
+        if prompt_yes(
+            json,
+            &format!(
+                "Create a one-member VM named '{}' for this project?",
+                entry.name
+            ),
+        )? {
             return Ok(Some(
                 VmRegistry::new(config.clone()).ensure_for_project(&entry.path, harness)?,
             ));
@@ -571,6 +574,7 @@ fn delete_project_command(
             print_project_git(&entry.path, &info, json);
             if !yes
                 && !confirm(
+                    json,
                     &format!(
                         "Delete managed clone '{}' at {}?",
                         entry.name,
@@ -611,6 +615,7 @@ fn delete_project_command(
             print_project_git(&entry.path, &info, json);
             if !yes
                 && !confirm(
+                    json,
                     &format!(
                         "Remove git worktree '{}' at {}? The parent project stays.",
                         entry.name,
@@ -681,10 +686,13 @@ fn delete_registered_external(
     let is_import_link = registered_import_link(config, entry);
     let is_direct_child = registered_direct_child(config, entry);
     if !yes
-        && !prompt_yes(&format!(
-            "Remove project '{}' from hegn? Its VM is never deleted.",
-            entry.name
-        ))?
+        && !prompt_yes(
+            json,
+            &format!(
+                "Remove project '{}' from hegn? Its VM is never deleted.",
+                entry.name
+            ),
+        )?
     {
         println!("Cancelled.");
         return Ok(0);
@@ -694,10 +702,10 @@ fn delete_registered_external(
     } else if keep_files {
         false
     } else if should_prompt(json) {
-        prompt_yes(&format!(
-            "Also delete the project files at {}?",
-            entry.path.display()
-        ))?
+        prompt_yes(
+            json,
+            &format!("Also delete the project files at {}?", entry.path.display()),
+        )?
     } else {
         bail!("choose --delete-files or --keep-files in non-interactive mode");
     };
@@ -808,10 +816,13 @@ fn delete_external_picker_entry(
     json: bool,
 ) -> Result<i32> {
     if !yes
-        && !prompt_yes(&format!(
-            "Remove project '{}' from the picker? Its VM is never deleted.",
-            info.name
-        ))?
+        && !prompt_yes(
+            json,
+            &format!(
+                "Remove project '{}' from the picker? Its VM is never deleted.",
+                info.name
+            ),
+        )?
     {
         return Ok(0);
     }
@@ -820,10 +831,10 @@ fn delete_external_picker_entry(
     } else if keep_files {
         false
     } else if should_prompt(json) {
-        prompt_yes(&format!(
-            "Also delete the project files at {}?",
-            picker.display()
-        ))?
+        prompt_yes(
+            json,
+            &format!("Also delete the project files at {}?", picker.display()),
+        )?
     } else {
         bail!("choose --delete-files or --keep-files in non-interactive mode");
     };
@@ -999,6 +1010,27 @@ mod tests {
         .to_string();
         assert!(err.contains("--delete-files"), "{err}");
         assert!(err.contains("--keep-files"), "{err}");
+    }
+
+    #[test]
+    fn project_delete_without_yes_fails_closed_in_json_mode() {
+        // This is the gate that used to prompt on a TTY even with `--json`.
+        let (_dir, config) = config();
+        let project = config.projects_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let err = project_command(
+            ProjectCommands::Delete {
+                project: "demo".into(),
+                delete_files: false,
+                keep_files: false,
+                yes: false,
+            },
+            config,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--yes"), "{err}");
     }
 
     #[test]
