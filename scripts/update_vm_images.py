@@ -19,6 +19,7 @@ import hashlib
 import json
 import re
 import sys
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,15 @@ KERNEL_NAMES = {"x86_64": "vmlinux-x86_64", "aarch64": "Image-arm64"}
 ROOTFS_PREFIX = {"x86_64": "jammy-server-cloudimg-amd64-custom-", "aarch64": "jammy-server-cloudimg-arm64-custom-"}
 ROOTFS_SUFFIX = {"x86_64": ".qcow2", "aarch64": ".raw"}
 ROOTFS_FORMAT = {"x86_64": "Qcow2", "aarch64": "Raw"}
+ALLOWED_URL_HOSTS = frozenset(
+    {
+        "github.com",
+        "api.github.com",
+        "raw.githubusercontent.com",
+        "ch-images.azureedge.net",
+        "objects.githubusercontent.com",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -50,9 +60,44 @@ def log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+def safe_url(url: str) -> str:
+    """Validate an upstream URL before it is handed to urllib.
+
+    Only ``https`` is accepted; credentials and fragments are rejected; and the
+    host must be on the explicit allowlist. Returns the URL unchanged so callers
+    can validate inline. Final response URLs (after redirects) are checked with
+    the same helper.
+    """
+    if not isinstance(url, str) or not url:
+        raise SystemExit(f"refusing invalid URL {url!r}")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https":
+        raise SystemExit(f"refusing non-HTTPS URL {url}")
+    if parts.username is not None or parts.password is not None:
+        raise SystemExit(f"refusing URL with credentials {url}")
+    if parts.fragment:
+        raise SystemExit(f"refusing URL with fragment {url}")
+    host = parts.hostname
+    if not host or host not in ALLOWED_URL_HOSTS:
+        raise SystemExit(f"refusing URL with disallowed host {url}")
+    return url
+
+
+def checked_response(response) -> None:
+    """Re-validate the URL urllib actually connected to (redirect target)."""
+    final = response.geturl()
+    if final:
+        safe_url(final)
+
+
 def fetch_text(url: str) -> str:
+    url = safe_url(url)
     request = urllib.request.Request(url, headers={"User-Agent": "hegn-vm-images"})
-    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+    # safe_url enforces https, rejects credentials/fragments, and limits the host.
+    with urllib.request.urlopen(  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+        request, timeout=TIMEOUT
+    ) as response:
+        checked_response(response)
         return response.read().decode("utf-8", "replace")
 
 
@@ -77,9 +122,13 @@ def parse_assets(text: str) -> list[dict[str, str]]:
 
 def linux_release() -> tuple[str, list[dict]]:
     request = urllib.request.Request(
-        LINUX_RELEASES_URL, headers={"User-Agent": "hegn-vm-images"}
+        safe_url(LINUX_RELEASES_URL), headers={"User-Agent": "hegn-vm-images"}
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
+    # safe_url enforces https, rejects credentials/fragments, and limits the host.
+    with urllib.request.urlopen(  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+        request, timeout=60
+    ) as response:
+        checked_response(response)
         release = json.load(response)
     return release["tag_name"], release.get("assets", [])
 
@@ -126,8 +175,13 @@ def extract_version(filename: str) -> str:
 def download_and_hash(url: str) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
+    url = safe_url(url)
     request = urllib.request.Request(url, headers={"User-Agent": "hegn-vm-images"})
-    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+    # safe_url enforces https, rejects credentials/fragments, and limits the host.
+    with urllib.request.urlopen(  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+        request, timeout=TIMEOUT
+    ) as response:
+        checked_response(response)
         while True:
             chunk = response.read(1024 * 1024)
             if not chunk:
