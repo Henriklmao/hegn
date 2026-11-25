@@ -37,6 +37,10 @@ use crate::agent::launch::LaunchConfig;
 
 use self::tools::{alternate_cloud_hypervisor_name, resolve_binary};
 
+/// One warning replacing both the generic deprecation notice and a validation
+/// failure for the legacy `guest_mount = "/workspace"` default.
+const GUEST_MOUNT_MIGRATION_WARNING: &str = r#"warning: legacy guest_mount = "/workspace" is reserved for the primary /workspace symlink; using guest_projects_base = "/projects" instead. Set guest_projects_base explicitly to silence this warning."#;
+
 /// User configuration, loaded from `~/.config/hegn/config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -142,17 +146,26 @@ impl Config {
     /// `HEGN_KERNEL_IMAGE` and `HEGN_ROOTFS_IMAGE`.
     ///
     /// Deprecated keys (`instances_dir`, `shared_tag`, `guest_mount`) still
-    /// parse, but each one used in the file prints a warning to stderr.
+    /// parse, but each one used in the file prints a warning to stderr. The
+    /// legacy `guest_mount = "/workspace"` form is migrated to the new default
+    /// with a single specific warning instead of the generic deprecation one.
     pub fn load() -> Result<Self> {
         let path = Self::config_path();
         let mut config = if path.exists() {
             let raw = fs::read_to_string(&path)
                 .with_context(|| format!("failed to read config {}", path.display()))?;
+            let (config, migrated) = Self::parse_with_migration(&path, &raw)?;
             for key in deprecated_keys(&raw) {
+                if migrated && key == "guest_mount" {
+                    continue;
+                }
                 let replacement = self::deprecated::replacement(key);
                 eprintln!("warning: config key `{key}` is deprecated; use `{replacement}` instead");
             }
-            Self::parse_at(&path, &raw)?
+            if migrated {
+                eprintln!("{GUEST_MOUNT_MIGRATION_WARNING}");
+            }
+            config
         } else {
             Self::default()
         };
@@ -169,7 +182,26 @@ impl Config {
     }
 
     fn parse_at(path: &Path, raw: &str) -> Result<Self> {
-        toml::from_str(raw).with_context(|| format!("failed to parse config {}", path.display()))
+        Ok(Self::parse_with_migration(path, raw)?.0)
+    }
+
+    /// Parse `raw` and migrate the legacy `guest_mount = "/workspace"` form.
+    ///
+    /// `/workspace` is reserved for the primary-project symlink, but older
+    /// hegn versions used it as the default projects base. A file that still
+    /// says `guest_mount = "/workspace"` therefore means the old default, not
+    /// a request to mount projects below the symlink, and is rewritten to the
+    /// current default. An explicit `guest_projects_base = "/workspace"` is not
+    /// migrated and still fails validation.
+    fn parse_with_migration(path: &Path, raw: &str) -> Result<(Self, bool)> {
+        let mut config: Self = toml::from_str(raw)
+            .with_context(|| format!("failed to parse config {}", path.display()))?;
+        let migrated = config.guest_projects_base == crate::security::WORKSPACE_GUEST_PATH
+            && deprecated_keys(raw).contains(&"guest_mount");
+        if migrated {
+            config.guest_projects_base = crate::security::DEFAULT_GUEST_PROJECTS_BASE.to_string();
+        }
+        Ok((config, migrated))
     }
 
     /// Create runtime and config directories. Safe to call repeatedly.
@@ -537,9 +569,49 @@ guest_mount = "/legacy-workspace"
         assert_eq!(config.vms_dir, PathBuf::from("/data/legacy-instances"));
         assert_eq!(config.share_tag_prefix, "legacy-tag");
         assert_eq!(config.guest_projects_base, "/legacy-workspace");
+        assert!(config.validate().is_ok());
         assert_eq!(
             deprecated_keys(&raw),
             vec!["instances_dir", "shared_tag", "guest_mount"]
+        );
+    }
+
+    #[test]
+    fn legacy_guest_mount_workspace_migrates_to_the_new_default() {
+        let (_dir, path) = temp_config("guest_mount = \"/workspace\"\n");
+        let raw = fs::read_to_string(&path).unwrap();
+        let config = Config::load_from(&path).unwrap();
+
+        assert_eq!(config.guest_projects_base, "/projects");
+        assert!(config.validate().is_ok());
+        assert_eq!(deprecated_keys(&raw), vec!["guest_mount"]);
+    }
+
+    #[test]
+    fn new_guest_projects_base_workspace_is_not_migrated() {
+        let (_dir, path) = temp_config("guest_projects_base = \"/workspace\"\n");
+        let raw = fs::read_to_string(&path).unwrap();
+        let config = Config::load_from(&path).unwrap();
+
+        assert_eq!(config.guest_projects_base, "/workspace");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("reserved"), "{err}");
+        assert!(deprecated_keys(&raw).is_empty());
+    }
+
+    #[test]
+    fn new_guest_projects_base_is_not_rewritten() {
+        let (_dir, path) = temp_config("guest_projects_base = \"/custom-base\"\n");
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.guest_projects_base, "/custom-base");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn workspace_migration_warning_names_the_old_and_new_values() {
+        assert_eq!(
+            GUEST_MOUNT_MIGRATION_WARNING,
+            r#"warning: legacy guest_mount = "/workspace" is reserved for the primary /workspace symlink; using guest_projects_base = "/projects" instead. Set guest_projects_base explicitly to silence this warning."#
         );
     }
 
