@@ -543,17 +543,20 @@ fn build_session(
     }
 }
 
-/// Candidate `session.json` paths: the instance-scoped layout and the legacy
-/// `state_dir/run` layout.
+/// Candidate `session.json` paths for active v2 VMs.
+///
+/// Only `<vms_dir>/<vm>/run/session.json` for directories with a regular
+/// `vm.toml` is accepted. The v1 `state_dir/run` layout and v1 instance
+/// directories are never candidates.
 fn session_candidates(config: &Config) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    let legacy = config.state_dir.join("run").join("session.json");
-    if legacy.is_file() {
-        paths.push(legacy);
-    }
     if let Ok(entries) = fs::read_dir(&config.vms_dir) {
         for entry in entries.flatten() {
-            let candidate = entry.path().join("run").join("session.json");
+            let path = entry.path();
+            if !is_v2_vm_dir(&path) {
+                continue;
+            }
+            let candidate = path.join("run").join("session.json");
             if candidate.is_file() {
                 paths.push(candidate);
             }
@@ -635,8 +638,8 @@ fn disk_costs(config: &Config) -> Vec<DiskCost> {
 
 /// Disk usage of every active VM directory below `vms_dir`.
 ///
-/// Only direct child directories are VMs. v1 instance directories elsewhere
-/// are reported separately and never counted here.
+/// Only real child directories with a regular `vm.toml` are VMs. v1 instance
+/// directories elsewhere are reported separately and never counted here.
 fn vm_disk_costs(config: &Config) -> Vec<VmDisk> {
     let Ok(entries) = fs::read_dir(&config.vms_dir) else {
         return Vec::new();
@@ -644,10 +647,7 @@ fn vm_disk_costs(config: &Config) -> Vec<VmDisk> {
     let mut vms = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !metadata.file_type().is_dir() {
+        if !is_v2_vm_dir(&path) {
             continue;
         }
         let usage = usage_excluding(&path, None);
@@ -663,24 +663,60 @@ fn vm_disk_costs(config: &Config) -> Vec<VmDisk> {
     vms
 }
 
+/// A real directory with a regular `vm.toml` is an active v2 VM.
+fn is_v2_vm_dir(path: &Path) -> bool {
+    is_real_dir(path) && is_regular_file(&path.join(crate::vm::config::VM_CONFIG_FILE))
+}
+
+/// A real directory; symlinks are never VMs or legacy state.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// A regular file; a symlinked marker does not make a directory a VM.
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Existing v1 instance directories that are not active VMs in v2.
 ///
 /// v1 stored instances next to the snapshot root as `instances` and later
 /// `sandboxes`. The default data directory is checked too, so a custom
-/// `vms_dir` cannot hide the old default directories.
+/// `vms_dir` cannot hide the old default directories. A reused `vms_dir` may
+/// also contain v1 instances directly; a v2 VM has `vm.toml`, a v1 instance
+/// has `hegn.toml` instead.
 fn legacy_instance_dirs(config: &Config, data_root: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    let mut siblings = Vec::new();
     if let Some(parent) = config.vms_dir.parent() {
-        candidates.push(parent.join("instances"));
-        candidates.push(parent.join("sandboxes"));
+        siblings.push(parent.join("instances"));
+        siblings.push(parent.join("sandboxes"));
     }
     if let Some(root) = data_root {
-        candidates.push(root.join("instances"));
-        candidates.push(root.join("sandboxes"));
+        siblings.push(root.join("instances"));
+        siblings.push(root.join("sandboxes"));
     }
+    candidates.extend(siblings.into_iter().filter(|path| {
+        path != &config.vms_dir
+            && !path.starts_with(&config.vms_dir)
+            && !config.vms_dir.starts_with(path)
+    }));
+
+    if let Ok(entries) = fs::read_dir(&config.vms_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_real_dir(&path)
+                && is_regular_file(&path.join(crate::project::PROJECT_META_FILE))
+                && !is_regular_file(&path.join(crate::vm::config::VM_CONFIG_FILE))
+            {
+                candidates.push(path);
+            }
+        }
+    }
+
+    candidates.retain(|path| is_real_dir(path));
     candidates.sort();
     candidates.dedup();
-    candidates.retain(|path| path.is_dir() && !path.starts_with(&config.vms_dir));
     candidates
 }
 
@@ -711,7 +747,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_candidates_cover_the_instance_layout() {
+    fn session_candidates_cover_the_vm_layout() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
@@ -720,6 +756,7 @@ mod tests {
         };
 
         fs::create_dir_all(config.vms_dir.join("a/run")).unwrap();
+        fs::write(config.vms_dir.join("a/vm.toml"), b"version = 2\n").unwrap();
         fs::write(config.vms_dir.join("a/run/session.json"), b"{}").unwrap();
 
         let candidates = session_candidates(&config);
@@ -844,33 +881,57 @@ mod tests {
     }
 
     #[test]
-    fn session_candidates_include_the_legacy_layout_in_sorted_order() {
+    fn session_candidates_skip_v1_layouts_with_live_pids() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            vms_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("vms"),
             ..Config::default()
         };
-        for instance in ["b", "a"] {
-            fs::create_dir_all(config.vms_dir.join(instance).join("run")).unwrap();
-            fs::write(
-                config.vms_dir.join(instance).join("run/session.json"),
-                b"{}",
-            )
-            .unwrap();
-        }
+        let session = serde_json::json!({
+            "project": dir.path().join("project"),
+            "instance": "old",
+            "started_at": "2026-01-01T00:00:00Z",
+            "vm_pid": std::process::id(),
+            "relay_pid": 0,
+            "virtiofs_pid": 0,
+        });
+
+        // A v1 instance left inside the reused vms_dir.
+        let v1_child = config.vms_dir.join("old");
+        fs::create_dir_all(v1_child.join("run")).unwrap();
+        fs::write(v1_child.join("hegn.toml"), "harness = \"shell\"\n").unwrap();
+        fs::write(
+            v1_child.join("run/session.json"),
+            serde_json::to_vec(&session).unwrap(),
+        )
+        .unwrap();
+
+        // The legacy single-session layout directly under state_dir.
         fs::create_dir_all(config.state_dir.join("run")).unwrap();
-        fs::write(config.state_dir.join("run/session.json"), b"{}").unwrap();
+        fs::write(
+            config.state_dir.join("run/session.json"),
+            serde_json::to_vec(&session).unwrap(),
+        )
+        .unwrap();
+
+        // A real v2 VM is still discovered.
+        let v2 = config.vms_dir.join("current");
+        fs::create_dir_all(v2.join("run")).unwrap();
+        fs::write(v2.join("vm.toml"), b"version = 2\n").unwrap();
+        fs::write(v2.join("run/session.json"), b"{}").unwrap();
 
         let candidates = session_candidates(&config);
-        assert_eq!(candidates.len(), 3);
-        let mut sorted = candidates.clone();
-        sorted.sort();
-        assert_eq!(candidates, sorted);
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            candidates[0].ends_with("vms/current/run/session.json"),
+            "{candidates:?}"
+        );
         assert!(
             candidates
                 .iter()
-                .any(|path| path.ends_with("instances/a/run/session.json"))
+                .all(|path| !path.ends_with("run/session.json") || path.starts_with(&v2)),
+            "v1 sessions with a live pid are never candidates: {candidates:?}"
         );
     }
 
@@ -883,6 +944,7 @@ mod tests {
             ..Config::default()
         };
         fs::create_dir_all(config.vms_dir.join("a/run")).unwrap();
+        fs::write(config.vms_dir.join("a/vm.toml"), b"version = 2\n").unwrap();
         fs::write(config.vms_dir.join("a/run/session.json"), b"{not json").unwrap();
 
         let mut notes = Vec::new();
@@ -967,13 +1029,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            vms_dir: dir.path().join("data/instances"),
+            vms_dir: dir.path().join("data/vms"),
             ..Config::default()
         };
-        fs::create_dir_all(config.state_dir.join("run")).unwrap();
+        let vm = config.vms_dir.join("demo");
+        fs::create_dir_all(vm.join("run")).unwrap();
+        fs::write(vm.join("vm.toml"), b"version = 2\n").unwrap();
         let session = serde_json::json!({
             "project": dir.path().join("project"),
-            "instance": "demo",
+            "vm": "demo",
             "harness": "shell",
             "started_at": "2026-01-01T00:00:00Z",
             "vm_pid": std::process::id(),
@@ -981,7 +1045,7 @@ mod tests {
             "relay_pid": 0,
         });
         fs::write(
-            config.state_dir.join("run/session.json"),
+            vm.join("run/session.json"),
             serde_json::to_vec(&session).unwrap(),
         )
         .unwrap();
@@ -1002,17 +1066,21 @@ mod tests {
         for (name, bytes) in [("beta", 200usize), ("alpha", 100)] {
             let vm = config.vms_dir.join(name);
             fs::create_dir_all(&vm).unwrap();
+            fs::write(vm.join("vm.toml"), b"version = 2\n").unwrap();
             fs::write(vm.join("rootfs.raw"), vec![0u8; bytes]).unwrap();
         }
+        // A stray directory without vm.toml is not a VM.
+        fs::create_dir_all(config.vms_dir.join("stray")).unwrap();
         fs::write(config.vms_dir.join("vm-registry.toml"), b"not a VM").unwrap();
         let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("vm.toml"), b"version = 2\n").unwrap();
         fs::write(outside.path().join("keep"), vec![0u8; 4096]).unwrap();
         std::os::unix::fs::symlink(outside.path(), config.vms_dir.join("linked")).unwrap();
 
         let vms = vm_disk_costs(&config);
         let names = vms.iter().map(|vm| vm.name.as_str()).collect::<Vec<_>>();
-        assert_eq!(names, ["alpha", "beta"], "sorted and directories only");
-        assert!(vms.iter().all(|vm| vm.files == 1));
+        assert_eq!(names, ["alpha", "beta"], "sorted and v2 directories only");
+        assert!(vms.iter().all(|vm| vm.files == 2));
         assert!(
             vms.iter().all(|vm| vm.path.starts_with(&config.vms_dir)),
             "only active vms_dir children are VMs"
@@ -1032,6 +1100,7 @@ mod tests {
         };
         let active = config.vms_dir.join("demo");
         fs::create_dir_all(&active).unwrap();
+        fs::write(active.join("vm.toml"), b"version = 2\n").unwrap();
         fs::write(active.join("rootfs.raw"), vec![0u8; 1024]).unwrap();
         fs::create_dir_all(data_root.join("instances/old-a")).unwrap();
         fs::write(
@@ -1045,6 +1114,11 @@ mod tests {
             vec![0u8; 4096],
         )
         .unwrap();
+        // A v1 instance left inside the reused vms_dir.
+        let old_child = config.vms_dir.join("old-c");
+        fs::create_dir_all(&old_child).unwrap();
+        fs::write(old_child.join("hegn.toml"), "harness = \"shell\"\n").unwrap();
+        fs::write(old_child.join("rootfs.raw"), vec![0u8; 512]).unwrap();
 
         let vms = vm_disk_costs(&config);
         assert_eq!(vms.len(), 1);
@@ -1052,17 +1126,25 @@ mod tests {
         assert!(
             vms.iter()
                 .all(|vm| vm.name != "instances" && vm.name != "sandboxes"),
-            "legacy directories are not active VMs"
+            "legacy sibling directories are not active VMs"
+        );
+        assert!(
+            vms.iter().all(|vm| vm.name != "old-c"),
+            "a v1 child inside vms_dir is not an active VM"
         );
 
         let legacy = legacy_instance_disk(&config, Some(&data_root)).expect("legacy dirs");
         assert_eq!(
             legacy.paths,
-            vec![data_root.join("instances"), data_root.join("sandboxes")]
+            vec![
+                data_root.join("instances"),
+                data_root.join("sandboxes"),
+                old_child.clone()
+            ]
         );
-        assert_eq!(legacy.files, 2);
-        assert!(legacy.allocated_bytes >= 2048 + 4096);
-        assert!(legacy.apparent_bytes >= 2048 + 4096);
+        assert_eq!(legacy.files, 4);
+        assert!(legacy.allocated_bytes >= 2048 + 4096 + 512);
+        assert!(legacy.apparent_bytes >= 2048 + 4096 + 512);
 
         let report = collect_with(&config, Some(&data_root), |_, _| true);
         assert_eq!(
@@ -1074,7 +1156,13 @@ mod tests {
                 .sum::<u64>()
         );
         assert_eq!(report.vm_disk.len(), 1);
-        assert!(report.legacy_instances.is_some());
+        assert!(
+            report
+                .legacy_instances
+                .as_ref()
+                .is_some_and(|legacy| legacy.paths.contains(&old_child)),
+            "the in-vms_dir v1 instance is reported as legacy"
+        );
         assert!(
             report
                 .notes
