@@ -62,7 +62,7 @@ pub struct ProjectEntry {
     pub read_only: bool,
     #[serde(default)]
     pub kind: ProjectKind,
-    /// Picker name of the parent project for a worktree.
+    /// Picker name of the parent project for a clone or worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     /// True only for hegn-created clone directories.
@@ -399,9 +399,12 @@ impl ProjectRegistry {
                     }
                 }
             }
-            if entry.kind != ProjectKind::Worktree && entry.parent.is_some() {
+            // A clone records the project it was forked from for lineage and
+            // display; it is not a worktree and is never nested in it. Only an
+            // external project has no parent to name.
+            if entry.kind == ProjectKind::External && entry.parent.is_some() {
                 bail!(
-                    "project '{}' may only name a parent when it is a worktree",
+                    "external project '{}' may only name a parent when it is a clone or worktree",
                     entry.name
                 );
             }

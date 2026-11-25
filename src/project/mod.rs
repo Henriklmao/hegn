@@ -9,6 +9,7 @@
 //! - [`create`] — creating a seeded project directory
 //! - [`import`] — importing existing directories as symlinks
 //! - [`delete`] — removing projects and their instances
+//! - [`workspace`] — clone and worktree forks of a project
 
 mod create;
 mod delete;
@@ -19,6 +20,7 @@ mod import;
 mod meta;
 mod model;
 mod registry;
+mod workspace;
 
 pub use create::create_project;
 pub use delete::delete_project;
@@ -32,3 +34,4 @@ pub use meta::{
 };
 pub use model::{GitSummary, Project, ProjectDeleteOutcome, ProjectMeta};
 pub use registry::{ProjectEntry, ProjectKind, ProjectRegistry, REGISTRY_FILE};
+pub use workspace::{ForkMode, WorkspaceService, default_worktree_path, is_real_worktree};
