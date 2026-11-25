@@ -218,25 +218,37 @@ pub(crate) fn print_report(report: &VmReport, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Render snapshot metadata as the plain-text block printed by `show` and
+/// `create`. Kept separate so the VM label can be asserted without capturing
+/// stdout.
+pub(crate) fn snapshot_text(meta: &SnapshotMeta) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::new();
+    let _ = writeln!(text, "{}", meta.name);
+    let _ = writeln!(
+        text,
+        "  created {}",
+        meta.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    let _ = writeln!(text, "  state   {}", meta.vm_state);
+    let _ = writeln!(text, "  size    {}", meta.size_label());
+    let _ = writeln!(text, "  dir     {}", meta.dir.display());
+    let _ = writeln!(text, "  source  {}", meta.source_url());
+    if let Some(vm) = meta.vm() {
+        let _ = writeln!(text, "  VM      {vm}");
+    }
+    if let Some(project) = &meta.project {
+        let _ = writeln!(text, "  project  {}", project.display());
+    }
+    text
+}
+
 pub(crate) fn print_snapshot(meta: &SnapshotMeta, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(meta)?);
     } else {
-        println!("{}", meta.name);
-        println!(
-            "  created {}",
-            meta.created_at.format("%Y-%m-%d %H:%M:%S UTC")
-        );
-        println!("  state   {}", meta.vm_state);
-        println!("  size    {}", meta.size_label());
-        println!("  dir     {}", meta.dir.display());
-        println!("  source  {}", meta.source_url());
-        if let Some(instance) = &meta.instance {
-            println!("  instance {instance}");
-        }
-        if let Some(project) = &meta.project {
-            println!("  project  {}", project.display());
-        }
+        print!("{}", snapshot_text(meta));
     }
     Ok(())
 }
@@ -272,6 +284,28 @@ mod tests {
     fn human_size_uses_tebibytes_for_larger_values() {
         assert_eq!(human_size(1024_u64.pow(4)), "1.0 TiB");
         assert_eq!(human_size(u64::MAX), "16777216.0 TiB");
+    }
+
+    #[test]
+    fn snapshot_text_labels_the_vm_and_drops_the_legacy_instance_label() {
+        let meta = SnapshotMeta {
+            name: "demo".into(),
+            instance: Some("rust".into()),
+            ..SnapshotMeta::default()
+        };
+        let text = snapshot_text(&meta);
+        assert!(text.contains("  VM      rust"), "{text}");
+        assert!(
+            !text.to_lowercase().contains("instance"),
+            "the transitional label must not leak: {text}"
+        );
+
+        let json = serde_json::to_value(&meta).unwrap();
+        assert_eq!(json["vm"], "rust");
+        assert!(
+            json.get("instance").is_none(),
+            "JSON already emits vm, not instance"
+        );
     }
 
     #[test]
