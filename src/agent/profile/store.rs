@@ -1,4 +1,4 @@
-//! Filesystem store for profile templates and the per-instance bundle layout.
+//! Filesystem store for profile templates and the per-VM bundle layout.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -224,7 +224,7 @@ mod tests {
     fn config(dir: &Path) -> Config {
         let mut config = Config::default();
         config.profiles_dir = dir.join("profiles");
-        config.vms_dir = dir.join("instances");
+        config.vms_dir = dir.join("vms");
         config.projects_root = dir.join("projects");
         fs::create_dir_all(&config.profiles_dir).unwrap();
         config

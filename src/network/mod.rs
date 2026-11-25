@@ -1,7 +1,7 @@
-//! Host-enforced network guard for instances.
+//! Host-enforced network guard for VMs.
 //!
 //! The guest never gets a bridge or a route into the host LAN. Each guarded
-//! instance receives a dedicated TAP device from a pre-created pool. Host
+//! VM receives a dedicated TAP device from a pre-created pool. Host
 //! nftables rules accept only outbound HTTP(S) and DNS to public resolvers;
 //! every other packet, including all RFC1918/link-local traffic and all IPv6,
 //! is dropped before it can be forwarded. Because the rules live on the host,
@@ -41,7 +41,7 @@ pub use script::{reload_script, setup_script, teardown_script};
 
 /// TAP devices created by `hegn network setup`.
 pub const TAP_POOL: u8 = 16;
-/// Root of the isolated instance network. Each TAP gets a `/30` slice.
+/// Root of the isolated VM network. Each TAP gets a `/30` slice.
 pub const SUBNET: Ipv4Addr = Ipv4Addr::new(10, 213, 0, 0);
 /// Guest netmask for every `/30` slice.
 pub const NETMASK: &str = "255.255.255.252";

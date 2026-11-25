@@ -175,7 +175,7 @@ mod tests {
         assert!(text.contains("hegn"), "{text}");
         assert!(text.contains("[dashboard]"), "{text}");
         assert!(
-            !text.contains("Cloud Hypervisor instances for coding agents"),
+            !text.contains("Cloud Hypervisor VMs for coding agents"),
             "the dashboard header no longer repeats the tagline:\n{text}"
         );
     }

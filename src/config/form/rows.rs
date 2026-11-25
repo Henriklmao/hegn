@@ -275,7 +275,7 @@ const PROFILE_ROWS: &[ConfigRow] = &[
     ConfigRow::Field(ConfigField::Profile(Harness::PrimeAgent)),
     ConfigRow::Field(ConfigField::Profile(Harness::Aider)),
     ConfigRow::Field(ConfigField::Profile(Harness::GeminiCli)),
-    ConfigRow::Note("CLI: hegn profile show <harness> · hegn skills sync-back <instance>"),
+    ConfigRow::Note("CLI: hegn profile show <harness> · hegn skills sync-back <vm>"),
 ];
 
 const VM_ROWS: &[ConfigRow] = &[

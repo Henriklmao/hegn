@@ -296,7 +296,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             state_dir: dir.path().join("state"),
-            vms_dir: dir.path().join("instances"),
+            vms_dir: dir.path().join("vms"),
             // `acquire` fails closed on guarded networking without a root
             // marker. The pool internals under test do not depend on the mode.
             network: NetworkMode::Off,

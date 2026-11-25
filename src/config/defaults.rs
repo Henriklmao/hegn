@@ -65,7 +65,7 @@ impl Default for Config {
 /// `AGENTS.md` seeded into new projects from `templates_dir`.
 pub const DEFAULT_AGENTS_MD: &str = r#"# Agent instructions
 
-This project runs inside a hegn instance.
+This project runs inside a hegn VM.
 
 ## Rules
 

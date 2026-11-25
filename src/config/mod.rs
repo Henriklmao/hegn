@@ -88,11 +88,11 @@ pub struct Config {
     pub vcpus: u8,
     /// Guest memory in MiB.
     pub memory_mib: u32,
-    /// Hard ceiling for per-instance root filesystem growth, in GiB. Sparse
+    /// Hard ceiling for per-VM root filesystem growth, in GiB. Sparse
     /// images only consume host space when the guest writes, but a runaway
     /// guest must not be able to fill the host filesystem.
     pub max_rootfs_gib: u32,
-    /// Warn in `hegn doctor` when the filesystem holding the instances is
+    /// Warn in `hegn doctor` when the filesystem holding the VMs is
     /// fuller than this percentage.
     pub disk_usage_warn_percent: u8,
     /// Prefix for the per-project virtio-fs tags. Each exported project gets
@@ -127,9 +127,9 @@ pub struct Config {
     pub periodic_snapshots: bool,
     /// Seconds between automatic snapshots. Must be at least 30.
     pub snapshot_interval_secs: u64,
-    /// Number of automatic snapshots kept per instance. Older ones are pruned.
+    /// Number of automatic snapshots kept per VM. Older ones are pruned.
     pub snapshot_keep: u32,
-    /// Restore the newest automatic snapshot when starting an instance instead
+    /// Restore the newest automatic snapshot when starting a VM instead
     /// of cold booting it.
     pub auto_resume: bool,
     pub security: SecurityMode,

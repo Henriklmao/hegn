@@ -6,13 +6,13 @@
 //! editing the global config.
 //!
 //! The host is always the source of truth for configuration files. Skills are
-//! **copied** into a private per-instance bundle and exported through a second
+//! **copied** into a private per-VM bundle and exported through a second
 //! `virtiofsd`; the host's real skill directories are never mounted into the
 //! guest. Changes made in the guest can be copied back explicitly with
 //! `hegn skills sync-back`.
 //!
 //! ```text
-//! <vms_dir>/<instance>/profile/
+//! <vms_dir>/<vm>/profile/
 //!   local.json          host-side mapping (never exported)
 //!   bundle/             exported to the guest at /run/hegn/profile
 //!     manifest          tab-separated copy plan

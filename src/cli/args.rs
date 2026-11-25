@@ -343,24 +343,24 @@ pub enum VmCommands {
 /// non-zero; no legacy lifecycle behaviour remains.
 #[derive(Debug, Subcommand)]
 pub enum LegacyMappingCommands {
-    /// List all instances and their state.
+    /// List all VMs and their state.
     #[command(visible_alias = "ls")]
     List,
-    /// Create an instance for a project.
+    /// Create a VM for a project.
     Create {
         project: String,
-        /// Instance name (defaults to the project directory name).
+        /// VM name (defaults to the project directory name).
         #[arg(long)]
         name: Option<String>,
         #[arg(long, value_enum)]
         harness: Option<Harness>,
-        /// Copy the project into the instance instead of exporting it directly.
+        /// Copy the project into the VM instead of exporting it directly.
         #[arg(long)]
         clone: bool,
     },
-    /// Clone an instance for parallel agent work.
+    /// Clone a VM for parallel agent work.
     Clone {
-        /// Instance or project to clone.
+        /// VM or project to clone.
         source: String,
         /// Base name for the clone(s).
         #[arg(long)]
@@ -374,9 +374,9 @@ pub enum LegacyMappingCommands {
         #[arg(long)]
         no_start: bool,
     },
-    /// Boot an instance, creating it from a project if necessary.
+    /// Boot a VM, creating it from a project if necessary.
     Start {
-        /// Instance name, project name or project path.
+        /// VM name, project name or project path.
         name: String,
         #[arg(long, value_enum)]
         harness: Option<Harness>,
@@ -384,15 +384,15 @@ pub enum LegacyMappingCommands {
         #[arg(long)]
         clone: bool,
     },
-    /// Stop one instance, or the only running instance.
+    /// Stop one VM, or the only running VM.
     Stop { name: Option<String> },
-    /// Show one instance, or all instances.
+    /// Show one VM, or all VMs.
     Status { name: Option<String> },
-    /// Pause an instance.
+    /// Pause a VM.
     Pause { name: String },
-    /// Resume an instance.
+    /// Resume a VM.
     Resume { name: String },
-    /// Show or edit an instance's hegn.toml.
+    /// Show or edit a VM's hegn.toml.
     Config {
         name: String,
         /// Open the config in $EDITOR.
@@ -402,13 +402,13 @@ pub enum LegacyMappingCommands {
         #[arg(long)]
         path: bool,
     },
-    /// Stop and delete an instance.
+    /// Stop and delete a VM.
     Delete {
         name: String,
-        /// Delete an in-instance clone workspace.
+        /// Delete an in-VM clone workspace.
         #[arg(long, conflicts_with = "keep_files")]
         delete_files: bool,
-        /// Keep an in-instance clone workspace.
+        /// Keep an in-VM clone workspace.
         #[arg(long, conflicts_with = "delete_files")]
         keep_files: bool,
         /// Skip interactive prompts (a file policy flag is still required).

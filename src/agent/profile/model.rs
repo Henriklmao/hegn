@@ -32,7 +32,7 @@ pub struct ProfileFile {
 pub struct ProfileSkill {
     /// Host skill directory. `~` expands to the user's home directory.
     pub source: PathBuf,
-    /// Absolute guest directory. The guest target links to the per-instance
+    /// Absolute guest directory. The guest target links to the per-VM
     /// copy, never to the host directory.
     pub target: String,
     /// Permit `hegn skills sync-back` to copy guest changes to the host.
@@ -132,7 +132,7 @@ pub struct ProfileShare {
     pub manifest_id: String,
 }
 
-/// Result of preparing a profile for an instance start.
+/// Result of preparing a profile for a VM start.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProfilePlan {
     /// Packages contributed by the profile.

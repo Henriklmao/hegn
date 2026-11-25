@@ -173,7 +173,7 @@ pub fn validate_local_endpoints(endpoints: &[LocalEndpoint]) -> Result<()> {
             );
         }
         // Ports below 1024 are reserved for privileged host services (SSH,
-        // DNS, …). Exposing those to an instance is never an LLM passthrough.
+        // DNS, …). Exposing those to a VM is never an LLM passthrough.
         if endpoint.port < 1024 {
             bail!(
                 "local endpoint '{}' uses port {}; ports below 1024 are not exposed",

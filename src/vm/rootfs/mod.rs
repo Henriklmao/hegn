@@ -2,7 +2,7 @@
 //!
 //! The pinned cloud image is only about 2.2 GiB. That is enough for a bare
 //! Ubuntu cloud image, but not for Node.js, a global npm package and the
-//! user's extra apt selections. Each instance therefore gets a sparse disk
+//! user's extra apt selections. Each VM therefore gets a sparse disk
 //! with a comfortable floor: raw images are extended with `set_len`, and qcow2
 //! images get a larger virtual size (a bigger L1 table) without rewriting the
 //! existing clusters.
@@ -25,7 +25,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::RootfsFormat;
 
-/// Comfortable floor for an instance root filesystem. Sparse files mean this
+/// Comfortable floor for a VM root filesystem. Sparse files mean this
 /// costs almost no host disk space until the guest actually writes to it.
 pub const MIN_INSTANCE_ROOTFS_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 

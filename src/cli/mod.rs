@@ -33,7 +33,7 @@ pub(crate) mod test_support {
         config.projects_root = dir.path().join("projects");
         config.state_dir = dir.path().join("state");
         config.snapshots_dir = dir.path().join("snapshots");
-        config.vms_dir = dir.path().join("instances");
+        config.vms_dir = dir.path().join("vms");
         config.templates_dir = dir.path().join("templates");
         config.profiles_dir = dir.path().join("profiles");
         config.backend = BackendKind::Auto;

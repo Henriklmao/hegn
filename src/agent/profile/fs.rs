@@ -1,4 +1,4 @@
-//! Private filesystem helpers for the per-instance profile bundle.
+//! Private filesystem helpers for the per-VM profile bundle.
 //!
 //! These helpers never follow symlinks planted by a guest: secure directories
 //! are recreated instead, and files are opened with `O_NOFOLLOW`.
@@ -217,8 +217,8 @@ pub(super) fn secure_dir(path: &Path) -> Result<()> {
 }
 
 /// Ensure `path` is a real directory owned by hegn. A guest can replace a
-/// per-instance bundle subdirectory with a symlink; following it on the host
-/// would let the guest redirect writes outside the instance. Remove such a
+/// per-VM bundle subdirectory with a symlink; following it on the host
+/// would let the guest redirect writes outside the VM. Remove such a
 /// plant and recreate a private directory.
 pub(super) fn ensure_real_dir(path: &Path) -> Result<()> {
     if let Ok(metadata) = fs::symlink_metadata(path)

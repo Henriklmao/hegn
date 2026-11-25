@@ -1,5 +1,5 @@
 //! `hegn config` handler plus the shared `$EDITOR` launcher used by the
-//! instance and profile commands.
+//! VM and profile commands.
 
 use std::path::Path;
 use std::process::Command;

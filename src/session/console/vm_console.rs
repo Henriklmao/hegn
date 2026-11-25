@@ -229,7 +229,7 @@ mod tests {
     fn config(dir: &Path) -> Config {
         let mut config = Config::default();
         config.state_dir = dir.join("state");
-        config.vms_dir = dir.join("instances");
+        config.vms_dir = dir.join("vms");
         config.backend = BackendKind::CloudHypervisor;
         config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
         config

@@ -141,7 +141,7 @@ pub fn setup(user: &str, endpoints: &[u16]) -> Result<()> {
     let script = setup_script(user, &endpoints)?;
     // The script replaces the nftables table. Drop the marker first so a
     // failed re-run cannot leave a "ready" marker vouching for a guard that no
-    // longer exists; new instance starts then fail closed until setup succeeds.
+    // longer exists; new VM starts then fail closed until setup succeeds.
     clear_marker()?;
     run_script(&script).context("failed to configure the guarded network")?;
     // Do not write a readiness receipt unless the rules actually landed. A

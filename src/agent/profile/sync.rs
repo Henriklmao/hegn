@@ -1,7 +1,7 @@
-//! Materialize the profile bundle for an instance and sync skills in both
+//! Materialize the profile bundle for a VM and sync skills in both
 //! directions.
 //!
-//! Skills are always copied: the guest target links to the per-instance copy,
+//! Skills are always copied: the guest target links to the per-VM copy,
 //! never to the host directory. Symlinks and special files are skipped in both
 //! directions so a poisoned guest cannot redirect host writes.
 
@@ -24,7 +24,7 @@ use super::model::{ProfilePlan, ProfileShare, SyncBackReport, SyncReport};
 use super::store::{ProfileLayout, ProfileState, ProfileStore, StoredFile, StoredSkill};
 use super::validate::expand_home;
 
-/// What `prepare` should do with existing per-instance skill copies.
+/// What `prepare` should do with existing per-VM skill copies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refresh {
     /// Re-copy configuration files, keep existing skill copies.
@@ -33,12 +33,12 @@ enum Refresh {
     Skills,
 }
 
-/// Build the profile payload for an instance start.
+/// Build the profile payload for a VM start.
 pub fn prepare_for_start(config: &Config, vm: &VmConfig) -> Result<ProfilePlan> {
     materialize(config, vm, Refresh::Start)
 }
 
-/// Copy host skill changes into an existing per-instance bundle.
+/// Copy host skill changes into an existing per-VM bundle.
 ///
 /// Host files win for files they contain; guest-only files are preserved. The
 /// guest target is a link to this bundle, so a running VM sees the new files
@@ -91,7 +91,7 @@ pub fn sync_skills(config: &Config, vm: &VmConfig) -> Result<SyncReport> {
     Ok(report)
 }
 
-/// Copy changed and new skill files from the instance bundle back to the host.
+/// Copy changed and new skill files from the VM bundle back to the host.
 ///
 /// Only regular files are copied. Symlinks and special files are skipped, so a
 /// poisoned guest cannot redirect a host write outside the configured skill
@@ -100,13 +100,13 @@ pub fn sync_skills_back(config: &Config, vm: &VmConfig, dry_run: bool) -> Result
     let layout = ProfileLayout::new(config, vm)?;
     let state = layout.load_state().with_context(|| {
         format!(
-            "instance '{}' has no profile copy yet; start it once or run `hegn skills sync {}`",
+            "VM '{}' has no profile copy yet; start it once or run `hegn skills sync {}`",
             vm.name, vm.name
         )
     })?;
     if state.harness != vm.harness {
         bail!(
-            "instance '{}' has a profile copy for harness '{}' but is configured for '{}'; \
+            "VM '{}' has a profile copy for harness '{}' but is configured for '{}'; \
              start it once to rebuild the profile",
             vm.name,
             state.harness.label(),
@@ -422,7 +422,7 @@ fn materialize(config: &Config, vm: &VmConfig, refresh: Refresh) -> Result<Profi
         }
     }
 
-    // Skills are seeded once. On later starts the per-instance copy is kept so
+    // Skills are seeded once. On later starts the per-VM copy is kept so
     // guest-created skills survive a reboot and can be synced back.
     for skill in profile.skills.iter() {
         let source = expand_home(&skill.source);
@@ -434,7 +434,7 @@ fn materialize(config: &Config, vm: &VmConfig, refresh: Refresh) -> Result<Profi
                     .push(format!("skill source {} is missing", source.display()));
             }
             // Keep a previous mapping when only the host source disappeared
-            // temporarily; the per-instance copy may still hold guest edits.
+            // temporarily; the per-VM copy may still hold guest edits.
             if dest.exists()
                 && let Some(previous) = previous
                     .as_ref()
@@ -448,7 +448,7 @@ fn materialize(config: &Config, vm: &VmConfig, refresh: Refresh) -> Result<Profi
             let (copied, mut warnings) = merge_tree(&source, &dest, false)?;
             if copied > 0 {
                 plan.warnings.push(format!(
-                    "copied {copied} file(s) from {} into the instance skill copy",
+                    "copied {copied} file(s) from {} into the VM skill copy",
                     source.display()
                 ));
             }
@@ -609,7 +609,7 @@ mod tests {
     fn config(dir: &Path) -> Config {
         let mut config = Config::default();
         config.profiles_dir = dir.join("profiles");
-        config.vms_dir = dir.join("instances");
+        config.vms_dir = dir.join("vms");
         config.projects_root = dir.join("projects");
         fs::create_dir_all(&config.profiles_dir).unwrap();
         config
@@ -714,7 +714,7 @@ OPENAI_API_KEY = "sk-test"
             b"# guest"
         );
 
-        // Host change is merged into the instance copy without deleting the
+        // Host change is merged into the VM copy without deleting the
         // guest-created skill.
         fs::write(host_skills.join("demo/SKILL.md"), b"# host-v2").unwrap();
         let report = sync_skills(&config, &vm).unwrap();
@@ -786,7 +786,7 @@ OPENAI_API_KEY = "sk-test"
         let share = plan.share.unwrap();
 
         // A compromised guest replaces its skill copy with a symlink to a
-        // host directory outside the instance.
+        // host directory outside the VM.
         let trap = dir.path().join("trap");
         fs::create_dir_all(&trap).unwrap();
         fs::write(trap.join("do-not-touch"), b"host").unwrap();

@@ -17,7 +17,7 @@ pub(super) fn global_config(dir: &Path) -> Config {
     config.projects_root = dir.join("projects");
     config.state_dir = dir.join("state");
     config.snapshots_dir = dir.join("snapshots");
-    config.vms_dir = dir.join("instances");
+    config.vms_dir = dir.join("vms");
     config.templates_dir = dir.join("templates");
     config.profiles_dir = dir.join("profiles");
     config
