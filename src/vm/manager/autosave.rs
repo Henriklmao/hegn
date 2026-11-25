@@ -24,7 +24,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::Config;
 use crate::session::snapshot::{AUTOSAVE_NOTE, SnapshotStore};
 use crate::shared::process::executable_matches;
-use crate::vm::config::VmConfig;
+use crate::vm::config::{VmConfig, VmStore};
 use crate::vm::hypervisor::VmState;
 use crate::vm::registry::VmRegistry;
 
@@ -96,13 +96,23 @@ pub fn process_matches(pid: u32, binary: &Path) -> bool {
 /// Returns the existing pid when a matching worker is still alive. A stale pid
 /// file is replaced. The child is left detached; a reaper thread avoids a
 /// zombie while the parent (usually the TUI) is alive.
-pub(crate) fn spawn(config: &Config, vm: &VmConfig, paths: &VmPaths) -> Result<u32> {
-    if !config.periodic_snapshots {
+///
+/// `periodic_snapshots` is the VM's own setting (`vm.toml`), never the global
+/// default that only seeded the VM when it was created. `config` is accepted so
+/// start and restore share one entry point; no autosave setting is read from it.
+pub(crate) fn spawn(_config: &Config, vm: &VmConfig, paths: &VmPaths) -> Result<u32> {
+    if !vm.periodic_snapshots {
         return Ok(0);
     }
     let exe = std::env::current_exe().context("failed to locate the hegn executable")?;
+    spawn_with(&exe, vm, paths)
+}
+
+/// Spawn the worker executable. Split out so tests can inject a short-lived
+/// process instead of launching the real hegn binary.
+fn spawn_with(exe: &Path, vm: &VmConfig, paths: &VmPaths) -> Result<u32> {
     if let Some(pid) = read_pid(&paths.autosave_pid)
-        && process_matches(pid, &exe)
+        && process_matches(pid, exe)
     {
         return Ok(pid);
     }
@@ -114,7 +124,7 @@ pub(crate) fn spawn(config: &Config, vm: &VmConfig, paths: &VmPaths) -> Result<u
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&paths.autosave_log)
         .with_context(|| format!("failed to open {}", paths.autosave_log.display()))?;
-    let mut child = Command::new(&exe)
+    let mut child = Command::new(exe)
         .arg(INTERNAL_ARG)
         .arg("--vm")
         .arg(&vm.name)
@@ -143,10 +153,40 @@ fn reaper(mut child: Child) {
         });
 }
 
+/// Automatic-snapshot settings read from one VM's own `vm.toml`.
+///
+/// The global config only seeds a new [`VmConfig`]; after that, interval and
+/// retention belong to the VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutosavePolicy {
+    enabled: bool,
+    interval: Duration,
+    keep: u32,
+}
+
+impl AutosavePolicy {
+    fn for_vm(vm: &VmConfig) -> Self {
+        Self {
+            enabled: vm.periodic_snapshots,
+            interval: Duration::from_secs(vm.snapshot_interval_secs.max(30)),
+            keep: vm.snapshot_keep.max(1),
+        }
+    }
+}
+
+/// Load the worker policy from the persisted `vm.toml` of `name`.
+fn worker_policy(config: &Config, name: &str) -> Result<AutosavePolicy> {
+    Ok(AutosavePolicy::for_vm(&VmStore::new(config).load(name)?))
+}
+
 /// Loop until the VM disappears, checkpointing it every interval.
 fn run_worker(config: &Config, name: &str) -> Result<()> {
-    let interval = Duration::from_secs(config.snapshot_interval_secs.max(30));
-    let keep = config.snapshot_keep.max(1);
+    // Re-read the policy from `vm.toml`: a spawn from an older hegn, or a
+    // manual worker invocation, must not keep snapshoting a VM that disabled it.
+    let policy = worker_policy(config, name)?;
+    if !policy.enabled {
+        return Ok(());
+    }
     let registry = VmRegistry::new(config.clone());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -154,7 +194,7 @@ fn run_worker(config: &Config, name: &str) -> Result<()> {
         .context("failed to build the autosnapshot runtime")?;
 
     loop {
-        std::thread::sleep(interval);
+        std::thread::sleep(policy.interval);
         let manager = match registry.manager_by_name(name) {
             Ok(manager) => manager,
             // The VM was deleted while it was running.
@@ -175,7 +215,7 @@ fn run_worker(config: &Config, name: &str) -> Result<()> {
         {
             Ok(_) => {
                 if let Err(err) =
-                    SnapshotStore::new(&config.snapshots_dir).prune_autosaves(name, keep)
+                    SnapshotStore::new(&config.snapshots_dir).prune_autosaves(name, policy.keep)
                 {
                     append_event_log(
                         &manager.paths().event_log,
@@ -236,15 +276,74 @@ mod tests {
     }
 
     #[test]
-    fn disabled_periodic_snapshots_do_not_spawn_a_worker() {
+    fn a_vm_disables_periodic_snapshots_even_when_the_global_setting_is_on() {
+        use crate::vm::manager::test_support::{config_with_assets, manager};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.periodic_snapshots = true;
+        let manager = manager(config, dir.path());
+        let mut vm = manager.vm().clone();
+        vm.periodic_snapshots = false;
+        let paths = manager.paths();
+        assert_eq!(spawn(manager.config(), &vm, &paths).unwrap(), 0);
+        assert!(!paths.autosave_pid.exists());
+    }
+
+    #[test]
+    fn a_vm_enables_periodic_snapshots_even_when_the_global_setting_is_off() {
         use crate::vm::manager::test_support::{config_with_assets, manager};
 
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
         config.periodic_snapshots = false;
         let manager = manager(config, dir.path());
+        let vm = manager.vm();
+        assert!(vm.periodic_snapshots, "fixture VM wants autosave");
         let paths = manager.paths();
-        assert_eq!(spawn(manager.config(), manager.vm(), &paths).unwrap(), 0);
-        assert!(!paths.autosave_pid.exists());
+        paths.ensure().unwrap();
+
+        let exe = std::env::current_exe().unwrap();
+        assert!(spawn_with(&exe, vm, &paths).unwrap() > 0);
+        assert!(paths.autosave_pid.exists());
+    }
+
+    #[test]
+    fn interval_and_retention_come_from_the_vm_not_the_global_config() {
+        use crate::vm::config::VmStore;
+        use crate::vm::manager::test_support::config_with_assets;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.snapshot_interval_secs = 300;
+        config.snapshot_keep = 2;
+
+        let mut vm = VmConfig {
+            name: "demo".into(),
+            snapshot_interval_secs: 45,
+            snapshot_keep: 7,
+            ..VmConfig::default()
+        };
+        VmStore::new(&config).save(&vm).unwrap();
+
+        let policy = worker_policy(&config, "demo").unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.interval, Duration::from_secs(45));
+        assert_eq!(policy.keep, 7);
+
+        // A VM seeded from the globals keeps the global values.
+        let seeded = VmConfig::from_config(&config, "seeded", None);
+        let seeded_policy = AutosavePolicy::for_vm(&seeded);
+        assert!(seeded_policy.enabled);
+        assert_eq!(seeded_policy.interval, Duration::from_secs(300));
+        assert_eq!(seeded_policy.keep, 2);
+
+        vm.snapshot_interval_secs = 1;
+        vm.snapshot_keep = 0;
+        vm.periodic_snapshots = false;
+        let clamped = AutosavePolicy::for_vm(&vm);
+        assert!(!clamped.enabled);
+        assert_eq!(clamped.interval, Duration::from_secs(30));
+        assert_eq!(clamped.keep, 1);
     }
 }

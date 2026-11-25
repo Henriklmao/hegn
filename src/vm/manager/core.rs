@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::Config;
+use crate::config::{Config, SecurityMode};
 use crate::project::ProjectRegistry;
 use crate::vm::config::{VmConfig, VmStore};
 
@@ -57,6 +57,19 @@ impl VmManager {
 
     pub fn vm(&self) -> &VmConfig {
         &self.vm
+    }
+
+    /// The full per-VM configuration, for callers that render VM settings.
+    pub fn vm_config(&self) -> &VmConfig {
+        &self.vm
+    }
+
+    /// Security mode of this VM, never the global default.
+    ///
+    /// The TUI reads it per VM so two VMs on the same host can use different
+    /// guardrail modes.
+    pub fn security_mode(&self) -> SecurityMode {
+        self.vm.security
     }
 
     pub fn store(&self) -> &VmStore {
@@ -438,8 +451,24 @@ mod tests {
         let config = config_with_assets(dir.path());
         let manager = manager(config.clone(), dir.path());
         assert_eq!(manager.vm().name, "demo");
+        assert_eq!(manager.vm_config().name, "demo");
+        assert_eq!(manager.security_mode(), manager.vm().security);
         assert_eq!(manager.store().root(), config.vms_dir);
         assert_eq!(manager.registry().entries().len(), 1);
         let _ = VmConfig::default();
+    }
+
+    #[test]
+    fn security_mode_comes_from_the_vm_not_the_global_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.security = SecurityMode::Off;
+        let base = manager(config.clone(), dir.path());
+        let mut vm = base.vm().clone();
+        vm.security = SecurityMode::Enforce;
+        let manager = VmManager::new(config, vm).unwrap();
+
+        assert_eq!(manager.config().security, SecurityMode::Off);
+        assert_eq!(manager.security_mode(), SecurityMode::Enforce);
     }
 }

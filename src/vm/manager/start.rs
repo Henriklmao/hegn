@@ -167,9 +167,8 @@ impl VmManager {
         // restart into a resume instead of a full cold boot. A checkpoint whose
         // device tree no longer matches is skipped with a logged reason, never
         // deleted, and the VM cold boots.
-        if self.config.auto_resume {
-            let store = SnapshotStore::new(&self.config.snapshots_dir);
-            match store.autosaves_for(&self.vm.name) {
+        if let Some(candidates) = auto_resume_candidates(&self.config, &self.vm) {
+            match candidates {
                 Ok(candidates) if !candidates.is_empty() => {
                     let current = super::snapshot::current_boot(
                         &self.config,
@@ -549,6 +548,17 @@ pub(super) fn effective_rootfs(config: &Config, vm: &VmConfig) -> PathBuf {
     path.canonicalize().unwrap_or(path)
 }
 
+/// Automatic checkpoints eligible for this start.
+///
+/// `None` means the VM disabled auto-resume. The global `Config::auto_resume`
+/// only seeds a new [`VmConfig`]; an existing VM's `vm.toml` is authoritative.
+fn auto_resume_candidates(config: &Config, vm: &VmConfig) -> Option<Result<Vec<SnapshotMeta>>> {
+    if !vm.auto_resume {
+        return None;
+    }
+    Some(SnapshotStore::new(&config.snapshots_dir).autosaves_for(&vm.name))
+}
+
 /// Reject a canonical member path already exported by a running VM.
 fn ensure_no_running_export(config: &Config, store: &VmStore, plan: &BootPlan) -> Result<()> {
     for other in store.list()? {
@@ -626,6 +636,35 @@ mod tests {
         let manager = manager(config, dir.path());
         let err = manager.start().unwrap_err().to_string();
         assert!(err.contains("missing VM assets"), "{err}");
+    }
+
+    #[test]
+    fn auto_resume_is_decided_from_the_vm_not_the_global_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.auto_resume = true;
+        let mut vm = VmConfig::from_config(&config, "demo", Some(Harness::Shell));
+
+        vm.auto_resume = false;
+        assert!(
+            auto_resume_candidates(&config, &vm).is_none(),
+            "vm.toml must win over the global default"
+        );
+
+        vm.auto_resume = true;
+        let candidates = auto_resume_candidates(&config, &vm).expect("auto-resume enabled");
+        assert!(candidates.unwrap().is_empty(), "fixture has no snapshots");
+    }
+
+    #[test]
+    fn a_vm_seeded_from_the_global_config_inherits_auto_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.auto_resume = false;
+        let vm = VmConfig::from_config(&config, "demo", Some(Harness::Shell));
+
+        assert!(!vm.auto_resume);
+        assert!(auto_resume_candidates(&config, &vm).is_none());
     }
 
     #[test]
