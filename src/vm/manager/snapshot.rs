@@ -846,13 +846,7 @@ pub(super) async fn restore_snapshot_locked(
         .context("the recorded membership lost its primary project")?;
     let serial_log = logs.create_session(&primary_path, started_at, std::process::id())?;
 
-    let vm_child = spawn_restore(
-        config,
-        &paths,
-        snapshot,
-        &vm_binary,
-        network_lease.data_lease(),
-    )?;
+    let vm_child = spawn_restore(config, &paths, snapshot, &vm_binary, Some(&network_lease))?;
     let vm_pid = vm_child.id();
     rollback.vm = Some(vm_child);
     let relay_pid = {

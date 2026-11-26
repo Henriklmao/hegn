@@ -89,7 +89,7 @@ pub(super) fn cloud_hypervisor_args(
     plan: &BootPlan,
     paths: &VmPaths,
     rootfs: &Path,
-    network: Option<&network::Lease>,
+    network: Option<&network::NetworkLease>,
     profile_socket: Option<&Path>,
 ) -> Vec<OsString> {
     let mut args = common_args(config, paths);
@@ -143,17 +143,25 @@ pub(super) fn cloud_hypervisor_args(
         );
     }
     if let Some(lease) = network {
+        // Data first, control last: the guest sees the guarded data NIC as
+        // eth0-equivalent and the control NIC as the extra host-only link.
+        if let Some(data) = &lease.data {
+            args.push("--net".into());
+            args.push(data.cloud_hypervisor_arg().into());
+        }
         args.push("--net".into());
-        args.push(lease.cloud_hypervisor_arg().into());
+        args.push(lease.control.cloud_hypervisor_arg().into());
         // Cloud Hypervisor checks an existing TAP's multiqueue support by
         // reading `/sys/class/net/<tap>/tun_flags`, which sysfs resolves to
         // `/sys/devices/virtual/net/<tap>/tun_flags`. Its own Landlock ruleset
         // only grants `/dev/net/tun`, so that read fails with EACCES and the VM
         // dies while creating the virtio-net device. Grant exactly this VM's
-        // TAP directory, read-only: other interfaces and the rest of /sys stay
-        // invisible to the VMM.
-        args.push("--landlock-rules".into());
-        args.push(format!("path=/sys/devices/virtual/net/{},access=r", lease.tap).into());
+        // TAP directories, read-only: other interfaces and the rest of /sys
+        // stay invisible to the VMM.
+        for tap in lease.taps() {
+            args.push("--landlock-rules".into());
+            args.push(format!("path=/sys/devices/virtual/net/{},access=r", tap.tap).into());
+        }
     }
     args.push("--serial".into());
     args.push(format!("socket={}", paths.serial_socket.display()).into());
@@ -169,14 +177,18 @@ pub(super) fn restore_args(
     config: &Config,
     paths: &VmPaths,
     snapshot: &SnapshotMeta,
-    network: Option<&network::Lease>,
+    network: Option<&network::NetworkLease>,
 ) -> Vec<OsString> {
     let mut args = common_args(config, paths);
     if let Some(lease) = network {
-        // Same sysfs read as a cold boot: Cloud Hypervisor probes the existing
-        // TAP's multiqueue flags while recreating the virtio-net device.
-        args.push("--landlock-rules".into());
-        args.push(format!("path=/sys/devices/virtual/net/{},access=r", lease.tap).into());
+        // The snapshot owns the device tree, so no `--net` is passed. Cloud
+        // Hypervisor still probes each existing TAP's multiqueue flags while
+        // recreating the virtio-net devices, so every TAP needs its sysfs
+        // directory granted read-only.
+        for tap in lease.taps() {
+            args.push("--landlock-rules".into());
+            args.push(format!("path=/sys/devices/virtual/net/{},access=r", tap.tap).into());
+        }
     }
     args.push("--restore".into());
     args.push(format!("source_url={},resume=true", snapshot.source_url()).into());
@@ -219,7 +231,7 @@ pub(super) fn spawn_cloud_hypervisor(
     paths: &VmPaths,
     rootfs: &Path,
     binary: &Path,
-    network: Option<&network::Lease>,
+    network: Option<&network::NetworkLease>,
     profile_socket: Option<&Path>,
 ) -> Result<Child> {
     let args = cloud_hypervisor_args(config, vm, plan, paths, rootfs, network, profile_socket);
@@ -232,7 +244,7 @@ pub(super) fn spawn_restore(
     paths: &VmPaths,
     snapshot: &SnapshotMeta,
     binary: &Path,
-    network: Option<&network::Lease>,
+    network: Option<&network::NetworkLease>,
 ) -> Result<Child> {
     let args = restore_args(config, paths, snapshot, network);
     spawn_vmm(binary, paths, args)
@@ -355,6 +367,32 @@ mod tests {
     use super::*;
     use crate::vm::manager::test_support::{config_with_assets, manager, plan_for, strings};
 
+    /// A network lease with a control TAP and an optional guarded data TAP.
+    fn network_lease(vm: &str, slot: u8, with_data: bool) -> crate::network::NetworkLease {
+        let control = crate::network::Lease {
+            index: slot,
+            vm: vm.to_string(),
+            tap: crate::network::control_tap_name(slot),
+            mac: crate::network::control_mac(slot),
+            host_ip: crate::network::control_host_ip(slot),
+            guest_ip: crate::network::control_guest_ip(slot),
+        };
+        let data = with_data.then(|| crate::network::Lease {
+            index: slot,
+            vm: vm.to_string(),
+            tap: crate::network::tap_name(slot),
+            mac: crate::network::mac(slot),
+            host_ip: crate::network::host_ip(slot),
+            guest_ip: crate::network::guest_ip(slot),
+        });
+        crate::network::NetworkLease {
+            slot,
+            vm: vm.to_string(),
+            data,
+            control,
+        }
+    }
+
     fn plan_and_paths(
         dir: &Path,
     ) -> (
@@ -450,19 +488,12 @@ mod tests {
     }
 
     #[test]
-    fn guarded_network_adds_only_a_tap_and_mac() {
+    fn guarded_network_adds_data_then_control_taps() {
         let dir = tempfile::tempdir().unwrap();
         let (config, vm, plan, paths, _manager) = plan_and_paths(dir.path());
-        let lease = crate::network::Lease {
-            index: 2,
-            vm: vm.name.clone(),
-            tap: crate::network::tap_name(2),
-            mac: crate::network::mac(2),
-            host_ip: crate::network::host_ip(2),
-            guest_ip: crate::network::guest_ip(2),
-        };
+        let lease = network_lease(&vm.name, 2, true);
         let rootfs = vm.rootfs_path(&config);
-        let joined = strings(&cloud_hypervisor_args(
+        let args = strings(&cloud_hypervisor_args(
             &config,
             &vm,
             &plan,
@@ -470,10 +501,14 @@ mod tests {
             &rootfs,
             Some(&lease),
             None,
-        ))
-        .join(" ");
+        ));
+        let joined = args.join(" ");
         assert!(
             joined.contains("--net tap=hegn2,mac=52:54:00:00:00:03"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--net tap=hegnc2,mac=52:54:00:00:01:03"),
             "{joined}"
         );
         // Cloud Hypervisor's own Landlock ruleset only grants /dev/net/tun;
@@ -483,12 +518,73 @@ mod tests {
             "{joined}"
         );
         assert!(
+            joined.contains("--landlock-rules path=/sys/devices/virtual/net/hegnc2,access=r"),
+            "{joined}"
+        );
+        assert!(
             !joined.contains("--landlock-rules path=/sys/devices/virtual/net,access=r"),
             "{joined}"
         );
-        // The host TAP address is owned by `hegn network setup`, not the VMM.
-        assert!(!joined.contains("ip=10.213.0."), "{joined}");
-        assert!(!joined.contains("mask="), "{joined}");
+        let data_net = args
+            .iter()
+            .position(|arg| arg == "tap=hegn2,mac=52:54:00:00:00:03")
+            .expect("data net");
+        let control_net = args
+            .iter()
+            .position(|arg| arg == "tap=hegnc2,mac=52:54:00:00:01:03")
+            .expect("control net");
+        assert!(
+            data_net < control_net,
+            "data comes before control: {args:?}"
+        );
+        let data_rule = args
+            .iter()
+            .position(|arg| arg.contains("net/hegn2,access=r"))
+            .expect("data landlock");
+        let control_rule = args
+            .iter()
+            .position(|arg| arg.contains("net/hegnc2,access=r"))
+            .expect("control landlock");
+        assert!(
+            data_rule < control_rule,
+            "data rule comes before control: {args:?}"
+        );
+        // The host TAP addresses are owned by `hegn network setup`, not the VMM.
+        for forbidden in ["ip=10.213.0.", "ip=10.214.0.", "mask="] {
+            assert!(!joined.contains(forbidden), "{forbidden} in {joined}");
+        }
+    }
+
+    #[test]
+    fn off_network_adds_only_the_control_tap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, vm, plan, paths, _manager) = plan_and_paths(dir.path());
+        let lease = network_lease(&vm.name, 2, false);
+        let rootfs = vm.rootfs_path(&config);
+        let args = strings(&cloud_hypervisor_args(
+            &config,
+            &vm,
+            &plan,
+            &paths,
+            &rootfs,
+            Some(&lease),
+            None,
+        ));
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == "--net").count(),
+            1,
+            "{args:?}"
+        );
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("--net tap=hegnc2,mac=52:54:00:00:01:03"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--landlock-rules path=/sys/devices/virtual/net/hegnc2,access=r"),
+            "{joined}"
+        );
+        assert!(!joined.contains("net/hegn2,"), "{joined}");
     }
 
     #[test]
@@ -696,25 +792,38 @@ mod tests {
     }
 
     #[test]
-    fn restore_args_keep_landlock_and_add_the_tap_rule() {
+    fn restore_args_keep_landlock_and_add_both_tap_rules() {
         let dir = tempfile::tempdir().unwrap();
         let (config, vm, _plan, paths, _manager) = plan_and_paths(dir.path());
         let snapshot = snapshot(dir.path());
-        let lease = crate::network::Lease {
-            index: 4,
-            vm: vm.name.clone(),
-            tap: crate::network::tap_name(4),
-            mac: crate::network::mac(4),
-            host_ip: crate::network::host_ip(4),
-            guest_ip: crate::network::guest_ip(4),
-        };
+        let lease = network_lease(&vm.name, 4, true);
         let joined = strings(&restore_args(&config, &paths, &snapshot, Some(&lease))).join(" ");
         assert!(joined.contains("--landlock"), "{joined}");
         assert!(
             joined.contains("--landlock-rules path=/sys/devices/virtual/net/hegn4,access=r"),
             "{joined}"
         );
+        assert!(
+            joined.contains("--landlock-rules path=/sys/devices/virtual/net/hegnc4,access=r"),
+            "{joined}"
+        );
+        assert!(!joined.contains("--net"), "{joined}");
         assert!(joined.contains("--seccomp true"), "{joined}");
+    }
+
+    #[test]
+    fn restore_off_network_grants_only_the_control_tap_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, vm, _plan, paths, _manager) = plan_and_paths(dir.path());
+        let snapshot = snapshot(dir.path());
+        let lease = network_lease(&vm.name, 4, false);
+        let joined = strings(&restore_args(&config, &paths, &snapshot, Some(&lease))).join(" ");
+        assert!(
+            joined.contains("--landlock-rules path=/sys/devices/virtual/net/hegnc4,access=r"),
+            "{joined}"
+        );
+        assert!(!joined.contains("net/hegn4,"), "{joined}");
+        assert!(!joined.contains("--net"), "{joined}");
     }
 
     #[test]
@@ -760,14 +869,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (config, vm, plan, paths, _manager) = plan_and_paths(dir.path());
         let last = crate::network::TAP_POOL - 1;
-        let lease = crate::network::Lease {
-            index: last,
-            vm: vm.name.clone(),
-            tap: crate::network::tap_name(last),
-            mac: crate::network::mac(last),
-            host_ip: crate::network::host_ip(last),
-            guest_ip: crate::network::guest_ip(last),
-        };
+        let lease = network_lease(&vm.name, last, true);
         let joined = strings(&cloud_hypervisor_args(
             &config,
             &vm,
@@ -783,7 +885,15 @@ mod tests {
             "{joined}"
         );
         assert!(
+            joined.contains("--net tap=hegnc15,mac=52:54:00:00:01:10"),
+            "{joined}"
+        );
+        assert!(
             joined.contains("--landlock-rules path=/sys/devices/virtual/net/hegn15,access=r"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--landlock-rules path=/sys/devices/virtual/net/hegnc15,access=r"),
             "{joined}"
         );
         for forbidden in ["ip=", "mask=", "gateway=", "dns="] {

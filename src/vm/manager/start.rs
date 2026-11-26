@@ -348,7 +348,7 @@ impl VmManager {
             &paths,
             &rootfs,
             &vm_binary,
-            network_lease.data_lease(),
+            Some(&network_lease),
             profile_plan
                 .share
                 .as_ref()
