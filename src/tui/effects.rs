@@ -443,17 +443,31 @@ fn open_editor(path: &Path) -> Result<()> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".to_string());
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!("exec {editor} \"$1\""))
-        .arg("hegn-editor")
-        .arg(path)
+    let status = editor_command(&editor, path)
+        .with_context(|| format!("failed to launch editor '{editor}'"))?
         .status()
         .with_context(|| format!("failed to launch editor '{editor}'"))?;
     if !status.success() {
         anyhow::bail!("editor exited with {status}");
     }
     Ok(())
+}
+
+/// Build an editor invocation without going through a shell.
+///
+/// `$VISUAL`/`$EDITOR` conventionally hold a program plus optional arguments
+/// (`code -w`). Splitting on ASCII whitespace and appending the path as the
+/// last argument keeps shell metacharacters inert: they can only end up in an
+/// argument or an unresolved program name, never as `/bin/sh` syntax.
+fn editor_command(editor: &str, path: &Path) -> Result<Command> {
+    let mut parts = editor.split_ascii_whitespace();
+    let program = parts
+        .next()
+        .context("$VISUAL/$EDITOR does not name an editor")?;
+    let mut command = Command::new(program);
+    command.args(parts);
+    command.arg(path);
+    Ok(command)
 }
 
 fn setup_network(ports: &[u16]) -> Result<()> {
@@ -537,6 +551,37 @@ mod tests {
             "hegn: rust",
             "an empty record project must not produce a dangling separator"
         );
+    }
+
+    #[test]
+    fn editor_commands_are_split_without_a_shell() {
+        let path = Path::new("/tmp/note.md");
+
+        let command = editor_command("vi", path).unwrap();
+        assert_eq!(command.get_program().to_string_lossy(), "vi");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["/tmp/note.md"]);
+
+        let command = editor_command("code -w", path).unwrap();
+        assert_eq!(command.get_program().to_string_lossy(), "code");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["-w", "/tmp/note.md"]);
+
+        let command = editor_command("vi; rm -rf /", path).unwrap();
+        assert_eq!(
+            command.get_program().to_string_lossy(),
+            "vi;",
+            "shell metacharacters must stay inert parts of the program name"
+        );
+
+        assert!(editor_command("", path).is_err());
+        assert!(editor_command("  \t", path).is_err());
     }
 
     #[test]
