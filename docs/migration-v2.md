@@ -3,11 +3,44 @@
 hegn v2 is a hard cut. There is no automatic migration from the v1
 one-project-per-VM model.
 
+- [Upgrading an existing v2 installation](#upgrading-an-existing-v2-installation)
 - [What v2 reads](#what-v2-reads)
 - [What happens to v1 state](#what-happens-to-v1-state)
 - [Recreate a v1 instance](#recreate-a-v1-instance)
 - [Command mapping](#command-mapping)
 - [Limitations carried into v2](#limitations-carried-into-v2)
+
+---
+
+## Upgrading an existing v2 installation
+
+The SSH/control-TAP release keeps the v2 config and state format, but it changes
+the network setup, the guest seed and the snapshot fingerprint. Upgrade an
+existing v2 host in this order:
+
+1. **Host tools.** Install the OpenSSH client if it is missing. `ssh` and
+   `ssh-keygen` must be on `PATH`; `hegn doctor` now checks both.
+2. **Network setup.** Run `sudo hegn network setup --user "$USER"` again. The
+   marker moves to version 3 and the 16 control TAPs (`hegnc0`–`hegnc15`) plus
+   the control nftables rules are created. This is required even for
+   `network = "off"`, because every VM now gets a control TAP for SSH.
+3. **Seed and guest.** `hegn vm apply <vm>` regenerates the seed with version 13
+   and restarts the VM. The next boot re-runs cloud-init once, configures the
+   control netplan and sshd, generates fresh guest host keys and authorizes the
+   per-VM public key. For a stopped VM, `hegn vm start <vm>` does the same on
+   its next boot; a reboot inside the guest does not rewrite the seed.
+4. **Snapshots.** Snapshots from before seed version 13 or the
+   `hegn-snapshot-boot-v3` fingerprint domain are not resumed. The next start
+   cold boots and logs why. Manual restore refuses them; take a fresh snapshot
+   after `hegn vm apply` if you need a restorable checkpoint.
+5. **Old session records.** A VM whose `session.json` predates `guest_ip` and
+   `ssh_user` refuses the default SSH attach. Use
+   `hegn attach <vm> --serial` until `hegn vm apply <vm>` has refreshed the
+   record, or run `hegn vm apply` first and attach over SSH afterwards.
+
+`hegn doctor` reports an outdated network marker, missing control TAPs, missing
+SSH tools and running VMs without `guest_ip`/`ssh_user`/key. There is no
+automatic serial fallback; `--serial` is the explicit recovery path.
 
 ---
 
@@ -122,8 +155,11 @@ VM named after the project.
 
 ## Limitations carried into v2
 
-- **One console per VM.** A vsock session broker is out of scope for this
-  release. Use guest `tmux` for several agents in one VM, or separate VMs.
+- **SSH sessions, no vsock broker.** Several SSH sessions per VM run in
+  parallel over the control TAP, each with its own guest PTY. The embedded TUI
+  terminal remains the serial console; there are no TUI tabs, VT emulator or
+  hegn-side session multiplexer. Guest `tmux` is optional persistence, not the
+  transport.
 - **Membership changes require a restart.** There is no live virtio-fs hot-plug;
   `hegn vm apply` restarts the VM and kills running agents.
 - **Tool changes are not reconciled.** A provisioner installs the baseline once.

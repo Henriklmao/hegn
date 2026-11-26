@@ -48,9 +48,10 @@ prints a warning. Use `--vm`.
 `state.json` and `memory-ranges` into a private directory. Then the VM resumes.
 
 Cloud Hypervisor stores device paths in the snapshot: the rootfs, the serial and
-virtio-fs sockets, and the Landlock rule. Restore therefore needs the same
-`state_dir` and `snapshots_dir`. If those paths have moved, the restore fails
-safely instead of starting an inconsistent VM.
+virtio-fs sockets, the network devices and the Landlock rules, including the
+sysfs rule for each TAP. Restore therefore needs the same `state_dir` and
+`snapshots_dir`. If those paths have moved, the restore fails safely instead of
+starting an inconsistent VM.
 
 ---
 
@@ -75,7 +76,7 @@ seconds instead of a full boot.
 
 ## Boot fingerprints
 
-A v2 snapshot records:
+A snapshot records:
 
 ```text
 vm: "dev"
@@ -92,24 +93,39 @@ adding a worktree does not invalidate a snapshot.
 - ordered membership (name, canonical path, tag, guest mount, read-only, kind),
 - `vcpus`, `memory_mib`, rootfs path and format,
 - `network_index`, profile-share presence,
+- `seed_version` and `network_mode` (control-only vs control+data),
 - the `primary` project that drives `/workspace`.
+
+The fingerprint domain is `hegn-snapshot-boot-v3`. The `network_mode` input is
+what distinguishes `network = "off"` (control TAP only) from `guarded`
+(control + data TAP).
 
 Semantics:
 
-- **Automatic resume:** a checkpoint whose fingerprint differs is skipped with a
-  logged reason, and the VM cold boots. hegn never restores a VM whose embedded
-  mounts no longer exist.
+- **Automatic resume:** a checkpoint whose fingerprint or fingerprint domain
+  differs is skipped with a logged reason, and the VM cold boots. This includes
+  a different `seed_version` or `network_mode`. hegn never restores a VM whose
+  embedded mounts no longer exist or whose device tree predates the control NIC.
 - **Manual restore:** a fingerprint mismatch is refused with a message naming the
-  changed fields and suggesting `hegn vm apply`. There is no `--force` option. A
-  restored VM cannot be reconciled with shares that were added or removed after
-  the snapshot was taken.
-- **Restore flow:** hegn re-spawns one `virtiofsd` per recorded member on the
-  same indexed sockets, regenerates the seed from the recorded membership,
-  restores the VMM, and rewrites the session record.
+  changed fields and suggesting `hegn vm apply`. A snapshot from an older
+  domain, or one without the control NIC, is refused as well. There is no
+  `--force` option. A restored VM cannot be reconciled with shares or a network
+  mode that changed after the snapshot was taken.
+- **Restore flow:** hegn reserves the control TAP and, when recorded, the data
+  TAP; checks both TAP MACs against the snapshot; re-spawns one `virtiofsd` per
+  recorded member on the same indexed sockets; regenerates the seed from the
+  recorded membership and network mode; restores the VMM with the Landlock rules
+  for both TAPs; and rewrites the session record.
 
-Assigning or unassigning a project, changing the primary, or changing VM
-resources therefore makes older snapshots non-resumable. Take a new snapshot
-after `hegn vm apply` if you need a restorable checkpoint of the new layout.
+Assigning or unassigning a project, changing the primary, changing VM resources,
+the seed version or the network mode therefore makes older snapshots
+non-resumable. Take a new snapshot after `hegn vm apply` if you need a
+restorable checkpoint of the new layout.
+
+Snapshots written before the SSH/control-TAP release use an older fingerprint
+domain and are invalidated once. The next start cold boots, then new automatic
+checkpoints use the v3 domain. A restore needs the current network setup marker
+(version 3) because the control TAP is part of the restored device tree.
 
 ---
 
