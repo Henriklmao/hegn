@@ -424,7 +424,7 @@ impl VmManager {
             serial_log: Some(serial_log.clone()),
             membership: membership.members.clone(),
             guest_ip: Some(network_lease.control_guest_ip()),
-            ssh_user: None,
+            ssh_user: Some(ssh_user.as_str().to_string()),
         };
         let recorded = (|| -> Result<()> {
             membership.save(&paths.membership)?;
