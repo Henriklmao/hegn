@@ -39,7 +39,7 @@ impl VmConsole {
             Some(session) => session,
             None if paths.session.exists() => bail!(
                 "session metadata in {} is unreadable or from an older hegn version; \
-                 stop the old VM and remove the run directory",
+                 run `hegn vm start <name>` to archive the stale state and boot again",
                 paths.run_dir.display()
             ),
             None => bail!(
@@ -378,7 +378,7 @@ mod tests {
 
         let err = VmConsole::attach(&config, &vm).unwrap_err().to_string();
         assert!(err.contains("unreadable"), "{err}");
-        assert!(err.contains("stop the old VM"), "{err}");
+        assert!(err.contains("archive the stale state"), "{err}");
     }
 
     #[test]

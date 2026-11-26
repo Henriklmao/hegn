@@ -92,8 +92,8 @@ impl VmManager {
         if self.unreadable_session() {
             state = "failed".into();
             note = Some(
-                "session metadata is unreadable or from an older hegn version; stop the old VM \
-                 and remove the run directory"
+                "session metadata is unreadable or from an older hegn version; \
+                 the stale run state is archived automatically on the next start or stop"
                     .into(),
             );
         }
