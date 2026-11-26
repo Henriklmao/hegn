@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::firewall::HostFirewall;
 use super::pool::status;
-use super::{MARKER, MARKER_VERSION, SUBNET, TAP_POOL};
+use super::{CONTROL_SUBNET, CONTROL_TAP_POOL, MARKER, MARKER_VERSION, SUBNET, TAP_POOL};
 use crate::config::Config;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +19,11 @@ pub struct ReadyMarker {
     pub version: u32,
     pub pool: u8,
     pub subnet: String,
+    /// Number of control TAP slots. Every VM needs one for SSH, independent of
+    /// its data-network mode.
+    pub control_pool: u8,
+    /// Root of the host-only control network (`10.214.0.0`).
+    pub control_subnet: String,
     pub dns: Vec<String>,
     /// TCP ports DNATed to the host loopback for the guest.
     #[serde(default)]
@@ -37,7 +42,14 @@ pub fn marker_path() -> &'static Path {
 
 /// Read and validate the host firewall marker.
 pub fn ready_marker() -> Option<ReadyMarker> {
-    let path = marker_path();
+    ready_marker_at(marker_path())
+}
+
+/// Read and validate a marker from `path`.
+///
+/// Kept separate from [`marker_path`] so tests can exercise the file-level
+/// safety checks (symlinks, ownership) without touching `/run`.
+fn ready_marker_at(path: &Path) -> Option<ReadyMarker> {
     let meta = fs::symlink_metadata(path).ok()?;
     if !meta.file_type().is_file() {
         return None;
@@ -52,10 +64,22 @@ pub fn ready_marker() -> Option<ReadyMarker> {
         }
     }
     let raw = fs::read_to_string(path).ok()?;
-    let marker: ReadyMarker = serde_json::from_str(&raw).ok()?;
+    parse_marker(&raw)
+}
+
+/// Parse and validate the marker payload.
+///
+/// The version gate is what makes an old marker unusable for new rules. The
+/// control fields are required (not serde defaults), so a version 2 marker
+/// cannot be reinterpreted as a version 3 receipt even if someone edits its
+/// version number.
+fn parse_marker(raw: &str) -> Option<ReadyMarker> {
+    let marker: ReadyMarker = serde_json::from_str(raw).ok()?;
     (marker.version == MARKER_VERSION
         && marker.pool == TAP_POOL
-        && marker.subnet == SUBNET.to_string())
+        && marker.subnet == SUBNET.to_string()
+        && marker.control_pool == CONTROL_TAP_POOL
+        && marker.control_subnet == CONTROL_SUBNET.to_string())
     .then_some(marker)
 }
 
@@ -111,21 +135,27 @@ mod tests {
     use super::*;
     use crate::network::DNS;
 
+    fn marker(endpoints: Vec<u16>, host_firewall: HostFirewall) -> ReadyMarker {
+        ReadyMarker {
+            version: MARKER_VERSION,
+            pool: TAP_POOL,
+            subnet: SUBNET.to_string(),
+            control_pool: CONTROL_TAP_POOL,
+            control_subnet: CONTROL_SUBNET.to_string(),
+            dns: DNS.iter().map(ToString::to_string).collect(),
+            endpoints,
+            host_firewall,
+            applied_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn ready_marker_is_readable_by_the_unprivileged_doctor() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("network.json");
-        let marker = ReadyMarker {
-            version: MARKER_VERSION,
-            pool: TAP_POOL,
-            subnet: SUBNET.to_string(),
-            dns: DNS.iter().map(ToString::to_string).collect(),
-            endpoints: Vec::new(),
-            host_firewall: HostFirewall::Ufw,
-            applied_at: Utc::now(),
-        };
+        let marker = marker(Vec::new(), HostFirewall::Ufw);
         write_marker(&path, &marker).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -138,20 +168,8 @@ mod tests {
         assert!(raw.contains("\"host_firewall\": \"ufw\""), "{raw}");
     }
 
-    fn marker(endpoints: Vec<u16>, host_firewall: HostFirewall) -> ReadyMarker {
-        ReadyMarker {
-            version: MARKER_VERSION,
-            pool: TAP_POOL,
-            subnet: SUBNET.to_string(),
-            dns: DNS.iter().map(ToString::to_string).collect(),
-            endpoints,
-            host_firewall,
-            applied_at: Utc::now(),
-        }
-    }
-
     #[test]
-    fn marker_roundtrip_preserves_endpoints_and_firewall() {
+    fn marker_roundtrip_preserves_endpoints_control_fields_and_firewall() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("network.json");
         let expected = marker(vec![1234, 11434], HostFirewall::Firewalld);
@@ -161,9 +179,78 @@ mod tests {
         let raw = fs::read_to_string(&path).unwrap();
         let parsed: ReadyMarker = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed, expected);
+        assert_eq!(parsed.version, 3);
+        assert_eq!(parsed.control_pool, CONTROL_TAP_POOL);
+        assert_eq!(parsed.control_subnet, "10.214.0.0");
+        assert!(raw.contains("\"control_pool\": 16"), "{raw}");
+        assert!(raw.contains("\"control_subnet\": \"10.214.0.0\""), "{raw}");
         assert!(raw.contains("\"endpoints\": [\n"), "{raw}");
         assert!(raw.contains("11434"), "{raw}");
         assert!(raw.contains("\"host_firewall\": \"firewalld\""), "{raw}");
+        assert_eq!(parse_marker(&raw), Some(expected));
+    }
+
+    #[test]
+    fn version_two_markers_never_vouch_for_version_three_rules() {
+        // A plain v2 marker has no control fields and must not deserialize.
+        let legacy = r#"{
+            "version": 2,
+            "pool": 16,
+            "subnet": "10.213.0.0",
+            "dns": ["1.1.1.1", "9.9.9.9"],
+            "endpoints": [],
+            "host_firewall": "none",
+            "applied_at": "2024-01-01T00:00:00Z"
+        }"#;
+        assert!(serde_json::from_str::<ReadyMarker>(legacy).is_err());
+        assert_eq!(parse_marker(legacy), None);
+
+        // Even a v2 marker that carries the new fields is rejected by version.
+        let upgraded = r#"{
+            "version": 2,
+            "pool": 16,
+            "subnet": "10.213.0.0",
+            "control_pool": 16,
+            "control_subnet": "10.214.0.0",
+            "dns": ["1.1.1.1", "9.9.9.9"],
+            "endpoints": [],
+            "host_firewall": "none",
+            "applied_at": "2024-01-01T00:00:00Z"
+        }"#;
+        assert_eq!(parse_marker(upgraded), None);
+    }
+
+    #[test]
+    fn markers_without_control_fields_are_rejected() {
+        let raw = r#"{
+            "version": 3,
+            "pool": 16,
+            "subnet": "10.213.0.0",
+            "dns": ["1.1.1.1", "9.9.9.9"],
+            "endpoints": [],
+            "host_firewall": "none",
+            "applied_at": "2024-01-01T00:00:00Z"
+        }"#;
+        assert!(
+            serde_json::from_str::<ReadyMarker>(raw).is_err(),
+            "control fields must be required, not defaulted"
+        );
+        assert_eq!(parse_marker(raw), None);
+    }
+
+    #[test]
+    fn marker_with_wrong_control_pool_or_subnet_is_rejected() {
+        for (pool, subnet) in [
+            (CONTROL_TAP_POOL - 1, "10.214.0.0"),
+            (CONTROL_TAP_POOL, "10.215.0.0"),
+            (CONTROL_TAP_POOL, "10.213.0.0"),
+        ] {
+            let mut marker = marker(Vec::new(), HostFirewall::None);
+            marker.control_pool = pool;
+            marker.control_subnet = subnet.to_string();
+            let raw = serde_json::to_string(&marker).unwrap();
+            assert_eq!(parse_marker(&raw), None, "{pool}/{subnet} must be rejected");
+        }
     }
 
     #[test]
@@ -182,41 +269,17 @@ mod tests {
     }
 
     #[test]
-    fn legacy_marker_without_optional_fields_still_deserializes() {
-        // A marker written before local endpoints existed has neither
-        // `endpoints` nor `host_firewall`; both default rather than failing.
-        let legacy = r#"{
-            "version": 1,
-            "pool": 16,
-            "subnet": "10.213.0.0",
-            "dns": ["1.1.1.1", "9.9.9.9"],
-            "applied_at": "2024-01-01T00:00:00Z"
-        }"#;
-        let parsed: ReadyMarker = serde_json::from_str(legacy).unwrap();
-        assert_eq!(parsed.version, 1);
-        assert!(parsed.endpoints.is_empty());
-        assert_eq!(parsed.host_firewall, HostFirewall::None);
-        // The version gate is what makes a v1 marker unusable for v2 rules.
-        assert_ne!(
-            parsed.version, MARKER_VERSION,
-            "an old marker must never vouch for the current rules"
-        );
-    }
+    fn a_marker_owned_by_a_non_root_user_is_rejected() {
+        use std::os::unix::fs::MetadataExt;
 
-    #[test]
-    fn malformed_or_incomplete_markers_are_rejected() {
-        for raw in [
-            "",
-            "not json",
-            "{}",
-            r#"{"version": 2}"#,
-            r#"{"version": "2", "pool": 16, "subnet": "10.213.0.0", "dns": [], "applied_at": "2024-01-01T00:00:00Z"}"#,
-            r#"{"version": 2, "pool": 16, "subnet": "10.213.0.0", "dns": [], "applied_at": "yesterday"}"#,
-        ] {
-            assert!(
-                serde_json::from_str::<ReadyMarker>(raw).is_err(),
-                "malformed marker must be rejected: {raw:?}"
-            );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("network.json");
+        write_marker(&path, &marker(Vec::new(), HostFirewall::None)).unwrap();
+
+        // The test process normally runs unprivileged; under root this check
+        // cannot be exercised without changing file ownership.
+        if fs::metadata(&path).unwrap().uid() != 0 {
+            assert_eq!(ready_marker_at(&path), None);
         }
     }
 
@@ -255,6 +318,21 @@ mod tests {
             "O_NOFOLLOW must reject a symlinked marker"
         );
         assert_eq!(fs::read_to_string(&victim).unwrap(), "root owned");
+    }
+
+    #[test]
+    fn reading_a_symlinked_marker_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        write_marker(&target, &marker(Vec::new(), HostFirewall::None)).unwrap();
+        let link = dir.path().join("network.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            ready_marker_at(&link),
+            None,
+            "a symlink must never be accepted as the readiness marker"
+        );
     }
 
     #[test]

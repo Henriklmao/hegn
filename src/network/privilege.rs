@@ -11,7 +11,7 @@ use chrono::Utc;
 use super::firewall::{SAFE_PATH, command_exists, detect_host_firewall};
 use super::marker::{ReadyMarker, marker_path, ready_marker, write_marker};
 use super::script::{reload_script, render_command, run_script, setup_script, teardown_script};
-use super::{DNS, MARKER_VERSION, SUBNET, TAP_POOL};
+use super::{CONTROL_SUBNET, CONTROL_TAP_POOL, DNS, MARKER_VERSION, SUBNET, TAP_POOL};
 use crate::config::{Config, NetworkMode};
 
 /// User that should own the TAP devices. `SUDO_USER` wins when hegn itself was
@@ -200,6 +200,8 @@ fn record_ready(endpoints: Vec<u16>) -> Result<()> {
         version: MARKER_VERSION,
         pool: TAP_POOL,
         subnet: SUBNET.to_string(),
+        control_pool: CONTROL_TAP_POOL,
+        control_subnet: CONTROL_SUBNET.to_string(),
         dns: DNS.iter().map(ToString::to_string).collect(),
         endpoints,
         // Detected after the script ran: it reports what the guard had to

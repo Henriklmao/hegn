@@ -53,10 +53,9 @@ pub const DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(9, 9, 9
 /// Marker written by the privileged setup step. `/run` is cleared on reboot,
 /// so a stale marker cannot outlive the nftables rules it vouches for.
 pub const MARKER: &str = "/run/hegn/network.json";
-/// Bumped only for incompatible rule generations. `endpoints` defaults to an
-/// empty list, so a marker written before local endpoints existed stays valid
-/// for a configuration without endpoints. Version 2 added the host-firewall
-/// carve-out: a version 1 guard predates it and would silently drop all guest
-/// traffic on hosts whose firewall also filters `forward`.
-const MARKER_VERSION: u32 = 2;
+/// Bumped only for incompatible rule generations. Version 2 added the
+/// host-firewall carve-out; version 3 adds the control TAP pool that every
+/// session uses for SSH. A version 2 marker neither records nor vouches for the
+/// control devices, so it must never be accepted for a version 3 setup.
+const MARKER_VERSION: u32 = 3;
 const NETWORK_DIR: &str = "network";
