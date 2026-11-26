@@ -19,6 +19,7 @@ use crate::vm::config::VmConfig;
 use super::PROFILE_VERSION;
 use super::fs::{
     DirFd, EntryKind, copy_file_private, copy_open_source_to_file, ensure_real_dir, remove_path,
+    repaired_warning,
 };
 use super::model::{ProfilePlan, ProfileShare, SyncBackReport, SyncReport};
 use super::store::{ProfileLayout, ProfileState, ProfileStore, StoredFile, StoredSkill};
@@ -87,7 +88,7 @@ pub fn sync_skills(config: &Config, vm: &VmConfig) -> Result<SyncReport> {
         report.warnings.append(&mut warnings);
         upsert_skill(&mut state, &source, &skill.target, &bundle, skill.sync_back);
     }
-    layout.save(&state, &profile)?;
+    report.warnings.append(&mut layout.save(&state, &profile)?);
     Ok(report)
 }
 
@@ -368,7 +369,9 @@ fn materialize(config: &Config, vm: &VmConfig, refresh: Refresh) -> Result<Profi
         // Configuration files are refreshed from the host on every start. The
         // previous bundle is discarded so deleted files disappear from the
         // guest copy as well.
-        layout.reset_files()?;
+        if layout.reset_files()? {
+            plan.warnings.push(repaired_warning(&layout.files_dir()));
+        }
         state.files.clear();
         for (index, file) in profile.files.iter().enumerate() {
             let source = expand_home(&file.source);
@@ -460,7 +463,7 @@ fn materialize(config: &Config, vm: &VmConfig, refresh: Refresh) -> Result<Profi
         upsert_skill(&mut state, &source, &skill.target, &bundle, skill.sync_back);
     }
 
-    layout.save(&state, &profile)?;
+    plan.warnings.append(&mut layout.save(&state, &profile)?);
     let env = layout.env_contents(&profile);
     let manifest = layout.manifest_contents(&state)?;
     let has_payload = !state.files.is_empty() || !state.skills.is_empty() || !env.is_empty();
