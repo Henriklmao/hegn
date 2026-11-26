@@ -296,18 +296,11 @@ impl SshIdentity {
 }
 
 fn validate_vm_name(vm: &str) -> Result<(), SshError> {
-    let invalid = vm.is_empty()
-        || vm == "."
-        || vm == ".."
-        || vm.starts_with('.')
-        || vm.contains('/')
-        || vm.contains('\\')
-        || vm.contains('\0')
-        || vm.trim() != vm;
-    if invalid {
-        return Err(SshError::InvalidVmName { vm: vm.to_string() });
-    }
-    Ok(())
+    // Reuse the VM config validator so an SSH identity can never be created
+    // for a name that `VmStore` would reject (or vice versa). It enforces the
+    // trimmed/empty/length rules, rejects path separators and a leading dot,
+    // and allows only ASCII alphanumerics plus '-', '_' and '.'.
+    crate::vm::config::validate_name(vm).map_err(|_| SshError::InvalidVmName { vm: vm.to_string() })
 }
 
 fn validate_public_key(vm: &str, path: &Path, contents: &str) -> Result<String, SshError> {
@@ -588,6 +581,28 @@ mod tests {
             placeholder.is_dir(),
             "remove_all must leave the placeholder path alone"
         );
+    }
+
+    #[test]
+    fn vm_names_match_the_vm_config_rules() {
+        for name in [
+            "", " ", " two", "two ", "a b", "a\nb", "a\tb", ".", "..", ".hidden",
+        ] {
+            assert!(
+                validate_vm_name(name).is_err(),
+                "accepted invalid name {name:?}"
+            );
+        }
+        assert!(
+            validate_vm_name(&"a".repeat(65)).is_err(),
+            "accepted 65 bytes"
+        );
+        for name in ["rust", "rust-1", "rust_1", "rust.1", "A9", &"a".repeat(64)] {
+            assert!(
+                validate_vm_name(name).is_ok(),
+                "rejected valid name {name:?}"
+            );
+        }
     }
 
     #[test]
