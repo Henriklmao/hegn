@@ -138,11 +138,14 @@ impl VmManager {
         let _hegn = hegn_binary()?;
         let _lock = self.lock(&paths)?;
         if self.unreadable_session() {
-            bail!(
-                "session metadata in {} is unreadable or from an older hegn version; \
-                 stop the old VM manually and remove that directory before starting",
-                paths.run_dir.display()
-            );
+            let archive =
+                super::repair::repair_unreadable_session_locked(&self.config, &self.vm, &paths)?;
+            if let Some(archive) = archive {
+                append_event_log(
+                    &paths.event_log,
+                    &format!("archived unreadable session state to {}", archive.display()),
+                );
+            }
         }
         if self.is_running() {
             bail!(
@@ -749,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn start_refuses_an_unreadable_session() {
+    fn start_repairs_an_unreadable_session() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
         config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
@@ -763,9 +766,19 @@ mod tests {
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
 
-        let err = manager.start().unwrap_err().to_string();
-        assert!(err.contains("unreadable"), "{err}");
-        assert_eq!(std::fs::read(&paths.session).unwrap(), b"{not json");
+        // The boot may still fail on the fake assets, but the stale metadata
+        // must be archived instead of blocking the start forever.
+        let _ = manager.start();
+        assert!(!paths.session.exists());
+        let archive = std::fs::read_dir(&paths.run_dir)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("stale-"))
+            .expect("archive directory");
+        assert_eq!(
+            std::fs::read(archive.path().join("session.json")).unwrap(),
+            b"{not json"
+        );
     }
 
     #[test]

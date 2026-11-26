@@ -798,11 +798,12 @@ pub(super) async fn restore_snapshot_locked(
     // Prepare the keypair and resolve the guest account before the current VM
     // is stopped; an invalid ssh_user must not cost a running session.
     let (ssh_user, ssh_public_key) = prepare_guest_ssh(config, vm)?;
-    if manager.unreadable_session() {
-        bail!(
-            "session metadata in {} is unreadable or from an older hegn version; \
-             stop the old VM manually and remove that directory before restoring",
-            paths.run_dir.display()
+    if manager.unreadable_session()
+        && let Some(archive) = super::repair::repair_unreadable_session_locked(config, vm, &paths)?
+    {
+        append_event_log(
+            &paths.event_log,
+            &format!("archived unreadable session state to {}", archive.display()),
         );
     }
     // The snapshot embeds its device tree. Check the profile before stopping
@@ -1340,7 +1341,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_refuses_an_unreadable_session() {
+    fn restore_repairs_an_unreadable_session() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
         config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
@@ -1352,14 +1353,16 @@ mod tests {
         let snap_dir = dir.path().join("snap");
         write_snapshot_files(&snap_dir);
         let snapshot = matching_snapshot(&manager, &snap_dir);
-        let err = runtime()
-            .block_on(manager.restore_snapshot(&snapshot))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unreadable"), "{err}");
-        assert!(
-            paths.session.exists(),
-            "unreadable metadata must be preserved"
+        let _ = runtime().block_on(manager.restore_snapshot(&snapshot));
+        assert!(!paths.session.exists());
+        let archive = std::fs::read_dir(&paths.run_dir)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("stale-"))
+            .expect("archive directory");
+        assert_eq!(
+            std::fs::read(archive.path().join("session.json")).unwrap(),
+            b"{not json"
         );
     }
 
