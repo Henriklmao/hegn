@@ -17,9 +17,10 @@ use crate::agent::launch;
 use crate::agent::provision::{ProvisionPlan, ProvisionProgress, ProvisionWatcher};
 use crate::config::Config;
 use crate::project::{ProjectEntry, ProjectKind, ProjectRegistry};
+use crate::session::ssh::{GuestEnv, SshError, SshIdentity, SshTarget};
 use crate::shared::text::shell_quote;
 use crate::vm::config::{VmConfig, VmStore};
-use crate::vm::manager::{BootPlan, VmPaths};
+use crate::vm::manager::{BootPlan, SessionRecord, VmManager, VmPaths};
 use crate::vm::registry::{VmRegistry, remove_private_rootfs};
 
 use crate::cli::args::VmCommands;
@@ -295,7 +296,12 @@ pub(crate) fn vm_command(command: VmCommands, config: Config, json: bool) -> Res
             }
             Ok(0)
         }
-        VmCommands::Shell { name, project } => {
+        VmCommands::Shell {
+            name,
+            project,
+            serial,
+        } => {
+            let transport = TransportChoice::from_serial(serial);
             let vm = registry.store().load(&name)?;
             let registry_file = ProjectRegistry::load(&config.state_dir)?;
             let target = match project {
@@ -318,16 +324,13 @@ pub(crate) fn vm_command(command: VmCommands, config: Config, json: bool) -> Res
             };
             let guest_path = guest_path_for(&config, &vm, &target)?;
             let spec = launch::resolve(&config, vm.harness, Some(launch::HARNESS), None)?;
-            let command = guest_cwd_command(
-                &guest_path,
-                (!spec.is_shell()).then_some(spec.command.as_str()),
-            );
             let manager = registry.manager(vm.clone())?;
             let plan = ProvisionPlan::new(vm.harness, &vm.extra_packages).ok();
-            let report = if manager.is_running() {
-                None
-            } else {
+            let started = !manager.is_running();
+            let report = if started {
                 Some(manager.start()?)
+            } else {
+                None
             };
             if config.cloud_init
                 && let (Some(report), Some(plan)) = (&report, plan)
@@ -338,13 +341,33 @@ pub(crate) fn vm_command(command: VmCommands, config: Config, json: bool) -> Res
                 eprintln!("warning: {warning}");
             }
             println!("VM '{}' · project '{}' · {guest_path}", vm.name, target);
-            let console = manager.attach_console()?;
-            crate::session::console::run_interactive_with_command(
-                console,
-                spec.bar,
-                Some(&command),
-            )?;
-            Ok(0)
+            match transport {
+                TransportChoice::Serial => {
+                    let command = guest_cwd_command(
+                        &guest_path,
+                        (!spec.is_shell()).then_some(spec.command.as_str()),
+                    );
+                    let console = manager.attach_console()?;
+                    crate::session::console::run_interactive_with_command(
+                        console,
+                        spec.bar,
+                        Some(&command),
+                    )?;
+                    Ok(0)
+                }
+                TransportChoice::Ssh => {
+                    let session = running_session(&manager, &vm)?;
+                    let target = ssh_target(&config, &vm, &session)?;
+                    if started {
+                        ssh_ready_context(&vm.name, target.wait_ready(SSH_READY_TIMEOUT))?;
+                    }
+                    let command = ssh_session_command(
+                        Some(&guest_path),
+                        (!spec.is_shell()).then_some(spec.command.as_str()),
+                    );
+                    run_ssh_session(&target, command.as_deref())
+                }
+            }
         }
         VmCommands::Delete {
             name,
@@ -646,6 +669,160 @@ pub(crate) fn guest_cwd_command(guest_path: &str, command: Option<&str>) -> Stri
     }
 }
 
+/// How long `hegn open`/`hegn vm shell` wait for a booted guest to accept SSH.
+pub(crate) const SSH_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Transport chosen by the `--serial` flag. SSH is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportChoice {
+    Ssh,
+    Serial,
+}
+
+impl TransportChoice {
+    pub(crate) fn from_serial(serial: bool) -> Self {
+        if serial { Self::Serial } else { Self::Ssh }
+    }
+
+    pub(crate) fn is_serial(self) -> bool {
+        self == Self::Serial
+    }
+}
+
+/// Validate the SSH connection fields a running VM records at boot.
+pub(crate) fn session_ssh_endpoint(
+    session: &SessionRecord,
+    vm: &str,
+) -> Result<(std::net::Ipv4Addr, String)> {
+    let guest_ip = session.guest_ip.with_context(|| missing_ssh_fields(vm))?;
+    let ssh_user = session
+        .ssh_user
+        .as_deref()
+        .map(str::trim)
+        .filter(|user| !user.is_empty())
+        .with_context(|| missing_ssh_fields(vm))?;
+    Ok((guest_ip, ssh_user.to_string()))
+}
+
+fn missing_ssh_fields(vm: &str) -> String {
+    format!(
+        "VM '{vm}' has no SSH address or user in its session record; it was probably started \
+         before SSH support. Run 'hegn attach {vm} --serial', or run 'hegn vm apply {vm}' and \
+         restart the VM."
+    )
+}
+
+/// Guest session context forwarded over SSH.
+pub(crate) fn session_guest_env(vm: &str, session: &SessionRecord) -> GuestEnv {
+    let project = session
+        .project
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_default();
+    let workspace = if session.workspace.as_os_str().is_empty() {
+        &session.project
+    } else {
+        &session.workspace
+    };
+    GuestEnv {
+        vm: vm.to_string(),
+        project,
+        harness: session.harness.label().to_string(),
+        workspace: workspace.display().to_string(),
+    }
+}
+
+/// Load the session record of a running VM, or fail with a start hint.
+pub(crate) fn running_session(manager: &VmManager, vm: &VmConfig) -> Result<SessionRecord> {
+    if !manager.is_running() {
+        bail!(
+            "VM '{}' is not running; start it with `hegn vm start {}`",
+            vm.name,
+            vm.name
+        );
+    }
+    manager.session().with_context(|| {
+        format!(
+            "VM '{}' has no readable session record; stop it and start it again with \
+             `hegn vm start {}`",
+            vm.name, vm.name
+        )
+    })
+}
+
+/// Build the SSH target of a running VM from its recorded session.
+pub(crate) fn ssh_target(
+    config: &Config,
+    vm: &VmConfig,
+    session: &SessionRecord,
+) -> Result<SshTarget> {
+    let (guest_ip, ssh_user) = session_ssh_endpoint(session, &vm.name)?;
+    let identity = SshIdentity::new(&config.vms_dir, &vm.name);
+    // `load` never regenerates a key: a running guest would not know it.
+    identity.load()?;
+    let target = SshTarget::new(
+        vm.name.clone(),
+        guest_ip,
+        ssh_user,
+        identity.key().to_path_buf(),
+        identity.known_hosts().to_path_buf(),
+    )
+    .with_context(|| format!("invalid SSH target for VM '{}'", vm.name))?;
+    Ok(target.with_env(session_guest_env(&vm.name, session)))
+}
+
+/// The remote command for an SSH session, anchored in the guest project path.
+///
+/// With a project path and no command the remote shell is replaced by an
+/// interactive login shell that starts in that directory. Without a path the
+/// raw command is passed through unchanged.
+pub(crate) fn ssh_session_command(
+    guest_path: Option<&str>,
+    command: Option<&str>,
+) -> Option<String> {
+    let command = command.map(str::trim).filter(|command| !command.is_empty());
+    match (guest_path, command) {
+        (Some(path), Some(command)) => Some(guest_cwd_command(path, Some(command))),
+        (Some(path), None) => Some(format!(
+            "cd {} && exec \"${{SHELL:-/bin/sh}}\" -l",
+            shell_quote(path)
+        )),
+        (None, Some(command)) => Some(command.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Run an SSH session and propagate the remote exit code.
+///
+/// Transport failures become a hegn error that names the VM and destination.
+pub(crate) fn run_ssh_session(target: &SshTarget, command: Option<&str>) -> Result<i32> {
+    ssh_failure_context(target, target.interactive(command))
+}
+
+/// Attach the VM/destination context to an SSH result, for callers and tests.
+pub(crate) fn ssh_failure_context(
+    target: &SshTarget,
+    result: std::result::Result<i32, SshError>,
+) -> Result<i32> {
+    result.with_context(|| {
+        format!(
+            "SSH to VM '{}' failed ({}@{})",
+            target.vm, target.user, target.host
+        )
+    })
+}
+
+/// Turn a failed readiness probe into an actionable `hegn open` error.
+pub(crate) fn ssh_ready_context(vm: &str, result: std::result::Result<(), SshError>) -> Result<()> {
+    result.with_context(|| {
+        format!(
+            "VM '{vm}' is running, but SSH is not ready. Try 'hegn attach {vm} --serial', or run \
+             'hegn vm apply {vm}' and restart the VM."
+        )
+    })
+}
+
 /// Wait for the guest provisioner while showing a rough progress bar.
 ///
 /// Pre-provisioned images never emit progress, so the wait is bounded: after a
@@ -923,5 +1100,153 @@ mod tests {
                 .name,
             "demo"
         );
+    }
+
+    fn session_record() -> SessionRecord {
+        SessionRecord {
+            project: PathBuf::from("/projects/parser"),
+            workspace: PathBuf::from("/projects/parser"),
+            vm: "rust".into(),
+            harness: Harness::Shell,
+            started_at: Utc::now(),
+            vm_pid: 0,
+            vm_binary: None,
+            relay_pid: 0,
+            virtiofs_pids: Vec::new(),
+            profile_virtiofs_pid: 0,
+            boot_args: String::new(),
+            serial_log: None,
+            membership: Vec::new(),
+            guest_ip: Some(std::net::Ipv4Addr::new(10, 214, 0, 2)),
+            ssh_user: Some("root".into()),
+        }
+    }
+
+    #[test]
+    fn serial_flag_maps_to_the_transport_choice() {
+        assert_eq!(TransportChoice::from_serial(false), TransportChoice::Ssh);
+        assert_eq!(TransportChoice::from_serial(true), TransportChoice::Serial);
+        assert!(!TransportChoice::from_serial(false).is_serial());
+        assert!(TransportChoice::from_serial(true).is_serial());
+    }
+
+    #[test]
+    fn session_endpoint_requires_both_recorded_fields() {
+        let mut record = session_record();
+        let (ip, user) = session_ssh_endpoint(&record, "rust").unwrap();
+        assert_eq!(ip, std::net::Ipv4Addr::new(10, 214, 0, 2));
+        assert_eq!(user, "root");
+
+        record.ssh_user = None;
+        let err = session_ssh_endpoint(&record, "rust")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--serial"), "{err}");
+        assert!(err.contains("hegn vm apply rust"), "{err}");
+
+        record.ssh_user = Some("  ".into());
+        assert!(session_ssh_endpoint(&record, "rust").is_err());
+
+        record.ssh_user = Some("root".into());
+        record.guest_ip = None;
+        let err = session_ssh_endpoint(&record, "rust")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--serial"), "{err}");
+    }
+
+    #[test]
+    fn guest_env_uses_the_recorded_project_and_workspace() {
+        let record = session_record();
+        let env = session_guest_env("rust", &record);
+        assert_eq!(env.vm, "rust");
+        assert_eq!(env.project, "parser");
+        assert_eq!(env.harness, "shell");
+        assert_eq!(env.workspace, "/projects/parser");
+    }
+
+    #[test]
+    fn ssh_session_command_anchors_the_guest_path_and_quotes_it() {
+        assert_eq!(
+            ssh_session_command(Some("/projects/a b"), Some("opencode")),
+            Some("cd '/projects/a b' && opencode".into())
+        );
+        assert_eq!(
+            ssh_session_command(Some("/projects/demo"), Some("  ")),
+            Some("cd /projects/demo && exec \"${SHELL:-/bin/sh}\" -l".into())
+        );
+        assert_eq!(
+            ssh_session_command(None, Some("opencode")),
+            Some("opencode".into())
+        );
+        assert_eq!(ssh_session_command(None, None), None);
+    }
+
+    #[test]
+    fn ssh_target_uses_the_recorded_endpoint_and_identity() {
+        let (_dir, config) = config();
+        let vm = VmConfig::from_config(&config, "rust", Some(Harness::Shell));
+        let identity = SshIdentity::new(&config.vms_dir, "rust");
+        if identity.ensure().is_err() {
+            eprintln!("skipping: ssh-keygen is not installed");
+            return;
+        }
+        let mut record = session_record();
+        record.ssh_user = Some("hegn".into());
+
+        let target = ssh_target(&config, &vm, &record).unwrap();
+        assert_eq!(target.vm, "rust");
+        assert_eq!(target.host, std::net::Ipv4Addr::new(10, 214, 0, 2));
+        assert_eq!(target.user, "hegn");
+        assert_eq!(target.key, identity.key());
+        assert_eq!(target.known_hosts, identity.known_hosts());
+        assert_eq!(target.env.project, "parser");
+    }
+
+    #[test]
+    fn ssh_exit_codes_are_propagated_and_transport_errors_gain_context() {
+        let target = SshTarget::new(
+            "rust",
+            std::net::Ipv4Addr::new(10, 214, 0, 2),
+            "root",
+            PathBuf::from("/tmp/key"),
+            PathBuf::from("/tmp/known_hosts"),
+        )
+        .unwrap();
+
+        assert_eq!(ssh_failure_context(&target, Ok(7)).unwrap(), 7);
+
+        let err = ssh_failure_context(
+            &target,
+            Err(SshError::TransportAfterConnect {
+                vm: "rust".into(),
+                user: "root".into(),
+                host: std::net::Ipv4Addr::new(10, 214, 0, 2),
+            }),
+        )
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("SSH to VM 'rust' failed (root@10.214.0.2)"),
+            "{err}"
+        );
+        assert!(err.contains("--serial"), "{err}");
+    }
+
+    #[test]
+    fn ssh_ready_errors_name_the_serial_recovery_path() {
+        let err = ssh_ready_context(
+            "rust",
+            Err(SshError::ConnectionRefused {
+                vm: "rust".into(),
+                user: "root".into(),
+                host: std::net::Ipv4Addr::new(10, 214, 0, 2),
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("SSH is not ready"), "{err}");
+        assert!(err.contains("hegn attach rust --serial"), "{err}");
+        assert!(err.contains("hegn vm apply rust"), "{err}");
     }
 }

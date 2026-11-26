@@ -18,8 +18,9 @@ use crate::vm::registry::VmRegistry;
 
 use super::config::run_editor;
 use super::vm::{
-    guest_cwd_command, guest_path_for, only_running_vm, primary_guest_path, resolve_project_entry,
-    vm_for_entry, wait_for_provision,
+    SSH_READY_TIMEOUT, TransportChoice, guest_cwd_command, guest_path_for, only_running_vm,
+    primary_guest_path, resolve_project_entry, run_ssh_session, running_session, ssh_ready_context,
+    ssh_session_command, ssh_target, vm_for_entry, wait_for_provision,
 };
 use crate::cli::args::LegacyMappingCommands;
 
@@ -64,15 +65,18 @@ fn should_create_session_branch(auto_branch: bool, no_branch: bool) -> bool {
     auto_branch && !no_branch
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn open(
     project: String,
     editor: bool,
     lazygit: bool,
     no_branch: bool,
+    serial: bool,
     no_bar: bool,
     command: Option<String>,
     config: Config,
 ) -> Result<i32> {
+    let transport = TransportChoice::from_serial(serial);
     let entry = resolve_project_entry(&config, &project)?;
     if editor {
         return run_editor(&entry.path);
@@ -116,42 +120,77 @@ pub(crate) fn open(
     }
 
     println!("Guest path: {guest_path}");
-    let typed = command
-        .as_deref()
-        .map(|command| guest_cwd_command(&guest_path, Some(command)));
-    let console = manager.attach_console()?;
-    crate::session::console::run_interactive_with_command(console, !no_bar, typed.as_deref())?;
-    Ok(0)
+    match transport {
+        TransportChoice::Serial => {
+            let typed = command
+                .as_deref()
+                .map(|command| guest_cwd_command(&guest_path, Some(command)));
+            let console = manager.attach_console()?;
+            crate::session::console::run_interactive_with_command(
+                console,
+                !no_bar,
+                typed.as_deref(),
+            )?;
+            Ok(0)
+        }
+        TransportChoice::Ssh => {
+            let session = running_session(&manager, &vm)?;
+            let target = ssh_target(&config, &vm, &session)?;
+            ssh_ready_context(&vm.name, target.wait_ready(SSH_READY_TIMEOUT))?;
+            let remote = ssh_session_command(Some(&guest_path), command.as_deref());
+            run_ssh_session(&target, remote.as_deref())
+        }
+    }
 }
 
 pub(crate) fn attach(
     selector: Option<String>,
+    serial: bool,
     no_bar: bool,
     command: Option<String>,
     config: Config,
 ) -> Result<i32> {
+    let transport = TransportChoice::from_serial(serial);
     let registry = VmRegistry::new(config.clone());
     let vm = match selector {
         Some(selector) => registry.resolve(&selector)?,
         None => only_running_vm(&registry)?,
     };
     // VmConsole::attach re-verifies the recorded pid, VM binary and relay.
-    let manager = registry.manager(vm)?;
+    let manager = registry.manager(vm.clone())?;
     if let Some(warning) = manager.membership_warning() {
         eprintln!("warning: {warning}");
     }
-    let console = manager.attach_console()?;
-    crate::session::console::run_interactive_with_command(console, !no_bar, command.as_deref())?;
-    Ok(0)
+    match transport {
+        TransportChoice::Serial => {
+            let console = manager.attach_console()?;
+            crate::session::console::run_interactive_with_command(
+                console,
+                !no_bar,
+                command.as_deref(),
+            )?;
+            Ok(0)
+        }
+        TransportChoice::Ssh => {
+            let session = running_session(&manager, &vm)?;
+            let target = ssh_target(&config, &vm, &session)?;
+            // Attach has no project selector; start in the VM primary.
+            let guest_path = primary_guest_path(&config, &vm).ok().flatten();
+            let remote = ssh_session_command(guest_path.as_deref(), command.as_deref());
+            run_ssh_session(&target, remote.as_deref())
+        }
+    }
 }
 
 pub(crate) fn launch_command(
     selector: Option<String>,
     command: Option<String>,
     integration: Option<Integration>,
+    serial: bool,
     no_bar: bool,
     config: Config,
 ) -> Result<i32> {
+    let transport = TransportChoice::from_serial(serial);
     let registry = VmRegistry::new(config.clone());
     let (vm, entry) = match selector {
         Some(selector) => match registry.store().load(&selector) {
@@ -204,28 +243,51 @@ pub(crate) fn launch_command(
     if no_bar {
         spec.bar = false;
     }
+    // Resolve the SSH command before the serial path prefixes the command with
+    // its own `cd`; the SSH path starts an interactive shell instead of typing
+    // a bare `cd` into a remote non-interactive shell.
+    let original_command = (!spec.is_shell()).then(|| spec.command.clone());
+    let ssh_command = ssh_session_command(guest_path.as_deref(), original_command.as_deref());
     if let Some(guest_path) = &guest_path {
         let original = (!spec.is_shell()).then_some(spec.command.as_str());
         spec.command = guest_cwd_command(guest_path, original);
     }
     let hegn = std::env::current_exe().context("failed to locate the hegn executable")?;
-    match launch::action(&spec, &vm.name, &host_path, &hegn)? {
-        LaunchAction::Embedded { command } => {
-            let console = manager.attach_console()?;
-            crate::session::console::run_interactive_with_command(
-                console,
-                spec.bar,
-                Some(&command),
-            )?;
-        }
-        LaunchAction::External { vm, command, bar } => {
-            let console = registry.manager_by_name(&vm)?.attach_console()?;
-            crate::session::console::run_interactive_with_command(
-                console,
-                bar,
-                command.as_deref(),
-            )?;
-        }
+    let action = launch::action(&spec, &vm.name, &host_path, &hegn)?;
+    let action = forward_serial_transport(action, transport.is_serial());
+    match action {
+        LaunchAction::Embedded { command } => match transport {
+            TransportChoice::Serial => {
+                let console = manager.attach_console()?;
+                crate::session::console::run_interactive_with_command(
+                    console,
+                    spec.bar,
+                    Some(&command),
+                )?;
+                Ok(0)
+            }
+            TransportChoice::Ssh => {
+                ssh_launch(&config, &vm, &manager, started_now, ssh_command.as_deref())
+            }
+        },
+        LaunchAction::External {
+            vm: external,
+            command,
+            bar,
+        } => match transport {
+            TransportChoice::Serial => {
+                let console = registry.manager_by_name(&external)?.attach_console()?;
+                crate::session::console::run_interactive_with_command(
+                    console,
+                    bar,
+                    command.as_deref(),
+                )?;
+                Ok(0)
+            }
+            TransportChoice::Ssh => {
+                ssh_launch(&config, &vm, &manager, started_now, ssh_command.as_deref())
+            }
+        },
         LaunchAction::Spawn { program, args } => {
             let status = Command::new(&program)
                 .args(&args)
@@ -234,12 +296,55 @@ pub(crate) fn launch_command(
             if !status.success() {
                 bail!("{program} launch integration failed");
             }
+            Ok(0)
         }
         LaunchAction::Herdr { pane_command, cwd } => {
             launch::spawn_herdr(&pane_command, &cwd)?;
+            Ok(0)
         }
     }
-    Ok(0)
+}
+
+/// Open the SSH session for a CLI launch, waiting for a freshly booted guest.
+fn ssh_launch(
+    config: &Config,
+    vm: &VmConfig,
+    manager: &crate::vm::manager::VmManager,
+    started_now: bool,
+    command: Option<&str>,
+) -> Result<i32> {
+    let session = running_session(manager, vm)?;
+    let target = ssh_target(config, vm, &session)?;
+    if started_now {
+        ssh_ready_context(&vm.name, target.wait_ready(SSH_READY_TIMEOUT))?;
+    }
+    run_ssh_session(&target, command)
+}
+
+/// Forward `--serial` to the `hegn attach` command a spawn integration runs.
+///
+/// tmux keeps the pane command as its last argument and herdr stores the whole
+/// command; the attach CLI accepts flags in any position.
+fn forward_serial_transport(action: LaunchAction, serial: bool) -> LaunchAction {
+    if !serial {
+        return action;
+    }
+    match action {
+        LaunchAction::Spawn { program, mut args } => {
+            if let Some(pane) = args.last_mut() {
+                pane.push_str(" --serial");
+            }
+            LaunchAction::Spawn { program, args }
+        }
+        LaunchAction::Herdr {
+            mut pane_command,
+            cwd,
+        } => {
+            pane_command.push_str(" --serial");
+            LaunchAction::Herdr { pane_command, cwd }
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -287,7 +392,9 @@ mod tests {
     #[test]
     fn attach_without_a_session_is_a_hard_error() {
         let (_dir, config) = config();
-        let err = attach(None, false, None, config).unwrap_err().to_string();
+        let err = attach(None, false, false, None, config)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no running VM"), "{err}");
     }
 
@@ -303,5 +410,36 @@ mod tests {
             "--no-branch always forces off"
         );
         assert!(!should_create_session_branch(false, true));
+    }
+
+    #[test]
+    fn serial_is_forwarded_to_spawned_tmux_and_herdr_attaches() {
+        let tmux = LaunchAction::Spawn {
+            program: "tmux".into(),
+            args: vec!["new-window".into(), "hegn attach demo --no-bar".into()],
+        };
+        let LaunchAction::Spawn { args, .. } = forward_serial_transport(tmux, true) else {
+            panic!("expected a spawn action");
+        };
+        assert!(args.last().unwrap().ends_with(" --serial"));
+        assert!(args.last().unwrap().contains("--no-bar"));
+
+        let herdr = LaunchAction::Herdr {
+            pane_command: "hegn attach demo".into(),
+            cwd: std::path::PathBuf::from("/tmp/demo"),
+        };
+        let LaunchAction::Herdr { pane_command, .. } = forward_serial_transport(herdr, true) else {
+            panic!("expected a herdr action");
+        };
+        assert_eq!(pane_command, "hegn attach demo --serial");
+
+        let ssh = LaunchAction::Spawn {
+            program: "tmux".into(),
+            args: vec!["new-window".into(), "hegn attach demo".into()],
+        };
+        let LaunchAction::Spawn { args, .. } = forward_serial_transport(ssh, false) else {
+            panic!("expected a spawn action");
+        };
+        assert_eq!(args.last().unwrap(), "hegn attach demo");
     }
 }
