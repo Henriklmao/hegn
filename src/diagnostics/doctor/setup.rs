@@ -32,6 +32,10 @@ impl SetupActions {
 
 /// What a first launch or the doctor modal can fix automatically.
 pub fn setup_actions(config: &Config) -> SetupActions {
+    setup_actions_with(config, crate::network::guard_ready(config))
+}
+
+fn setup_actions_with(config: &Config, network_ready: bool) -> SetupActions {
     SetupActions {
         create_dirs: !config.projects_root.is_dir()
             || !config.state_dir.is_dir()
@@ -43,8 +47,9 @@ pub fn setup_actions(config: &Config) -> SetupActions {
         init_config: !Config::config_path().exists(),
         init_profiles: crate::agent::profile::ProfileStore::new(config).needs_templates(),
         download_images: images::status(config).iter().any(AssetStatus::missing),
-        configure_network: config.network == crate::config::NetworkMode::Guarded
-            && !crate::network::guard_ready(config),
+        // Every mode needs the one-time setup: `off` still gets control TAPs
+        // for SSH, guarded additionally needs the data TAPs and egress rules.
+        configure_network: !network_ready,
     }
 }
 
@@ -69,5 +74,32 @@ mod tests {
         assert!(actions.create_dirs);
         assert!(actions.download_images);
         assert!(actions.any());
+    }
+
+    #[test]
+    fn network_setup_is_required_for_off_and_guarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            state_dir: dir.path().join("state"),
+            projects_root: dir.path().join("projects"),
+            snapshots_dir: dir.path().join("snapshots"),
+            vms_dir: dir.path().join("instances"),
+            templates_dir: dir.path().join("templates"),
+            ..Config::default()
+        };
+        for mode in [
+            crate::config::NetworkMode::Off,
+            crate::config::NetworkMode::Guarded,
+        ] {
+            config.network = mode;
+            assert!(
+                setup_actions_with(&config, false).configure_network,
+                "{mode:?} needs network setup"
+            );
+            assert!(
+                !setup_actions_with(&config, true).configure_network,
+                "{mode:?} is ready"
+            );
+        }
     }
 }
