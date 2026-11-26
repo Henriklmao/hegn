@@ -139,6 +139,15 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 app.refresh_vms();
                 app.toast(note, ToastLevel::Info);
             }
+            Ok(ScanMessage::VmStopped { vm, note }) => {
+                if app.attached_vm.as_deref() == Some(vm.as_str()) {
+                    app.session = None;
+                    app.attached_vm = None;
+                }
+                app.clear_provision();
+                app.refresh_vms();
+                app.toast(note, ToastLevel::Info);
+            }
             Ok(ScanMessage::Error(err)) => {
                 if app.loading {
                     app.loading = false;
@@ -389,6 +398,24 @@ mod tests {
                 ToastLevel::Info
             )
         );
+    }
+
+    #[test]
+    fn drain_scan_clears_provisioning_when_the_vm_stops() {
+        let (_dir, mut app) = test_app();
+        let (tx, rx) = mpsc::channel();
+        let plan = crate::agent::provision::ProvisionPlan::new(Harness::Shell, &[]).unwrap();
+        app.set_provision_progress(crate::agent::provision::ProvisionProgress::new(&plan));
+        assert!(app.provision.is_some());
+
+        tx.send(ScanMessage::VmStopped {
+            vm: "rust".into(),
+            note: "VM rust stopped".into(),
+        })
+        .unwrap();
+        drain_scan(&mut app, &rx);
+
+        assert!(app.provision.is_none());
     }
 
     #[test]

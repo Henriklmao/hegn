@@ -335,6 +335,9 @@ impl VmManager {
                             self.vm.name
                         )
                     })?;
+                    if let Some(log) = &report.serial_log {
+                        self.wait_for_provision(log)?;
+                    }
                     return Ok(());
                 }
                 Err(error) => {
@@ -360,6 +363,37 @@ impl VmManager {
         );
     }
 
+    /// Wait until the first-boot provisioner installed the harness preset.
+    ///
+    /// `wait_for_guest_ssh` returns as soon as sshd accepts connections, but
+    /// cloud-init may still be installing the harness in the background. A
+    /// user who stops the VM right after `apply` would otherwise interrupt the
+    /// installation and only see it finish on the next boot.
+    fn wait_for_provision(&self, log: &Path) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(15 * 60);
+        loop {
+            match provision_state(log) {
+                ProvisionState::Ready => return Ok(()),
+                ProvisionState::Failed(reason) => bail!(
+                    "VM '{}' is running, but the harness setup failed: {reason}. \
+                     Attach with 'hegn attach {} --serial' to inspect the guest.",
+                    self.vm.name,
+                    self.vm.name
+                ),
+                ProvisionState::Pending => {}
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "VM '{}' is running, but the harness setup did not finish within 15 minutes. \
+                     Attach with 'hegn attach {} --serial' to follow the provisioning log.",
+                    self.vm.name,
+                    self.vm.name
+                );
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     /// Attach the TUI/CLI terminal to the running guest serial console.
     pub fn attach_console(&self) -> Result<crate::session::console::VmConsole> {
         crate::session::console::VmConsole::attach(&self.config, &self.vm)
@@ -382,6 +416,32 @@ fn cloud_init_finished(path: &Path) -> bool {
     let text = String::from_utf8_lossy(&bytes);
     text.lines()
         .any(|line| line.contains("Cloud-init") && line.contains("finished at"))
+}
+
+enum ProvisionState {
+    Pending,
+    Ready,
+    Failed(String),
+}
+
+/// Read the harness provisioner state from the end of the serial log.
+fn provision_state(path: &Path) -> ProvisionState {
+    let Ok(bytes) = tail_bytes(path, 2000) else {
+        return ProvisionState::Pending;
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    if text.lines().any(|line| {
+        line.contains("hegn: preset ready") || line.contains("hegn: preset already provisioned")
+    }) {
+        return ProvisionState::Ready;
+    }
+    if let Some(line) = text
+        .lines()
+        .find(|line| line.contains("hegn-progress:") && line.contains("\"stage\":\"failed\""))
+    {
+        return ProvisionState::Failed(line.trim().to_string());
+    }
+    ProvisionState::Pending
 }
 
 #[cfg(test)]
@@ -577,6 +637,20 @@ mod tests {
         )
         .unwrap();
         assert!(cloud_init_finished(&log));
+    }
+
+    #[test]
+    fn provision_state_detects_ready_already_and_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("serial.log");
+        std::fs::write(&log, "booting\n").unwrap();
+        assert!(matches!(provision_state(&log), ProvisionState::Pending));
+        std::fs::write(&log, "hegn: preset already provisioned\n").unwrap();
+        assert!(matches!(provision_state(&log), ProvisionState::Ready));
+        std::fs::write(&log, "hegn: preset ready\n").unwrap();
+        assert!(matches!(provision_state(&log), ProvisionState::Ready));
+        std::fs::write(&log, "hegn-progress: {\"stage\":\"failed\",\"code\":2}\n").unwrap();
+        assert!(matches!(provision_state(&log), ProvisionState::Failed(_)));
     }
 
     #[test]

@@ -96,8 +96,7 @@ impl App {
         self.session = None;
         self.attached_vm = None;
         self.pending_launch = None;
-        self.provision_running = false;
-        self.provision_ready_seen = false;
+        self.clear_provision();
         self.terminal.clear();
         self.scroll = 0;
         self.input.clear();
@@ -219,8 +218,7 @@ impl App {
         self.session = None;
         self.attached_vm = None;
         self.pending_launch = None;
-        self.provision_running = false;
-        self.provision_ready_seen = false;
+        self.clear_provision();
         self.terminal.clear();
         self.scroll = 0;
         self.input.clear();
@@ -297,8 +295,7 @@ impl App {
         self.session = None;
         self.attached_vm = None;
         self.pending_launch = None;
-        self.provision_running = false;
-        self.provision_ready_seen = false;
+        self.clear_provision();
         self.vm.state = VmUiState::Failed;
         self.vm.started_at = None;
         self.vm.note = Some(error.clone());

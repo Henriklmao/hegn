@@ -35,6 +35,11 @@ pub(super) enum ScanMessage {
         vm: String,
         note: String,
     },
+    /// `vm` stopped; any first-boot provisioning progress is stale now.
+    VmStopped {
+        vm: String,
+        note: String,
+    },
     Doctor {
         report: DoctorReport,
         note: Option<String>,
@@ -115,6 +120,10 @@ mod tests {
                 vm: "rust".into(),
                 note: "VM rust restarted with the current config".into(),
             },
+            ScanMessage::VmStopped {
+                vm: "rust".into(),
+                note: "VM rust stopped".into(),
+            },
             ScanMessage::Error("unreadable state".into()),
             ScanMessage::Doctor {
                 report: DoctorReport {
@@ -135,7 +144,7 @@ mod tests {
             ScanMessage::ProvisionFailed("no network".into()),
             ScanMessage::Error("scan failed".into()),
         ];
-        assert_eq!(messages.len(), 13);
+        assert_eq!(messages.len(), 14);
 
         if let ScanMessage::Started {
             console,
@@ -160,13 +169,14 @@ mod tests {
             matches!(&messages[3], ScanMessage::VmsChanged { .. }),
             matches!(&messages[4], ScanMessage::ProjectAssigned { .. }),
             matches!(&messages[5], ScanMessage::VmApplied { .. }),
-            matches!(&messages[6], ScanMessage::Error(_)),
-            matches!(&messages[7], ScanMessage::Doctor { .. }),
-            matches!(&messages[8], ScanMessage::DownloadProgress(_)),
-            matches!(&messages[9], ScanMessage::Provision(_)),
-            matches!(&messages[10], ScanMessage::ProvisionReady),
-            matches!(&messages[11], ScanMessage::ProvisionFailed(_)),
-            matches!(&messages[12], ScanMessage::Error(_)),
+            matches!(&messages[6], ScanMessage::VmStopped { .. }),
+            matches!(&messages[7], ScanMessage::Error(_)),
+            matches!(&messages[8], ScanMessage::Doctor { .. }),
+            matches!(&messages[9], ScanMessage::DownloadProgress(_)),
+            matches!(&messages[10], ScanMessage::Provision(_)),
+            matches!(&messages[11], ScanMessage::ProvisionReady),
+            matches!(&messages[12], ScanMessage::ProvisionFailed(_)),
+            matches!(&messages[13], ScanMessage::Error(_)),
         ];
         assert!(variants.iter().all(|matched| *matched));
     }

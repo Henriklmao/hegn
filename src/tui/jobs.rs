@@ -223,9 +223,15 @@ fn spawn_lifecycle(
             let registry = VmRegistry::new(config);
             let result = match operation {
                 Lifecycle::Stop => registry.stop(&vm),
-                Lifecycle::Apply => registry
-                    .manager_by_name(&vm)
-                    .and_then(|manager| manager.apply().map(|_| ())),
+                Lifecycle::Apply => registry.manager_by_name(&vm).and_then(|manager| {
+                    let plan =
+                        ProvisionPlan::new(manager.vm().harness, &manager.vm().extra_packages).ok();
+                    let report = manager.apply()?;
+                    if let (Some(log), Some(plan)) = (report.serial_log.clone(), plan) {
+                        spawn_provision_watch(log, plan, thread_tx.clone());
+                    }
+                    Ok(())
+                }),
             };
             match result {
                 Ok(()) => {
@@ -234,10 +240,7 @@ fn spawn_lifecycle(
                         Lifecycle::Apply => format!("VM {vm} restarted with the current config"),
                     };
                     let message = match operation {
-                        Lifecycle::Stop => ScanMessage::VmsChanged {
-                            note,
-                            level: ToastLevel::Info,
-                        },
+                        Lifecycle::Stop => ScanMessage::VmStopped { vm, note },
                         Lifecycle::Apply => ScanMessage::VmApplied { vm, note },
                     };
                     let _ = thread_tx.send(message);
