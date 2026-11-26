@@ -97,7 +97,9 @@ Notes:
   (`--vm`/`--solo`, `--yes`, `--delete-files`/`--keep-files`) and fail with an
   actionable error, not a guess; prompts go to stderr, stdout stays parseable.
 - `project assign` and `project unassign` never start, stop or delete a VM. A
-  running VM keeps its current shares until `hegn vm apply`.
+  running VM keeps its current shares until `hegn vm apply`. `vm apply` waits
+  for cloud-init and SSH readiness before returning, and a changed seed identity
+  re-runs the harness provisioner.
 - `project fork` always creates a member of the parent's VM. Clone is the
   default; `--target` is valid only with `--mode worktree` and must stay inside
   the parent project.
