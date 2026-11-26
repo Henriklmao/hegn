@@ -237,7 +237,19 @@ impl VmManager {
     ///
     /// This is deliberately explicit: applying membership kills running
     /// agents. hegn never restarts a VM on its own.
+    ///
+    /// The guest may present a new host key after the reboot, so the cached
+    /// `known_hosts` entry is dropped first. The client keypair is kept: the
+    /// guest is re-provisioned with the existing public key on the next start.
     pub fn apply(&self) -> Result<super::session::VmReport> {
+        crate::session::ssh::SshIdentity::new(&self.config.vms_dir, &self.vm.name)
+            .remove_known_hosts()
+            .with_context(|| {
+                format!(
+                    "failed to clear the SSH host key cache for VM '{}'",
+                    self.vm.name
+                )
+            })?;
         if self.is_running() {
             self.stop()?;
         }
@@ -267,6 +279,7 @@ mod tests {
 
     use super::*;
     use crate::config::Harness;
+    use crate::session::ssh::SshIdentity;
     use crate::vm::config::VmConfig;
     use crate::vm::manager::test_support::{config_with_assets, manager};
 
@@ -444,6 +457,30 @@ mod tests {
         assert!(
             err.contains("VM log:") || err.contains("cloud-hypervisor"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn apply_forgets_the_guest_host_key_but_keeps_the_client_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(config_with_assets(dir.path()), dir.path());
+        let identity = SshIdentity::new(&manager.config().vms_dir, manager.vm().name.as_str());
+        std::fs::create_dir_all(identity.dir()).unwrap();
+        std::fs::write(identity.key(), b"client-key").unwrap();
+        std::fs::write(identity.known_hosts(), b"demo ssh-ed25519 AAAA\n").unwrap();
+
+        // The fixture has no VM binaries, so start fails after `apply` cleared
+        // the host-key cache and before anything else could touch it.
+        assert!(manager.apply().is_err());
+
+        assert!(
+            !identity.known_hosts().exists(),
+            "a reboot may change the guest host key"
+        );
+        assert_eq!(
+            std::fs::read(identity.key()).unwrap(),
+            b"client-key",
+            "the client key must survive apply"
         );
     }
 
