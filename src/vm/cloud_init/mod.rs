@@ -11,5 +11,5 @@ mod network;
 mod seed;
 mod user_data;
 
-pub use seed::{MountSpec, SEED_VERSION, disk_arg, instance_id, write_seed};
+pub use seed::{MountSpec, SEED_VERSION, SeedIdentity, disk_arg, instance_id, write_seed};
 pub(crate) use seed::{safe_mount, safe_token};

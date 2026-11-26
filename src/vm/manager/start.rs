@@ -17,8 +17,9 @@ use crate::network;
 use crate::project::ProjectRegistry;
 use crate::session::logs::{DEFAULT_KEEP, LogStore};
 use crate::session::snapshot::{SnapshotMeta, SnapshotStore};
+use crate::session::ssh::SshIdentity;
 use crate::vm::cloud_init;
-use crate::vm::config::{VmConfig, VmStore};
+use crate::vm::config::{SshUser, VmConfig, VmStore};
 use crate::vm::manager::autosave;
 use crate::vm::rootfs::prepare_rootfs;
 use crate::vm::virtiofs::VirtiofsProcess;
@@ -35,6 +36,24 @@ use super::paths::VmPaths;
 use super::process::{hegn_binary, terminate_relay};
 use super::session::{SessionRecord, VmReport};
 use super::util::{append_event_log, endpoint_urls, write_private};
+
+/// Resolve the guest SSH account and materialize the per-VM keypair.
+///
+/// The key is created once per VM under `<vms_dir>/<vm>/ssh/` and never leaves
+/// the host; only the public half goes into the cloud-init seed. A corrupt
+/// identity is repaired here because this runs on the boot path, before any
+/// guest exists.
+pub(super) fn prepare_guest_ssh(config: &Config, vm: &VmConfig) -> Result<(SshUser, String)> {
+    let user = vm.effective_ssh_user(config.guest_credential_hardening)?;
+    let identity = SshIdentity::new(&config.vms_dir, &vm.name);
+    identity
+        .ensure()
+        .with_context(|| format!("failed to prepare the SSH identity for VM '{}'", vm.name))?;
+    let public_key = identity
+        .public_key()
+        .with_context(|| format!("failed to read the SSH public key for VM '{}'", vm.name))?;
+    Ok((user, public_key))
+}
 
 impl VmManager {
     /// Boot every exported project, Cloud Hypervisor and the console relay.
@@ -120,6 +139,10 @@ impl VmManager {
                 self.vm.name
             );
         }
+        // Fail fast on an invalid ssh_user/hardening combination and create or
+        // repair the per-VM key before any child process is spawned. This runs
+        // under the lifecycle lock, so two starts cannot race on the keypair.
+        let (ssh_user, ssh_public_key) = prepare_guest_ssh(&self.config, &self.vm)?;
         // Save the primary the first time an empty VM gets a member. `/workspace`
         // is a boot-time symlink, so this is the only place it is chosen.
         if plan.primary_changed {
@@ -317,8 +340,15 @@ impl VmManager {
                 .primary_guest_path()
                 .context("the boot plan lost the primary guest path")?;
             let mounts = plan.mount_specs();
+            let workspace = primary_path.to_string_lossy().into_owned();
+            let identity = cloud_init::SeedIdentity {
+                vm: &self.vm.name,
+                project: &plan.primary,
+                workspace: &workspace,
+                ssh_user,
+                ssh_public_key: &ssh_public_key,
+            };
             let instance_id = cloud_init::instance_id(
-                &self.vm.name,
                 &mounts,
                 primary_guest,
                 &provision,
@@ -326,6 +356,7 @@ impl VmManager {
                 Some(&network_lease),
                 &self.config.local_endpoints,
                 self.config.guest_credential_hardening,
+                &identity,
             );
             cloud_init::write_seed(
                 &paths.cloud_init,
@@ -337,6 +368,7 @@ impl VmManager {
                 Some(&network_lease),
                 &self.config.local_endpoints,
                 self.config.guest_credential_hardening,
+                &identity,
             )?;
         }
 

@@ -50,7 +50,7 @@ use super::process::{
     ensure_socket, hegn_binary, read_pid, terminate, terminate_autosave, terminate_relay,
 };
 use super::session::SessionRecord;
-use super::start::effective_rootfs;
+use super::start::{effective_rootfs, prepare_guest_ssh};
 use super::util::{append_event_log, dir_size, secure_snapshot_dir, write_private};
 
 /// TAP names embedded in a Cloud Hypervisor snapshot config.
@@ -660,6 +660,12 @@ pub(super) async fn restore_snapshot_locked(
     }
     // Validate the recorded membership before stopping anything.
     let plan = recorded_plan(manager, snapshot)?;
+    let primary_path = plan
+        .members
+        .iter()
+        .find(|member| member.name == plan.primary)
+        .map(|member| member.path.clone())
+        .context("the recorded membership lost its primary project")?;
     paths.ensure()?;
     config.ensure_dirs()?;
     SnapshotStore::new(&config.snapshots_dir).ensure_staging()?;
@@ -694,6 +700,9 @@ pub(super) async fn restore_snapshot_locked(
         );
     }
     let hegn = hegn_binary()?;
+    // Prepare the keypair and resolve the guest account before the current VM
+    // is stopped; an invalid ssh_user must not cost a running session.
+    let (ssh_user, ssh_public_key) = prepare_guest_ssh(config, vm)?;
     if manager.unreadable_session() {
         bail!(
             "session metadata in {} is unreadable or from an older hegn version; \
@@ -819,8 +828,15 @@ pub(super) async fn restore_snapshot_locked(
             .primary_guest_path()
             .context("the recorded membership lost the primary guest path")?;
         let mounts = plan.mount_specs();
+        let workspace = primary_path.to_string_lossy().into_owned();
+        let identity = cloud_init::SeedIdentity {
+            vm: &vm.name,
+            project: &plan.primary,
+            workspace: &workspace,
+            ssh_user,
+            ssh_public_key: &ssh_public_key,
+        };
         let instance_id = cloud_init::instance_id(
-            &vm.name,
             &mounts,
             primary_guest,
             &provision,
@@ -828,6 +844,7 @@ pub(super) async fn restore_snapshot_locked(
             Some(&network_lease),
             &config.local_endpoints,
             config.guest_credential_hardening,
+            &identity,
         );
         cloud_init::write_seed(
             &paths.cloud_init,
@@ -839,6 +856,7 @@ pub(super) async fn restore_snapshot_locked(
             Some(&network_lease),
             &config.local_endpoints,
             config.guest_credential_hardening,
+            &identity,
         )?;
     }
 
@@ -850,12 +868,6 @@ pub(super) async fn restore_snapshot_locked(
             &format!("warning: could not prune old serial logs: {err:#}"),
         );
     }
-    let primary_path = plan
-        .members
-        .iter()
-        .find(|member| member.name == plan.primary)
-        .map(|member| member.path.clone())
-        .context("the recorded membership lost its primary project")?;
     let serial_log = logs.create_session(&primary_path, started_at, std::process::id())?;
 
     let vm_child = spawn_restore(config, &paths, snapshot, &vm_binary, Some(&network_lease))?;

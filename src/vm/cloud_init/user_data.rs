@@ -9,10 +9,10 @@
 use crate::agent::profile::{PROFILE_GUEST_MOUNT, PROFILE_SHARE_TAG, ProfileShare, apply_script};
 use crate::agent::provision::ProvisionPlan;
 
-use super::seed::MountSpec;
+use super::seed::{MountSpec, SeedIdentity};
 
-pub(super) fn meta_data(instance_id: &str) -> String {
-    format!("instance-id: {instance_id}\nlocal-hostname: hegn\n")
+pub(super) fn meta_data(instance_id: &str, vm: &str) -> String {
+    format!("instance-id: {instance_id}\nlocal-hostname: {vm}\n")
 }
 
 pub(super) fn user_data(
@@ -22,6 +22,7 @@ pub(super) fn user_data(
     profile: Option<&ProfileShare>,
     endpoints: Option<&str>,
     credential_hardening: bool,
+    _identity: &SeedIdentity<'_>,
 ) -> String {
     let script = indent(&provision.script(), 6);
     let endpoint_file = match endpoints {
@@ -303,6 +304,16 @@ mod tests {
         ProvisionPlan::new(Harness::Shell, &[]).unwrap()
     }
 
+    fn identity() -> SeedIdentity<'static> {
+        SeedIdentity {
+            vm: "demo",
+            project: "parser",
+            workspace: "/home/henrik/projects/parser",
+            ssh_user: crate::vm::config::SshUser::Root,
+            ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyMaterial hegn:demo",
+        }
+    }
+
     fn mounts() -> Vec<MountSpec> {
         vec![
             MountSpec {
@@ -320,17 +331,25 @@ mod tests {
 
     #[test]
     fn meta_data_is_a_single_instance_block() {
-        let meta = meta_data("hegn-demo-v12-0123456789ab");
+        let meta = meta_data("hegn-demo-v13-0123456789ab", "demo");
         assert_eq!(
             meta,
-            "instance-id: hegn-demo-v12-0123456789ab\nlocal-hostname: hegn\n"
+            "instance-id: hegn-demo-v13-0123456789ab\nlocal-hostname: demo\n"
         );
         assert_eq!(meta.lines().count(), 2);
     }
 
     #[test]
     fn every_member_gets_a_quoted_mount_and_runcmd() {
-        let data = user_data(&mounts(), "/projects/parser", &plan(), None, None, false);
+        let data = user_data(
+            &mounts(),
+            "/projects/parser",
+            &plan(),
+            None,
+            None,
+            false,
+            &identity(),
+        );
         assert!(
             data.contains("- [ 'hegn-prj-0', '/projects/parser', virtiofs"),
             "{data}"
@@ -359,7 +378,15 @@ mod tests {
 
     #[test]
     fn git_safe_directories_cover_every_mount_and_workspace() {
-        let data = user_data(&mounts(), "/projects/parser", &plan(), None, None, false);
+        let data = user_data(
+            &mounts(),
+            "/projects/parser",
+            &plan(),
+            None,
+            None,
+            false,
+            &identity(),
+        );
         for path in ["/projects/parser", "/projects/cli", "/workspace"] {
             assert!(
                 data.contains(&format!("      directory = {path}\n")),
@@ -370,7 +397,15 @@ mod tests {
 
     #[test]
     fn guest_maintenance_syncs_the_clock_and_reseeds_the_rng() {
-        let data = user_data(&mounts(), "/projects/parser", &plan(), None, None, false);
+        let data = user_data(
+            &mounts(),
+            "/projects/parser",
+            &plan(),
+            None,
+            None,
+            false,
+            &identity(),
+        );
         assert!(
             data.contains("  - path: /usr/local/sbin/hegn-maintenance\n    permissions: '0700'\n"),
             "{data}"
@@ -385,14 +420,30 @@ mod tests {
 
     #[test]
     fn credential_hardening_is_opt_in() {
-        let relaxed = user_data(&mounts(), "/projects/parser", &plan(), None, None, false);
+        let relaxed = user_data(
+            &mounts(),
+            "/projects/parser",
+            &plan(),
+            None,
+            None,
+            false,
+            &identity(),
+        );
         assert!(relaxed.contains("--autologin root"), "{relaxed}");
         assert!(
             relaxed.contains("sudo: ALL=(ALL) NOPASSWD:ALL"),
             "{relaxed}"
         );
 
-        let hardened = user_data(&mounts(), "/projects/parser", &plan(), None, None, true);
+        let hardened = user_data(
+            &mounts(),
+            "/projects/parser",
+            &plan(),
+            None,
+            None,
+            true,
+            &identity(),
+        );
         assert!(hardened.contains("--autologin hegn"), "{hardened}");
         assert!(!hardened.contains("--autologin root"), "{hardened}");
         assert!(hardened.contains("sudo: ALL=(ALL) ALL"), "{hardened}");
@@ -402,7 +453,15 @@ mod tests {
 
     #[test]
     fn read_only_members_are_ro_in_both_the_mount_table_and_runcmd() {
-        let writable = user_data(&mounts(), "/projects/parser", &plan(), None, None, false);
+        let writable = user_data(
+            &mounts(),
+            "/projects/parser",
+            &plan(),
+            None,
+            None,
+            false,
+            &identity(),
+        );
         assert!(
             writable.contains(r#"virtiofs, "defaults,nofail", "0", "0""#),
             "{writable}"
@@ -433,6 +492,7 @@ mod tests {
             None,
             Some(&content),
             false,
+            &identity(),
         );
         assert!(
             data.contains(
@@ -461,6 +521,7 @@ mod tests {
             Some(&profile),
             None,
             false,
+            &identity(),
         );
         assert!(
             data.contains("[ 'hegn-profile', '/run/hegn/profile', virtiofs"),
@@ -480,7 +541,15 @@ mod tests {
 
     #[test]
     fn login_shell_uses_the_workspace_symlink() {
-        let data = user_data(&mounts(), "/projects/parser", &plan(), None, None, false);
+        let data = user_data(
+            &mounts(),
+            "/projects/parser",
+            &plan(),
+            None,
+            None,
+            false,
+            &identity(),
+        );
         assert!(
             data.contains("  - path: /etc/profile.d/hegn-workspace.sh\n    permissions: '0644'\n"),
             "{data}"
@@ -492,7 +561,15 @@ mod tests {
     #[test]
     fn the_embedded_provision_script_is_fully_indented() {
         let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
-        let data = user_data(&mounts(), "/projects/parser", &plan, None, None, false);
+        let data = user_data(
+            &mounts(),
+            "/projects/parser",
+            &plan,
+            None,
+            None,
+            false,
+            &identity(),
+        );
         assert!(
             data.contains("  - path: /usr/local/sbin/hegn-provision\n    permissions: '0700'\n"),
             "{data}"
