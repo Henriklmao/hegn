@@ -9,7 +9,9 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 use super::firewall::{SAFE_PATH, command_exists, detect_host_firewall};
-use super::marker::{ReadyMarker, marker_path, ready_marker, write_marker};
+use super::marker::{
+    ReadyMarker, control_taps_present, data_taps_present, marker_path, ready_marker, write_marker,
+};
 use super::script::{reload_script, render_command, run_script, setup_script, teardown_script};
 use super::{CONTROL_SUBNET, CONTROL_TAP_POOL, DNS, MARKER_VERSION, SUBNET, TAP_POOL};
 use crate::config::{Config, NetworkMode};
@@ -76,34 +78,63 @@ pub fn setup_with_privilege(user: &str, endpoints: &[u16]) -> Result<()> {
     Ok(())
 }
 
-/// Fail closed when guarded networking is configured but not applied.
+/// Fail closed when the configured networking has not been applied.
+///
+/// Both modes need the one-time privileged setup: guarded guests need the
+/// egress guard, while air-gapped guests still need their control TAPs for SSH.
+/// There is no mode that silently skips host preparation.
 pub fn ensure_ready(config: &Config) -> Result<()> {
-    if NetworkMode::Guarded != config.network {
-        return Ok(());
-    }
-    let Some(marker) = ready_marker() else {
+    let endpoints = config.endpoint_ports();
+    ensure_ready_with(
+        config.network,
+        &endpoints,
+        ready_marker().as_ref(),
+        control_taps_present(),
+        data_taps_present(),
+        super::firewall::live_guard_status(&endpoints),
+        is_privileged(),
+    )
+}
+
+/// Pure readiness gate, so each mode/TAP/live combination is testable without a
+/// real `/run` marker or `/sys/class/net`.
+fn ensure_ready_with(
+    mode: NetworkMode,
+    endpoints: &[u16],
+    marker: Option<&ReadyMarker>,
+    control_taps: bool,
+    data_taps: bool,
+    live: Option<bool>,
+    privileged: bool,
+) -> Result<()> {
+    let Some(marker) = marker else {
         bail!(
-            "guarded networking is enabled but the host firewall is not active; run `sudo hegn \
-             network setup` once (or set `network = \"off\"` for an air-gapped VM)"
+            "networking is not set up for mode '{}'; run `sudo hegn network setup --user $USER`",
+            mode.label()
         );
     };
-    let expected = config.endpoint_ports();
-    if marker.endpoints != expected {
+    if marker.endpoints != endpoints {
         bail!(
             "local LLM endpoints changed (configured {:?}, firewall has {:?}); re-run `sudo hegn \
              network setup`",
-            expected,
+            endpoints,
             marker.endpoints
+        );
+    }
+    if !control_taps {
+        bail!("the control TAP pool is incomplete; run `sudo hegn network setup --user $USER`");
+    }
+    if mode == NetworkMode::Guarded && !data_taps {
+        bail!(
+            "the guarded-network data TAP pool is incomplete; run `sudo hegn network setup \
+             --user $USER`"
         );
     }
     // A root-owned receipt can outlive its rules; verify the kernel state when
     // this process is allowed to read it (root-only). A privileged caller can
     // always run nft, so an unverifiable guard is not ready; unprivileged
     // callers keep the root-owned marker as their gate.
-    if !super::firewall::guard_ready_from_status(
-        super::firewall::live_guard_status(&expected),
-        is_privileged(),
-    ) {
+    if !super::firewall::guard_ready_from_status(live, privileged) {
         bail!(
             "the nftables guard is missing, incomplete, or could not be verified; re-run `sudo \
              hegn network setup --user $USER`"
@@ -144,10 +175,11 @@ pub fn setup(user: &str, endpoints: &[u16]) -> Result<()> {
     // longer exists; new VM starts then fail closed until setup succeeds.
     clear_marker()?;
     run_script(&script).context("failed to configure the guarded network")?;
-    // Do not write a readiness receipt unless the rules actually landed. A
-    // host firewall or a concurrent `nft flush` must not leave a marker that
-    // vouches for a table that does not exist.
+    // Do not write a readiness receipt unless the rules and both TAP families
+    // actually landed. A host firewall or a concurrent `nft flush` must not
+    // leave a marker that vouches for a guard that does not exist.
     ensure_guard_live(&endpoints, "setup")?;
+    ensure_tap_pools("setup")?;
     record_ready(endpoints)
 }
 
@@ -158,15 +190,18 @@ pub fn reload(endpoints: &[u16]) -> Result<()> {
         bail!("`hegn network reload` must run as root (try `sudo hegn network reload`)");
     }
     if ready_marker().is_none() {
-        bail!("guarded networking is not set up; run `sudo hegn network setup --user $USER` first");
+        bail!("networking is not set up; run `sudo hegn network setup --user $USER` first");
     }
     let mut endpoints = endpoints.to_vec();
     endpoints.sort_unstable();
     endpoints.dedup();
     let script = reload_script(&endpoints)?;
-    clear_marker()?;
+    // Keep the marker in place: a failed reload with unchanged endpoints leaves
+    // the previous guard installed, and an endpoint change already fails
+    // closed because the marker records the old list.
     run_script(&script).context("failed to reload the guarded network")?;
     ensure_guard_live(&endpoints, "reload")?;
+    ensure_tap_pools("reload")?;
     record_ready(endpoints)
 }
 
@@ -195,6 +230,25 @@ fn ensure_guard_live(endpoints: &[u16], phase: &str) -> Result<()> {
     Ok(())
 }
 
+/// A marker may only be written when the devices it names actually exist. The
+/// control pool is mandatory for every mode; the data pool backs guarded
+/// egress.
+fn ensure_tap_pools(phase: &str) -> Result<()> {
+    if !control_taps_present() {
+        bail!(
+            "the control TAP pool is missing after {phase}; refusing to write {}",
+            marker_path().display()
+        );
+    }
+    if !data_taps_present() {
+        bail!(
+            "the guarded-network TAP pool is missing after {phase}; refusing to write {}",
+            marker_path().display()
+        );
+    }
+    Ok(())
+}
+
 fn record_ready(endpoints: Vec<u16>) -> Result<()> {
     let marker = ReadyMarker {
         version: MARKER_VERSION,
@@ -216,13 +270,18 @@ pub fn teardown() -> Result<()> {
     if !is_privileged() {
         bail!("`hegn network teardown` must run as root");
     }
-    run_script(&teardown_script()).context("failed to tear down the guarded network")
+    let torn_down =
+        run_script(&teardown_script()).context("failed to tear down the guarded network");
+    // The marker goes last, even when the script failed: a missing marker fails
+    // closed, while a stale one could vouch for devices that are already gone.
+    clear_marker()?;
+    torn_down
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LocalEndpoint, NetworkMode};
+    use crate::config::NetworkMode;
 
     #[test]
     fn safe_user_accepts_normal_unix_account_names() {
@@ -319,79 +378,165 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ensure_ready_allows_air_gapped_networks_without_a_marker() {
-        let config = Config {
-            network: NetworkMode::Off,
-            ..Config::default()
-        };
-        assert!(ensure_ready(&config).is_ok());
+    fn ready_marker_fixture(endpoints: Vec<u16>) -> ReadyMarker {
+        ReadyMarker {
+            version: MARKER_VERSION,
+            pool: TAP_POOL,
+            subnet: SUBNET.to_string(),
+            control_pool: CONTROL_TAP_POOL,
+            control_subnet: CONTROL_SUBNET.to_string(),
+            dns: DNS.iter().map(ToString::to_string).collect(),
+            endpoints,
+            host_firewall: crate::network::HostFirewall::None,
+            applied_at: Utc::now(),
+        }
     }
 
     #[test]
-    fn ensure_ready_fails_closed_for_guarded_networking() {
-        let config = Config::default();
-        assert_eq!(config.network, NetworkMode::Guarded);
-        match ready_marker() {
-            None => {
+    fn ensure_ready_without_a_marker_fails_closed_for_every_mode() {
+        for mode in NetworkMode::ALL {
+            let err = ensure_ready_with(mode, &[], None, true, true, None, false).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(&format!("mode '{}'", mode.label()))
+                    && message.contains("sudo hegn network setup"),
+                "unexpected error: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn air_gapped_ensure_ready_still_requires_a_marker_and_control_taps() {
+        let marker = ready_marker_fixture(Vec::new());
+        // Off needs no data pool, but the control pool and marker are mandatory.
+        assert!(
+            ensure_ready_with(
+                NetworkMode::Off,
+                &[],
+                Some(&marker),
+                true,
+                false,
+                None,
+                false
+            )
+            .is_ok()
+        );
+        let err = ensure_ready_with(
+            NetworkMode::Off,
+            &[],
+            Some(&marker),
+            false,
+            false,
+            Some(true),
+            true,
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("control TAP pool") && message.contains("sudo hegn network setup"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn guarded_ensure_ready_also_requires_the_data_pool() {
+        let marker = ready_marker_fixture(Vec::new());
+        assert!(
+            ensure_ready_with(
+                NetworkMode::Guarded,
+                &[],
+                Some(&marker),
+                true,
+                true,
+                Some(true),
+                true
+            )
+            .is_ok()
+        );
+        let err = ensure_ready_with(
+            NetworkMode::Guarded,
+            &[],
+            Some(&marker),
+            true,
+            false,
+            Some(true),
+            true,
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("data TAP pool") && message.contains("sudo hegn network setup"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn ensure_ready_rejects_changed_endpoints_in_every_mode() {
+        let marker = ready_marker_fixture(vec![11434]);
+        for mode in NetworkMode::ALL {
+            let err = ensure_ready_with(mode, &[4321], Some(&marker), true, true, Some(true), true)
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("endpoints changed"),
+                "{mode:?}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn privileged_ensure_ready_fails_closed_when_the_live_guard_is_unverifiable() {
+        let marker = ready_marker_fixture(Vec::new());
+        for live in [None, Some(false)] {
+            let err = ensure_ready_with(
+                NetworkMode::Off,
+                &[],
+                Some(&marker),
+                true,
+                false,
+                live,
+                true,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("could not be verified"),
+                "live={live:?}: {err:#}"
+            );
+        }
+        // Unprivileged callers cannot run nft; the marker is their gate.
+        assert!(
+            ensure_ready_with(
+                NetworkMode::Off,
+                &[],
+                Some(&marker),
+                true,
+                false,
+                None,
+                false
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn ensure_ready_on_this_host_fails_closed_without_a_marker() {
+        // Read-only: never writes to /run. On a host with a v3 marker this
+        // test has nothing to prove about the missing-marker path.
+        let marker = ready_marker();
+        for mode in NetworkMode::ALL {
+            let config = Config {
+                network: mode,
+                ..Config::default()
+            };
+            if marker.is_none() {
                 let err = ensure_ready(&config).unwrap_err();
                 let message = format!("{err:#}");
                 assert!(
-                    message.contains("host firewall is not active")
-                        && message.contains("network setup"),
-                    "unexpected error: {message}"
-                );
-            }
-            Some(marker) => {
-                // A marker exists on this host. A changed endpoint list must
-                // still make readiness fail closed.
-                let Some(port) = [65535u16, 65000, 64512]
-                    .into_iter()
-                    .find(|port| !marker.endpoints.contains(port))
-                else {
-                    return;
-                };
-                let mut config = config;
-                config.local_endpoints = vec![LocalEndpoint {
-                    name: "probe".to_string(),
-                    port,
-                }];
-                let err = ensure_ready(&config).unwrap_err();
-                assert!(
-                    format!("{err:#}").contains("endpoints changed"),
-                    "unexpected error: {err:#}"
+                    message.contains("networking is not set up")
+                        && message.contains("sudo hegn network setup"),
+                    "{mode:?}: {message}"
                 );
             }
         }
-    }
-
-    #[test]
-    fn ensure_ready_accepts_the_endpoints_the_marker_vouched_for() {
-        let Some(marker) = ready_marker() else {
-            return;
-        };
-        if marker.endpoints.iter().any(|port| *port < 1024) {
-            return;
-        }
-        // A privileged test process must also see a live guard; a host without
-        // the exact table installed is not a valid fixture for this test.
-        if is_privileged()
-            && super::super::firewall::live_guard_status(&marker.endpoints) != Some(true)
-        {
-            return;
-        }
-        let config = Config {
-            local_endpoints: marker
-                .endpoints
-                .iter()
-                .map(|port| LocalEndpoint {
-                    name: format!("probe{port}"),
-                    port: *port,
-                })
-                .collect(),
-            ..Config::default()
-        };
-        assert!(ensure_ready(&config).is_ok());
     }
 
     #[test]
