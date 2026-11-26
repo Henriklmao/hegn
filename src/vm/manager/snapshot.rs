@@ -813,7 +813,7 @@ pub(super) async fn restore_snapshot_locked(
             primary_guest,
             &provision,
             profile_plan.share.as_ref(),
-            network_lease.data_lease(),
+            Some(&network_lease),
             &config.local_endpoints,
             config.guest_credential_hardening,
         );
@@ -824,7 +824,7 @@ pub(super) async fn restore_snapshot_locked(
             &instance_id,
             &provision,
             profile_plan.share.as_ref(),
-            network_lease.data_lease(),
+            Some(&network_lease),
             &config.local_endpoints,
             config.guest_credential_hardening,
         )?;

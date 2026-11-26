@@ -16,9 +16,9 @@ use fatfs::{FileSystem, FormatVolumeOptions, FsOptions};
 use crate::agent::profile::ProfileShare;
 use crate::agent::provision::ProvisionPlan;
 use crate::config::LocalEndpoint;
-use crate::network::Lease;
+use crate::network::NetworkLease;
 
-use super::network::endpoint_env;
+use super::network::{endpoint_env, network_config};
 use super::user_data::{meta_data, user_data};
 
 /// 4 MiB is enough for the seed and keeps it cheap.
@@ -74,7 +74,7 @@ pub fn write_seed(
     instance_id: &str,
     provision: &ProvisionPlan,
     profile: Option<&ProfileShare>,
-    network: Option<&Lease>,
+    network: Option<&NetworkLease>,
     endpoints: &[LocalEndpoint],
     credential_hardening: bool,
 ) -> Result<()> {
@@ -105,8 +105,9 @@ pub fn write_seed(
         anyhow::bail!("unsafe cloud-init instance id: {instance_id:?}");
     }
     let endpoint_env = network
+        .and_then(|lease| lease.data.as_ref())
         .filter(|_| !endpoints.is_empty())
-        .map(|lease| endpoint_env(lease, endpoints));
+        .map(|data| endpoint_env(data, endpoints));
     let user_data = user_data(
         mounts,
         primary_guest,
@@ -145,7 +146,9 @@ pub fn write_seed(
         write_file(&root, "user-data", &user_data)?;
         write_file(&root, "meta-data", &meta_data(instance_id))?;
         if let Some(network) = network {
-            write_file(&root, "network-config", &network.guest_network_config())?;
+            // The control NIC always exists, so network-config is always
+            // present when a lease was reserved (including off mode).
+            write_file(&root, "network-config", &network_config(network))?;
         }
     }
     file.sync_all()?;
@@ -176,7 +179,7 @@ pub fn instance_id(
     primary_guest: &str,
     provision: &ProvisionPlan,
     profile: Option<&ProfileShare>,
-    network: Option<&Lease>,
+    network: Option<&NetworkLease>,
     endpoints: &[LocalEndpoint],
     credential_hardening: bool,
 ) -> String {
@@ -198,8 +201,13 @@ pub fn instance_id(
         hasher.update(profile.manifest_id.as_bytes());
     }
     if let Some(lease) = network {
-        hasher.update(lease.guest_network_config().as_bytes());
-        hasher.update(endpoint_env(lease, endpoints).as_bytes());
+        // The control configuration is part of every seed; a slot or MAC
+        // change must make cloud-init re-apply the new netplan.
+        hasher.update(lease.control.control_network_config().as_bytes());
+        if let Some(data) = &lease.data {
+            hasher.update(data.guest_network_config().as_bytes());
+            hasher.update(endpoint_env(data, endpoints).as_bytes());
+        }
     }
     let digest = hex::encode(hasher.finalize());
     format!("hegn-{vm}-v{SEED_VERSION}-{}", &digest[..12])
@@ -214,19 +222,38 @@ pub fn disk_arg(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::config::Harness;
-    use crate::network::{Lease, guest_ip, host_ip, mac, tap_name};
+    use crate::network::{
+        Lease, NetworkLease, control_guest_ip, control_host_ip, control_mac, control_tap_name,
+        guest_ip, host_ip, mac, tap_name,
+    };
     use std::io::Read;
     use std::path::PathBuf;
 
-    fn lease() -> Lease {
-        Lease {
-            index: 0,
+    fn network_lease(slot: u8, with_data: bool) -> NetworkLease {
+        NetworkLease {
+            slot,
             vm: "demo".into(),
-            tap: tap_name(0),
-            mac: mac(0),
-            host_ip: host_ip(0),
-            guest_ip: guest_ip(0),
+            data: with_data.then(|| Lease {
+                index: slot,
+                vm: "demo".into(),
+                tap: tap_name(slot),
+                mac: mac(slot),
+                host_ip: host_ip(slot),
+                guest_ip: guest_ip(slot),
+            }),
+            control: Lease {
+                index: slot,
+                vm: "demo".into(),
+                tap: control_tap_name(slot),
+                mac: control_mac(slot),
+                host_ip: control_host_ip(slot),
+                guest_ip: control_guest_ip(slot),
+            },
         }
+    }
+
+    fn lease() -> NetworkLease {
+        network_lease(0, true)
     }
 
     fn mounts() -> Vec<MountSpec> {
@@ -323,8 +350,73 @@ mod tests {
         assert!(user_data.contains("hegn-provision.service"));
         assert!(meta_data.contains("instance-id: hegn-demo"), "{meta_data}");
         let network = network.expect("network-config must be present");
+        assert!(network.contains("hegn0:"), "{network}");
+        assert!(network.contains("hegnc0:"), "{network}");
         assert!(network.contains("10.213.0.2/30"), "{network}");
+        assert!(network.contains("10.214.0.2/30"), "{network}");
         assert!(network.contains("via: 10.213.0.1"), "{network}");
+    }
+
+    #[test]
+    fn instance_id_tracks_the_control_slot_and_the_data_nic() {
+        let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
+        let mounts = mounts();
+        let first = network_lease(0, false);
+        let same = network_lease(0, false);
+        let other_slot = network_lease(1, false);
+        let guarded = network_lease(0, true);
+
+        let base = instance_id(
+            "demo",
+            &mounts,
+            "/projects/parser",
+            &plan,
+            None,
+            Some(&first),
+            &[],
+            false,
+        );
+        assert_eq!(
+            base,
+            instance_id(
+                "demo",
+                &mounts,
+                "/projects/parser",
+                &plan,
+                None,
+                Some(&same),
+                &[],
+                false
+            )
+        );
+        assert_ne!(
+            base,
+            instance_id(
+                "demo",
+                &mounts,
+                "/projects/parser",
+                &plan,
+                None,
+                Some(&other_slot),
+                &[],
+                false
+            ),
+            "a different control slot must re-run cloud-init"
+        );
+        assert_ne!(
+            base,
+            instance_id(
+                "demo",
+                &mounts,
+                "/projects/parser",
+                &plan,
+                None,
+                Some(&guarded),
+                &[],
+                false
+            ),
+            "off and guarded leases must produce different seeds"
+        );
     }
 
     #[test]
@@ -556,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn off_network_omits_network_config() {
+    fn off_network_writes_a_control_only_network_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cloud-init.img");
         let plan = ProvisionPlan::new(Harness::Shell, &[]).unwrap();
@@ -567,14 +659,18 @@ mod tests {
             "hegn-demo",
             &plan,
             None,
-            None,
+            Some(&network_lease(0, false)),
             &[],
             false,
         )
         .unwrap();
-        let (user_data, _, network) = read_seed(&path);
-        assert!(network.is_none());
-        assert!(!user_data.contains("network-config"));
+        let (_, _, network) = read_seed(&path);
+        let network = network.expect("the control NIC always needs a netplan");
+        assert!(network.contains("hegnc0:"), "{network}");
+        assert!(network.contains("10.214.0.2/30"), "{network}");
+        assert!(!network.contains("hegn0:"), "{network}");
+        assert!(!network.contains("via:"), "{network}");
+        assert!(!network.contains("nameservers:"), "{network}");
     }
 
     #[test]

@@ -323,7 +323,7 @@ impl VmManager {
                 primary_guest,
                 &provision,
                 profile_plan.share.as_ref(),
-                network_lease.data_lease(),
+                Some(&network_lease),
                 &self.config.local_endpoints,
                 self.config.guest_credential_hardening,
             );
@@ -334,7 +334,7 @@ impl VmManager {
                 &instance_id,
                 &provision,
                 profile_plan.share.as_ref(),
-                network_lease.data_lease(),
+                Some(&network_lease),
                 &self.config.local_endpoints,
                 self.config.guest_credential_hardening,
             )?;
