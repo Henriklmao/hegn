@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::{Config, SecurityMode};
 use crate::project::ProjectRegistry;
 use crate::session::logs::tail_bytes;
-use crate::session::ssh::{SshIdentity, SshTarget};
+use crate::session::ssh::{SshError, SshIdentity, SshTarget};
 use crate::vm::config::{VmConfig, VmStore};
 
 use super::membership::MembershipManifest;
@@ -337,7 +337,17 @@ impl VmManager {
                     })?;
                     return Ok(());
                 }
-                Err(error) => last = Some(error.to_string()),
+                Err(error) => {
+                    if matches!(
+                        error,
+                        SshError::MissingClient
+                            | SshError::InvalidUser { .. }
+                            | SshError::MissingIdentity { .. }
+                    ) {
+                        return Err(error.into());
+                    }
+                    last = Some(error.to_string());
+                }
             }
         }
         identity.remove_known_hosts().ok();
@@ -366,7 +376,7 @@ impl VmManager {
 
 /// True when the serial log shows cloud-init's final stage.
 fn cloud_init_finished(path: &Path) -> bool {
-    let Ok(bytes) = tail_bytes(path, 400) else {
+    let Ok(bytes) = tail_bytes(path, 2000) else {
         return false;
     };
     let text = String::from_utf8_lossy(&bytes);
