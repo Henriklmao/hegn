@@ -162,7 +162,8 @@ VM named after the project.
   transport.
 - **Membership changes require a restart.** There is no live virtio-fs hot-plug;
   `hegn vm apply` restarts the VM and kills running agents.
-- **Tool changes are not reconciled.** A provisioner installs the baseline once.
+- **Tool changes are not reconciled.** The provisioner installs the baseline and
+  runs again when the seed identity changes (for example after `hegn vm apply`).
   Later changes are manual in the guest or `hegn vm rebuild <vm>` plus a fresh
   first boot.
 - **No per-project snapshots.** A snapshot belongs to the VM and covers every

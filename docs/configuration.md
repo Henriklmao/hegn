@@ -183,7 +183,9 @@ VM in `vm.toml` and copied from the global defaults when the VM is created.
 `ssh_user` is VM-only; its effective default is computed from
 `guest_credential_hardening` when the key is absent. All of them are effective
 at runtime: changing them in `vm.toml` takes effect on the next start, and
-`hegn vm apply <vm>` restarts a running VM to apply them. `vm.toml` deliberately does **not** list projects. Boot resolves the VM
+`hegn vm apply <vm>` restarts a running VM to apply them. `apply` waits for
+cloud-init to finish and SSH to become ready; a changed seed identity also
+re-runs the harness provisioner. `vm.toml` deliberately does **not** list projects. Boot resolves the VM
 name to members by scanning the private registry, so membership has one source
 of truth.
 
