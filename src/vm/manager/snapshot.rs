@@ -53,8 +53,21 @@ use super::session::SessionRecord;
 use super::start::{effective_rootfs, prepare_guest_ssh};
 use super::util::{append_event_log, dir_size, secure_snapshot_dir, write_private};
 
-/// TAP names embedded in a Cloud Hypervisor snapshot config.
-fn snapshot_network_taps(dir: &Path) -> Result<Vec<String>> {
+/// One NIC embedded in a Cloud Hypervisor snapshot config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotNic {
+    tap: String,
+    mac: String,
+}
+
+impl SnapshotNic {
+    fn label(&self) -> String {
+        format!("{} ({})", self.tap, self.mac)
+    }
+}
+
+/// TAP names and MACs embedded in a Cloud Hypervisor snapshot config.
+fn snapshot_network_taps(dir: &Path) -> Result<Vec<SnapshotNic>> {
     let path = dir.join("config.json");
     let raw =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -66,8 +79,15 @@ fn snapshot_network_taps(dir: &Path) -> Result<Vec<String>> {
         .map(|devices| {
             devices
                 .iter()
-                .filter_map(|device| device.get("tap").and_then(serde_json::Value::as_str))
-                .map(str::to_string)
+                .filter_map(|device| {
+                    let tap = device.get("tap")?.as_str()?.to_string();
+                    let mac = device
+                        .get("mac")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    Some(SnapshotNic { tap, mac })
+                })
                 .collect()
         })
         .unwrap_or_default())
@@ -76,39 +96,64 @@ fn snapshot_network_taps(dir: &Path) -> Result<Vec<String>> {
 /// Check that a snapshot's recorded NICs match the current network lease.
 ///
 /// A snapshot owns its device tree, so the expected set is exact: the control
-/// TAP always, plus the data TAP only in guarded mode. Extra, missing or
-/// foreign TAPs would either attach a NIC the guest never configured or boot a
-/// guest with no control interface at all.
+/// NIC always, plus the data NIC only in guarded mode. Both the TAP name and
+/// the MAC must match, because the guest configures its interfaces by MAC.
+/// Extra, missing or foreign NICs would either attach an interface the guest
+/// never configured or boot a guest with no control link at all.
 fn validate_snapshot_taps(
     snapshot_name: &str,
     vm_name: &str,
     lease: &network::NetworkLease,
-    snapshot_taps: &[String],
+    snapshot_nics: &[SnapshotNic],
 ) -> Result<()> {
-    if snapshot_taps.is_empty() {
-        // Old snapshots predate the always-present control NIC. The slot
+    let control = &lease.control;
+    let control_present = snapshot_nics
+        .iter()
+        .any(|nic| nic.tap == control.tap && nic.mac == control.mac);
+    if !control_present {
+        // Old snapshots predate the always-present control NIC; a data-only
+        // device tree cannot carry SSH or hegn's guest metadata. The slot
         // reservation stays with the VM: a running VM may still own it and the
         // next start reuses it.
-        bail!("snapshot '{snapshot_name}' has no control NIC; cold boot required");
+        bail!(
+            "snapshot '{snapshot_name}' has no control NIC ({} / {}); cold boot required",
+            control.tap,
+            control.mac
+        );
     }
-    let mut expected: Vec<String> = lease
-        .taps()
-        .into_iter()
-        .map(|tap| tap.tap.clone())
+    let mut expected: Vec<&network::TapLease> = Vec::with_capacity(2);
+    if let Some(data) = &lease.data {
+        expected.push(data);
+    }
+    expected.push(control);
+    let mut expected_nics: Vec<(&str, &str)> = expected
+        .iter()
+        .map(|nic| (nic.tap.as_str(), nic.mac.as_str()))
         .collect();
-    expected.sort();
-    let mut found = snapshot_taps.to_vec();
-    found.sort();
-    if found != expected {
+    expected_nics.sort();
+    let mut found_nics: Vec<(&str, &str)> = snapshot_nics
+        .iter()
+        .map(|nic| (nic.tap.as_str(), nic.mac.as_str()))
+        .collect();
+    found_nics.sort();
+    if found_nics != expected_nics {
         // Leave the VM's reservation intact: an old VM may still be running on
         // that TAP, and the next start will reuse it.
         bail!(
-            "snapshot '{}' expects TAPs [{}], but VM '{}' owns [{}]; restore it in the VM that \
+            "snapshot '{}' expects NICs [{}], but VM '{}' owns [{}]; restore it in the VM that \
              created it",
             snapshot_name,
-            expected.join(", "),
+            expected
+                .iter()
+                .map(|nic| format!("{} ({})", nic.tap, nic.mac))
+                .collect::<Vec<_>>()
+                .join(", "),
             vm_name,
-            found.join(", ")
+            snapshot_nics
+                .iter()
+                .map(SnapshotNic::label)
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     Ok(())
@@ -183,6 +228,8 @@ fn boot_inputs(
         rootfs_path: effective_rootfs(config, vm),
         rootfs_format: config.rootfs_format,
         network_index: vm.network_index,
+        seed_version: cloud_init::SEED_VERSION,
+        network_mode: config.network,
         profile_share,
         primary: Some(primary),
     }
@@ -213,6 +260,16 @@ pub(super) fn select_auto_resume(
             ));
             continue;
         };
+        // v2 files predate the seed-version field and deserialize it as zero.
+        // Never resume one: the guest may have been provisioned from an older
+        // seed generation that no longer matches the current devices.
+        if recorded.seed_version == 0 {
+            reasons.push(format!(
+                "skipping autosave {}: snapshot has no recorded seed version; cold boot required",
+                snapshot.name
+            ));
+            continue;
+        }
         if snapshot.fingerprint_matches(&fingerprint) {
             return AutoResume::Resume(Box::new(snapshot));
         }
@@ -745,14 +802,14 @@ pub(super) async fn restore_snapshot_locked(
     // The snapshot embeds its device tree. Never silently restore a NIC that
     // contradicts the current policy, and never attach a snapshot to a
     // different VM TAP than the one it was created with.
-    let snapshot_taps = match snapshot_network_taps(&snapshot.dir) {
-        Ok(taps) => taps,
+    let snapshot_nics = match snapshot_network_taps(&snapshot.dir) {
+        Ok(nics) => nics,
         Err(err) => {
             network::release(config, &vm.name);
             return Err(err);
         }
     };
-    validate_snapshot_taps(&snapshot.name, &vm.name, &network_lease, &snapshot_taps)?;
+    validate_snapshot_taps(&snapshot.name, &vm.name, &network_lease, &snapshot_nics)?;
 
     // Stop the old VM, relay and every member filesystem daemon. The sockets
     // are freed and recreated below with the same paths the snapshot expects.
@@ -1033,52 +1090,84 @@ mod tests {
         }
     }
 
-    fn taps(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| (*name).to_string()).collect()
+    fn nic(tap: &str, mac: String) -> SnapshotNic {
+        SnapshotNic {
+            tap: tap.to_string(),
+            mac,
+        }
+    }
+
+    fn control_nic(lease: &crate::network::NetworkLease) -> SnapshotNic {
+        nic(&lease.control.tap, lease.control.mac.clone())
+    }
+
+    fn data_nic(lease: &crate::network::NetworkLease) -> SnapshotNic {
+        let data = lease.data.as_ref().expect("lease has no data NIC");
+        nic(&data.tap, data.mac.clone())
     }
 
     #[test]
-    fn snapshot_taps_must_match_the_guarded_lease_exactly() {
+    fn snapshot_nics_must_match_the_guarded_lease_exactly() {
         let lease = network_lease(3, true);
+        let control = control_nic(&lease);
+        let data = data_nic(&lease);
         assert!(
-            validate_snapshot_taps("snap", "demo", &lease, &taps(&["hegn3", "hegnc3"])).is_ok()
+            validate_snapshot_taps("snap", "demo", &lease, &[data.clone(), control.clone()])
+                .is_ok()
         );
-        // A snapshot from the data-only area is refused: it has no control NIC.
-        let err = validate_snapshot_taps("snap", "demo", &lease, &taps(&["hegn3"]))
+        // A data-only snapshot predates the control NIC and must cold boot.
+        let err = validate_snapshot_taps("snap", "demo", &lease, std::slice::from_ref(&data))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("expects TAPs [hegn3, hegnc3]"), "{err}");
-        assert!(err.contains("owns [hegn3]"), "{err}");
-        // A foreign or extra TAP is refused too.
-        let err =
-            validate_snapshot_taps("snap", "demo", &lease, &taps(&["hegn3", "hegnc3", "hegn9"]))
-                .unwrap_err()
-                .to_string();
+        assert!(err.contains("has no control NIC"), "{err}");
+        assert!(err.contains("hegnc3"), "{err}");
+        assert!(err.contains("cold boot required"), "{err}");
+        // A foreign or extra NIC is refused too.
+        let extra = nic("hegn9", crate::network::mac(9));
+        let err = validate_snapshot_taps(
+            "snap",
+            "demo",
+            &lease,
+            &[data.clone(), control.clone(), extra],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("hegn9"), "{err}");
+        // The MAC belongs to the fingerprint: a mismatching data MAC is refused
+        // even when the TAP name matches.
+        let wrong_data = nic(&data.tap, crate::network::mac(4));
+        let err = validate_snapshot_taps("snap", "demo", &lease, &[wrong_data, control])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expects NICs"), "{err}");
     }
 
     #[test]
-    fn snapshot_taps_accept_off_mode_with_only_the_control_nic() {
+    fn snapshot_nics_accept_off_mode_with_only_the_control_nic() {
         let lease = network_lease(3, false);
-        assert!(validate_snapshot_taps("snap", "demo", &lease, &taps(&["hegnc3"])).is_ok());
+        let control = control_nic(&lease);
+        assert!(
+            validate_snapshot_taps("snap", "demo", &lease, std::slice::from_ref(&control)).is_ok()
+        );
         // Off mode never has a data TAP; a snapshot that contains one is
         // contradictory and must be refused.
-        let err = validate_snapshot_taps("snap", "demo", &lease, &taps(&["hegn3", "hegnc3"]))
+        let data = nic("hegn3", crate::network::mac(3));
+        let err = validate_snapshot_taps("snap", "demo", &lease, &[data, control])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("expects TAPs [hegnc3]"), "{err}");
-        assert!(err.contains("owns [hegn3, hegnc3]"), "{err}");
+        assert!(err.contains("expects NICs [hegnc3"), "{err}");
+        assert!(err.contains("owns [hegn3"), "{err}");
     }
 
     #[test]
     fn snapshots_without_any_nic_require_a_cold_boot() {
-        let err = validate_snapshot_taps("snap", "demo", &network_lease(3, true), &[])
+        let lease = network_lease(3, true);
+        let err = validate_snapshot_taps("snap", "demo", &lease, &[])
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("has no control NIC; cold boot required"),
-            "{err}"
-        );
+        assert!(err.contains("has no control NIC"), "{err}");
+        assert!(err.contains("hegnc3"), "{err}");
+        assert!(err.contains("cold boot required"), "{err}");
     }
 
     fn snapshot(dir: &Path, owner: &str) -> SnapshotMeta {
@@ -1265,6 +1354,8 @@ mod tests {
             rootfs_path: std::path::PathBuf::from("/vms/rust/old-rootfs.qcow2"),
             rootfs_format: crate::config::RootfsFormat::Raw,
             network_index: Some(9),
+            seed_version: 11,
+            network_mode: crate::config::NetworkMode::Off,
             profile_share: true,
             primary: Some("demo".into()),
         });
@@ -1281,6 +1372,8 @@ mod tests {
             "rootfs /vms/rust/old-rootfs.qcow2 ->",
             "rootfs format raw -> qcow2",
             "network index 9 -> none",
+            "seed version 11 -> 13",
+            "network mode off -> guarded",
             "profile share present -> absent",
             "member 'demo' read-only true -> false",
             "There is no --force",
@@ -1654,6 +1747,37 @@ mod tests {
     }
 
     #[test]
+    fn auto_resume_skips_a_v2_snapshot_without_a_seed_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(config_with_assets(dir.path()), dir.path());
+        let plan = plan_for(&manager);
+        let members = current_membership(&plan);
+        let current = current_boot(manager.config(), manager.vm(), &plan, false);
+
+        let mut old = matching_snapshot(&manager, &dir.path().join("snap"));
+        old.name = "autosave-v2".into();
+        old.note = Some(AUTOSAVE_NOTE.into());
+        // v2 metadata has no `seed_version` key, so serde defaults it to zero.
+        old.boot.as_mut().unwrap().seed_version = 0;
+        old.boot_fingerprint = Some(compute_fingerprint(
+            &old.membership,
+            old.boot.as_ref().unwrap(),
+        ));
+
+        match select_auto_resume(vec![old], &current, &members) {
+            AutoResume::ColdBoot(reasons) => {
+                assert_eq!(reasons.len(), 1);
+                assert!(
+                    reasons[0].contains("has no recorded seed version"),
+                    "{reasons:?}"
+                );
+                assert!(reasons[0].contains("cold boot required"), "{reasons:?}");
+            }
+            AutoResume::Resume(_) => panic!("a v2 checkpoint must never be resumed"),
+        }
+    }
+
+    #[test]
     fn snapshot_metadata_records_the_manifest_membership_in_boot_order() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
@@ -1687,6 +1811,14 @@ mod tests {
         assert!(meta.membership[1].read_only);
         assert_eq!(meta.membership[1].kind, ProjectKind::Clone);
         assert!(!meta.boot.as_ref().unwrap().profile_share);
+        assert_eq!(
+            meta.boot.as_ref().unwrap().seed_version,
+            cloud_init::SEED_VERSION
+        );
+        assert_eq!(
+            meta.boot.as_ref().unwrap().network_mode,
+            manager.config().network
+        );
         assert_eq!(
             meta.boot_fingerprint.as_deref().unwrap(),
             compute_fingerprint(&meta.membership, meta.boot.as_ref().unwrap())
@@ -1723,14 +1855,20 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_tap_names_are_read_from_the_device_tree() {
+    fn snapshot_nics_are_read_from_the_device_tree() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.json"),
-            r#"{"net":[{"tap":"hegn3","mac":"52:54:00:00:00:04"}]}"#,
+            r#"{"net":[{"tap":"hegn3","mac":"52:54:00:00:00:04"},{"tap":"hegnc3","mac":"52:54:00:00:01:04"}]}"#,
         )
         .unwrap();
-        assert_eq!(snapshot_network_taps(dir.path()).unwrap(), vec!["hegn3"]);
+        assert_eq!(
+            snapshot_network_taps(dir.path()).unwrap(),
+            vec![
+                nic("hegn3", "52:54:00:00:00:04".into()),
+                nic("hegnc3", "52:54:00:00:01:04".into()),
+            ]
+        );
         std::fs::write(dir.path().join("config.json"), r#"{"net":[]}"#).unwrap();
         assert!(snapshot_network_taps(dir.path()).unwrap().is_empty());
     }

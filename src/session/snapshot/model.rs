@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::RootfsFormat;
+use crate::config::{NetworkMode, RootfsFormat};
 use crate::project::ProjectKind;
 use crate::shared::text::human_bytes as human_size;
 
@@ -28,7 +28,12 @@ pub const SNAPSHOT_VERSION: u32 = 2;
 const LEGACY_VERSION: u32 = 1;
 
 /// Domain separator mixed into [`compute_fingerprint`].
-const FINGERPRINT_DOMAIN: &str = "hegn-snapshot-boot-v2";
+///
+/// v3 hashes the cloud-init seed version and the network mode. Bumping the
+/// domain invalidates every checkpoint written before those inputs were part
+/// of the fingerprint, so an old snapshot cannot be resumed into a different
+/// seed or NIC layout.
+const FINGERPRINT_DOMAIN: &str = "hegn-snapshot-boot-v3";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotMeta {
@@ -176,6 +181,15 @@ pub struct SnapshotBoot {
     /// Guarded-network TAP slice, kept across restores.
     #[serde(default)]
     pub network_index: Option<u8>,
+    /// Cloud-init seed generation the guest was provisioned with. Missing in
+    /// v2 files, which deserialize as `0` and therefore never match.
+    #[serde(default)]
+    pub seed_version: u32,
+    /// Network mode of the recorded boot. Missing in v2 files, which
+    /// deserialize as [`NetworkMode::Guarded`] and are invalidated by the
+    /// fingerprint domain bump.
+    #[serde(default)]
+    pub network_mode: NetworkMode,
     /// Whether the profile/skill share was part of the device tree.
     #[serde(default)]
     pub profile_share: bool,
@@ -192,6 +206,8 @@ impl Default for SnapshotBoot {
             rootfs_path: PathBuf::new(),
             rootfs_format: RootfsFormat::default(),
             network_index: None,
+            seed_version: 0,
+            network_mode: NetworkMode::default(),
             profile_share: false,
             primary: None,
         }
@@ -219,6 +235,8 @@ pub fn compute_fingerprint(membership: &[SnapshotMember], boot: &SnapshotBoot) -
         "network_index",
         &optional_u8(boot.network_index),
     );
+    hash_field(&mut hasher, "seed_version", &boot.seed_version.to_string());
+    hash_field(&mut hasher, "network_mode", boot.network_mode.label());
     hash_field(
         &mut hasher,
         "profile_share",
@@ -308,6 +326,19 @@ pub fn describe_boot_changes(
             "network index {} -> {}",
             optional_u8(recorded.network_index),
             optional_u8(current.network_index)
+        ));
+    }
+    if recorded.seed_version != current.seed_version {
+        changes.push(format!(
+            "seed version {} -> {}",
+            recorded.seed_version, current.seed_version
+        ));
+    }
+    if recorded.network_mode != current.network_mode {
+        changes.push(format!(
+            "network mode {} -> {}",
+            recorded.network_mode.label(),
+            current.network_mode.label()
         ));
     }
     if recorded.profile_share != current.profile_share {
@@ -454,6 +485,8 @@ mod tests {
             rootfs_path: PathBuf::from("/vms/rust/rootfs.qcow2"),
             rootfs_format: RootfsFormat::Qcow2,
             network_index: Some(3),
+            seed_version: 13,
+            network_mode: NetworkMode::Guarded,
             profile_share: true,
             primary: Some("parser".into()),
         }
@@ -536,6 +569,14 @@ mod tests {
                 ..boot()
             },
             SnapshotBoot {
+                seed_version: 12,
+                ..boot()
+            },
+            SnapshotBoot {
+                network_mode: NetworkMode::Off,
+                ..boot()
+            },
+            SnapshotBoot {
                 profile_share: false,
                 ..boot()
             },
@@ -604,6 +645,8 @@ mod tests {
             rootfs_path: PathBuf::from("/vms/rust/other.qcow2"),
             rootfs_format: RootfsFormat::Raw,
             network_index: Some(5),
+            seed_version: 12,
+            network_mode: NetworkMode::Off,
             profile_share: false,
             primary: Some("cli".into()),
         };
@@ -626,6 +669,8 @@ mod tests {
             "rootfs /vms/rust/rootfs.qcow2 -> /vms/rust/other.qcow2",
             "rootfs format qcow2 -> raw",
             "network index 3 -> 5",
+            "seed version 13 -> 12",
+            "network mode guarded -> off",
             "profile share present -> absent",
             "member 'parser' tag hegn-prj-0 -> hegn-prj-9",
             "member 'cli' read-only false -> true",
@@ -679,6 +724,8 @@ mod tests {
         assert!(raw.contains("\"version\": 2"), "{raw}");
         assert!(raw.contains("\"boot_fingerprint\""), "{raw}");
         assert!(raw.contains("\"membership\""), "{raw}");
+        assert!(raw.contains("\"seed_version\": 13"), "{raw}");
+        assert!(raw.contains("\"network_mode\": \"guarded\""), "{raw}");
         let loaded: SnapshotMeta = serde_json::from_str(&raw).unwrap();
         assert_eq!(loaded, meta);
 
@@ -686,6 +733,31 @@ mod tests {
         let loaded: SnapshotMeta = serde_json::from_str(&legacy_named).unwrap();
         assert_eq!(loaded.vm(), Some("rust"));
         assert!(!loaded.is_legacy());
+    }
+
+    #[test]
+    fn v2_metadata_without_the_new_boot_fields_is_incompatible() {
+        let mut raw = serde_json::to_value(meta()).unwrap();
+        let boot_fields = raw["boot"].as_object_mut().unwrap();
+        boot_fields.remove("seed_version");
+        boot_fields.remove("network_mode");
+
+        let loaded: SnapshotMeta = serde_json::from_value(raw).unwrap();
+        let recorded = loaded.boot.as_ref().unwrap();
+        // Old v2 files still load: serde falls back to zero/guarded, but the
+        // v3 fingerprint domain and the seed version make them incompatible.
+        assert_eq!(recorded.seed_version, 0);
+        assert_eq!(recorded.network_mode, NetworkMode::Guarded);
+        assert!(!loaded.is_legacy(), "the v2 structure is still intact");
+        assert!(!loaded.fingerprint_matches(&compute_fingerprint(&loaded.membership, recorded)));
+
+        let changes = describe_boot_changes(recorded, &loaded.membership, &boot(), &membership());
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "seed version 0 -> 13"),
+            "{changes:?}"
+        );
     }
 
     #[test]

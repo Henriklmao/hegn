@@ -287,7 +287,7 @@ impl SnapshotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RootfsFormat;
+    use crate::config::{NetworkMode, RootfsFormat};
     use crate::project::ProjectKind;
     use crate::session::snapshot::{
         SNAPSHOT_VERSION, SnapshotBoot, SnapshotMember, compute_fingerprint,
@@ -311,6 +311,8 @@ mod tests {
             rootfs_path: PathBuf::from("/vms/demo/rootfs.qcow2"),
             rootfs_format: RootfsFormat::Qcow2,
             network_index: None,
+            seed_version: 13,
+            network_mode: NetworkMode::Guarded,
             profile_share: false,
             primary: Some("demo".into()),
         }
