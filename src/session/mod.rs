@@ -7,11 +7,13 @@
 //! - [`logs`] — private, persistent serial-console logs
 //! - [`snapshot`] — on-disk snapshot metadata
 //! - [`state`] — persisted recent and hidden project state
+//! - [`ssh`] — per-VM SSH identity and OpenSSH client wrapper
 
 pub mod attach_bar;
 pub mod console;
 pub mod logs;
 pub mod relay;
 pub mod snapshot;
+pub mod ssh;
 pub mod state;
 pub mod terminal;
