@@ -16,7 +16,8 @@ pub struct SetupActions {
     pub init_profiles: bool,
     /// Download and hash-check missing kernel/rootfs images.
     pub download_images: bool,
-    /// Create the guarded-network TAP pool and nftables rules (needs root).
+    /// Create the control and (for guarded mode) data TAP pools plus the
+    /// nftables rules (needs root). Every mode needs this setup.
     pub configure_network: bool,
 }
 
