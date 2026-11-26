@@ -141,7 +141,7 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
             }
             Ok(ScanMessage::VmStopped { vm, note }) => {
                 if app.attached_vm.as_deref() == Some(vm.as_str()) {
-                    app.session = None;
+                    app.detach_console();
                     app.attached_vm = None;
                 }
                 app.clear_provision();
