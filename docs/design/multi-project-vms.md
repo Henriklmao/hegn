@@ -21,7 +21,7 @@ The new model separates three things that are currently fused:
 | Concept | Role | Cardinality |
 | --- | --- | --- |
 | **Project** | A directory the user works in; the primary navigation object | many |
-| **VM** | A named tool profile and runtime: harness, packages, CPU/RAM, rootfs, network, snapshots, console | many |
+| **VM** | A named tool profile and runtime: harness, packages, CPU/RAM, rootfs, network, snapshots, SSH access | many |
 | **Workspace** | A concrete checkout exported to a VM: the project itself, a clone, or a git worktree | one per project membership |
 
 A **project belongs to at most one VM**. A **VM hosts many projects**. The
@@ -638,7 +638,7 @@ although I'm the only user...
 - **N daemons cost N processes.** Shared-tool VMs reduce rootfs and provision
   cost but increase per-VM process count. `max_projects_per_vm` bounds it.
 - **No per-project snapshots.** A snapshot belongs to the VM and covers every
-  member; that is the price of a shared rootfs and console.
+  member; that is the price of a shared rootfs and runtime.
 - **No inter-project isolation inside a VM.** Every member is visible at
   `/projects/<slug>`. Group only projects that may read each other's files and
   secrets; use separate VMs for a hard boundary.
@@ -700,8 +700,8 @@ its own commit and review.
 2. **Guest multiplexing (resolved).** Parallel sessions use SSH over the
    control TAP, one guest PTY per attach; no vsock broker (ADR-011). Guest
    `tmux` is optional persistence, not the transport.
-3. **Cwd injection.** Should `hegn open <project>` type `cd` into a plain
-   shell, or only into the configured launch command? This design only types
-   through the existing launch path.
+3. **Cwd injection (resolved).** The SSH login shell starts in `/workspace`;
+   `--command` runs through SSH exec with the selected project's guest CWD. hegn
+   does not type `cd` into a shared serial shell.
 4. **Tool reconciliation.** When should package changes be applied: manual in
    the guest, an explicit `vm rebuild`, or a guest-side manifest reconciler?

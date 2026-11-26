@@ -1223,7 +1223,7 @@ its own security review. The control TAP keeps the existing egress guarantee:
 it has no default route, DNS, forwarding or masquerade, so SSH can never become
 a second path to the host, the local network or the internet.
 
-**Consequence:** hosting now requires `ssh` and `ssh-keygen`; `network = "off"`
+**Consequence:** the host now requires `ssh` and `ssh-keygen`; `network = "off"`
 still needs the root-owned network setup and marker version 3 for the control
 TAP. Each VM owns a private key and `known_hosts`, and `apply`/`rebuild` must
 rotate the guest host keys. Existing VMs need `hegn vm apply` before SSH attach
