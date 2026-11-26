@@ -100,6 +100,10 @@ Notes:
   running VM keeps its current shares until `hegn vm apply`. `vm apply` waits
   for cloud-init, SSH readiness and the harness provisioner's ready marker
   before returning, and a changed seed identity re-runs the harness provisioner.
+- `vm start`, `vm stop` and snapshot restore repair an unreadable or legacy
+  `run/session.json` automatically: verified child processes are stopped and the
+  stale runtime files are moved to `run/stale-<timestamp>/`. Logs and the
+  lifecycle lock stay in place; no manual run-directory removal is needed.
 - `project fork` always creates a member of the parent's VM. Clone is the
   default; `--target` is valid only with `--mode worktree` and must stay inside
   the parent project.

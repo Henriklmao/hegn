@@ -40,6 +40,7 @@ Common membership errors:
 | `primary project ... is not an exported member` | `hegn vm primary <vm> <project>` |
 | `network marker ... older` / `network setup` missing | `sudo hegn network setup --user "$USER"` |
 | `ssh`/`ssh-keygen` missing | Install the OpenSSH client |
+| `session metadata ... unreadable or from an older hegn version` | Run `hegn vm start <vm>`, `hegn vm stop <vm>` or restore again. hegn archives the stale run files under `run/stale-<timestamp>/` automatically and continues; no manual directory removal is needed. |
 
 If you changed membership while the VM was running, run `hegn vm apply <vm>`.
 That restarts the VM and kills running agents and SSH sessions.

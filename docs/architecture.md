@@ -260,6 +260,11 @@ All state paths can be overridden in `config.toml` or by environment variables
 4. Take the VM's exclusive `run/hegn.lock`. A second lifecycle operation on the
    same VM fails fast; other VMs are independent.
 5. If a stale session exists, clean up its run files and any verified children.
+   If `session.json` is unreadable or from an older release, archive the stale
+   runtime files under `run/stale-<timestamp>/` after verifying recorded PIDs;
+   logs and the lifecycle lock stay in place, so the VM can start immediately.
+   Unknown live processes that reference the run directory are never killed:
+   the repair stops with their PID instead.
 6. Create the session log (`LogStore::create_session`); prune old logs
    best-effort. Give the VM a private rootfs copy on first start (reflink or
    full copy) and extend it to a 16 GiB sparse virtual size so the first-boot
