@@ -223,6 +223,41 @@ fn has_established_related(expr: &Value) -> bool {
     })
 }
 
+/// A rule consisting only of one `iifname == iface` match, a counter and a
+/// drop. Any additional match would narrow the drop and let traffic through
+/// that the guard must reject.
+fn is_bare_iface_drop(expr: &Value, iface: &str) -> bool {
+    let Some(items) = expr.as_array() else {
+        return false;
+    };
+    let mut iface_match = 0usize;
+    let mut counter = false;
+    let mut drop = false;
+    for item in items {
+        if item.get("counter").is_some() {
+            counter = true;
+        } else if item.get("drop").is_some() {
+            drop = true;
+        } else if let Some(m) = item.get("match") {
+            let key = m
+                .get("left")
+                .and_then(|left| left.get("meta"))
+                .and_then(|meta| meta.get("key"))
+                .and_then(|key| key.as_str());
+            if key != Some("iifname")
+                || m.get("op").and_then(|op| op.as_str()) != Some("==")
+                || m.get("right").and_then(|right| right.as_str()) != Some(iface)
+            {
+                return false;
+            }
+            iface_match += 1;
+        } else {
+            return false;
+        }
+    }
+    iface_match == 1 && counter && drop
+}
+
 /// Render one set element. nft prints a single interval member as a `range`
 /// object with identical endpoints, which still means one address.
 fn set_element_text(value: &Value) -> Option<String> {
@@ -370,8 +405,9 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
                 }
             }
         }
-        if drop && iface.as_deref() == Some("@hegn_control_ifaces") {
-            // Control traffic is host-only and must never be forwarded.
+        if is_bare_iface_drop(expr, "@hegn_control_ifaces") {
+            // Control traffic is host-only and must never be forwarded. The
+            // drop may not carry an extra match that would let some of it pass.
             min_handle(&mut control_forward_drop, *handle);
         }
         if drop
@@ -411,6 +447,7 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
     let mut control_source_handles = Vec::new();
     let mut control_established_accept: Option<u64> = None;
     let mut control_input_drop: Option<u64> = None;
+    let mut unexpected_input_accept = false;
     for (handle, expr) in &input_rules {
         let drop = has_verdict(expr, "drop");
         let accept = has_verdict(expr, "accept");
@@ -432,14 +469,20 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
                 }
             }
         }
-        if accept
-            && iface.as_deref() == Some("@hegn_control_ifaces")
-            && match_text(expr, "daddr").as_deref() == Some("@hegn_control_hosts")
-            && has_established_related(expr)
-        {
-            min_handle(&mut control_established_accept, *handle);
+        if accept {
+            let is_control_established = iface.as_deref() == Some("@hegn_control_ifaces")
+                && match_text(expr, "daddr").as_deref() == Some("@hegn_control_hosts")
+                && has_established_related(expr);
+            let is_data_endpoint = iface.as_deref() == Some("@hegn_ifaces");
+            if is_control_established {
+                min_handle(&mut control_established_accept, *handle);
+            } else if !is_data_endpoint {
+                // A control TAP must never gain a broader input accept than
+                // the established reply to the host control address.
+                unexpected_input_accept = true;
+            }
         }
-        if drop && iface.as_deref() == Some("@hegn_control_ifaces") {
+        if is_bare_iface_drop(expr, "@hegn_control_ifaces") {
             min_handle(&mut control_input_drop, *handle);
         }
     }
@@ -471,6 +514,7 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
         .copied()
         .chain(ipv6_drop)
         .chain(private_drop)
+        .chain(control_forward_drop)
         .collect();
     let early_drops_precede_accepts = first_accept.is_some_and(|accept| {
         early_drops.iter().all(|handle| *handle < accept)
@@ -493,6 +537,7 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
         && seen_control_sources.len() == CONTROL_TAP_POOL as usize
         && control_order
         && control_forward_drop.is_some()
+        && !unexpected_input_accept
         && !control_masquerade
 }
 
@@ -1663,6 +1708,104 @@ mod tests {
         assert!(
             !parse_live_guard(&via_set.to_string(), &[]),
             "a control-set masquerade must be rejected"
+        );
+    }
+
+    #[test]
+    fn live_guard_requires_the_control_forward_drop_before_any_accept() {
+        let mut fixture = live_fixture(&[]);
+        for item in fixture["nftables"].as_array_mut().unwrap() {
+            let Some(rule) = item.get_mut("rule") else {
+                continue;
+            };
+            let text = rule["expr"].to_string();
+            if rule["chain"] == "forward"
+                && text.contains("@hegn_control_ifaces")
+                && text.contains("drop")
+            {
+                // Push the drop behind every forward accept.
+                rule["handle"] = json!(10_000);
+            }
+        }
+        assert!(
+            !parse_live_guard(&fixture.to_string(), &[]),
+            "the control forward drop must precede every forward accept"
+        );
+    }
+
+    #[test]
+    fn live_guard_rejects_a_broad_control_input_accept() {
+        let mut fixture = live_fixture(&[]);
+        fixture["nftables"].as_array_mut().unwrap().push(json!({
+            "rule": {
+                "family": "inet", "table": "hegn", "chain": "input", "handle": 9100,
+                "expr": [
+                    {"match": {"op": "==", "left": {"meta": {"key": "iifname"}},
+                     "right": "@hegn_control_ifaces"}},
+                    {"counter": null},
+                    {"accept": null}
+                ]
+            }
+        }));
+        assert!(
+            !parse_live_guard(&fixture.to_string(), &[]),
+            "only the established control reply may reach the host input stack"
+        );
+    }
+
+    #[test]
+    fn live_guard_rejects_a_narrowed_control_input_drop() {
+        let mut fixture = live_fixture(&[]);
+        for item in fixture["nftables"].as_array_mut().unwrap() {
+            let Some(rule) = item.get_mut("rule") else {
+                continue;
+            };
+            let text = rule["expr"].to_string();
+            if rule["chain"] == "input"
+                && text.contains("@hegn_control_ifaces")
+                && text.contains("drop")
+            {
+                rule["expr"].as_array_mut().unwrap().insert(
+                    1,
+                    json!({
+                        "match": {"op": "==",
+                         "left": {"payload": {"protocol": "tcp", "field": "dport"}},
+                         "right": 22}
+                    }),
+                );
+            }
+        }
+        assert!(
+            !parse_live_guard(&fixture.to_string(), &[]),
+            "a narrowed control input drop must not satisfy the catch-all"
+        );
+    }
+
+    #[test]
+    fn live_guard_rejects_a_narrowed_control_forward_drop() {
+        let mut fixture = live_fixture(&[]);
+        for item in fixture["nftables"].as_array_mut().unwrap() {
+            let Some(rule) = item.get_mut("rule") else {
+                continue;
+            };
+            let text = rule["expr"].to_string();
+            if rule["chain"] == "forward"
+                && text.contains("@hegn_control_ifaces")
+                && text.contains("drop")
+            {
+                rule["expr"].as_array_mut().unwrap().insert(
+                    1,
+                    json!({
+                        "match": {"op": "==",
+                         "left": {"payload": {"protocol": "tcp", "field": "dport"}},
+                         "right": 22}
+                    }),
+                );
+            }
+        }
+        assert!(
+            !parse_live_guard(&fixture.to_string(), &[]),
+            "a narrowed control forward drop must not satisfy the catch-all"
         );
     }
 
