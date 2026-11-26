@@ -279,7 +279,10 @@ All state paths can be overridden in `config.toml` or by environment variables
    Otherwise log why it was skipped and cold boot.
 9. Ensure the per-VM SSH client identity exists: `<vm>/ssh/id_ed25519` (mode
    `0600`, directory `0700`) and its public key. A missing or corrupt private
-   key is regenerated before boot; `known_hosts` stays per VM.
+   key is regenerated before boot; `known_hosts` stays per VM. Root-run hegn
+   (for example through `sudo`) hands identity files back to `SUDO_UID`; a
+   root-owned `known_hosts` left by an older run is unlinked and recreated by
+   the next start.
 10. Require the root-owned `/run/hegn/network.json` marker (version 3) and
     reserve the slot's **control** TAP. With `network = "guarded"` the same
     lease also claims the data TAP; with `network = "off"` only the control TAP

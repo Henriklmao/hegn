@@ -72,6 +72,7 @@ mount. The boot log names the member.
 | `SSH ... Connection refused` | The VM predates SSH support, sshd is not ready, or the control TAP is missing. Wait for boot, or run `hegn vm apply <vm>` and start the VM again; `apply` now waits for cloud-init, SSH readiness and the harness provisioner, and the VM stays running on failure. |
 | `Permission denied (publickey)` | The seed does not authorize the current key for `ssh_user`. `hegn vm apply <vm>` regenerates the seed; `hegn vm rebuild <vm>` also creates a new client key. |
 | `Host key verification failed` | The guest host key changed. The per-VM `known_hosts` is never overwritten silently. `hegn vm apply <vm>` clears it, waits for cloud-init's host-key rotation, and clears it again after SSH is ready. |
+| `Permission denied` on `ssh/known_hosts` | A root-run (for example `sudo hegn vm apply`) left a root-owned cache in the user-owned `ssh/` directory. The next start/apply unlinks and recreates it automatically; root-run hegn also hands new identity files back to `SUDO_UID`. |
 | `missing guest_ip` / `missing ssh_user` | The session record predates this release. Use `hegn attach <vm> --serial` until `hegn vm apply <vm>` has refreshed it. |
 | `ssh: command not found` | Install the host OpenSSH client; `hegn doctor` checks `ssh` and `ssh-keygen`. |
 | SSH fails but the data network works | Check `hegn doctor` for marker version 3, control TAPs and control nftables rules; run `sudo hegn network setup --user "$USER"` if needed. |
