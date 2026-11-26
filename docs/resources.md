@@ -37,7 +37,7 @@ processes plus the guest:
 | `virtiofsd` (parent + worker), one per project | shares one project directory into the guest (`--sandbox=namespace --cache=never`) | ~12 MiB total each |
 | `virtiofsd` (profile share) | optional daemon for the VM's copied config/skill payload | ~12 MiB total when the profile has content |
 | `cloud-hypervisor(-static)` | the VMM and all guest RAM | ~404 MiB resident with a 2 GiB guest, ~2.1 GiB virtual |
-| `hegn attach` | optional second client on the console socket | ~7 MiB |
+| `ssh` (OpenSSH client) | one interactive session or `--command` over the control TAP | normal system `ssh` process; not re-measured for the SSH release |
 
 The VMM maps the configured guest memory up front, so its virtual size is
 `memory_mib` plus a few MiB, while the resident set grows towards
@@ -93,7 +93,7 @@ per VM. `hegn benchmark` lists running VMs and totals their RAM.
 | `hegn vm start` | spawns one virtiofsd per member, boots the VMM and waits for the Cloud Hypervisor API socket (15 s cap; usually well under a second on a local SSD), then starts the relay (5 s cap) |
 | Guest login prompt | a few seconds after boot on the pinned kernel |
 | First-boot cloud-init | runs in the background; measured ~91 s until "cloud-init finished" in the sample guest (it probes for a network that does not exist). The console is usable before that |
-| `hegn attach` | connects to an existing socket; effectively instant |
+| `hegn attach` | opens `ssh` to the running VM; ready as soon as the guest sshd accepts the key |
 | `hegn vm stop` | SIGTERM to the VMM, 2 s grace, then SIGKILL; the relay, autosave worker and every member virtiofsd are terminated and the run directory is cleaned |
 | `hegn vm apply` | full stop plus cold start (or a fingerprint-matching resume); kills running agents |
 | `hegn snapshot create` | pauses the VM, writes guest RAM and device state, resumes; proportional to `memory_mib` and disk write speed |

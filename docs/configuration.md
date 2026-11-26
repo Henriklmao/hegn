@@ -79,7 +79,7 @@ default         = "harness"  # "harness", "shell", or a name from commands
 integration     = "auto"     # auto | embedded | external | tmux | herdr
 auto_start      = true
 
-# Optional extra commands. They are typed into the guest shell.
+# Optional extra commands. They run in the guest shell (SSH or embedded serial).
 [[launch.commands]]
 name            = "review"
 command         = "opencode"

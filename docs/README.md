@@ -11,12 +11,12 @@ the short version.
 | [Getting started](getting-started.md) | First VM, first project, harness presets |
 | [Projects, VMs and workspaces](projects-and-vms.md) | Membership, imports, forks, deleting, read-only exports |
 | [Harnesses and profiles](harnesses.md) | Harness presets, profiles, skill sync, launch commands |
-| [Sessions, attach and logs](sessions-and-logs.md) | Attaching, the attach bar, session logs |
+| [Sessions, attach and logs](sessions-and-logs.md) | SSH sessions, the serial console, session logs |
 | [Configuration](configuration.md) | `config.toml`, `vm.toml`, project `hegn.toml`, environment variables |
 | [TUI guide](tui.md) | Screens and keyboard shortcuts |
 | [CLI reference](cli-reference.md) | All commands, flags and exit codes |
 | [Snapshots](snapshots.md) | Manual snapshots, boot fingerprints and automatic resume |
-| [Networking](networking.md) | Guarded network, local LLM endpoints, host firewalls |
+| [Networking](networking.md) | Control TAP for SSH, guarded network, local LLM endpoints, host firewalls |
 | [VM images](vm-images.md) | Pinned images, verification, guest login |
 | [Security](security.md) | Isolation, guardrails, limits |
 | [Troubleshooting](troubleshooting.md) | Common problems and log locations |
@@ -29,7 +29,7 @@ the short version.
 | Document | What's in it |
 | --- | --- |
 | [Architecture](architecture.md) | Design goals, modules, lifecycle flows, safety invariants, CI |
-| [Multi-project VMs](design/multi-project-vms.md) | Design record for many projects per VM, clones/worktrees, snapshots and migration |
+| [Multi-project VMs](design/multi-project-vms.md) | Design record for many projects per VM, SSH sessions, clones/worktrees, snapshots and migration |
 
 ## Features in detail
 
@@ -59,7 +59,12 @@ the short version.
 - **Snapshots:** save and restore the full VM state, plus automatic checkpoints.
   A boot fingerprint invalidates membership or resource changes. See
   [Snapshots](snapshots.md).
-- **Guarded network:** the guest reaches only the public web and DNS. See
+- **SSH by default:** every VM has a control TAP for SSH, with one guest PTY per
+  session. The serial console remains the boot and recovery channel
+  (`--serial`). The control link has no egress. See
+  [Sessions, attach and logs](sessions-and-logs.md) and
+  [Networking](networking.md).
+- **Guarded network:** the data TAP reaches only the public web and DNS. See
   [Networking](networking.md).
 - **Command guardrails:** checks for homoglyphs, secret exfiltration, encoded
   payloads and destructive operations. Every `/projects/*` root and `/workspace`

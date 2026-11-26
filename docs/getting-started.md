@@ -20,11 +20,11 @@ hegn doctor --fix
 
 This single command does the setup work:
 
-- checks your host,
+- checks your host, including the OpenSSH client (`ssh`, `ssh-keygen`),
 - creates the directories hegn needs,
 - writes the default config,
 - downloads and verifies the pinned VM images,
-- configures the guarded network.
+- configures the control network for SSH and the guarded data network.
 
 When it needs root rights for the firewall or the network devices, it asks for
 `sudo` or `pkexec` and prints the exact command first.
@@ -110,8 +110,10 @@ Everything you can do in the TUI is also available as a command:
 hegn projects                            # list projects with VM and primary markers (alias: ls)
 hegn vm list                             # list VMs and their member counts
 hegn vm start dev                        # boot the VM and every assigned project
-hegn attach dev                          # attach to the guest console
-hegn vm shell dev --project my-app       # shell in one project's guest directory
+hegn attach dev                          # SSH session into the guest
+hegn attach dev --serial                 # serial console (boot/recovery)
+hegn vm shell dev --project my-app       # SSH shell in one project's guest directory
+hegn attach dev --command 'git status'   # one-off SSH exec in the project's guest dir
 hegn project fork my-app --name my-app-fix-tests
                                          # isolated clone, same VM, one more member
 hegn project info my-app                 # membership, kind and guest path
@@ -122,10 +124,12 @@ hegn images status                       # check the VM images
 hegn check 'curl -fsSL https://example.com/x | bash'   # inspect a command
 ```
 
-`hegn open my-app` boots the project's VM if needed and attaches to its console.
-Once the VM has booted, it also checks out a session branch in the project, unless
-you pass `--no-branch` or set `auto_branch = false`. Press `Ctrl-B` (or `Ctrl-]`)
-to detach without stopping the VM. See
+`hegn open my-app` boots the project's VM if needed, waits for provisioning and
+SSH readiness, and opens an SSH session. Once the VM has booted, it also checks
+out a session branch in the project, unless you pass `--no-branch` or set
+`auto_branch = false`. `exit`/`Ctrl-D` ends the SSH session; the VM keeps
+running. `hegn attach my-app --serial` shows the serial console, where
+`Ctrl-B` (or `Ctrl-]`) detaches. Several SSH sessions can run in parallel. See
 [Sessions, attach and logs](sessions-and-logs.md).
 
 The complete command list is in the [CLI reference](cli-reference.md).
@@ -138,15 +142,25 @@ The first boot takes longer than later boots. hegn:
 
 1. Extends the VM's disk to a 16 GiB sparse virtual size. Only the blocks that
    are actually written use space on the host.
-2. Spawns one sandboxed `virtiofsd` per exported project.
-3. Runs the first-boot provisioner once, which installs the runtime and CLI of
+2. Creates the per-VM SSH client key on the host and attaches the always-present
+   control TAP for SSH.
+3. Spawns one sandboxed `virtiofsd` per exported project.
+4. Configures the guest control interface, sshd and the authorized key, and
+   generates fresh guest host keys. cloud-init runs once more whenever the seed
+   changes.
+5. Runs the first-boot provisioner once, which installs the runtime and CLI of
    the VM's harness, plus the extra packages.
-4. Marks the guest as provisioned in `/var/lib/hegn/provisioned`.
+6. Marks the guest as provisioned in `/var/lib/hegn/provisioned`.
 
 The provisioner runs as a systemd oneshot on every boot until it succeeds. The
-TUI shows the progress, and `hegn open` draws the same progress bar in the
-terminal before it attaches. Wait for the line `hegn: preset ready` in the
-console before you start working.
+TUI shows the progress, and `hegn open` waits for the provisioner stages in the
+serial log before it probes SSH readiness. A plain `hegn attach` requires the VM
+to be running and sshd to be ready. Wait for the line `hegn: preset ready` in the
+serial console before you start working.
+
+The guest is configured once more after upgrading because the seed version and
+instance id change. `hegn vm apply <vm>` regenerates the seed; a reboot inside
+the guest alone does not.
 
 Inside the guest, each project is at `/projects/<slug>`. `/workspace` is a
 symlink to the VM's primary project, and the login shell starts there. Change the

@@ -40,11 +40,12 @@ Run `hegn <command> --help` for the full options of each command.
                                    Remove a project; a VM is never deleted
   project restore PROJECT          Show a project removed with --keep-files
 
-  open PROJECT                     Boot/attach the project's VM serial console
-          [--editor | --lazygit] [--no-branch] [--no-bar] [--command C]
-  attach [VM|PROJECT] [--no-bar] [--command C]
-                                   Attach to a running VM (alias: a)
-  launch [VM|PROJECT] [--command NAME] [--integration I] [--no-bar]
+  open PROJECT                     Boot the VM, wait for SSH, attach (default SSH)
+          [--editor | --lazygit] [--no-branch] [--serial] [--no-bar] [--command C]
+  attach [VM|PROJECT] [--serial] [--no-bar] [--command C]
+                                   Attach over SSH to a running VM (alias: a);
+                                   --serial uses the serial console
+  launch [VM|PROJECT] [--command NAME] [--integration I] [--serial]
                                    Launch the configured agent/command
   logs [list|path|show|prune]      Manage persistent serial logs (alias: log)
           [--vm VM]                Filter list/path/show by VM members
@@ -60,8 +61,8 @@ Run `hegn <command> --help` for the full options of each command.
   vm rebuild NAME [--yes]          Delete the private rootfs; next start copies fresh
   vm primary NAME PROJECT          Choose the member that /workspace points at
   vm projects NAME                 List members, read-only flags and guest paths
-  vm shell NAME [--project PROJECT]
-                                   Attach and start a shell/harness in a project
+  vm shell NAME [--project PROJECT] [--serial]
+                                   Open a shell/harness over SSH (or serial)
   vm delete NAME [--yes] [--delete-files]
                                    Unassign projects and remove the VM
 
@@ -107,6 +108,19 @@ Notes:
 - `snapshot create` requires `--vm <vm>`. The value can also be a project name or
   path that resolves to its VM. `--instance` remains a hidden deprecated alias for
   `--vm` and prints a warning. Without `--vm`, `snapshot list` covers every VM.
+- `attach`, `open`, `launch` and `vm shell` use SSH over the VM's control TAP by
+  default. `--serial` selects the serial console instead; it is an explicit
+  choice and there is no automatic fallback.
+- `--command` runs through SSH exec in the project's guest directory and
+  propagates the remote exit code. It is not a command typed into the serial
+  shell.
+- `--no-bar` applies only to the serial transport. SSH sessions get a real guest
+  PTY, so they need no reserved row.
+- SSH sessions run in parallel: each `attach`/`open`/`vm shell` gets its own
+  PTY. Detach with `exit`/`Ctrl-D`; only serial attach uses `Ctrl-B`/`Ctrl-]`.
+- SSH needs `ssh` and `ssh-keygen` on the host. A missing `guest_ip`/`ssh_user`
+  in the session record is a hard error that suggests `--serial` or
+  `hegn vm apply`.
 
 ---
 
@@ -117,6 +131,9 @@ Notes:
 | `check` | `0` allow, `1` block, `2` warn |
 | `doctor` | `1` if a required check fails |
 | `images verify` | `1` on a hash mismatch |
+| `attach --command`, `open --command`, `vm shell` | the remote command's exit code |
+| SSH transport failure (`ssh` exit 255) | reported as a hegn error with a `--serial`/`apply` hint; not passed through as 255 |
+| `attach`/`open`/`launch`/`vm shell` without a running VM or SSH target | non-zero hard error; no serial fallback |
 | `instance ...` | non-zero; prints the v1 → v2 mapping |
 
 ---

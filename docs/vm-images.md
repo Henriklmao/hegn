@@ -56,9 +56,21 @@ with the new pins. hegn does not publish an image of its own.
 
 ## Guest login
 
-The seed disk that hegn creates enables a serial root login through cloud-init.
-This is convenient for a local tool, but it is less strict.
+hegn configures two ways into the guest:
 
-Set `guest_credential_hardening = true` to change this. The console then logs in
-as the unprivileged `hegn` user, and `sudo` asks for a password. Set that password
-inside the guest first.
+- **SSH** is the default for `hegn attach`, `hegn open`, `launch` and
+  `hegn vm shell`. Every VM gets its own Ed25519 client key under
+  `<vms_dir>/<vm>/ssh/` and its own `known_hosts`. cloud-init installs a
+  public-key-only sshd drop-in, authorizes the key for `ssh_user` and
+  regenerates the guest host keys on each run.
+- **The serial console** remains the boot, provisioning and recovery channel
+  (`hegn attach <vm> --serial`). The seed enables serial autologin there.
+
+`ssh_user` defaults to `root`, or `hegn` when
+`guest_credential_hardening = true`. Setting it to `root` together with
+hardening is rejected. Only the chosen account receives the key. Password,
+keyboard-interactive, agent and TCP forwarding are disabled.
+
+The official cloud image already ships OpenSSH server and `ssh-keygen`; custom
+`rootfs_image` builds must include both. The host needs the OpenSSH client
+(`ssh`, `ssh-keygen`); `hegn doctor` checks it.
