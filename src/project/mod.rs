@@ -23,7 +23,10 @@ mod model;
 mod registry;
 mod workspace;
 
-pub use assign::{UnassignOutcome, assign_project, registered_entry, unassign_project};
+pub use assign::{
+    AssignOutcome, UnassignOutcome, assign_project, assign_project_detailed, registered_entry,
+    unassign_project,
+};
 pub use create::create_project;
 pub use delete::{delete_project, delete_registered_project};
 pub use discovery::{discover, discover_protected};
