@@ -7,12 +7,15 @@
 //! - [`identity`] — per-VM keypair and `known_hosts`
 //! - [`client`] — the OpenSSH client wrapper, readiness probe and error
 //!   classification
+//! - [`title`] — RAII terminal-title guard for interactive sessions
 
 mod client;
 mod identity;
+mod title;
 
 pub use client::{ClassifiedError, GuestEnv, SshTarget, classify_stderr};
 pub use identity::SshIdentity;
+pub use title::{TitleGuard, reset_sequence, title_sequence};
 
 use std::io;
 use std::net::Ipv4Addr;
