@@ -605,16 +605,17 @@ These are product requirements, not implementation details.
     hidden. The VM is the trust boundary; read-only does not provide secrecy.
 19. **SSH is management-only.** SSH terminates on the guest's control NIC
     (`hegnc<i>`). The control TAP has no default route, DNS, forwarding or
-    masquerade, so it cannot reach the host, the local network or the internet.
-    All egress still goes through the guarded data TAP, which exists only with
-    `network = "guarded"`.
+    masquerade, so the guest cannot originate connections to other host
+    services, the local network or the internet; only SSH replies to the host
+    are accepted. All egress still goes through the guarded data TAP, which
+    exists only with `network = "guarded"`.
 20. **Serial is recovery, not a fallback.** `hegn attach` defaults to SSH;
     `--serial` is an explicit choice. A refused or failed SSH connection is a
     hard error and never silently attaches to the serial relay.
 21. **SSH identity is per VM and private.** The client key lives in
     `<vms_dir>/<vm>/ssh/` (`0700`, key `0600`) with a per-VM `known_hosts`;
     host keys are regenerated on the next boot after `hegn vm apply`, and
-    `hegn vm rebuild`/`clone` get a fresh client key. sshd accepts public keys
+    `hegn vm rebuild` gets a fresh client key. sshd accepts public keys
     only, for the configured `ssh_user` only, with agent, TCP and X11
     forwarding disabled.
 
