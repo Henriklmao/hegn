@@ -11,17 +11,20 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
 use crate::config::{Config, SecurityMode};
 use crate::project::ProjectRegistry;
+use crate::session::logs::tail_bytes;
+use crate::session::ssh::{SshIdentity, SshTarget};
 use crate::vm::config::{VmConfig, VmStore};
 
 use super::membership::MembershipManifest;
 use super::paths::VmPaths;
 use super::process::process_matches;
-use super::session::SessionRecord;
+use super::session::{SessionRecord, VmReport};
 
 #[derive(Debug, Clone)]
 pub struct VmManager {
@@ -259,7 +262,92 @@ impl VmManager {
         if self.is_running() {
             self.stop()?;
         }
-        self.start_cold()
+        let report = self.start_cold()?;
+        self.wait_for_guest_ssh(&report)?;
+        Ok(report)
+    }
+
+    /// Wait until cloud-init finished and SSH accepts the new host key.
+    ///
+    /// A boot with cloud-init rotates the guest host keys in its final stage.
+    /// Returning immediately after the VMM starts would let a later attach
+    /// cache the image host key and then fail once cloud-init rotates it. The
+    /// host-key cache is cleared before every probe and once more at the end,
+    /// so the next attach accepts the host key that is current at that time.
+    fn wait_for_guest_ssh(&self, report: &VmReport) -> Result<()> {
+        if !self.config.cloud_init {
+            return Ok(());
+        }
+        let Some(index) = self.vm.network_index else {
+            return Ok(());
+        };
+        let user = self
+            .vm
+            .effective_ssh_user(self.config.guest_credential_hardening)?;
+        let identity = SshIdentity::new(&self.config.vms_dir, &self.vm.name);
+        identity.load().with_context(|| {
+            format!("failed to load the SSH identity for VM '{}'", self.vm.name)
+        })?;
+        let target = SshTarget::new(
+            self.vm.name.clone(),
+            crate::network::control_guest_ip(index),
+            user.as_str(),
+            identity.key().to_path_buf(),
+            identity.known_hosts().to_path_buf(),
+        )?;
+
+        // Cloud-init rotates the guest host keys near the end of its run. Wait
+        // for that marker before probing SSH; a missing or unreadable log is
+        // not fatal, the SSH timeout below still applies.
+        if let Some(log) = &report.serial_log {
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while Instant::now() < deadline {
+                if cloud_init_finished(log) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+
+        identity.remove_known_hosts().with_context(|| {
+            format!(
+                "failed to clear the SSH host key cache for VM '{}'",
+                self.vm.name
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut last: Option<String> = None;
+        while Instant::now() < deadline {
+            // `accept-new` cannot replace an existing entry. Clearing the
+            // cache before each probe also covers a host-key rotation that
+            // happens between two probes.
+            identity.remove_known_hosts().with_context(|| {
+                format!(
+                    "failed to clear the SSH host key cache for VM '{}'",
+                    self.vm.name
+                )
+            })?;
+            match target.wait_ready(Duration::from_secs(5)) {
+                Ok(()) => {
+                    identity.remove_known_hosts().with_context(|| {
+                        format!(
+                            "failed to clear the SSH host key cache for VM '{}'",
+                            self.vm.name
+                        )
+                    })?;
+                    return Ok(());
+                }
+                Err(error) => last = Some(error.to_string()),
+            }
+        }
+        identity.remove_known_hosts().ok();
+        bail!(
+            "VM '{}' restarted, but SSH did not become ready: {}. Use 'hegn attach {} --serial' \
+             if the guest did not boot.",
+            self.vm.name,
+            last.as_deref().unwrap_or("no probe completed"),
+            self.vm.name
+        );
     }
 
     /// Attach the TUI/CLI terminal to the running guest serial console.
@@ -274,6 +362,16 @@ impl VmManager {
         }
         self.attach_console()
     }
+}
+
+/// True when the serial log shows cloud-init's final stage.
+fn cloud_init_finished(path: &Path) -> bool {
+    let Ok(bytes) = tail_bytes(path, 400) else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    text.lines()
+        .any(|line| line.contains("Cloud-init") && line.contains("finished at"))
 }
 
 #[cfg(test)]
@@ -451,6 +549,24 @@ mod tests {
             "{warning}"
         );
         assert!(warning.contains("hegn vm apply demo"), "{warning}");
+    }
+
+    #[test]
+    fn cloud_init_finished_detects_the_final_serial_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("serial.log");
+        std::fs::write(
+            &log,
+            "Cloud-init v. 24.4 running 'modules:config' at Thu, 26 Nov 2026\n",
+        )
+        .unwrap();
+        assert!(!cloud_init_finished(&log));
+        std::fs::write(
+            &log,
+            "Cloud-init v. 24.4 finished at Thu, 26 Nov 2026 16:35:00 +0000\n",
+        )
+        .unwrap();
+        assert!(cloud_init_finished(&log));
     }
 
     #[test]
