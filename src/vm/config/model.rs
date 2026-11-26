@@ -17,6 +17,36 @@ pub const VM_CONFIG_FILE: &str = "vm.toml";
 pub const CONFIG_VERSION: u32 = 2;
 const MAX_NAME_BYTES: usize = 64;
 
+/// Guest account used for SSH over the control NIC.
+///
+/// The key is installed for exactly this account. `root` is only valid without
+/// [`crate::config::Config::guest_credential_hardening`]; see
+/// [`VmConfig::effective_ssh_user`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SshUser {
+    Root,
+    Hegn,
+    Ubuntu,
+}
+
+impl SshUser {
+    pub const ALL: [Self; 3] = [Self::Root, Self::Hegn, Self::Ubuntu];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Hegn => "hegn",
+            Self::Ubuntu => "ubuntu",
+        }
+    }
+
+    /// The guest account used when the VM does not pin `ssh_user`.
+    pub fn default_for(hardening: bool) -> Self {
+        if hardening { Self::Hegn } else { Self::Root }
+    }
+}
+
 /// Description of one VM: harness, resources and runtime policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -45,6 +75,10 @@ pub struct VmConfig {
     /// Stable slice of the guarded-network TAP pool, kept across restores.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_index: Option<u8>,
+    /// Guest account that receives the per-VM SSH key over the control NIC.
+    /// `None` means `hegn` under credential hardening, otherwise `root`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_user: Option<SshUser>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -65,6 +99,7 @@ impl Default for VmConfig {
             snapshot_keep: 2,
             auto_resume: true,
             network_index: None,
+            ssh_user: None,
             created_at: Utc::now(),
         }
     }
@@ -101,6 +136,23 @@ impl VmConfig {
             snapshot_keep: config.snapshot_keep,
             auto_resume: config.auto_resume,
             ..Self::default()
+        }
+    }
+
+    /// Resolve the guest SSH account for a boot.
+    ///
+    /// An explicit `ssh_user` always wins. Without one, hardening selects
+    /// `hegn` and the relaxed default is `root`. Hardening together with an
+    /// explicit `root` is contradictory and a hard error.
+    pub fn effective_ssh_user(&self, hardening: bool) -> Result<SshUser> {
+        match self.ssh_user {
+            Some(SshUser::Root) if hardening => bail!(
+                "VM '{}' selects ssh_user = \"root\", but guest credential hardening is enabled; \
+                 choose \"hegn\" or \"ubuntu\", or disable guest_credential_hardening",
+                self.name
+            ),
+            Some(user) => Ok(user),
+            None => Ok(SshUser::default_for(hardening)),
         }
     }
 
@@ -314,6 +366,53 @@ mod tests {
         assert!(err.contains("TAP pool"), "{err}");
         vm.network_index = Some(crate::network::TAP_POOL - 1);
         assert!(vm.validate().is_ok());
+    }
+
+    #[test]
+    fn ssh_user_defaults_to_none_and_parses_known_values() {
+        assert_eq!(VmConfig::default().ssh_user, None);
+
+        let parsed: VmConfig = toml::from_str("name = \"rust\"\nssh_user = \"hegn\"\n").unwrap();
+        assert_eq!(parsed.ssh_user, Some(SshUser::Hegn));
+        for (value, expected) in [
+            ("root", SshUser::Root),
+            ("hegn", SshUser::Hegn),
+            ("ubuntu", SshUser::Ubuntu),
+        ] {
+            let parsed: VmConfig =
+                toml::from_str(&format!("name = \"rust\"\nssh_user = \"{value}\"\n")).unwrap();
+            assert_eq!(parsed.ssh_user, Some(expected));
+            assert_eq!(expected.as_str(), value);
+        }
+
+        let err = toml::from_str::<VmConfig>("name = \"rust\"\nssh_user = \"admin\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown variant") || err.contains("admin"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn effective_ssh_user_prefers_the_explicit_value() {
+        let mut vm = valid();
+        assert_eq!(vm.effective_ssh_user(false).unwrap(), SshUser::Root);
+        assert_eq!(vm.effective_ssh_user(true).unwrap(), SshUser::Hegn);
+
+        vm.ssh_user = Some(SshUser::Ubuntu);
+        assert_eq!(vm.effective_ssh_user(false).unwrap(), SshUser::Ubuntu);
+        assert_eq!(vm.effective_ssh_user(true).unwrap(), SshUser::Ubuntu);
+
+        vm.ssh_user = Some(SshUser::Hegn);
+        assert_eq!(vm.effective_ssh_user(false).unwrap(), SshUser::Hegn);
+
+        vm.ssh_user = Some(SshUser::Root);
+        let err = vm.effective_ssh_user(true).unwrap_err().to_string();
+        assert!(err.contains("ssh_user"), "{err}");
+        assert!(err.contains("root"), "{err}");
+        assert!(err.contains("hardening"), "{err}");
+        assert_eq!(vm.effective_ssh_user(false).unwrap(), SshUser::Root);
     }
 
     #[test]

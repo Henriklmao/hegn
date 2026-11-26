@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{BackendKind, Config, Harness, NetworkMode, RootfsFormat, SecurityMode};
 use crate::shared::math::cycle_value;
-use crate::vm::config::{VM_CONFIG_FILE, VmConfig};
+use crate::vm::config::{SshUser, VM_CONFIG_FILE, VmConfig};
 
 use super::rows::{
     ConfigField, ConfigKind, ConfigPage, ConfigRow, FieldKind, endpoints_value, first_field,
@@ -222,6 +222,11 @@ impl ConfigForm {
                 ConfigField::Vcpus => vm.vcpus.to_string(),
                 ConfigField::Memory => vm.memory_mib.to_string(),
                 ConfigField::Security => vm.security.label().to_string(),
+                ConfigField::SshUser => vm
+                    .ssh_user
+                    .unwrap_or_else(|| SshUser::default_for(self.base.guest_credential_hardening))
+                    .as_str()
+                    .to_string(),
                 ConfigField::SharedTag => self.base.share_tag_prefix.clone(),
                 ConfigField::GuestProjectsBase => self.base.guest_projects_base.clone(),
                 ConfigField::ExtraPackages => list_value(&vm.extra_packages),
@@ -516,6 +521,12 @@ impl ConfigForm {
                 ConfigField::Security => {
                     vm.security = cycle_value(&SecurityMode::ALL, &vm.security, dir.into())
                 }
+                ConfigField::SshUser => {
+                    let current = vm.ssh_user.unwrap_or_else(|| {
+                        SshUser::default_for(self.base.guest_credential_hardening)
+                    });
+                    vm.ssh_user = Some(cycle_value(&SshUser::ALL, &current, dir.into()));
+                }
                 _ => {}
             },
         }
@@ -600,6 +611,33 @@ impl ConfigForm {
 mod tests {
     use super::*;
     use crate::config::form::test_support::{global_config, key, select};
+    use crate::vm::config::VmConfig;
+
+    #[test]
+    fn vm_form_shows_and_cycles_the_effective_ssh_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = global_config(dir.path());
+        let vm = VmConfig::from_config(&config, "demo", None);
+        let mut form = ConfigForm::vm(vm, config.clone());
+        select(&mut form, ConfigField::SshUser);
+        assert_eq!(form.value(ConfigField::SshUser), "root");
+        form.adjust(1);
+        assert_eq!(form.value(ConfigField::SshUser), "hegn");
+        form.adjust(1);
+        assert_eq!(form.value(ConfigField::SshUser), "ubuntu");
+        form.adjust(1);
+        assert_eq!(form.value(ConfigField::SshUser), "root");
+
+        let mut hardened = config;
+        hardened.guest_credential_hardening = true;
+        let vm = VmConfig::from_config(&hardened, "demo", None);
+        let form = ConfigForm::vm(vm, hardened);
+        assert_eq!(
+            form.value(ConfigField::SshUser),
+            "hegn",
+            "the form shows the effective default under hardening"
+        );
+    }
 
     #[test]
     fn navigation_skips_headers_and_notes() {

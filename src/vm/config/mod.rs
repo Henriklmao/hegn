@@ -13,5 +13,5 @@
 mod model;
 mod store;
 
-pub use model::{CONFIG_VERSION, VM_CONFIG_FILE, VmConfig, validate_name};
+pub use model::{CONFIG_VERSION, SshUser, VM_CONFIG_FILE, VmConfig, validate_name};
 pub use store::VmStore;
