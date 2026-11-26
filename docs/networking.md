@@ -120,8 +120,8 @@ safely.
 ## nftables rules
 
 The privileged setup installs the `inet hegn` table. In addition to the data
-allow-list it creates control sets (`hegn_control_ifaces`, `hegn_control_hosts`
-and an optional `hegn_control_guests` set) and applies these rules:
+allow-list it creates the control sets `hegn_control_ifaces` and
+`hegn_control_hosts` and applies these rules:
 
 Input chain, in order:
 
@@ -138,10 +138,10 @@ Forward chain:
 - no masquerade for `10.214.0.0/24`; only the guarded data network is NATed.
 
 The established-accept rule must come before the control drop, otherwise SSH
-replies from the guest would be discarded. `hegn network status` and a root-run
-`hegn doctor` parse the live table and refuse to trust the marker when the
-control sets, source drops, established-accept, forward drop or the absence of
-control masquerade do not match.
+replies from the guest would be discarded. A root-run `hegn doctor` parses the
+live table and refuses to trust the marker when the control sets, source drops,
+established-accept, forward drop or the absence of control masquerade do not
+match.
 
 ---
 
@@ -235,8 +235,9 @@ The kernel log shows which rule dropped a packet:
 
 1. `hegn doctor` reports the `ssh`/`ssh-keygen` tools, marker version 3, the
    control TAPs and the control nftables rules. Fix what it names.
-2. `hegn network status` shows the control TAPs and the setup marker. If the
-   marker is older than version 3, run `sudo hegn network setup --user "$USER"`.
+2. `hegn network status` shows the setup marker and the data TAPs; a root-run
+   `hegn doctor` checks the control TAPs. If the marker is older than version 3,
+   run `sudo hegn network setup --user "$USER"`.
 3. `Connection refused` usually means the VM was booted before SSH support or
    sshd is not ready. Wait for the boot/provisioning to finish, or run
    `hegn vm apply <vm>` and start the VM again. The VM keeps running.

@@ -245,9 +245,9 @@ the network. The explicit equivalent remains:
 sudo hegn network setup --user "$USER"
 ```
 
-**Gate:** `hegn network status` reports `guard: ready`, marker version 3, and
-lists `hegnc0` and `hegn0` as `up`. `hegn doctor` reports the `network guard`
-check as ok. If the host already has a conflicting `10.213.0.0/24` or
+**Gate:** `hegn network status` reports `guard: ready` and lists `hegn0` as
+`up`; a root-run `hegn doctor` verifies marker version 3, the control TAPs and
+the control rules. If the host already has a conflicting `10.213.0.0/24` or
 `10.214.0.0/24` network, stop and report it; do not weaken the rules.
 
 ## Step 5 — Host check
