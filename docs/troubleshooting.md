@@ -41,6 +41,7 @@ Common membership errors:
 | `network marker ... older` / `network setup` missing | `sudo hegn network setup --user "$USER"` |
 | `ssh`/`ssh-keygen` missing | Install the OpenSSH client |
 | `session metadata ... unreadable or from an older hegn version` | Run `hegn vm start <vm>`, `hegn vm stop <vm>` or restore again. hegn archives the stale run files under `run/stale-<timestamp>/` automatically and continues; no manual directory removal is needed. |
+| `failed to remove .../profile/bundle/files: Permission denied` | A root-run (for example `sudo hegn vm apply`) left a root-owned bundle directory. The next start replaces an empty leftover automatically; for a non-empty one the error prints the exact `sudo rm -rf` command. Root-run hegn hands the bundle back to `SUDO_UID`, and the next start rewrites root-owned `manifest`/`env.sh`/`local.json` in the user-owned directory. |
 
 If you changed membership while the VM was running, run `hegn vm apply <vm>`.
 That restarts the VM and kills running agents and SSH sessions.

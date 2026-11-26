@@ -484,7 +484,12 @@ checked managed path; deleting a worktree uses `git worktree remove`.
    and materializes `<vm>/profile/bundle/`.
 3. Configuration files are copied fresh on every start. Skills are seeded only
    when their per-VM copy does not exist; later starts keep the copy so
-   guest-created skills survive reboots and can be synced back.
+   guest-created skills survive reboots and can be synced back. A bundle
+   directory a root-run hegn left root-owned (for example after
+   `sudo hegn vm apply`) is replaced automatically when it is empty; a non-empty
+   leftover fails with the exact `sudo rm -rf` command. Root-run hegn hands the
+   bundle tree back to `SUDO_UID`/`SUDO_GID`, and metadata files it left behind
+   are unlinked and rewritten by the directory owner.
 4. The bundle carries a tab-separated `manifest`, an `env.sh`, and the copies.
    The host-side mapping (`local.json`) stays outside the exported directory.
 5. A second `virtiofsd` exports only `bundle/` at `/run/hegn/profile`. The
