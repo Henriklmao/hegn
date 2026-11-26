@@ -314,6 +314,8 @@ mod tests {
             seed_version: 13,
             seed_generation: 0,
             network_mode: NetworkMode::Guarded,
+            ssh_user: Some("hegn".into()),
+            ssh_public_key_hash: Some("0".repeat(64)),
             profile_share: false,
             primary: Some("demo".into()),
         }
@@ -334,7 +336,7 @@ mod tests {
             version: SNAPSHOT_VERSION,
             boot_fingerprint: Some(compute_fingerprint(&membership, &boot)),
             membership,
-            boot: Some(boot),
+            boot: Some(Box::new(boot)),
         }
     }
 

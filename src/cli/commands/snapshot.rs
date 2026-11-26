@@ -193,7 +193,7 @@ mod tests {
             version: SNAPSHOT_VERSION,
             boot_fingerprint: Some(compute_fingerprint(&[], &boot)),
             membership: Vec::new(),
-            boot: Some(boot),
+            boot: Some(Box::new(boot)),
         };
         store.save_meta(&meta).unwrap();
         meta

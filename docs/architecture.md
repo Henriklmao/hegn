@@ -369,8 +369,9 @@ Create:
    record metadata with `SnapshotStore` (the directory holds `config.json`,
    `state.json` and `memory-ranges`). Metadata records the VM, the exported
    membership and the `boot_fingerprint` over membership and boot inputs. The
-   boot inputs now include `seed_version`, `network_mode` and the per-VM
-   `seed_generation` in addition to
+   boot inputs now include `seed_version`, `network_mode`, the per-VM
+   `seed_generation`, the guest `ssh_user` and a SHA-256 hash of the client
+   public key in addition to
    resources, rootfs, `network_index`, profile presence and `primary`; the
    fingerprint domain is `hegn-snapshot-boot-v3`.
 5. Always attempt to resume; if saving metadata fails, remove the snapshot
@@ -388,8 +389,9 @@ Automatic checkpoints:
    terminate it by verified pid.
 4. `start` computes the current fingerprint and selects the newest matching
    automatic checkpoint. A mismatch, a missing member, a changed resource, a
-   different seed version or network mode, or a snapshot from an older
-   fingerprint domain is logged, never restored, and falls back to a cold boot.
+   different seed version, network mode or SSH identity, or a snapshot from an
+   older fingerprint domain is logged, never restored, and falls back to a cold
+   boot.
    Manual snapshots and legacy snapshots are never selected.
 
 The cold-boot command line adds a host-backed `--rng src=/dev/urandom` device.
@@ -966,7 +968,8 @@ needs to recover or audit has a CLI form.
 - SSH tests cover the exact OpenSSH argv, key permissions, a missing binary,
   a missing guest IP, the readiness probe and exit-status propagation.
 - Snapshot tests cover mismatch skipping, manual refusal, legacy handling and
-  fingerprint sensitivity to `seed_version` and `network_mode`.
+  fingerprint sensitivity to `seed_version`, `network_mode` and the SSH
+  identity.
 - Log tests cover naming, permissions, symlink refusal, tail semantics, prune
   protection and foreign-file preservation.
 - Import tests cover symlink creation, discovery and dangerous targets.
@@ -1195,8 +1198,8 @@ deprecated aliases with warnings, so startup does not fail; logs remain readable
 **Decision:** every snapshot records the VM name, an ordered membership
 manifest and a `boot_fingerprint` over the VMM-affecting configuration
 (members, tags, mounts, read-only flags, vCPUs, memory, rootfs, network slot and
-mode, seed version, profile presence). Automatic resume skips a mismatched
-checkpoint; manual restore refuses one.
+mode, seed version, profile presence, SSH account and client public-key hash).
+Automatic resume skips a mismatched checkpoint; manual restore refuses one.
 
 **Why:** Cloud Hypervisor restore uses the device tree embedded in the
 snapshot. Adding or removing a virtio-fs share after the snapshot cannot be

@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 
 use crate::agent::profile::{self, PROFILE_SHARE_TAG, ProfilePlan};
 use crate::agent::provision::ProvisionPlan;
@@ -34,6 +35,7 @@ use crate::session::snapshot::{
     SNAPSHOT_VERSION, SnapshotBoot, SnapshotMember, SnapshotMeta, SnapshotStore,
     compute_fingerprint, describe_boot_changes,
 };
+use crate::session::ssh::SshIdentity;
 use crate::vm::cloud_init;
 use crate::vm::config::VmConfig;
 use crate::vm::hypervisor::{CloudHypervisorClient, SnapshotConfig};
@@ -239,9 +241,29 @@ fn boot_inputs(
         seed_version: cloud_init::SEED_VERSION,
         seed_generation,
         network_mode: config.network,
+        ssh_user: vm
+            .effective_ssh_user(config.guest_credential_hardening)
+            .ok()
+            .map(|user| user.as_str().to_string()),
+        ssh_public_key_hash: public_key_hash(config, vm),
         profile_share,
         primary: Some(primary),
     }
+}
+
+/// SHA-256 (lowercase hex) of the VM's trimmed client public key.
+///
+/// A missing, unreadable or invalid identity yields `None`: an old VM must
+/// still be able to snapshot, and the resulting fingerprint simply cannot
+/// match a boot that later has a usable key. The hash never leaves the host;
+/// only the public half is ever read.
+fn public_key_hash(config: &Config, vm: &VmConfig) -> Option<String> {
+    let key = SshIdentity::new(&config.vms_dir, &vm.name)
+        .public_key()
+        .ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(key.trim().as_bytes());
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// A checkpoint chosen for auto-resume, or the reasons no checkpoint matched.
@@ -676,7 +698,7 @@ impl VmManager {
             version: SNAPSHOT_VERSION,
             boot_fingerprint: Some(fingerprint),
             membership,
-            boot: Some(boot),
+            boot: Some(Box::new(boot)),
         })
     }
 
@@ -1219,7 +1241,7 @@ mod tests {
             version: SNAPSHOT_VERSION,
             boot_fingerprint: Some(compute_fingerprint(&members, &boot)),
             membership: members,
-            boot: Some(boot),
+            boot: Some(Box::new(boot)),
         }
     }
 
@@ -1366,7 +1388,7 @@ mod tests {
         let snap_dir = dir.path().join("snap");
         write_snapshot_files(&snap_dir);
         let mut snapshot = matching_snapshot(&manager, &snap_dir);
-        snapshot.boot = Some(SnapshotBoot {
+        snapshot.boot = Some(Box::new(SnapshotBoot {
             vcpus: 8,
             memory_mib: 8192,
             rootfs_path: std::path::PathBuf::from("/vms/rust/old-rootfs.qcow2"),
@@ -1375,9 +1397,11 @@ mod tests {
             seed_version: 11,
             seed_generation: 3,
             network_mode: crate::config::NetworkMode::Off,
+            ssh_user: Some("someone".into()),
+            ssh_public_key_hash: Some("0".repeat(64)),
             profile_share: true,
             primary: Some("demo".into()),
-        });
+        }));
         snapshot.membership[0].read_only = true;
         snapshot.boot_fingerprint = Some("0".repeat(64));
 
@@ -1393,6 +1417,8 @@ mod tests {
             "network index 9 -> none",
             "seed version 11 -> 13",
             "network mode off -> guarded",
+            "ssh user someone -> ",
+            &format!("ssh public key {} -> ", "0".repeat(64)),
             "profile share present -> absent",
             "member 'demo' read-only true -> false",
             "There is no --force",
@@ -1704,10 +1730,10 @@ mod tests {
         let mut old = matching_snapshot(&manager, &dir.path().join("snap"));
         old.name = "autosave-old".into();
         old.note = Some(AUTOSAVE_NOTE.into());
-        old.boot = Some(SnapshotBoot {
+        old.boot = Some(Box::new(SnapshotBoot {
             vcpus: 4,
             ..current.clone()
-        });
+        }));
         old.boot_fingerprint = Some(compute_fingerprint(
             &old.membership,
             old.boot.as_ref().unwrap(),
@@ -1843,6 +1869,26 @@ mod tests {
             compute_fingerprint(&meta.membership, meta.boot.as_ref().unwrap())
         );
         assert_eq!(meta.note.as_deref(), Some(AUTOSAVE_NOTE));
+    }
+
+    #[test]
+    fn public_key_hash_reads_trims_and_hashes_the_client_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let manager = manager(config.clone(), dir.path());
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample hegn:demo";
+
+        // A missing identity must not block a snapshot: it hashes to `None`.
+        assert_eq!(public_key_hash(&config, manager.vm()), None);
+
+        let ssh_dir = config.vms_dir.join(&manager.vm().name).join("ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        std::fs::write(ssh_dir.join("id_ed25519.pub"), format!("{key}\n")).unwrap();
+        let expected = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(key.as_bytes()))
+        };
+        assert_eq!(public_key_hash(&config, manager.vm()), Some(expected));
     }
 
     #[test]

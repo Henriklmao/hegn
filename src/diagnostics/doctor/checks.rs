@@ -1369,7 +1369,7 @@ mod tests {
                 dir,
                 version: SNAPSHOT_VERSION,
                 boot_fingerprint: Some("a".repeat(64)),
-                boot: Some(SnapshotBoot::default()),
+                boot: Some(Box::new(SnapshotBoot::default())),
                 ..SnapshotMeta::default()
             })
             .unwrap();

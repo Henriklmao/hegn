@@ -367,7 +367,9 @@ so adding one does not invalidate a snapshot.
 - `vcpus`, `memory_mib`, rootfs path and format,
 - `network_index`, profile-share presence,
 - `seed_version`, `network_mode` (control-only vs control+data) and the
-  per-VM `seed_generation` advanced by `hegn vm apply`.
+  per-VM `seed_generation` advanced by `hegn vm apply`,
+- `ssh_user` and the SHA-256 hash of the client public key the guest
+  authorized, so a changed identity invalidates the checkpoint.
 
 The fingerprint domain is `hegn-snapshot-boot-v3`.
 

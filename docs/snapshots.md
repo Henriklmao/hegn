@@ -95,6 +95,8 @@ adding a worktree does not invalidate a snapshot.
 - `network_index`, profile-share presence,
 - `seed_version`, `network_mode` (control-only vs control+data) and
   `seed_generation` (advanced by `hegn vm apply`),
+- `ssh_user` and a SHA-256 hash of the VM's client public key, because the
+  seed authorizes exactly that account and key,
 - the `primary` project that drives `/workspace`.
 
 The fingerprint domain is `hegn-snapshot-boot-v3`. The `network_mode` input is
@@ -105,7 +107,8 @@ Semantics:
 
 - **Automatic resume:** a checkpoint whose fingerprint or fingerprint domain
   differs is skipped with a logged reason, and the VM cold boots. This includes
-  a different `seed_version` or `network_mode`. hegn never restores a VM whose
+  a different `seed_version`, `network_mode`, `ssh_user` or client public key.
+  hegn never restores a VM whose
   embedded mounts no longer exist or whose device tree predates the control NIC.
 - **Manual restore:** a fingerprint mismatch is refused with a message naming the
   changed fields and suggesting `hegn vm apply`. A snapshot from an older
@@ -119,9 +122,9 @@ Semantics:
   for both TAPs; and rewrites the session record.
 
 Assigning or unassigning a project, changing the primary, changing VM resources,
-the seed version or the network mode therefore makes older snapshots
-non-resumable. Take a new snapshot after `hegn vm apply` if you need a
-restorable checkpoint of the new layout.
+the seed version, the network mode or the SSH identity (account or client
+public key) therefore makes older snapshots non-resumable. Take a new snapshot
+after `hegn vm apply` if you need a restorable checkpoint of the new layout.
 
 Snapshots written before the SSH/control-TAP release use an older fingerprint
 domain and are invalidated once. The next start cold boots, then new automatic
