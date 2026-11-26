@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::project::{ProjectEntry, ProjectKind, ProjectRegistry};
 use crate::session::ssh::{GuestEnv, SshError, SshIdentity, SshTarget};
 use crate::shared::text::shell_quote;
-use crate::vm::config::{VmConfig, VmStore};
+use crate::vm::config::{SshUser, VmConfig, VmStore};
 use crate::vm::manager::{BootPlan, SessionRecord, VmManager, VmPaths};
 use crate::vm::registry::{VmRegistry, remove_private_rootfs};
 
@@ -690,26 +690,91 @@ impl TransportChoice {
 }
 
 /// Validate the SSH connection fields a running VM records at boot.
+///
+/// The record is only trusted after it matches the VM's current config: the
+/// control address must belong to the VM's TAP slot and the account must be
+/// the one the config selects. A mismatch means the record is stale, so using
+/// it would connect to the wrong guest or as the wrong user.
 pub(crate) fn session_ssh_endpoint(
     session: &SessionRecord,
-    vm: &str,
+    vm: &VmConfig,
+    config: &Config,
 ) -> Result<(std::net::Ipv4Addr, String)> {
-    let guest_ip = session.guest_ip.with_context(|| missing_ssh_fields(vm))?;
+    let guest_ip = session
+        .guest_ip
+        .with_context(|| missing_ssh_fields(&vm.name))?;
     let ssh_user = session
         .ssh_user
         .as_deref()
         .map(str::trim)
         .filter(|user| !user.is_empty())
-        .with_context(|| missing_ssh_fields(vm))?;
+        .with_context(|| missing_ssh_fields(&vm.name))?;
+
+    let recorded_user = SshUser::ALL
+        .into_iter()
+        .find(|user| user.as_str() == ssh_user)
+        .with_context(|| {
+            format!(
+                "VM '{}' records SSH user '{ssh_user}', which is not a hegn guest account; {}.",
+                vm.name,
+                ssh_record_hint(&vm.name)
+            )
+        })?;
+    let expected_user = vm
+        .effective_ssh_user(config.guest_credential_hardening)
+        .with_context(|| {
+            format!(
+                "cannot resolve the SSH user for VM '{}'; {}.",
+                vm.name,
+                ssh_record_hint(&vm.name)
+            )
+        })?;
+    if recorded_user != expected_user {
+        bail!(
+            "VM '{}' records SSH user '{ssh_user}', but its config selects '{}'; {}.",
+            vm.name,
+            expected_user.as_str(),
+            ssh_record_hint(&vm.name)
+        );
+    }
+
+    let index = vm.network_index.with_context(|| {
+        format!(
+            "VM '{}' has no control network slot in its config (network_index is unset); {}.",
+            vm.name,
+            ssh_record_hint(&vm.name)
+        )
+    })?;
+    if index >= crate::network::TAP_POOL {
+        bail!(
+            "VM '{}' has control network slot {index}, outside the {} slot pool; {}.",
+            vm.name,
+            crate::network::TAP_POOL,
+            ssh_record_hint(&vm.name)
+        );
+    }
+    let expected_ip = crate::network::control_guest_ip(index);
+    if guest_ip != expected_ip {
+        bail!(
+            "VM '{}' records SSH address {guest_ip}, but control slot {index} owns \
+             {expected_ip}; {}.",
+            vm.name,
+            ssh_record_hint(&vm.name)
+        );
+    }
     Ok((guest_ip, ssh_user.to_string()))
 }
 
 fn missing_ssh_fields(vm: &str) -> String {
     format!(
         "VM '{vm}' has no SSH address or user in its session record; it was probably started \
-         before SSH support. Run 'hegn attach {vm} --serial', or run 'hegn vm apply {vm}' and \
-         restart the VM."
+         before SSH support. {}.",
+        ssh_record_hint(vm)
     )
+}
+
+fn ssh_record_hint(vm: &str) -> String {
+    format!("run 'hegn vm apply {vm}' and restart the VM, or use 'hegn attach {vm} --serial'")
 }
 
 /// Guest session context forwarded over SSH.
@@ -757,7 +822,7 @@ pub(crate) fn ssh_target(
     vm: &VmConfig,
     session: &SessionRecord,
 ) -> Result<SshTarget> {
-    let (guest_ip, ssh_user) = session_ssh_endpoint(session, &vm.name)?;
+    let (guest_ip, ssh_user) = session_ssh_endpoint(session, vm, config)?;
     let identity = SshIdentity::new(&config.vms_dir, &vm.name);
     // `load` never regenerates a key: a running guest would not know it.
     identity.load()?;
@@ -1130,29 +1195,81 @@ mod tests {
         assert!(TransportChoice::from_serial(true).is_serial());
     }
 
+    fn ssh_vm(config: &Config, index: Option<u8>) -> VmConfig {
+        let mut vm = VmConfig::from_config(config, "rust", Some(Harness::Shell));
+        vm.network_index = index;
+        vm
+    }
+
+    fn endpoint_error(record: &SessionRecord, vm: &VmConfig, config: &Config) -> String {
+        format!(
+            "{:#}",
+            session_ssh_endpoint(record, vm, config).unwrap_err()
+        )
+    }
+
     #[test]
     fn session_endpoint_requires_both_recorded_fields() {
+        let (_dir, config) = config();
+        let vm = ssh_vm(&config, Some(0));
         let mut record = session_record();
-        let (ip, user) = session_ssh_endpoint(&record, "rust").unwrap();
+        let (ip, user) = session_ssh_endpoint(&record, &vm, &config).unwrap();
         assert_eq!(ip, std::net::Ipv4Addr::new(10, 214, 0, 2));
         assert_eq!(user, "root");
 
         record.ssh_user = None;
-        let err = session_ssh_endpoint(&record, "rust")
-            .unwrap_err()
-            .to_string();
+        let err = endpoint_error(&record, &vm, &config);
         assert!(err.contains("--serial"), "{err}");
         assert!(err.contains("hegn vm apply rust"), "{err}");
 
         record.ssh_user = Some("  ".into());
-        assert!(session_ssh_endpoint(&record, "rust").is_err());
+        assert!(session_ssh_endpoint(&record, &vm, &config).is_err());
 
         record.ssh_user = Some("root".into());
         record.guest_ip = None;
-        let err = session_ssh_endpoint(&record, "rust")
-            .unwrap_err()
-            .to_string();
+        let err = endpoint_error(&record, &vm, &config);
         assert!(err.contains("--serial"), "{err}");
+    }
+
+    #[test]
+    fn session_endpoint_must_match_the_vm_control_slot_and_user() {
+        let (_dir, config) = config();
+        let vm = ssh_vm(&config, Some(0));
+        let mut record = session_record();
+
+        record.guest_ip = Some(std::net::Ipv4Addr::new(10, 214, 0, 6));
+        let err = endpoint_error(&record, &vm, &config);
+        assert!(err.contains("control slot 0"), "{err}");
+        assert!(err.contains("10.214.0.2"), "{err}");
+        assert!(err.contains("hegn attach rust --serial"), "{err}");
+        assert!(err.contains("hegn vm apply rust"), "{err}");
+
+        record.guest_ip = Some(std::net::Ipv4Addr::new(10, 214, 0, 2));
+        record.ssh_user = Some("ubuntu".into());
+        let err = endpoint_error(&record, &vm, &config);
+        assert!(err.contains("selects 'root'"), "{err}");
+        assert!(err.contains("hegn attach rust --serial"), "{err}");
+        assert!(err.contains("hegn vm apply rust"), "{err}");
+
+        record.ssh_user = Some("nobody".into());
+        let err = endpoint_error(&record, &vm, &config);
+        assert!(err.contains("not a hegn guest account"), "{err}");
+
+        let mut vm_hegn = ssh_vm(&config, Some(0));
+        vm_hegn.ssh_user = Some(SshUser::Hegn);
+        record.ssh_user = Some("hegn".into());
+        record.guest_ip = Some(crate::network::control_guest_ip(0));
+        assert_eq!(
+            session_ssh_endpoint(&record, &vm_hegn, &config).unwrap(),
+            (crate::network::control_guest_ip(0), "hegn".to_string())
+        );
+
+        let vm_without_slot = ssh_vm(&config, None);
+        record.ssh_user = Some("root".into());
+        let err = endpoint_error(&record, &vm_without_slot, &config);
+        assert!(err.contains("network_index is unset"), "{err}");
+        assert!(err.contains("hegn attach rust --serial"), "{err}");
+        assert!(err.contains("hegn vm apply rust"), "{err}");
     }
 
     #[test]
@@ -1185,7 +1302,9 @@ mod tests {
     #[test]
     fn ssh_target_uses_the_recorded_endpoint_and_identity() {
         let (_dir, config) = config();
-        let vm = VmConfig::from_config(&config, "rust", Some(Harness::Shell));
+        let mut vm = VmConfig::from_config(&config, "rust", Some(Harness::Shell));
+        vm.network_index = Some(0);
+        vm.ssh_user = Some(SshUser::Hegn);
         let identity = SshIdentity::new(&config.vms_dir, "rust");
         if identity.ensure().is_err() {
             eprintln!("skipping: ssh-keygen is not installed");

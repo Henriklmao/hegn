@@ -31,6 +31,7 @@ use crate::tui::jobs::{
 use crate::tui::launch::launch_agent;
 use crate::tui::messages::ScanMessage;
 use crate::tui::terminal::with_suspended_terminal;
+use crate::vm::config::{SshUser, VmConfig, VmStore};
 
 /// Delete one dashboard project, routing registry-only External projects through
 /// the domain helper and leaving clone/worktree removal to the VM surfaces.
@@ -85,29 +86,22 @@ pub(super) fn ssh_session_title(vm: &str, project: Option<&Path>) -> String {
 /// Resolve a session record into an SSH target.
 ///
 /// A record without the control address or the SSH user was written before
-/// SSH support existed. That is a hard error with the serial recovery hint,
-/// never a silent fallback to the serial relay.
+/// SSH support existed. The recorded endpoint is also checked against the VM's
+/// current config, because a stale record could point at another VM's slot or
+/// at an account the config no longer selects. Every mismatch is a hard error
+/// with the serial recovery hint, never a silent fallback to the serial relay.
 pub(super) fn ssh_session_from_record(
     config: &crate::config::Config,
     vm: &str,
     record: &crate::vm::manager::SessionRecord,
 ) -> Result<SshSession> {
-    let host = record.guest_ip.with_context(|| {
+    let vm_config = VmStore::new(config).load(vm).with_context(|| {
         format!(
-            "VM '{vm}' has no SSH address in its session record. Run 'hegn vm apply {vm}' and \
-             restart the VM, or use 'hegn attach {vm} --serial'."
+            "cannot read the config for VM '{vm}'; {}",
+            ssh_record_hint(vm)
         )
     })?;
-    let user = record
-        .ssh_user
-        .as_deref()
-        .filter(|user| !user.trim().is_empty())
-        .with_context(|| {
-            format!(
-                "VM '{vm}' has no SSH user in its session record. Run 'hegn vm apply {vm}' and \
-                 restart the VM, or use 'hegn attach {vm} --serial'."
-            )
-        })?;
+    let (host, user) = validated_ssh_endpoint(config, &vm_config, record)?;
 
     let identity = SshIdentity::new(&config.vms_dir, vm);
     identity.load().with_context(|| {
@@ -133,6 +127,89 @@ pub(super) fn ssh_session_from_record(
         target,
         title: ssh_session_title(vm, Some(project)),
     })
+}
+
+/// Trust a recorded endpoint only after it matches the VM's current config.
+///
+/// The control address must belong to the VM's TAP slot and the account must
+/// be the one the config selects; otherwise the record is stale and must not
+/// be used to reach a guest. This mirrors `session_ssh_endpoint` in the CLI;
+/// keep the two rules in sync.
+fn validated_ssh_endpoint(
+    config: &crate::config::Config,
+    vm: &VmConfig,
+    record: &crate::vm::manager::SessionRecord,
+) -> Result<(std::net::Ipv4Addr, String)> {
+    let name = vm.name.as_str();
+    let host = record.guest_ip.with_context(|| {
+        format!(
+            "VM '{name}' has no SSH address in its session record. {}",
+            ssh_record_hint(name)
+        )
+    })?;
+    let user = record
+        .ssh_user
+        .as_deref()
+        .map(str::trim)
+        .filter(|user| !user.is_empty())
+        .with_context(|| {
+            format!(
+                "VM '{name}' has no SSH user in its session record. {}",
+                ssh_record_hint(name)
+            )
+        })?;
+
+    let recorded_user = SshUser::ALL
+        .into_iter()
+        .find(|candidate| candidate.as_str() == user)
+        .with_context(|| {
+            format!(
+                "VM '{name}' records SSH user '{user}', which is not a hegn guest account. {}",
+                ssh_record_hint(name)
+            )
+        })?;
+    let expected_user = vm
+        .effective_ssh_user(config.guest_credential_hardening)
+        .with_context(|| {
+            format!(
+                "cannot resolve the SSH user for VM '{name}'. {}",
+                ssh_record_hint(name)
+            )
+        })?;
+    if recorded_user != expected_user {
+        anyhow::bail!(
+            "VM '{name}' records SSH user '{user}', but its config selects '{}'. {}",
+            expected_user.as_str(),
+            ssh_record_hint(name)
+        );
+    }
+
+    let index = vm.network_index.with_context(|| {
+        format!(
+            "VM '{name}' has no control network slot in its config (network_index is unset). {}",
+            ssh_record_hint(name)
+        )
+    })?;
+    if index >= crate::network::TAP_POOL {
+        anyhow::bail!(
+            "VM '{name}' has control network slot {index}, outside the {} slot pool. {}",
+            crate::network::TAP_POOL,
+            ssh_record_hint(name)
+        );
+    }
+    let expected_host = crate::network::control_guest_ip(index);
+    if host != expected_host {
+        anyhow::bail!(
+            "VM '{name}' records SSH address {host}, but control slot {index} owns \
+             {expected_host}. {}",
+            ssh_record_hint(name)
+        );
+    }
+    Ok((host, user.to_string()))
+}
+
+fn ssh_record_hint(vm: &str) -> String {
+    format!("Run 'hegn vm apply {vm}' and restart the VM, or use 'hegn attach {vm} --serial'.")
 }
 
 /// Look up a running VM and resolve its interactive SSH target.
@@ -506,6 +583,22 @@ mod tests {
         config
     }
 
+    fn write_vm_config(
+        config: &Config,
+        index: Option<u8>,
+        user: Option<SshUser>,
+    ) -> crate::vm::config::VmConfig {
+        let mut vm = crate::vm::config::VmConfig::from_config(
+            config,
+            "rust",
+            Some(crate::config::Harness::Shell),
+        );
+        vm.network_index = index;
+        vm.ssh_user = user;
+        VmStore::new(config).save(&vm).unwrap();
+        vm
+    }
+
     fn keygen_available() -> bool {
         std::process::Command::new("ssh-keygen")
             .arg("-V")
@@ -592,6 +685,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
+        write_vm_config(&config, Some(0), Some(SshUser::Hegn));
         SshIdentity::new(&config.vms_dir, "rust").ensure().unwrap();
         let record = session_record(
             Path::new("/projects/demo"),
@@ -618,6 +712,7 @@ mod tests {
     fn a_record_without_a_control_ip_is_a_hard_error_with_the_serial_hint() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
+        write_vm_config(&config, Some(0), None);
         let record = session_record(Path::new("/projects/demo"), None, Some("hegn"));
 
         let error = format!(
@@ -633,6 +728,7 @@ mod tests {
     fn a_record_without_an_ssh_user_is_a_hard_error_with_the_serial_hint() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
+        write_vm_config(&config, Some(0), None);
         let record = session_record(
             Path::new("/projects/demo"),
             Some(std::net::Ipv4Addr::new(10, 214, 0, 2)),
@@ -653,6 +749,7 @@ mod tests {
     fn a_missing_identity_points_at_apply_and_the_serial_console() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
+        write_vm_config(&config, Some(0), None);
         let record = session_record(
             Path::new("/projects/demo"),
             Some(std::net::Ipv4Addr::new(10, 214, 0, 2)),
@@ -677,6 +774,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
+        write_vm_config(&config, Some(0), None);
         SshIdentity::new(&config.vms_dir, "rust").ensure().unwrap();
         let mut record = session_record(
             Path::new(""),
@@ -688,6 +786,90 @@ mod tests {
         let session = ssh_session_from_record(&config, "rust", &record).unwrap();
 
         assert_eq!(session.title, "hegn: rust · legacy");
+    }
+
+    #[test]
+    fn a_stale_control_address_is_a_hard_error_with_the_serial_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        write_vm_config(&config, Some(0), None);
+        let record = session_record(
+            Path::new("/projects/demo"),
+            Some(std::net::Ipv4Addr::new(10, 214, 0, 6)),
+            Some("root"),
+        );
+
+        let error = format!(
+            "{:#}",
+            ssh_session_from_record(&config, "rust", &record).unwrap_err()
+        );
+
+        assert!(error.contains("control slot 0"), "{error}");
+        assert!(error.contains("owns 10.214.0.2"), "{error}");
+        assert!(error.contains("hegn attach rust --serial"), "{error}");
+        assert!(error.contains("hegn vm apply rust"), "{error}");
+    }
+
+    #[test]
+    fn a_stale_ssh_user_is_a_hard_error_with_the_serial_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        write_vm_config(&config, Some(0), Some(SshUser::Hegn));
+        let record = session_record(
+            Path::new("/projects/demo"),
+            Some(std::net::Ipv4Addr::new(10, 214, 0, 2)),
+            Some("root"),
+        );
+
+        let error = format!(
+            "{:#}",
+            ssh_session_from_record(&config, "rust", &record).unwrap_err()
+        );
+
+        assert!(error.contains("selects 'hegn'"), "{error}");
+        assert!(error.contains("hegn attach rust --serial"), "{error}");
+        assert!(error.contains("hegn vm apply rust"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_recorded_ssh_user_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        write_vm_config(&config, Some(0), None);
+        let record = session_record(
+            Path::new("/projects/demo"),
+            Some(std::net::Ipv4Addr::new(10, 214, 0, 2)),
+            Some("nobody"),
+        );
+
+        let error = format!(
+            "{:#}",
+            ssh_session_from_record(&config, "rust", &record).unwrap_err()
+        );
+
+        assert!(error.contains("not a hegn guest account"), "{error}");
+        assert!(error.contains("hegn attach rust --serial"), "{error}");
+    }
+
+    #[test]
+    fn a_vm_without_a_control_slot_is_a_hard_error_with_the_serial_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        write_vm_config(&config, None, None);
+        let record = session_record(
+            Path::new("/projects/demo"),
+            Some(std::net::Ipv4Addr::new(10, 214, 0, 2)),
+            Some("root"),
+        );
+
+        let error = format!(
+            "{:#}",
+            ssh_session_from_record(&config, "rust", &record).unwrap_err()
+        );
+
+        assert!(error.contains("network_index is unset"), "{error}");
+        assert!(error.contains("hegn attach rust --serial"), "{error}");
+        assert!(error.contains("hegn vm apply rust"), "{error}");
     }
 
     fn register(config: &Config, name: &str, path: &Path, kind: ProjectKind) -> ProjectEntry {
