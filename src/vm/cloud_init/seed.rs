@@ -20,7 +20,7 @@ use crate::network::NetworkLease;
 use crate::vm::config::SshUser;
 
 use super::network::{endpoint_env, network_config};
-use super::user_data::{meta_data, user_data};
+use super::user_data::meta_data;
 
 /// 4 MiB is enough for the seed and keeps it cheap.
 const SEED_BYTES: u64 = 4 * 1024 * 1024;
@@ -178,13 +178,14 @@ pub fn write_seed(
         .and_then(|lease| lease.data.as_ref())
         .filter(|_| !endpoints.is_empty())
         .map(|data| endpoint_env(data, endpoints));
-    let user_data = user_data(
+    let user_data = super::user_data::user_data_with_id(
         mounts,
         primary_guest,
         provision,
         profile,
         endpoint_env.as_deref(),
         credential_hardening,
+        instance_id,
         identity,
     );
     let mut file = OpenOptions::new()
@@ -467,6 +468,10 @@ mod tests {
         assert!(user_data.contains("/usr/local/sbin/hegn-provision"));
         assert!(user_data.contains("hegn-provision.service"));
         assert!(meta_data.contains("instance-id: hegn-demo"), "{meta_data}");
+        assert!(
+            user_data.contains("PROVISION_ID=hegn-demo"),
+            "the provision marker must be bound to the seed identity: {user_data}"
+        );
         assert!(
             meta_data.contains("local-hostname: demo"),
             "the VM name is the guest hostname: {meta_data}"

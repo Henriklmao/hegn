@@ -17,6 +17,7 @@ pub(super) fn meta_data(instance_id: &str, vm: &str) -> String {
     format!("instance-id: {instance_id}\nlocal-hostname: {vm}\n")
 }
 
+#[cfg(test)]
 pub(super) fn user_data(
     mounts: &[MountSpec],
     primary_guest: &str,
@@ -24,6 +25,33 @@ pub(super) fn user_data(
     profile: Option<&ProfileShare>,
     endpoints: Option<&str>,
     credential_hardening: bool,
+    identity: &SeedIdentity<'_>,
+) -> String {
+    user_data_with_id(
+        mounts,
+        primary_guest,
+        provision,
+        profile,
+        endpoints,
+        credential_hardening,
+        "0",
+        identity,
+    )
+}
+
+/// Render the cloud-config for a concrete cloud-init instance id.
+///
+/// The id also tags the provision marker, so a new seed re-runs the harness
+/// setup while an unchanged seed stays idempotent.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn user_data_with_id(
+    mounts: &[MountSpec],
+    primary_guest: &str,
+    provision: &ProvisionPlan,
+    profile: Option<&ProfileShare>,
+    endpoints: Option<&str>,
+    credential_hardening: bool,
+    provision_id: &str,
     identity: &SeedIdentity<'_>,
 ) -> String {
     let vm = identity.vm;
@@ -92,7 +120,7 @@ pub(super) fn user_data(
          Serial recovery: hegn attach {vm} --serial\n"
     );
     let issue = format!("hegn · {project} · {workspace}\nVM {vm} · harness {harness}\n");
-    let script = indent(&provision.script(), 6);
+    let script = indent(&provision.script_with_id(provision_id), 6);
     let endpoint_file = match endpoints {
         Some(content) => format!(
             "  - path: /etc/profile.d/hegn-endpoints.sh\n\

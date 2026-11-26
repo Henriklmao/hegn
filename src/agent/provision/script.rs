@@ -4,12 +4,24 @@
 //! and re-run manually when debugging a guest. Only validated package names and
 //! static command strings are interpolated.
 
+use crate::shared::text::shell_quote;
+
 use super::presets::ProvisionPlan;
 
 impl ProvisionPlan {
     /// The complete first-boot script. Kept as plain shell so it can be
     /// inspected in the seed and re-run manually when debugging a guest.
     pub fn script(&self) -> String {
+        self.script_with_id("0")
+    }
+
+    /// The first-boot script tagged with the seed identity.
+    ///
+    /// The marker stores this id instead of being empty. A new cloud-init
+    /// instance (for example after `hegn vm apply` advanced the seed
+    /// generation) removes the old marker and provisions the harness again,
+    /// while an unchanged seed remains idempotent.
+    pub fn script_with_id(&self, provision_id: &str) -> String {
         let mut script = format!(
             r#"#!/bin/bash
 set -euo pipefail
@@ -18,6 +30,7 @@ export PATH="/root/.local/bin:/usr/local/bin:$PATH"
 MARKER={marker}
 PACKAGE_MARKER={package_marker}
 PACKAGE_HASH={package_hash}
+PROVISION_ID={provision_id}
 
 progress() {{
   printf 'hegn-progress: {{"stage":"%s"}}\n' "$1"
@@ -106,6 +119,12 @@ if [ -x /usr/local/sbin/hegn-apply-profile ]; then
   echo "hegn: applying harness profile"
   /usr/local/sbin/hegn-apply-profile || echo "hegn: profile apply failed" >&2
 fi
+if [ -f "$MARKER" ] && [ "$(cat "$MARKER" 2>/dev/null || true)" != "$PROVISION_ID" ]; then
+  # The cloud-init instance changed (for example after `hegn vm apply`). Drop
+  # the marker so the harness setup runs again for this seed.
+  echo "hegn: seed identity changed; re-running provisioning"
+  rm -f "$MARKER"
+fi
 if [ -e "$MARKER" ] && [ -f "$PACKAGE_MARKER" ] && [ "$(cat "$PACKAGE_MARKER")" = "$PACKAGE_HASH" ]; then
   echo "hegn: preset already provisioned"
   progress ready
@@ -138,6 +157,7 @@ progress packages
             marker = Self::marker(),
             package_marker = Self::package_marker(),
             package_hash = self.package_hash(),
+            provision_id = shell_quote(provision_id),
         );
         if !self.packages.is_empty() {
             script.push_str("apt_install ");
@@ -204,7 +224,7 @@ cat >/etc/profile.d/hegn-path.sh <<'HEGN_PATH'
 export PATH="/root/.local/bin:/usr/local/bin:$PATH"
 HEGN_PATH
 chmod 0644 /etc/profile.d/hegn-path.sh
-touch "$MARKER"
+printf '%s\n' "$PROVISION_ID" > "$MARKER"
 progress ready
 echo "hegn: preset ready"
 "#,
@@ -230,6 +250,21 @@ mod tests {
         assert!(script.contains("install -y --no-install-recommends"));
         assert!(script.contains("grow_rootfs"));
         assert!(script.contains("apt_network_ready"));
+    }
+
+    #[test]
+    fn provision_id_is_written_to_the_marker_and_forces_a_rerun() {
+        let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
+        let first = plan.script_with_id("hegn-demo-v13-aaaa");
+        let second = plan.script_with_id("hegn-demo-v13-bbbb");
+        assert!(first.contains("PROVISION_ID=hegn-demo-v13-aaaa"), "{first}");
+        assert!(first.contains("re-running provisioning"), "{first}");
+        assert!(
+            first.contains("printf '%s\\n' \"$PROVISION_ID\" > \"$MARKER\""),
+            "{first}"
+        );
+        assert_ne!(first, second);
+        assert_eq!(plan.script(), plan.script_with_id("0"));
     }
 
     #[test]
