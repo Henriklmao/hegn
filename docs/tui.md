@@ -155,10 +155,12 @@ Creating a VM (`n` on the dashboard, or `n` outside the snapshots section here)
 opens a form for name, harness, vCPUs, memory and extra packages. Editing an
 existing VM uses `F5` or `e`, which opens `vm.toml` in the settings editor.
 
-Assigning a project opens a candidate list and a read-only toggle. After a
-successful assignment, hegn asks whether to restart the VM now with
-`hegn vm apply`. Answer `n`/`Esc` to apply later; the health section then shows
-`apply required · hegn vm apply <vm>` until an apply succeeds. Forking opens the
+Assigning a project opens a candidate list and a read-only toggle. The first
+project assigned to an empty VM applies automatically without a prompt, so the
+VM boots and its harness setup starts immediately. Later assignments ask whether
+to restart the VM now with `hegn vm apply`. Answer `n`/`Esc` to apply later; the
+health section then shows `apply required · hegn vm apply <vm>` until an apply
+succeeds. Forking opens the
 fork modal: `Tab` toggles between the isolated clone default and the nested
 worktree, `Enter` creates it, and `Esc` cancels. Detaching asks for confirmation
 and never deletes project files.

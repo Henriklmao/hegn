@@ -120,7 +120,9 @@ hegn project unassign ~/code/cli
 
 - A project can be assigned to one VM at a time. Assigning it elsewhere moves
   it.
-- The first project assigned to an empty VM becomes `primary` automatically.
+- The first project assigned to an empty VM becomes `primary` automatically. In
+  the TUI that first assignment also applies the VM immediately, so it boots and
+  starts harness provisioning; later assignments ask before applying.
 - `hegn vm primary dev parser` chooses which project `/workspace` points at.
   The change takes effect on the next start; a running VM warns until
   `hegn vm apply`.

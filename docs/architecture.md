@@ -453,7 +453,9 @@ cannot export the host filesystem or runtime state through virtiofsd.
 
 `project assign` upserts the entry, sets `vm` and `read_only`, saves the VM's
 `primary` when it had none, and validates the whole registry before returning.
-Any failure rolls the registry and primary back. `project unassign` clears the
+The first member of a previously empty VM is reported as `first`, so the TUI can
+apply the VM without asking; later assignments prompt. Any failure rolls the
+registry and primary back. `project unassign` clears the
 assignment, moves the primary to the next exported member when needed, and keeps
 the VM. A running VM is not modified; it warns until `hegn vm apply`.
 
