@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use crate::agent::provision::{ProvisionEvent, ProvisionPlan, ProvisionWatcher};
 use crate::config::{Config, Harness};
-use crate::project::{self, ProjectKind, ProjectRegistry, assign_project, unassign_project};
+use crate::project::{
+    self, ProjectKind, ProjectRegistry, assign_project_detailed, unassign_project,
+};
 use crate::project::{ForkMode, WorkspaceService};
 use crate::tui::app::ToastLevel;
 use crate::tui::messages::ScanMessage;
@@ -327,7 +329,7 @@ pub(super) fn spawn_assign_project(
     let spawned = std::thread::Builder::new()
         .name("hegn-assign-project".into())
         .spawn(move || {
-            let result = (|| -> anyhow::Result<()> {
+            let result = (|| -> anyhow::Result<bool> {
                 // Prefer the picker name so an imported symlink keeps its
                 // registered name; fall back to the path for outside-root
                 // projects that are not under the projects root.
@@ -340,14 +342,15 @@ pub(super) fn spawn_assign_project(
                 } else {
                     path.display().to_string()
                 };
-                assign_project(&config, &selector, &vm, read_only)?;
-                Ok(())
+                let outcome = assign_project_detailed(&config, &selector, &vm, read_only)?;
+                Ok(outcome.first)
             })();
             match result {
-                Ok(()) => {
+                Ok(first) => {
                     let _ = thread_tx.send(ScanMessage::ProjectAssigned {
                         note: format!("assigned {project} to VM {vm}"),
                         vm,
+                        first,
                     });
                 }
                 Err(err) => {
@@ -729,13 +732,14 @@ mod tests {
             false,
             tx,
         );
-        let ScanMessage::ProjectAssigned { vm, note } =
+        let ScanMessage::ProjectAssigned { vm, note, first } =
             rx.recv_timeout(Duration::from_secs(2)).unwrap()
         else {
             panic!("expected ProjectAssigned");
         };
         assert_eq!(vm, "rust");
-        assert!(note.contains("demo"), "{note}");
+        assert!(note.contains("assigned demo"));
+        assert!(first, "the VM had no projects before the assignment");
         assert_eq!(
             ProjectRegistry::load(&config.state_dir)
                 .unwrap()

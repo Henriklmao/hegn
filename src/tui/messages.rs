@@ -29,6 +29,8 @@ pub(super) enum ScanMessage {
     ProjectAssigned {
         vm: String,
         note: String,
+        /// True when the VM had no projects before this assignment.
+        first: bool,
     },
     /// `hegn vm apply` finished and `vm` is running the current config.
     VmApplied {
@@ -115,6 +117,7 @@ mod tests {
             ScanMessage::ProjectAssigned {
                 vm: "rust".into(),
                 note: "assigned demo to VM rust".into(),
+                first: false,
             },
             ScanMessage::VmApplied {
                 vm: "rust".into(),
