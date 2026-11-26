@@ -647,6 +647,51 @@ mod tests {
     }
 
     #[test]
+    fn delete_with_files_removes_the_ssh_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let registry = VmRegistry::new(config.clone());
+        registry
+            .ensure_for_project(&project(dir.path(), "demo"), Harness::Shell)
+            .unwrap();
+        let identity = SshIdentity::new(&config.vms_dir, "demo");
+        std::fs::create_dir_all(identity.dir()).unwrap();
+        std::fs::write(identity.key(), b"client-key").unwrap();
+        std::fs::write(identity.known_hosts(), b"host-key").unwrap();
+
+        registry.delete("demo", true).unwrap();
+
+        assert!(!config.vms_dir.join("demo").exists());
+        assert!(!identity.key().exists());
+        assert!(!identity.known_hosts().exists());
+    }
+
+    #[test]
+    fn delete_without_files_keeps_the_ssh_identity_in_the_renamed_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let registry = VmRegistry::new(config.clone());
+        registry
+            .ensure_for_project(&project(dir.path(), "demo"), Harness::Shell)
+            .unwrap();
+        let identity = SshIdentity::new(&config.vms_dir, "demo");
+        std::fs::create_dir_all(identity.dir()).unwrap();
+        std::fs::write(identity.key(), b"client-key").unwrap();
+        std::fs::write(identity.known_hosts(), b"host-key").unwrap();
+        std::fs::create_dir_all(config.vms_dir.join("demo/workspaces")).unwrap();
+
+        let outcome = registry.delete("demo", false).unwrap();
+
+        assert!(!config.vms_dir.join("demo/ssh").exists());
+        let kept = outcome
+            .kept_workspace
+            .expect("the kept directory holds the workspaces");
+        let kept_dir = kept.parent().unwrap();
+        assert!(kept_dir.join("ssh/id_ed25519").is_file());
+        assert!(kept_dir.join("ssh/known_hosts").is_file());
+    }
+
+    #[test]
     fn unique_name_never_reuses_an_existing_vm() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
