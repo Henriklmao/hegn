@@ -214,6 +214,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: None,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         };
         std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
     }
@@ -349,5 +351,25 @@ mod tests {
         );
         assert!(manager.status().unwrap().local_endpoints.is_empty());
         let _ = VmConfig::default();
+    }
+
+    #[test]
+    fn status_hides_local_endpoints_in_off_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.network = crate::config::NetworkMode::Off;
+        config.local_endpoints = vec![crate::config::LocalEndpoint {
+            name: "ollama".into(),
+            port: 11434,
+        }];
+        let manager = manager(config.clone(), dir.path());
+        let mut vm = manager.vm().clone();
+        vm.network_index = Some(2);
+        let manager = crate::vm::manager::VmManager::new(config, vm).unwrap();
+
+        assert!(
+            manager.status().unwrap().local_endpoints.is_empty(),
+            "off mode has no data TAP to expose endpoints on"
+        );
     }
 }

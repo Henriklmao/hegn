@@ -137,6 +137,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: None,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         }
     }
 

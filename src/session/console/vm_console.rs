@@ -281,6 +281,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: log,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         };
         std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
     }

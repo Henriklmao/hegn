@@ -73,6 +73,47 @@ fn snapshot_network_taps(dir: &Path) -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
+/// Check that a snapshot's recorded NICs match the current network lease.
+///
+/// A snapshot owns its device tree, so the expected set is exact: the control
+/// TAP always, plus the data TAP only in guarded mode. Extra, missing or
+/// foreign TAPs would either attach a NIC the guest never configured or boot a
+/// guest with no control interface at all.
+fn validate_snapshot_taps(
+    snapshot_name: &str,
+    vm_name: &str,
+    lease: &network::NetworkLease,
+    snapshot_taps: &[String],
+) -> Result<()> {
+    if snapshot_taps.is_empty() {
+        // Old snapshots predate the always-present control NIC. The slot
+        // reservation stays with the VM: a running VM may still own it and the
+        // next start reuses it.
+        bail!("snapshot '{snapshot_name}' has no control NIC; cold boot required");
+    }
+    let mut expected: Vec<String> = lease
+        .taps()
+        .into_iter()
+        .map(|tap| tap.tap.clone())
+        .collect();
+    expected.sort();
+    let mut found = snapshot_taps.to_vec();
+    found.sort();
+    if found != expected {
+        // Leave the VM's reservation intact: an old VM may still be running on
+        // that TAP, and the next start will reuse it.
+        bail!(
+            "snapshot '{}' expects TAPs [{}], but VM '{}' owns [{}]; restore it in the VM that \
+             created it",
+            snapshot_name,
+            expected.join(", "),
+            vm_name,
+            found.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// virtio-fs tags embedded in a Cloud Hypervisor snapshot config.
 fn snapshot_fs_tags(dir: &Path) -> Result<Vec<String>> {
     let path = dir.join("config.json");
@@ -702,36 +743,7 @@ pub(super) async fn restore_snapshot_locked(
             return Err(err);
         }
     };
-    if snapshot_taps.is_empty() {
-        // Old snapshots predate the always-present control NIC. Attaching one
-        // would boot a guest whose kernel has no control interface at all.
-        // The slot reservation stays with the VM: a running VM may still own
-        // it and the next start reuses it.
-        bail!(
-            "snapshot '{}' has no control NIC; cold boot required",
-            snapshot.name
-        );
-    }
-    let mut expected: Vec<String> = network_lease
-        .taps()
-        .into_iter()
-        .map(|lease| lease.tap.clone())
-        .collect();
-    expected.sort();
-    let mut found = snapshot_taps.clone();
-    found.sort();
-    if found != expected {
-        // Leave the VM's reservation intact: an old VM may still be running on
-        // that TAP, and the next start will reuse it.
-        bail!(
-            "snapshot '{}' expects TAPs [{}], but VM '{}' owns [{}]; restore it in the VM that \
-             created it",
-            snapshot.name,
-            expected.join(", "),
-            vm.name,
-            found.join(", ")
-        );
-    }
+    validate_snapshot_taps(&snapshot.name, &vm.name, &network_lease, &snapshot_taps)?;
 
     // Stop the old VM, relay and every member filesystem daemon. The sockets
     // are freed and recreated below with the same paths the snapshot expects.
@@ -898,6 +910,8 @@ pub(super) async fn restore_snapshot_locked(
         boot_args: super::args::boot_args(&config.root_device),
         serial_log: Some(serial_log),
         membership: membership.members.clone(),
+        guest_ip: Some(network_lease.control_guest_ip()),
+        ssh_user: None,
     };
     let recorded = (|| -> Result<()> {
         membership.save(&paths.membership)?;
@@ -981,6 +995,79 @@ mod tests {
     use crate::session::snapshot::AUTOSAVE_NOTE;
     use crate::vm::manager::SharedMember;
     use crate::vm::manager::test_support::{config_with_assets, manager, manager_for, plan_for};
+
+    fn network_lease(slot: u8, with_data: bool) -> crate::network::NetworkLease {
+        let control = crate::network::Lease {
+            index: slot,
+            vm: "demo".into(),
+            tap: crate::network::control_tap_name(slot),
+            mac: crate::network::control_mac(slot),
+            host_ip: crate::network::control_host_ip(slot),
+            guest_ip: crate::network::control_guest_ip(slot),
+        };
+        let data = with_data.then(|| crate::network::Lease {
+            index: slot,
+            vm: "demo".into(),
+            tap: crate::network::tap_name(slot),
+            mac: crate::network::mac(slot),
+            host_ip: crate::network::host_ip(slot),
+            guest_ip: crate::network::guest_ip(slot),
+        });
+        crate::network::NetworkLease {
+            slot,
+            vm: "demo".into(),
+            data,
+            control,
+        }
+    }
+
+    fn taps(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn snapshot_taps_must_match_the_guarded_lease_exactly() {
+        let lease = network_lease(3, true);
+        assert!(
+            validate_snapshot_taps("snap", "demo", &lease, &taps(&["hegn3", "hegnc3"])).is_ok()
+        );
+        // A snapshot from the data-only area is refused: it has no control NIC.
+        let err = validate_snapshot_taps("snap", "demo", &lease, &taps(&["hegn3"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expects TAPs [hegn3, hegnc3]"), "{err}");
+        assert!(err.contains("owns [hegn3]"), "{err}");
+        // A foreign or extra TAP is refused too.
+        let err =
+            validate_snapshot_taps("snap", "demo", &lease, &taps(&["hegn3", "hegnc3", "hegn9"]))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("hegn9"), "{err}");
+    }
+
+    #[test]
+    fn snapshot_taps_accept_off_mode_with_only_the_control_nic() {
+        let lease = network_lease(3, false);
+        assert!(validate_snapshot_taps("snap", "demo", &lease, &taps(&["hegnc3"])).is_ok());
+        // Off mode never has a data TAP; a snapshot that contains one is
+        // contradictory and must be refused.
+        let err = validate_snapshot_taps("snap", "demo", &lease, &taps(&["hegn3", "hegnc3"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expects TAPs [hegnc3]"), "{err}");
+        assert!(err.contains("owns [hegn3, hegnc3]"), "{err}");
+    }
+
+    #[test]
+    fn snapshots_without_any_nic_require_a_cold_boot() {
+        let err = validate_snapshot_taps("snap", "demo", &network_lease(3, true), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("has no control NIC; cold boot required"),
+            "{err}"
+        );
+    }
 
     fn snapshot(dir: &Path, owner: &str) -> SnapshotMeta {
         SnapshotMeta {

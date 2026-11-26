@@ -391,6 +391,8 @@ impl VmManager {
             boot_args: boot_args(&self.config.root_device),
             serial_log: Some(serial_log.clone()),
             membership: membership.members.clone(),
+            guest_ip: Some(network_lease.control_guest_ip()),
+            ssh_user: None,
         };
         let recorded = (|| -> Result<()> {
             membership.save(&paths.membership)?;
@@ -765,6 +767,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: None,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         };
         let raw = serde_json::to_string(&record).unwrap();
         fs::write(&paths.session, &raw).unwrap();
@@ -857,6 +861,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: None,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         };
         fs::write(&one_paths.session, serde_json::to_string(&record).unwrap()).unwrap();
 
@@ -936,6 +942,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: None,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         };
         fs::write(&one_paths.session, serde_json::to_string(&record).unwrap()).unwrap();
         MembershipManifest {
