@@ -1,8 +1,8 @@
 //! Agent launch integration for the TUI.
 //!
 //! Turns a [`LaunchSpec`] into a concrete [`LaunchAction`], then either types the
-//! command into the embedded console, suspends the TUI for an external or tmux
-//! client, spawns a detached program, or asks herdr for a new pane.
+//! command into the embedded serial console, suspends the TUI for an external
+//! SSH session, spawns a detached program, or asks herdr for a new pane.
 
 use std::io::Stdout;
 use std::process::Command;
@@ -14,7 +14,6 @@ use ratatui::backend::CrosstermBackend;
 use crate::agent::launch::{self, LaunchAction, LaunchSpec};
 use crate::tui::App;
 use crate::tui::app::ToastLevel;
-use crate::tui::terminal::with_suspended_terminal;
 
 pub(super) fn launch_agent(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -32,53 +31,32 @@ pub(super) fn launch_agent(
         }
     };
     match action {
-        LaunchAction::Embedded { command } => {
-            let result: Result<()> = (|| {
-                let session = app
-                    .session
-                    .as_mut()
-                    .context("open the terminal before launching an embedded command")?;
-                if !command.trim().is_empty() {
-                    session.send(command.as_bytes())?;
-                    session.send(b"\n")?;
-                }
-                Ok(())
-            })();
-            match result {
-                Ok(()) => {
-                    app.project_view = crate::tui::app::ProjectView::Split;
-                    app.terminal_focus = true;
-                    app.terminal_mode = crate::tui::app::TerminalMode::Normal;
-                    app.toast(format!("launched {}", spec.name), ToastLevel::Info);
-                }
-                Err(err) => app.toast(format!("launch failed: {err}"), ToastLevel::Error),
-            }
-        }
-        LaunchAction::External { vm, command, bar } => {
-            let registry = crate::vm::registry::VmRegistry::new(app.config.clone());
-            app.detach_console();
-            let result = with_suspended_terminal(terminal, || {
-                let manager = registry.manager_by_name(&vm)?;
-                let console = manager.attach_console()?;
-                crate::session::console::run_interactive_with_command(
-                    console,
-                    bar,
-                    command.as_deref(),
-                )
-            });
-            // The external client closed on detach; restore the embedded view so
-            // the project screen is not left without a console.
-            let reattached = registry
-                .manager_by_name(&vm)
-                .ok()
-                .and_then(|manager| manager.attach_console().ok());
-            if let Some(console) = reattached {
-                app.attach_console(Box::new(console));
+        LaunchAction::Embedded { command } => match send_embedded_command(app, &command) {
+            Ok(()) => {
                 app.project_view = crate::tui::app::ProjectView::Split;
                 app.terminal_focus = true;
+                app.terminal_mode = crate::tui::app::TerminalMode::Normal;
+                app.toast(format!("launched {}", spec.name), ToastLevel::Info);
             }
-            if let Err(err) = result {
-                app.toast(format!("launch failed: {err}"), ToastLevel::Error);
+            Err(err) => app.toast(format!("launch failed: {err}"), ToastLevel::Error),
+        },
+        LaunchAction::External { vm, command, bar } => {
+            // `bar` belongs to the serial console and has no SSH equivalent.
+            let _ = bar;
+            let result =
+                super::effects::attach_ssh_session(terminal, &app.config, &vm, command.as_deref());
+            // The SSH guard cleared the title; the event loop will not rewrite
+            // it because its cached title is unchanged.
+            let _ = super::terminal::set_title(terminal, &app.window_title());
+            match result {
+                Ok(()) => app.toast(
+                    format!("returned from SSH session to {vm}"),
+                    ToastLevel::Info,
+                ),
+                Err(err) => app.toast(
+                    format!("SSH launch in {vm} failed: {err:#}"),
+                    ToastLevel::Error,
+                ),
             }
         }
         LaunchAction::Spawn { program, args } => {
@@ -109,4 +87,103 @@ pub(super) fn launch_agent(
         }
     }
     Ok(())
+}
+
+/// Type an embedded launch command into the serial console.
+///
+/// Only external sessions use SSH; the embedded TUI terminal remains the
+/// serial relay with its line buffer.
+pub(super) fn send_embedded_command(app: &mut App, command: &str) -> Result<()> {
+    let session = app
+        .session
+        .as_mut()
+        .context("open the terminal before launching an embedded command")?;
+    if !command.trim().is_empty() {
+        session.send(command.as_bytes())?;
+        session.send(b"\n")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::console::TerminalConsole;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Sent(Arc<Mutex<Vec<u8>>>);
+
+    struct RecordingConsole {
+        sent: Sent,
+        project: PathBuf,
+    }
+
+    impl TerminalConsole for RecordingConsole {
+        fn send(&mut self, bytes: &[u8]) -> Result<()> {
+            self.sent.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn drain(&mut self) -> Vec<Vec<u8>> {
+            Vec::new()
+        }
+
+        fn is_exited(&mut self) -> bool {
+            false
+        }
+
+        fn project(&self) -> &Path {
+            &self.project
+        }
+
+        fn label(&self) -> &str {
+            "fake · serial"
+        }
+
+        fn vm_name(&self) -> &str {
+            "rust"
+        }
+    }
+
+    fn test_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            projects_root: dir.path().join("projects"),
+            state_dir: dir.path().join("state"),
+            vms_dir: dir.path().join("vms"),
+            ..crate::config::Config::default()
+        };
+        std::fs::create_dir_all(&config.projects_root).unwrap();
+        std::fs::create_dir_all(&config.vms_dir).unwrap();
+        (dir, App::new(config))
+    }
+
+    #[test]
+    fn embedded_launch_types_into_the_serial_console() {
+        let (_dir, mut app) = test_app();
+        let sent = Sent::default();
+        app.session = Some(Box::new(RecordingConsole {
+            sent: sent.clone(),
+            project: PathBuf::from("/projects/demo"),
+        }));
+
+        send_embedded_command(&mut app, "opencode").unwrap();
+
+        assert_eq!(sent.0.lock().unwrap().as_slice(), b"opencode\n");
+        assert!(
+            app.session.is_some(),
+            "an embedded launch must keep the serial console attached"
+        );
+    }
+
+    #[test]
+    fn embedded_launch_without_a_console_is_a_soft_error() {
+        let (_dir, mut app) = test_app();
+
+        let err = send_embedded_command(&mut app, "opencode").unwrap_err();
+
+        assert!(err.to_string().contains("open the terminal"), "{err}");
+    }
 }
