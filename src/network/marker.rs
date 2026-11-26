@@ -9,10 +9,13 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::addressing::{control_tap_name, tap_name};
 use super::firewall::HostFirewall;
-use super::pool::status;
 use super::{CONTROL_SUBNET, CONTROL_TAP_POOL, MARKER, MARKER_VERSION, SUBNET, TAP_POOL};
-use crate::config::Config;
+use crate::config::{Config, NetworkMode};
+
+/// Where the kernel exposes network interfaces.
+const SYSFS_NET: &str = "/sys/class/net";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadyMarker {
@@ -83,25 +86,67 @@ fn parse_marker(raw: &str) -> Option<ReadyMarker> {
     .then_some(marker)
 }
 
-/// Marker present, every TAP in the pool exists and — when the caller can
-/// inspect the kernel — the live nftables table still matches the marker.
+/// All slots of a TAP family exist under `root`.
+fn taps_present(root: &Path, pool: u8, name: impl Fn(u8) -> String) -> bool {
+    (0..pool).all(|index| root.join(name(index)).exists())
+}
+
+/// Whether every control TAP (`hegnc0..hegnc15`) currently exists.
+pub(super) fn control_taps_present() -> bool {
+    taps_present(Path::new(SYSFS_NET), CONTROL_TAP_POOL, control_tap_name)
+}
+
+/// Whether every guarded data TAP (`hegn0..hegn15`) currently exists.
+pub(super) fn data_taps_present() -> bool {
+    taps_present(Path::new(SYSFS_NET), TAP_POOL, tap_name)
+}
+
+/// Marker present, the control TAP pool exists and — when the caller can
+/// inspect the kernel — the live nftables rules still match the marker.
+///
+/// Air-gapped (`off`) guests still need their control TAPs for SSH, so there is
+/// no mode that skips host preparation. Guarded guests additionally need the
+/// data TAP pool.
 ///
 /// Unprivileged callers (TUI, `hegn network status`) cannot read nftables, so
 /// they fall back to the root-owned marker and TAP presence.
 pub fn guard_ready(config: &Config) -> bool {
     let endpoints = config.endpoint_ports();
-    if !(ready_marker().is_some_and(|marker| marker.endpoints == endpoints)
-        && status(config).iter().all(|tap| tap.exists))
-    {
+    guard_ready_with(
+        config.network,
+        &endpoints,
+        ready_marker().as_ref(),
+        control_taps_present(),
+        data_taps_present(),
+        super::firewall::live_guard_status(&endpoints),
+        super::privilege::is_privileged(),
+    )
+}
+
+/// Pure readiness decision, so every mode/TAP/live combination is testable
+/// without a real `/run` marker or `/sys/class/net`.
+fn guard_ready_with(
+    mode: NetworkMode,
+    endpoints: &[u16],
+    marker: Option<&ReadyMarker>,
+    control_taps: bool,
+    data_taps: bool,
+    live: Option<bool>,
+    privileged: bool,
+) -> bool {
+    let Some(marker) = marker else {
+        return false;
+    };
+    if marker.endpoints != endpoints || !control_taps {
+        return false;
+    }
+    if mode == NetworkMode::Guarded && !data_taps {
         return false;
     }
     // A privileged caller can always inspect nftables, so an unverifiable
     // guard must fail closed. Unprivileged callers keep the root-owned marker
     // as their only gate.
-    super::firewall::guard_ready_from_status(
-        super::firewall::live_guard_status(&endpoints),
-        super::privilege::is_privileged(),
-    )
+    super::firewall::guard_ready_from_status(live, privileged)
 }
 
 /// The marker is deliberately world-readable: the unprivileged TUI reads it to
@@ -342,26 +387,170 @@ mod tests {
     }
 
     #[test]
-    fn guard_ready_requires_a_valid_marker_matching_endpoints_and_all_taps() {
-        // Read-only: never writes to /run. On an unguarded host there is no
-        // marker and readiness must be false; on a guarded host readiness is
-        // exactly "endpoints match && every pool TAP exists".
-        let config = Config::default();
-        let marker = ready_marker();
-        let all_taps_exist = status(&config).iter().all(|tap| tap.exists);
-        let endpoints_match = marker
-            .as_ref()
-            .is_some_and(|marker| marker.endpoints == config.endpoint_ports());
+    fn tap_presence_requires_every_slot_of_the_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
 
-        let expected = endpoints_match
-            && all_taps_exist
-            && super::super::firewall::guard_ready_from_status(
-                super::super::firewall::live_guard_status(&config.endpoint_ports()),
-                super::super::privilege::is_privileged(),
+        assert!(!taps_present(root, CONTROL_TAP_POOL, control_tap_name));
+        assert!(!taps_present(root, TAP_POOL, tap_name));
+
+        for index in 0..TAP_POOL {
+            fs::write(root.join(control_tap_name(index)), "").unwrap();
+            fs::write(root.join(tap_name(index)), "").unwrap();
+        }
+        assert!(taps_present(root, CONTROL_TAP_POOL, control_tap_name));
+        assert!(taps_present(root, TAP_POOL, tap_name));
+
+        fs::remove_file(root.join(control_tap_name(15))).unwrap();
+        fs::remove_file(root.join(tap_name(0))).unwrap();
+        assert!(!taps_present(root, CONTROL_TAP_POOL, control_tap_name));
+        assert!(!taps_present(root, TAP_POOL, tap_name));
+    }
+
+    #[test]
+    fn guard_ready_requires_control_taps_in_every_mode() {
+        let marker = marker(Vec::new(), HostFirewall::None);
+        for mode in NetworkMode::ALL {
+            assert!(
+                !guard_ready_with(mode, &[], Some(&marker), false, true, Some(true), true),
+                "{mode:?} must not be ready without the control pool"
             );
-        assert_eq!(guard_ready(&config), expected);
-        if marker.is_none() {
-            assert!(!guard_ready(&config), "no marker means not ready");
+        }
+    }
+
+    #[test]
+    fn guarded_guard_ready_requires_the_data_pool_too() {
+        let marker = marker(Vec::new(), HostFirewall::None);
+        assert!(!guard_ready_with(
+            NetworkMode::Guarded,
+            &[],
+            Some(&marker),
+            true,
+            false,
+            Some(true),
+            true
+        ));
+        assert!(guard_ready_with(
+            NetworkMode::Guarded,
+            &[],
+            Some(&marker),
+            true,
+            true,
+            Some(true),
+            true
+        ));
+    }
+
+    #[test]
+    fn off_guard_ready_needs_a_marker_and_control_taps_but_no_data_pool() {
+        let marker = marker(Vec::new(), HostFirewall::None);
+        assert!(guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            Some(&marker),
+            true,
+            false,
+            Some(true),
+            true
+        ));
+        assert!(!guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            None,
+            true,
+            false,
+            Some(true),
+            true
+        ));
+        assert!(!guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            Some(&marker),
+            false,
+            true,
+            Some(true),
+            true
+        ));
+    }
+
+    #[test]
+    fn guard_ready_rejects_changed_endpoints() {
+        let marker = marker(vec![11434], HostFirewall::None);
+        assert!(!guard_ready_with(
+            NetworkMode::Off,
+            &[4321],
+            Some(&marker),
+            true,
+            false,
+            Some(true),
+            true
+        ));
+        assert!(guard_ready_with(
+            NetworkMode::Off,
+            &[11434],
+            Some(&marker),
+            true,
+            false,
+            Some(true),
+            true
+        ));
+    }
+
+    #[test]
+    fn privileged_guard_ready_fails_closed_when_the_live_guard_is_unverifiable() {
+        let marker = marker(Vec::new(), HostFirewall::None);
+        assert!(!guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            Some(&marker),
+            true,
+            false,
+            None,
+            true
+        ));
+        assert!(!guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            Some(&marker),
+            true,
+            false,
+            Some(false),
+            true
+        ));
+        // Unprivileged callers cannot run nft, so the root-owned marker stays
+        // their gate.
+        assert!(guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            Some(&marker),
+            true,
+            false,
+            None,
+            false
+        ));
+        assert!(!guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            Some(&marker),
+            true,
+            false,
+            Some(false),
+            false
+        ));
+    }
+
+    #[test]
+    fn guard_ready_never_vouches_from_the_host_state_without_a_marker() {
+        // Read-only: never writes to /run. On a host without a v3 marker both
+        // modes must report "not ready".
+        for mode in NetworkMode::ALL {
+            let config = Config {
+                network: mode,
+                ..Config::default()
+            };
+            if ready_marker().is_none() {
+                assert!(!guard_ready(&config), "{mode:?} without a marker");
+            }
         }
     }
 
