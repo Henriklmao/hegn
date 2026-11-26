@@ -1479,7 +1479,8 @@ mod tests {
 
         let absent = deprecated_project_keys_check(&Config {
             projects_root: dir.path().join("empty-projects"),
-            ..Config::default()
+            state_dir: dir.path().join("empty-state"),
+            ..isolated_config(dir.path())
         });
         assert!(absent.ok);
         assert!(absent.detail.contains("none found"), "{}", absent.detail);
