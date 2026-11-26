@@ -132,7 +132,26 @@ impl SshIdentity {
     }
 
     /// Remove the host-key cache. Missing files are not an error.
+    ///
+    /// A missing identity directory is fine, but a planted symlink or any
+    /// other non-directory at the `ssh/` path is refused: the cache must
+    /// never be deleted through a link.
     pub fn remove_known_hosts(&self) -> Result<(), SshError> {
+        self.validate()?;
+        match fs::symlink_metadata(&self.dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(io_error(&self.dir, error)),
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(io_error(
+                    &self.dir,
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "refusing non-directory SSH path",
+                    ),
+                ));
+            }
+        }
         match fs::remove_file(&self.known_hosts) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -144,6 +163,7 @@ impl SshIdentity {
     ///
     /// A planted symlink is removed as a link, never followed.
     pub fn remove_all(&self) -> Result<(), SshError> {
+        self.validate()?;
         match fs::symlink_metadata(&self.dir) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(io_error(&self.dir, error)),
@@ -520,6 +540,54 @@ mod tests {
         identity.remove_all().unwrap();
         identity.remove_all().unwrap();
         assert!(!identity.dir().exists());
+    }
+
+    #[test]
+    fn remove_known_hosts_is_idempotent_without_an_ssh_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = identity(dir.path());
+
+        assert!(identity.remove_known_hosts().is_ok());
+        assert!(!identity.dir().exists());
+    }
+
+    #[test]
+    fn remove_known_hosts_refuses_a_symlinked_ssh_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = identity(dir.path());
+        let target = dir.path().join("target-ssh");
+        fs::create_dir_all(&target).unwrap();
+        let target_hosts = target.join(KNOWN_HOSTS_FILE);
+        fs::write(&target_hosts, b"host-key").unwrap();
+        fs::create_dir_all(identity.dir().parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, identity.dir()).unwrap();
+
+        assert!(identity.remove_known_hosts().is_err());
+        assert_eq!(fs::read(&target_hosts).unwrap(), b"host-key");
+    }
+
+    #[test]
+    fn invalid_vm_names_cannot_remove_the_placeholder_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = SshIdentity::new(dir.path(), "../escape");
+        let placeholder = dir.path().join(".invalid-vm-name/ssh");
+        fs::create_dir_all(&placeholder).unwrap();
+        let sentinel = placeholder.join(KNOWN_HOSTS_FILE);
+        fs::write(&sentinel, b"sentinel").unwrap();
+
+        assert!(matches!(
+            identity.remove_known_hosts(),
+            Err(SshError::InvalidVmName { .. })
+        ));
+        assert!(matches!(
+            identity.remove_all(),
+            Err(SshError::InvalidVmName { .. })
+        ));
+        assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel");
+        assert!(
+            placeholder.is_dir(),
+            "remove_all must leave the placeholder path alone"
+        );
     }
 
     #[test]
