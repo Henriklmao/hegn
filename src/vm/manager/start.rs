@@ -226,16 +226,12 @@ impl VmManager {
         let mut packages = self.vm.extra_packages.clone();
         packages.extend(profile_plan.packages.iter().cloned());
         let provision = ProvisionPlan::new(self.vm.harness, &packages)?;
-        // Reserve the guarded-network slice before any process is spawned.
-        // `acquire` also verifies that the host firewall marker is present, so
-        // an unconfigured guard fails before virtiofsd or the VMM can start.
-        let network_lease = match self.config.network {
-            crate::config::NetworkMode::Guarded => Some(network::acquire(&self.config, &self.vm)?),
-            crate::config::NetworkMode::Off => None,
-        };
-        if let Some(lease) = &network_lease
-            && let Err(err) = self.persist_network_index(lease.index)
-        {
+        // Reserve the network slot before any process is spawned. `acquire`
+        // also verifies that the host firewall marker is present in guarded
+        // mode, so an unconfigured guard fails before virtiofsd or the VMM can
+        // start. The control TAP is reserved in every mode.
+        let network_lease = network::acquire(&self.config, &self.vm)?;
+        if let Err(err) = self.persist_network_index(network_lease.slot) {
             network::release(&self.config, &self.vm.name);
             return Err(err);
         }
@@ -327,7 +323,7 @@ impl VmManager {
                 primary_guest,
                 &provision,
                 profile_plan.share.as_ref(),
-                network_lease.as_ref(),
+                network_lease.data_lease(),
                 &self.config.local_endpoints,
                 self.config.guest_credential_hardening,
             );
@@ -338,7 +334,7 @@ impl VmManager {
                 &instance_id,
                 &provision,
                 profile_plan.share.as_ref(),
-                network_lease.as_ref(),
+                network_lease.data_lease(),
                 &self.config.local_endpoints,
                 self.config.guest_credential_hardening,
             )?;
@@ -352,7 +348,7 @@ impl VmManager {
             &paths,
             &rootfs,
             &vm_binary,
-            network_lease.as_ref(),
+            network_lease.data_lease(),
             profile_plan
                 .share
                 .as_ref()
@@ -433,7 +429,7 @@ impl VmManager {
             started_at: Some(record.started_at),
             serial_log: Some(serial_log),
             local_endpoints: network_lease
-                .as_ref()
+                .data_lease()
                 .map(|lease| endpoint_urls(&self.config, lease.host_ip))
                 .unwrap_or_default(),
             note: Some(format!(

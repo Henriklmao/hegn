@@ -154,11 +154,15 @@ impl VmManager {
             relay_pid: session.as_ref().map(|s| s.relay_pid),
             started_at: session.as_ref().map(|s| s.started_at),
             serial_log: session.as_ref().and_then(|s| s.serial_log.clone()),
-            local_endpoints: self
-                .vm
-                .network_index
-                .map(|index| endpoint_urls(&self.config, network::host_ip(index)))
-                .unwrap_or_default(),
+            local_endpoints: if self.config.network == crate::config::NetworkMode::Off {
+                // Off mode has no data TAP, so no host endpoint is reachable.
+                Vec::new()
+            } else {
+                self.vm
+                    .network_index
+                    .map(|index| endpoint_urls(&self.config, network::host_ip(index)))
+                    .unwrap_or_default()
+            },
             note,
         })
     }

@@ -685,13 +685,10 @@ pub(super) async fn restore_snapshot_locked(
             vm.harness.label()
         );
     }
-    let network_lease = match config.network {
-        crate::config::NetworkMode::Guarded => Some(network::acquire(config, vm)?),
-        crate::config::NetworkMode::Off => None,
-    };
-    if let Some(lease) = &network_lease
-        && let Err(err) = manager.persist_network_index(lease.index)
-    {
+    // The control TAP is reserved in every mode; guarded mode adds the data
+    // TAP. Off mode still gets a control link for SSH and metadata.
+    let network_lease = network::acquire(config, vm)?;
+    if let Err(err) = manager.persist_network_index(network_lease.slot) {
         network::release(config, &vm.name);
         return Err(err);
     }
@@ -705,35 +702,35 @@ pub(super) async fn restore_snapshot_locked(
             return Err(err);
         }
     };
-    match (&network_lease, snapshot_taps.as_slice()) {
-        (None, []) => {}
-        (None, [_, ..]) => {
-            bail!(
-                "snapshot '{}' contains a network device but `network = \"off\"`; enable \
-                 guarded networking or restore an air-gapped snapshot",
-                snapshot.name
-            );
-        }
-        (Some(lease), []) => append_event_log(
-            &paths.event_log,
-            &format!(
-                "warning: snapshot {} has no network device; restoring it without the reserved {}",
-                snapshot.name, lease.tap
-            ),
-        ),
-        (Some(lease), taps) if taps.iter().any(|tap| tap != &lease.tap) => {
-            // Leave the VM's reservation intact: an old VM may still be running
-            // on that TAP, and the next start will reuse it.
-            bail!(
-                "snapshot '{}' expects TAP {}, but VM '{}' owns {}; restore it in the VM that \
-                 created it",
-                snapshot.name,
-                taps.join(", "),
-                vm.name,
-                lease.tap
-            );
-        }
-        (Some(_), [_, ..]) => {}
+    if snapshot_taps.is_empty() {
+        // Old snapshots predate the always-present control NIC. Attaching one
+        // would boot a guest whose kernel has no control interface at all.
+        // The slot reservation stays with the VM: a running VM may still own
+        // it and the next start reuses it.
+        bail!(
+            "snapshot '{}' has no control NIC; cold boot required",
+            snapshot.name
+        );
+    }
+    let mut expected: Vec<String> = network_lease
+        .taps()
+        .into_iter()
+        .map(|lease| lease.tap.clone())
+        .collect();
+    expected.sort();
+    let mut found = snapshot_taps.clone();
+    found.sort();
+    if found != expected {
+        // Leave the VM's reservation intact: an old VM may still be running on
+        // that TAP, and the next start will reuse it.
+        bail!(
+            "snapshot '{}' expects TAPs [{}], but VM '{}' owns [{}]; restore it in the VM that \
+             created it",
+            snapshot.name,
+            expected.join(", "),
+            vm.name,
+            found.join(", ")
+        );
     }
 
     // Stop the old VM, relay and every member filesystem daemon. The sockets
@@ -816,7 +813,7 @@ pub(super) async fn restore_snapshot_locked(
             primary_guest,
             &provision,
             profile_plan.share.as_ref(),
-            network_lease.as_ref(),
+            network_lease.data_lease(),
             &config.local_endpoints,
             config.guest_credential_hardening,
         );
@@ -827,7 +824,7 @@ pub(super) async fn restore_snapshot_locked(
             &instance_id,
             &provision,
             profile_plan.share.as_ref(),
-            network_lease.as_ref(),
+            network_lease.data_lease(),
             &config.local_endpoints,
             config.guest_credential_hardening,
         )?;
@@ -849,7 +846,13 @@ pub(super) async fn restore_snapshot_locked(
         .context("the recorded membership lost its primary project")?;
     let serial_log = logs.create_session(&primary_path, started_at, std::process::id())?;
 
-    let vm_child = spawn_restore(config, &paths, snapshot, &vm_binary, network_lease.as_ref())?;
+    let vm_child = spawn_restore(
+        config,
+        &paths,
+        snapshot,
+        &vm_binary,
+        network_lease.data_lease(),
+    )?;
     let vm_pid = vm_child.id();
     rollback.vm = Some(vm_child);
     let relay_pid = {
