@@ -18,6 +18,10 @@ use super::process::{hegn_binary, read_pid, terminate, terminate_autosave, termi
 impl VmManager {
     /// Stop Cloud Hypervisor, the console relay, every member virtiofsd, the
     /// profile daemon and the autosave worker.
+    ///
+    /// Running SSH sessions end with the guest: the control TAP and its guest
+    /// sshd disappear when the VMM exits. The per-VM keypair and `known_hosts`
+    /// are intentionally kept so a later start can reuse the identity.
     pub fn stop(&self) -> Result<()> {
         let paths = self.paths();
         if !paths.run_dir.is_dir() {
