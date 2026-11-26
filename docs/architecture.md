@@ -369,7 +369,8 @@ Create:
    record metadata with `SnapshotStore` (the directory holds `config.json`,
    `state.json` and `memory-ranges`). Metadata records the VM, the exported
    membership and the `boot_fingerprint` over membership and boot inputs. The
-   boot inputs now include `seed_version` and `network_mode` in addition to
+   boot inputs now include `seed_version`, `network_mode` and the per-VM
+   `seed_generation` in addition to
    resources, rootfs, `network_index`, profile presence and `primary`; the
    fingerprint domain is `hegn-snapshot-boot-v3`.
 5. Always attempt to resume; if saving metadata fails, remove the snapshot

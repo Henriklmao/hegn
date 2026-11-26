@@ -93,7 +93,8 @@ adding a worktree does not invalidate a snapshot.
 - ordered membership (name, canonical path, tag, guest mount, read-only, kind),
 - `vcpus`, `memory_mib`, rootfs path and format,
 - `network_index`, profile-share presence,
-- `seed_version` and `network_mode` (control-only vs control+data),
+- `seed_version`, `network_mode` (control-only vs control+data) and
+  `seed_generation` (advanced by `hegn vm apply`),
 - the `primary` project that drives `/workspace`.
 
 The fingerprint domain is `hegn-snapshot-boot-v3`. The `network_mode` input is
