@@ -185,6 +185,10 @@ pub struct SnapshotBoot {
     /// v2 files, which deserialize as `0` and therefore never match.
     #[serde(default)]
     pub seed_version: u32,
+    /// Per-VM cloud-init generation recorded for this boot. `hegn vm apply`
+    /// increments it, so an older checkpoint can never hide the new seed.
+    #[serde(default)]
+    pub seed_generation: u64,
     /// Network mode of the recorded boot. Missing in v2 files, which
     /// deserialize as [`NetworkMode::Guarded`] and are invalidated by the
     /// fingerprint domain bump.
@@ -207,6 +211,7 @@ impl Default for SnapshotBoot {
             rootfs_format: RootfsFormat::default(),
             network_index: None,
             seed_version: 0,
+            seed_generation: 0,
             network_mode: NetworkMode::default(),
             profile_share: false,
             primary: None,
@@ -236,6 +241,11 @@ pub fn compute_fingerprint(membership: &[SnapshotMember], boot: &SnapshotBoot) -
         &optional_u8(boot.network_index),
     );
     hash_field(&mut hasher, "seed_version", &boot.seed_version.to_string());
+    hash_field(
+        &mut hasher,
+        "seed_generation",
+        &boot.seed_generation.to_string(),
+    );
     hash_field(&mut hasher, "network_mode", boot.network_mode.label());
     hash_field(
         &mut hasher,
@@ -332,6 +342,12 @@ pub fn describe_boot_changes(
         changes.push(format!(
             "seed version {} -> {}",
             recorded.seed_version, current.seed_version
+        ));
+    }
+    if recorded.seed_generation != current.seed_generation {
+        changes.push(format!(
+            "seed generation {} -> {}",
+            recorded.seed_generation, current.seed_generation
         ));
     }
     if recorded.network_mode != current.network_mode {
@@ -486,6 +502,7 @@ mod tests {
             rootfs_format: RootfsFormat::Qcow2,
             network_index: Some(3),
             seed_version: 13,
+            seed_generation: 0,
             network_mode: NetworkMode::Guarded,
             profile_share: true,
             primary: Some("parser".into()),
@@ -573,6 +590,10 @@ mod tests {
                 ..boot()
             },
             SnapshotBoot {
+                seed_generation: 1,
+                ..boot()
+            },
+            SnapshotBoot {
                 network_mode: NetworkMode::Off,
                 ..boot()
             },
@@ -646,6 +667,7 @@ mod tests {
             rootfs_format: RootfsFormat::Raw,
             network_index: Some(5),
             seed_version: 12,
+            seed_generation: 7,
             network_mode: NetworkMode::Off,
             profile_share: false,
             primary: Some("cli".into()),
@@ -670,6 +692,7 @@ mod tests {
             "rootfs format qcow2 -> raw",
             "network index 3 -> 5",
             "seed version 13 -> 12",
+            "seed generation 0 -> 7",
             "network mode guarded -> off",
             "profile share present -> absent",
             "member 'parser' tag hegn-prj-0 -> hegn-prj-9",
@@ -725,6 +748,7 @@ mod tests {
         assert!(raw.contains("\"boot_fingerprint\""), "{raw}");
         assert!(raw.contains("\"membership\""), "{raw}");
         assert!(raw.contains("\"seed_version\": 13"), "{raw}");
+        assert!(raw.contains("\"seed_generation\": 0"), "{raw}");
         assert!(raw.contains("\"network_mode\": \"guarded\""), "{raw}");
         let loaded: SnapshotMeta = serde_json::from_str(&raw).unwrap();
         assert_eq!(loaded, meta);
@@ -740,6 +764,7 @@ mod tests {
         let mut raw = serde_json::to_value(meta()).unwrap();
         let boot_fields = raw["boot"].as_object_mut().unwrap();
         boot_fields.remove("seed_version");
+        boot_fields.remove("seed_generation");
         boot_fields.remove("network_mode");
 
         let loaded: SnapshotMeta = serde_json::from_value(raw).unwrap();

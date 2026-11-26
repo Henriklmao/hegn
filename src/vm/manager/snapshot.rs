@@ -213,7 +213,14 @@ pub(super) fn current_boot(
     plan: &BootPlan,
     profile_share: bool,
 ) -> SnapshotBoot {
-    boot_inputs(config, vm, plan.primary.clone(), profile_share)
+    let seed_generation = super::seed_generation::read(config, vm).unwrap_or(0);
+    boot_inputs(
+        config,
+        vm,
+        plan.primary.clone(),
+        profile_share,
+        seed_generation,
+    )
 }
 
 fn boot_inputs(
@@ -221,6 +228,7 @@ fn boot_inputs(
     vm: &VmConfig,
     primary: String,
     profile_share: bool,
+    seed_generation: u64,
 ) -> SnapshotBoot {
     SnapshotBoot {
         vcpus: vm.vcpus,
@@ -229,6 +237,7 @@ fn boot_inputs(
         rootfs_format: config.rootfs_format,
         network_index: vm.network_index,
         seed_version: cloud_init::SEED_VERSION,
+        seed_generation,
         network_mode: config.network,
         profile_share,
         primary: Some(primary),
@@ -641,7 +650,14 @@ impl VmManager {
                 membership_path.display()
             ),
         };
-        let boot = boot_inputs(&self.config, &self.vm, primary, profile_share);
+        let seed_generation = super::seed_generation::read(&self.config, &self.vm)?;
+        let boot = boot_inputs(
+            &self.config,
+            &self.vm,
+            primary,
+            profile_share,
+            seed_generation,
+        );
         let fingerprint = compute_fingerprint(&membership, &boot);
         let project = boot
             .primary
@@ -1357,6 +1373,7 @@ mod tests {
             rootfs_format: crate::config::RootfsFormat::Raw,
             network_index: Some(9),
             seed_version: 11,
+            seed_generation: 3,
             network_mode: crate::config::NetworkMode::Off,
             profile_share: true,
             primary: Some("demo".into()),

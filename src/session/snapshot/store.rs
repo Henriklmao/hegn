@@ -312,6 +312,7 @@ mod tests {
             rootfs_format: RootfsFormat::Qcow2,
             network_index: None,
             seed_version: 13,
+            seed_generation: 0,
             network_mode: NetworkMode::Guarded,
             profile_share: false,
             primary: Some("demo".into()),
