@@ -338,7 +338,9 @@ mod tests {
     fn writing_a_marker_truncates_the_previous_one() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("network.json");
-        let long = marker(vec![1234, 4321, 9999], HostFirewall::Iptables);
+        let mut long = marker(vec![1234, 4321, 9999], HostFirewall::Iptables);
+        // A non-numeric token cannot collide with digits in the timestamp.
+        long.dns = vec!["192.0.2.123".to_string()];
         write_marker(&path, &long).unwrap();
 
         let short = marker(Vec::new(), HostFirewall::None);
@@ -347,7 +349,10 @@ mod tests {
         let raw = fs::read_to_string(&path).unwrap();
         let parsed: ReadyMarker = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed, short);
-        assert!(!raw.contains("9999"), "old contents must be gone: {raw}");
+        assert!(
+            !raw.contains("192.0.2.123"),
+            "old contents must be gone: {raw}"
+        );
     }
 
     #[test]
