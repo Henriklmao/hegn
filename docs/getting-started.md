@@ -157,10 +157,11 @@ The first boot takes longer than later boots. hegn:
 
 The TUI shows the progress, and `hegn open` waits for the provisioner stages in
 the serial log before it probes SSH readiness. `hegn vm apply` waits for
-cloud-init to finish and SSH to accept the new guest host key before it returns,
-then clears `known_hosts` once more so the next attach accepts the current key.
-A plain `hegn attach` requires the VM to be running and sshd to be ready. Wait
-for the line `hegn: preset ready` in the serial console before you start working.
+cloud-init to finish, SSH to accept the new guest host key, and the harness
+provisioner's ready marker before it returns, then clears `known_hosts` once
+more so the next attach accepts the current key. A plain `hegn attach` requires
+the VM to be running and sshd to be ready. Wait for the line
+`hegn: preset ready` in the serial console before you start working.
 
 The guest is configured once more after upgrading because the seed version and
 instance id change. `hegn vm apply <vm>` regenerates the seed; a reboot inside

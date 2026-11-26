@@ -197,6 +197,8 @@ or use `↑`/`↓`, `j`/`k` and `PgUp`/`PgDn`.
 The doctor and security modals scroll the same way. Mouse wheel and dragging
 work in every modal that overflows. All modals size themselves to the terminal
 and keep their buttons visible, wrapping them onto another row when needed.
+Long SSH attach failures open the same scrollable error modal instead of a
+one-line toast, so the full recovery hint stays readable.
 
 ---
 
