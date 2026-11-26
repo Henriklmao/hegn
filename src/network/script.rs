@@ -5,10 +5,10 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-use super::TAP_POOL;
-use super::addressing::{host_ip, mac, tap_name};
+use super::addressing::{control_host_ip, control_mac, control_tap_name, host_ip, mac, tap_name};
 use super::firewall::{host_firewall_cleanup, host_firewall_coexistence, nft_rules};
 use super::privilege::safe_user;
+use super::{CONTROL_TAP_POOL, TAP_POOL};
 use crate::shared::text::shell_quote_os;
 
 /// Shell script that creates the TAP pool and installs the nftables table.
@@ -70,6 +70,29 @@ pub fn setup_script(user: &str, endpoints: &[u16]) -> Result<String> {
                 "sysctl -q -w net.ipv4.conf.{tap}.route_localnet=1\n"
             ));
         }
+    }
+    // The control pool is always present: SSH attach needs it even for
+    // `network = "off"`. It is a host-only `/30` link, so it deliberately does
+    // not get `route_localnet` (there is no DNAT on this family). Ownership is
+    // reconciled exactly like the data pool, because the TAP owner can inject
+    // traffic without CAP_NET_ADMIN.
+    for index in 0..CONTROL_TAP_POOL {
+        let tap = control_tap_name(index);
+        let addr = control_host_ip(index);
+        let tap_mac = control_mac(index);
+        script.push_str(&format!(
+            "if ip link show dev {tap} >/dev/null 2>&1; then\n\
+             \x20 if ! ip tuntap show dev {tap} 2>/dev/null | grep -Eq \"$hegn_owner_re\"; then\n\
+             \x20   ip link del dev {tap}\n\
+             \x20 fi\n\
+             fi\n\
+             if ! ip link show dev {tap} >/dev/null 2>&1; then\n\
+             \x20 ip tuntap add dev {tap} mode tap user {user}\n\
+             fi\n\
+             ip link set dev {tap} address {tap_mac}\n\
+             ip addr replace {addr}/30 dev {tap}\n\
+             ip link set {tap} up\n"
+        ));
     }
     // One nft file is one transaction. `add` makes the delete idempotent and
     // `table` recreates the guard in the same batch, so a failed apply leaves
@@ -140,6 +163,12 @@ pub fn teardown_script() -> String {
             tap_name(index)
         ));
     }
+    for index in 0..CONTROL_TAP_POOL {
+        script.push_str(&format!(
+            "ip link del dev {} 2>/dev/null || true\n",
+            control_tap_name(index)
+        ));
+    }
     script.push_str(&host_firewall_cleanup());
     script.push_str("rm -f /run/hegn/network.json\n");
     script
@@ -202,7 +231,126 @@ mod tests {
                 tap_name(index)
             )));
         }
+        for index in 0..CONTROL_TAP_POOL {
+            assert!(script.contains(&format!(
+                "ip tuntap add dev {} mode tap user alice",
+                control_tap_name(index)
+            )));
+        }
         assert!(script.contains("nft -f -"));
+    }
+
+    #[test]
+    fn setup_script_creates_control_taps_with_their_own_slice_and_mac() {
+        let script = setup_script("alice", &[]).unwrap();
+        for index in 0..CONTROL_TAP_POOL {
+            let tap = control_tap_name(index);
+            assert!(
+                script.contains(&format!("ip tuntap add dev {tap} mode tap user alice")),
+                "missing control TAP {tap}:\n{script}"
+            );
+            assert!(
+                script.contains(&format!(
+                    "ip link set dev {tap} address {}",
+                    control_mac(index)
+                )),
+                "missing control MAC for {tap}:\n{script}"
+            );
+            assert!(
+                script.contains(&format!(
+                    "ip addr replace {}/30 dev {tap}",
+                    control_host_ip(index)
+                )),
+                "missing control address for {tap}:\n{script}"
+            );
+            assert!(
+                script.contains(&format!("ip link set {tap} up\n")),
+                "control TAP {tap} must be brought up:\n{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_taps_never_enable_route_localnet() {
+        let script = setup_script("alice", &[11434]).unwrap();
+        for index in 0..CONTROL_TAP_POOL {
+            assert!(
+                !script.contains(&format!(
+                    "net.ipv4.conf.{}.route_localnet",
+                    control_tap_name(index)
+                )),
+                "control TAP {} must not get route_localnet:\n{script}",
+                control_tap_name(index)
+            );
+        }
+        assert_eq!(
+            script.matches("route_localnet=1").count(),
+            TAP_POOL as usize,
+            "route_localnet is a data-TAP-only setting:\n{script}"
+        );
+    }
+
+    #[test]
+    fn teardown_script_deletes_both_tap_families() {
+        let script = teardown_script();
+        for index in 0..CONTROL_TAP_POOL {
+            assert!(
+                script.contains(&format!(
+                    "ip link del dev {} 2>/dev/null || true",
+                    control_tap_name(index)
+                )),
+                "missing control TAP deletion for {}:\n{script}",
+                control_tap_name(index)
+            );
+        }
+    }
+
+    #[test]
+    fn reload_script_loads_control_rules_without_touching_taps() {
+        let script = reload_script(&[]).unwrap();
+        assert!(script.contains("set hegn_control_ifaces"), "{script}");
+        assert!(script.contains("set hegn_control_hosts"), "{script}");
+        assert!(
+            script.contains("iifname \"hegnc0\" ip saddr != 10.214.0.2/32 counter drop"),
+            "{script}"
+        );
+        assert!(
+            script.contains("iifname @hegn_control_ifaces counter drop"),
+            "{script}"
+        );
+        for forbidden in ["ip tuntap", "ip link", "ip addr"] {
+            assert!(
+                !script.contains(forbidden),
+                "reload must not touch TAPs ({forbidden}):\n{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_and_reload_scripts_are_deterministic() {
+        assert_eq!(
+            setup_script("alice", &[11434]).unwrap(),
+            setup_script("alice", &[11434]).unwrap()
+        );
+        assert_eq!(
+            reload_script(&[11434]).unwrap(),
+            reload_script(&[11434]).unwrap()
+        );
+    }
+
+    #[test]
+    fn host_firewall_carve_out_stays_data_only() {
+        let script = setup_script("alice", &[]).unwrap();
+        for marker in [
+            "ufw route allow in on hegnc",
+            "filter FORWARD 0 -i hegnc",
+            "iptables -w -I FORWARD 1 -i hegnc",
+        ] {
+            assert!(
+                !script.contains(marker),
+                "control TAPs must not be exempted from the host forward policy: {marker}"
+            );
+        }
     }
 
     #[test]
@@ -401,10 +549,10 @@ mod tests {
         let user = "_alice-1";
         let script = setup_script(user, &[]).unwrap();
         // One `id -u` lookup, one ownership-regex occurrence and the owner on
-        // every `ip tuntap add` line.
+        // every `ip tuntap add` line for both TAP families.
         assert_eq!(
             script.matches(user).count(),
-            2 + TAP_POOL as usize,
+            2 + (TAP_POOL + CONTROL_TAP_POOL) as usize,
             "the user name belongs only on the validated ownership lines"
         );
         // A dot is the only regex metacharacter `safe_user` allows; it must be
@@ -420,6 +568,16 @@ mod tests {
             assert!(!script.contains(&format!(
                 "ip tuntap add dev {} mode tap user root",
                 tap_name(index)
+            )));
+        }
+        for index in 0..CONTROL_TAP_POOL {
+            assert!(script.contains(&format!(
+                "ip tuntap add dev {} mode tap user {user}",
+                control_tap_name(index)
+            )));
+            assert!(!script.contains(&format!(
+                "ip tuntap add dev {} mode tap user root",
+                control_tap_name(index)
             )));
         }
     }
@@ -527,6 +685,17 @@ mod tests {
                 "a foreign owner must replace {tap}:\n{script}"
             );
         }
+        for index in 0..CONTROL_TAP_POOL {
+            let tap = control_tap_name(index);
+            assert!(
+                script.contains(&format!("ip tuntap show dev {tap} 2>/dev/null | grep -Eq")),
+                "missing ownership probe for {tap}:\n{script}"
+            );
+            assert!(
+                script.contains(&format!("ip link del dev {tap}\n")),
+                "a foreign owner must replace {tap}:\n{script}"
+            );
+        }
     }
 
     #[test]
@@ -551,7 +720,7 @@ mod tests {
         );
         assert_eq!(
             script.matches("ip link del dev hegn").count(),
-            TAP_POOL as usize
+            (TAP_POOL + CONTROL_TAP_POOL) as usize
         );
         for line in script
             .lines()
