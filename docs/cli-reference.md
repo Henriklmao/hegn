@@ -45,7 +45,7 @@ Run `hegn <command> --help` for the full options of each command.
   attach [VM|PROJECT] [--serial] [--no-bar] [--command C]
                                    Attach over SSH to a running VM (alias: a);
                                    --serial uses the serial console
-  launch [VM|PROJECT] [--command NAME] [--integration I] [--serial]
+  launch [VM|PROJECT] [--command NAME] [--integration I] [--serial] [--no-bar]
                                    Launch the configured agent/command
   logs [list|path|show|prune]      Manage persistent serial logs (alias: log)
           [--vm VM]                Filter list/path/show by VM members

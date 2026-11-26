@@ -323,8 +323,8 @@ serial log is kept, exactly as today.
 
 Stop terminates every SSH session, the VMM, relay, every member `virtiofsd`
 (from `membership.json`), the profile daemon and the autosave worker, then
-releases the control TAP and, when present, the data TAP. It never deletes a
-workspace.
+releases the slot lease for the control TAP and, when present, the data TAP.
+The pool TAP devices themselves stay in place. It never deletes a workspace.
 
 ---
 
@@ -515,9 +515,9 @@ hegn project fork <project> [--mode clone|worktree] [--name <name>] [--vm <name>
 hegn project delete <project> [--keep-files|--delete-files]
 hegn projects [query]             # now shows the VM column
 
-hegn open <project> [--vm <name>] [--serial] [--command C]
-hegn attach <vm|project> [--project <name>] [--serial] [--no-bar] [--command C]
-hegn launch <project> [--command C] [--integration I] [--serial]
+hegn open <project> [--serial] [--command C]
+hegn attach <vm|project> [--serial] [--no-bar] [--command C]
+hegn launch <project> [--command C] [--integration I] [--serial] [--no-bar]
 hegn snapshot create|restore|list|delete --vm <name> ...
 hegn logs ...                     # per VM, filterable by project
 ```
