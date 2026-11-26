@@ -5,9 +5,13 @@
 //! TAP address and is only usable while the VM is running.
 //!
 //! - [`identity`] — per-VM keypair and `known_hosts`
+//! - [`client`] — the OpenSSH client wrapper, readiness probe and error
+//!   classification
 
+mod client;
 mod identity;
 
+pub use client::{ClassifiedError, GuestEnv, SshTarget, classify_stderr};
 pub use identity::SshIdentity;
 
 use std::io;
