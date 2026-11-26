@@ -779,6 +779,40 @@ mod tests {
     }
 
     #[test]
+    fn vm_rebuild_removes_the_private_rootfs_and_ssh_identity() {
+        use crate::session::ssh::SshIdentity;
+
+        let (_dir, config) = config();
+        let store = VmStore::new(&config);
+        let vm = VmConfig::from_config(&config, "rust", Some(Harness::Shell));
+        store.save(&vm).unwrap();
+        let rootfs = vm.rootfs_path(&config);
+        std::fs::create_dir_all(rootfs.parent().unwrap()).unwrap();
+        std::fs::write(&rootfs, b"disk").unwrap();
+        let identity = SshIdentity::new(&config.vms_dir, "rust");
+        std::fs::create_dir_all(identity.dir()).unwrap();
+        std::fs::write(identity.key(), b"client-key").unwrap();
+        std::fs::write(identity.known_hosts(), b"host-key").unwrap();
+
+        let code = vm_command(
+            VmCommands::Rebuild {
+                name: "rust".into(),
+                yes: true,
+            },
+            config.clone(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(code, 0);
+        assert!(!rootfs.exists());
+        assert!(
+            !identity.dir().exists(),
+            "rebuild must reset the SSH identity"
+        );
+    }
+
+    #[test]
     fn member_views_resolve_exported_guest_paths_and_primary_marker() {
         let (dir, config) = config();
         let store = VmStore::new(&config);
