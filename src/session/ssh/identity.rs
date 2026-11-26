@@ -79,6 +79,7 @@ impl SshIdentity {
                 detail: "ssh-keygen did not leave behind a readable Ed25519 keypair".to_string(),
             });
         }
+        self.adopt_invoking_owner()?;
         Ok(())
     }
 
@@ -104,6 +105,7 @@ impl SshIdentity {
         self.read_public_key()?;
         self.enforce_modes()?;
         self.ensure_known_hosts()?;
+        self.adopt_invoking_owner()?;
         Ok(())
     }
 
@@ -202,6 +204,33 @@ impl SshIdentity {
 
     fn ensure_known_hosts(&self) -> Result<(), SshError> {
         // `O_NOFOLLOW` refuses a planted symlink instead of writing through it.
+        match self.open_known_hosts() {
+            Ok(()) => {}
+            Err(error)
+                if error
+                    .raw_os_error()
+                    .is_some_and(|code| code == libc::EACCES || code == libc::EPERM) =>
+            {
+                // A previous root-run (for example `sudo hegn vm apply`) can
+                // leave a root-owned known_hosts in a user-owned 0700 directory.
+                // The directory owner may unlink it, so recreate the cache as
+                // the current user. Never remove a symlink or a non-file.
+                let metadata = fs::symlink_metadata(&self.known_hosts)
+                    .map_err(|error| io_error(&self.known_hosts, error))?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(io_error(&self.known_hosts, error));
+                }
+                fs::remove_file(&self.known_hosts)
+                    .map_err(|error| io_error(&self.known_hosts, error))?;
+                self.open_known_hosts()
+                    .map_err(|error| io_error(&self.known_hosts, error))?;
+            }
+            Err(error) => return Err(io_error(&self.known_hosts, error)),
+        }
+        set_file_mode(&self.known_hosts, 0o600)
+    }
+
+    fn open_known_hosts(&self) -> std::io::Result<()> {
         OpenOptions::new()
             .read(true)
             .write(true)
@@ -209,8 +238,33 @@ impl SshIdentity {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&self.known_hosts)
-            .map_err(|error| io_error(&self.known_hosts, error))?;
-        set_file_mode(&self.known_hosts, 0o600)
+            .map(|_| ())
+    }
+
+    /// Root is often invoked through sudo for network/doctor tasks. Keep the
+    /// per-VM identity usable by the invoking user instead of leaving
+    /// root-owned files behind.
+    fn adopt_invoking_owner(&self) -> Result<(), SshError> {
+        // Safety: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            return Ok(());
+        }
+        let Some(uid) = std::env::var("SUDO_UID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return Ok(());
+        };
+        let gid = std::env::var("SUDO_GID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok());
+        for path in [&self.dir, &self.key, &self.public_key, &self.known_hosts] {
+            if path.exists() {
+                std::os::unix::fs::chown(path, Some(uid), gid)
+                    .map_err(|error| io_error(path, error))?;
+            }
+        }
+        Ok(())
     }
 
     fn enforce_modes(&self) -> Result<(), SshError> {
@@ -229,6 +283,11 @@ impl SshIdentity {
         match self.read_public_key() {
             Ok(_) => Ok(true),
             Err(SshError::CorruptIdentity { .. }) => Ok(false),
+            Err(SshError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                Ok(false)
+            }
             Err(error) => Err(error),
         }
     }
@@ -514,6 +573,24 @@ mod tests {
         assert_eq!(mode(identity.key()), 0o600);
         assert_eq!(mode(&public), 0o644);
         assert_eq!(mode(identity.known_hosts()), 0o600);
+    }
+
+    #[test]
+    fn ensure_recovers_a_known_hosts_that_cannot_be_opened() {
+        if !keygen_available() {
+            eprintln!("skipping: ssh-keygen is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let identity = identity(dir.path());
+        identity.ensure().unwrap();
+        fs::set_permissions(identity.known_hosts(), fs::Permissions::from_mode(0o000)).unwrap();
+
+        identity.ensure().unwrap();
+
+        assert!(identity.known_hosts().is_file());
+        assert_eq!(mode(identity.known_hosts()), 0o600);
+        assert!(fs::read(identity.known_hosts()).unwrap().is_empty());
     }
 
     #[test]
