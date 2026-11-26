@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::tui::app::{App, ToastLevel};
 use crate::vm::images::DownloadProgress;
 
-use super::text::truncate;
+use super::text::{truncate, wrap_text};
 use super::theme::{ACCENT, GREEN, ON_ACCENT, RED, YELLOW};
 use super::widgets::render_progress_bar;
 
@@ -89,29 +89,31 @@ pub(crate) fn render_toast_notification(frame: &mut Frame, app: &App, area: Rect
         ToastLevel::Warn => YELLOW,
         ToastLevel::Error => RED,
     };
-    let width = (toast.text.width() as u16 + 4)
-        .min(area.width.saturating_sub(4))
-        .max(20);
+    if area.width < 4 || area.height < 3 {
+        return None;
+    }
+    let max_width = area.width.saturating_sub(4).max(20);
+    let width = (toast.text.width() as u16 + 4).min(max_width);
+    let inner_width = width.saturating_sub(2) as usize;
+    let wrapped = wrap_text(&toast.text, inner_width);
+    let height = (wrapped.len() as u16 + 2).min(area.height);
     let rect = Rect {
         x: area.x + area.width.saturating_sub(width + 2),
-        y: area.y + area.height.saturating_sub(3),
+        y: area.y + area.height.saturating_sub(height),
         width,
-        height: 3,
+        height,
     };
+    let style = Style::default()
+        .fg(ON_ACCENT)
+        .bg(color)
+        .add_modifier(Modifier::BOLD);
+    let lines: Vec<Line> = wrapped
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, style)))
+        .collect();
     frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(
-                " {} ",
-                truncate(&toast.text, width.saturating_sub(2) as usize)
-            ),
-            Style::default()
-                .fg(ON_ACCENT)
-                .bg(color)
-                .add_modifier(Modifier::BOLD),
-        )))
-        .alignment(Alignment::Center)
-        .block(
+        Paragraph::new(lines).alignment(Alignment::Center).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(color))
@@ -179,6 +181,24 @@ pub(crate) fn render_download_progress(
 mod tests {
     use super::*;
     use crate::tui::ui::test_support::*;
+
+    #[test]
+    fn long_error_toasts_wrap_instead_of_truncating() {
+        let (_dir, mut app) = app();
+        app.toast(
+            "SSH attach to main failed: VM 'main': host key verification failed for 10.214.0.2. \
+             Delete /home/henrik/.local/share/hegn/vms/main/ssh/known_hosts or run \
+             'hegn vm apply main' and restart the VM. recovery-hint",
+            ToastLevel::Error,
+        );
+        let (text, _) = render(&app);
+        assert!(text.contains("SSH attach to main failed"), "{text}");
+        assert!(text.contains("known_hosts"), "{text}");
+        assert!(
+            text.contains("recovery-hint"),
+            "the end of a long error must stay visible:\n{text}"
+        );
+    }
 
     #[test]
     fn image_download_shows_a_progress_notification() {

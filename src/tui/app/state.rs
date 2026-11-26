@@ -624,6 +624,15 @@ impl App {
         self.toast = Some(Toast::new(text, level));
     }
 
+    /// Open a scrollable error modal so long diagnostics are never clipped.
+    pub fn show_error(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        self.modal = Some(Modal::Error {
+            title: title.into(),
+            message: message.into(),
+            scroll: 0,
+        });
+    }
+
     /// Ask whether to restart `vm` so a new assignment takes effect.
     ///
     /// When another modal is already open the prompt would be lost, so the VM
@@ -689,6 +698,7 @@ impl App {
             self.session_closed_reported = true;
             self.vm.state = VmUiState::Stopped;
             self.vm.started_at = None;
+            self.clear_provision();
             self.toast("session exited", ToastLevel::Info);
         }
         if self

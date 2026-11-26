@@ -457,10 +457,11 @@ pub(super) fn handle_effects(
                         format!("returned from SSH session to {vm}"),
                         ToastLevel::Info,
                     ),
-                    Err(err) => app.toast(
-                        format!("SSH attach to {vm} failed: {err:#}"),
-                        ToastLevel::Error,
-                    ),
+                    Err(err) => {
+                        let message = format!("SSH attach to {vm} failed: {err:#}");
+                        app.toast(message.clone(), ToastLevel::Error);
+                        app.show_error("SSH attach failed", message);
+                    }
                 }
             }
             Effect::DeleteProject {
