@@ -1,11 +1,12 @@
 //! Host-enforced network guard for VMs.
 //!
-//! The guest never gets a bridge or a route into the host LAN. Each guarded
-//! VM receives a dedicated TAP device from a pre-created pool. Host
-//! nftables rules accept only outbound HTTP(S) and DNS to public resolvers;
-//! every other packet, including all RFC1918/link-local traffic and all IPv6,
-//! is dropped before it can be forwarded. Because the rules live on the host,
-//! root inside the guest cannot remove them.
+//! The guest never gets a bridge or a route into the host LAN. Every VM gets a
+//! slot with a pre-created control TAP for host-only SSH traffic and, in guarded
+//! mode, a data TAP for egress. Host nftables rules accept only outbound
+//! HTTP(S) and DNS to public resolvers on the data path; every other packet,
+//! including all RFC1918/link-local traffic and all IPv6, is dropped before it
+//! can be forwarded. Because the rules live on the host, root inside the guest
+//! cannot remove them.
 //!
 //! netfilter evaluates *every* base chain hooked at `forward` and a drop in any
 //! of them wins, so hegn's own table can only ever allow a packet: a host
@@ -16,9 +17,9 @@
 //! the packet.
 //!
 //! TAP creation and nftables need `CAP_NET_ADMIN`. `hegn network setup` is the
-//! explicit, one-time privileged step; `hegn vm start` is fail-closed and
-//! refuses to boot a guarded VM unless the host marker shows that the firewall
-//! is active.
+//! explicit, one-time privileged step for every network mode; `hegn vm start` is
+//! fail-closed and refuses to boot any VM unless the host marker shows that the
+//! setup is active.
 
 use std::net::Ipv4Addr;
 
