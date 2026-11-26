@@ -1,12 +1,15 @@
 //! Host-firewall detection and generation of the nftables guard rules.
 
+use std::collections::BTreeSet;
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::addressing::{guest_ip, host_ip, tap_name};
-use super::{DNS, TAP_POOL};
+use super::addressing::{
+    control_guest_ip, control_host_ip, control_tap_name, guest_ip, host_ip, tap_name,
+};
+use super::{CONTROL_TAP_POOL, DNS, TAP_POOL};
 
 /// Fixed `PATH` for every privileged command. root must never resolve `sh`,
 /// `ip`, `nft`, `sysctl`, `ufw`, `firewall-cmd` or `iptables` through an
@@ -198,13 +201,68 @@ fn min_handle(slot: &mut Option<u64>, handle: u64) {
     *slot = Some(slot.map_or(handle, |current| current.min(handle)));
 }
 
+/// Whether the rule matches `ct state established,related`.
+fn has_established_related(expr: &Value) -> bool {
+    expr.as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item.get("match").is_some_and(|m| {
+                m.get("left")
+                    .and_then(|left| left.get("ct"))
+                    .and_then(|ct| ct.get("key"))
+                    .and_then(|key| key.as_str())
+                    == Some("state")
+                    && m.get("right")
+                        .and_then(|right| right.as_array())
+                        .is_some_and(|states| {
+                            let names: Vec<&str> =
+                                states.iter().filter_map(|state| state.as_str()).collect();
+                            names.contains(&"established") && names.contains(&"related")
+                        })
+            })
+        })
+    })
+}
+
+/// Render one set element. nft prints a single interval member as a `range`
+/// object with identical endpoints, which still means one address.
+fn set_element_text(value: &Value) -> Option<String> {
+    if let Some(range) = value.get("range").and_then(|range| range.as_array())
+        && range.len() == 2
+    {
+        let start = value_text(&range[0])?;
+        let end = value_text(&range[1])?;
+        return Some(if start == end {
+            start
+        } else {
+            format!("{start}-{end}")
+        });
+    }
+    value_text(value)
+}
+
+/// Normalized element set. A `/32` and a bare host address are the same entry,
+/// because nft may print either form for an interval set.
+fn normalized_set_elements(set: &Value) -> BTreeSet<String> {
+    set.get("elem")
+        .and_then(|elem| elem.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(set_element_text)
+                .map(|text| text.trim_end_matches("/32").to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Validate `nft -j list table inet hegn` output against the guard layout.
 ///
 /// The verifier is deliberately structural rather than count-based: nft JSON
 /// ordering is not guaranteed, and a stale table can still have the same number
-/// of rules. It checks every per-interface source drop, the semantic anchors
-/// (IPv6/private drops, egress log-drop, input catch-all, masquerade) and the
-/// relative order of drops and accepts via nft handles.
+/// of rules. It checks every per-interface source drop for both TAP families,
+/// the semantic anchors (IPv6/private drops, egress log-drop, input catch-alls,
+/// masquerade, control sets) and the relative order of drops and accepts via
+/// nft handles.
 fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(raw) else {
         return false;
@@ -216,6 +274,10 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
     let mut has_input_drop = false;
     let mut has_masquerade = false;
     let mut endpoint_elements: Option<Vec<u64>> = None;
+    let mut control_ifaces: Option<BTreeSet<String>> = None;
+    let mut control_hosts: Option<BTreeSet<String>> = None;
+    let mut masquerade_texts: Vec<String> = Vec::new();
+    let mut input_rules: Vec<(u64, Value)> = Vec::new();
     let mut forward_rules: Vec<(u64, Value)> = Vec::new();
     for (position, item) in items.iter().enumerate() {
         if let Some(table) = item.get("table")
@@ -224,15 +286,24 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
         {
             has_table = true;
         }
-        if let Some(set) = item.get("set")
-            && set.get("name").and_then(|v| v.as_str()) == Some("endpoint_ports")
-        {
-            endpoint_elements = Some(
-                set.get("elem")
-                    .and_then(|elem| elem.as_array())
-                    .map(|elem| elem.iter().filter_map(|value| value.as_u64()).collect())
-                    .unwrap_or_default(),
-            );
+        if let Some(set) = item.get("set") {
+            match set.get("name").and_then(|v| v.as_str()) {
+                Some("endpoint_ports") => {
+                    endpoint_elements = Some(
+                        set.get("elem")
+                            .and_then(|elem| elem.as_array())
+                            .map(|elem| elem.iter().filter_map(|value| value.as_u64()).collect())
+                            .unwrap_or_default(),
+                    );
+                }
+                Some("hegn_control_ifaces") => {
+                    control_ifaces = Some(normalized_set_elements(set));
+                }
+                Some("hegn_control_hosts") => {
+                    control_hosts = Some(normalized_set_elements(set));
+                }
+                _ => {}
+            }
         }
         if let Some(rule) = item.get("rule") {
             let chain = rule
@@ -254,9 +325,11 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
                     {
                         has_input_drop = true;
                     }
+                    input_rules.push((handle, expr));
                 }
                 "postrouting" if has_verdict(&expr, "masquerade") => {
                     has_masquerade = true;
+                    masquerade_texts.push(expr.to_string());
                 }
                 _ => {}
             }
@@ -271,6 +344,7 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
     let mut egress_drop: Option<u64> = None;
     let mut inbound_accept: Option<u64> = None;
     let mut inbound_drop: Option<u64> = None;
+    let mut control_forward_drop: Option<u64> = None;
     for (handle, expr) in &forward_rules {
         let drop = has_verdict(expr, "drop");
         let accept = has_verdict(expr, "accept");
@@ -296,6 +370,10 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
                 }
             }
         }
+        if drop && iface.as_deref() == Some("@hegn_control_ifaces") {
+            // Control traffic is host-only and must never be forwarded.
+            min_handle(&mut control_forward_drop, *handle);
+        }
         if drop
             && find_match(expr, "nfproto")
                 .and_then(|(_, right)| right.as_str())
@@ -318,6 +396,64 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
             }
         }
     }
+
+    // The control TAPs are a host-only `/30` link. Each guest may only use its
+    // own source address, may only answer host-initiated flows to the control
+    // host address, and may not reach anything past the host input hook.
+    let expected_control_ifaces: BTreeSet<String> =
+        (0..CONTROL_TAP_POOL).map(control_tap_name).collect();
+    let expected_control_hosts: BTreeSet<String> = (0..CONTROL_TAP_POOL)
+        .map(|index| control_host_ip(index).to_string())
+        .collect();
+    let control_sets_match = control_ifaces.as_ref() == Some(&expected_control_ifaces)
+        && control_hosts.as_ref() == Some(&expected_control_hosts);
+    let mut seen_control_sources = BTreeSet::new();
+    let mut control_source_handles = Vec::new();
+    let mut control_established_accept: Option<u64> = None;
+    let mut control_input_drop: Option<u64> = None;
+    for (handle, expr) in &input_rules {
+        let drop = has_verdict(expr, "drop");
+        let accept = has_verdict(expr, "accept");
+        let iface = match_text(expr, "iifname");
+        if let Some(iface) = &iface {
+            for index in 0..CONTROL_TAP_POOL {
+                if iface != &control_tap_name(index) {
+                    continue;
+                }
+                let source = find_match(expr, "saddr").and_then(|(op, right)| {
+                    (op == "!=")
+                        .then(|| value_text(right))
+                        .flatten()
+                        .map(|right| right.trim_end_matches("/32").to_owned())
+                });
+                if drop && source.as_deref() == Some(control_guest_ip(index).to_string().as_str()) {
+                    control_source_handles.push(*handle);
+                    seen_control_sources.insert(index);
+                }
+            }
+        }
+        if accept
+            && iface.as_deref() == Some("@hegn_control_ifaces")
+            && match_text(expr, "daddr").as_deref() == Some("@hegn_control_hosts")
+            && has_established_related(expr)
+        {
+            min_handle(&mut control_established_accept, *handle);
+        }
+        if drop && iface.as_deref() == Some("@hegn_control_ifaces") {
+            min_handle(&mut control_input_drop, *handle);
+        }
+    }
+    let control_order = match (
+        control_source_handles.iter().copied().max(),
+        control_established_accept,
+        control_input_drop,
+    ) {
+        (Some(source), Some(accept), Some(drop)) => source < accept && accept < drop,
+        _ => false,
+    };
+    let control_masquerade = masquerade_texts
+        .iter()
+        .any(|text| text.contains("10.214.") || text.contains("hegn_control"));
 
     let mut expected: Vec<u64> = endpoints.iter().map(|port| u64::from(*port)).collect();
     expected.sort_unstable();
@@ -353,11 +489,20 @@ fn parse_live_guard(raw: &str, endpoints: &[u16]) -> bool {
         && endpoints_match
         && early_drops_precede_accepts
         && inbound_order
+        && control_sets_match
+        && seen_control_sources.len() == CONTROL_TAP_POOL as usize
+        && control_order
+        && control_forward_drop.is_some()
+        && !control_masquerade
 }
 
 /// nftables rules. Public HTTP(S) and public DNS only; everything else from a
 /// VM TAP is dropped, including RFC1918, link-local, CGNAT, multicast and
 /// all IPv6.
+///
+/// The control TAPs are a separate host-only `/30` family: a control guest may
+/// only answer host-initiated flows to the control host address. Control
+/// traffic is never forwarded and never masqueraded.
 ///
 /// `endpoints` adds a DNAT from the VM's own TAP host address to the host
 /// loopback on the same port, plus an input accept for those translated flows.
@@ -369,6 +514,14 @@ pub fn nft_rules(endpoints: &[u16]) -> String {
         .join(", ");
     let hosts = (0..TAP_POOL)
         .map(|index| host_ip(index).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let control_interfaces = (0..CONTROL_TAP_POOL)
+        .map(|index| format!("\"{}\"", control_tap_name(index)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let control_hosts = (0..CONTROL_TAP_POOL)
+        .map(|index| control_host_ip(index).to_string())
         .collect::<Vec<_>>()
         .join(", ");
     let dns = DNS
@@ -397,6 +550,16 @@ pub fn nft_rules(endpoints: &[u16]) -> String {
          \x20   type ipv4_addr\n\
          \x20   flags interval\n\
          \x20   elements = {{ {hosts} }}\n\
+         \x20 }}\n\
+         \x20 set hegn_control_ifaces {{\n\
+         \x20   type ifname\n\
+         \x20   flags constant\n\
+         \x20   elements = {{ {control_interfaces} }}\n\
+         \x20 }}\n\
+         \x20 set hegn_control_hosts {{\n\
+         \x20   type ipv4_addr\n\
+         \x20   flags interval\n\
+         \x20   elements = {{ {control_hosts} }}\n\
          \x20 }}\n\
          \x20 set private_v4 {{\n\
          \x20   type ipv4_addr\n\
@@ -432,6 +595,22 @@ pub fn nft_rules(endpoints: &[u16]) -> String {
         "\x20 chain input {\n\
          \x20   type filter hook input priority filter; policy accept;\n",
     );
+    // Control TAPs are a host-only `/30` link. Scope every control guest to its
+    // own source address, then only accept replies to connections the host
+    // opened to that guest's control address. Everything else never reaches the
+    // host input stack, and the data rules below are unchanged.
+    for index in 0..CONTROL_TAP_POOL {
+        rules.push_str(&format!(
+            "\x20   iifname \"{}\" ip saddr != {}/32 counter drop\n",
+            control_tap_name(index),
+            control_guest_ip(index)
+        ));
+    }
+    rules.push_str(
+        "\x20   iifname @hegn_control_ifaces ip daddr @hegn_control_hosts \\\n\
+         \x20     ct state established,related counter accept\n\
+         \x20   iifname @hegn_control_ifaces counter drop\n",
+    );
     if has_endpoints {
         rules.push_str(
             "\x20   iifname @hegn_ifaces ct status dnat ip protocol tcp \\\n\
@@ -444,6 +623,9 @@ pub fn nft_rules(endpoints: &[u16]) -> String {
          \x20 chain forward {\n\
          \x20   type filter hook forward priority filter; policy accept;\n",
     );
+    // Control traffic is host-only: it is never forwarded and is never
+    // masqueraded, so a control guest has no egress whatsoever.
+    rules.push_str("\x20   iifname @hegn_control_ifaces counter drop\n");
     // Scope each guest to its own address. A pool-wide source check would let
     // one guest spoof another guest's `/30` address and inherit its slice.
     for index in 0..TAP_POOL {
@@ -948,6 +1130,17 @@ mod tests {
                 }}));
                 handle += 1;
             };
+        // Control traffic is dropped before anything may be forwarded.
+        push(
+            &mut items,
+            "forward",
+            json!([
+                {"match": {"op": "==", "left": {"meta": {"key": "iifname"}},
+                 "right": "@hegn_control_ifaces"}},
+                {"counter": null},
+                {"drop": null}
+            ]),
+        );
         for index in 0..TAP_POOL {
             push(
                 &mut items,
@@ -1053,6 +1246,48 @@ mod tests {
                 {"drop": null}
             ]),
         );
+        // Control input: per-TAP source scope, then established replies to the
+        // control host, then the control catch-all.
+        for index in 0..CONTROL_TAP_POOL {
+            push(
+                &mut items,
+                "input",
+                json!([
+                    {"match": {"op": "==", "left": {"meta": {"key": "iifname"}},
+                     "right": control_tap_name(index)}},
+                    {"match": {"op": "!=",
+                     "left": {"payload": {"protocol": "ip", "field": "saddr"}},
+                     "right": control_guest_ip(index).to_string()}},
+                    {"counter": null},
+                    {"drop": null}
+                ]),
+            );
+        }
+        push(
+            &mut items,
+            "input",
+            json!([
+                {"match": {"op": "==", "left": {"meta": {"key": "iifname"}},
+                 "right": "@hegn_control_ifaces"}},
+                {"match": {"op": "==",
+                 "left": {"payload": {"protocol": "ip", "field": "daddr"}},
+                 "right": "@hegn_control_hosts"}},
+                {"match": {"op": "in", "left": {"ct": {"key": "state"}},
+                 "right": ["established", "related"]}},
+                {"counter": null},
+                {"accept": null}
+            ]),
+        );
+        push(
+            &mut items,
+            "input",
+            json!([
+                {"match": {"op": "==", "left": {"meta": {"key": "iifname"}},
+                 "right": "@hegn_control_ifaces"}},
+                {"counter": null},
+                {"drop": null}
+            ]),
+        );
         push(
             &mut items,
             "input",
@@ -1064,6 +1299,18 @@ mod tests {
             ]),
         );
         push(&mut items, "postrouting", json!([{"masquerade": null}]));
+        items.push(json!({"set": {
+            "family": "inet", "table": "hegn", "name": "hegn_control_ifaces",
+            "type": "ifname", "flags": ["constant"],
+            "elem": (0..CONTROL_TAP_POOL).map(control_tap_name).collect::<Vec<_>>()
+        }}));
+        items.push(json!({"set": {
+            "family": "inet", "table": "hegn", "name": "hegn_control_hosts",
+            "type": "ipv4_addr", "flags": ["interval"],
+            "elem": (0..CONTROL_TAP_POOL)
+                .map(|index| control_host_ip(index).to_string())
+                .collect::<Vec<_>>()
+        }}));
         if !endpoints.is_empty() {
             let mut ports = endpoints.to_vec();
             ports.sort_unstable();
@@ -1132,6 +1379,109 @@ mod tests {
     }
 
     #[test]
+    fn control_sets_cover_every_tap_and_host_address() {
+        let rules = nft_rules(&[]);
+        assert!(rules.contains("set hegn_control_ifaces {"), "{rules}");
+        assert!(rules.contains("set hegn_control_hosts {"), "{rules}");
+        for index in 0..CONTROL_TAP_POOL {
+            assert!(
+                rules.contains(&format!("\"{}\"", control_tap_name(index))),
+                "missing {}:\n{rules}",
+                control_tap_name(index)
+            );
+        }
+        let hosts = (0..CONTROL_TAP_POOL)
+            .map(|index| control_host_ip(index).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            rules.contains(&hosts),
+            "control host set is incomplete:\n{rules}"
+        );
+        // The guest set would be redundant: the source is matched per TAP.
+        assert!(!rules.contains("hegn_control_guests"), "{rules}");
+    }
+
+    #[test]
+    fn control_input_scopes_each_guest_and_allows_only_established_host_replies() {
+        let rules = nft_rules(&[]);
+        for index in 0..CONTROL_TAP_POOL {
+            let expected = format!(
+                "iifname \"{}\" ip saddr != {}/32 counter drop",
+                control_tap_name(index),
+                control_guest_ip(index)
+            );
+            assert!(rules.contains(&expected), "missing {expected}:\n{rules}");
+        }
+        let flat = one_line(&rules);
+        assert!(
+            flat.contains(
+                "iifname @hegn_control_ifaces ip daddr @hegn_control_hosts ct state \
+                 established,related counter accept"
+            ),
+            "{rules}"
+        );
+        assert!(
+            flat.contains("iifname @hegn_control_ifaces counter drop"),
+            "{rules}"
+        );
+    }
+
+    #[test]
+    fn control_input_rules_precede_every_data_input_rule() {
+        let rules = nft_rules(&[11434]);
+        let input =
+            &rules[rules.find("chain input").unwrap()..rules.find("chain forward").unwrap()];
+        let source = input
+            .find("iifname \"hegnc0\" ip saddr != 10.214.0.2/32 counter drop")
+            .unwrap();
+        let accept = input
+            .find("iifname @hegn_control_ifaces ip daddr @hegn_control_hosts")
+            .unwrap();
+        let drop = input
+            .find("iifname @hegn_control_ifaces counter drop")
+            .unwrap();
+        let endpoint = input.find("ct status dnat").unwrap();
+        let data_drop = input.find("iifname @hegn_ifaces counter drop").unwrap();
+        assert!(
+            source < accept && accept < drop && drop < endpoint && drop < data_drop,
+            "control rules must come first:\n{input}"
+        );
+    }
+
+    #[test]
+    fn control_forward_drop_precedes_the_data_accepts() {
+        let rules = nft_rules(&[]);
+        let forward =
+            &rules[rules.find("chain forward").unwrap()..rules.find("chain postrouting").unwrap()];
+        let control = forward
+            .find("iifname @hegn_control_ifaces counter drop")
+            .unwrap();
+        let established = forward
+            .find("iifname @hegn_ifaces ct state established,related accept")
+            .unwrap();
+        assert!(
+            control < established,
+            "control traffic must be dropped before any data accept:\n{forward}"
+        );
+    }
+
+    #[test]
+    fn control_traffic_is_never_masqueraded() {
+        let rules = nft_rules(&[]);
+        assert!(
+            rules.contains("ip saddr 10.213.0.0/24 masquerade"),
+            "{rules}"
+        );
+        assert!(!rules.contains("10.214.0.0/24 masquerade"), "{rules}");
+        assert!(
+            !rules.contains("ip saddr 10.214."),
+            "the control subnet must never be NATed:\n{rules}"
+        );
+        assert_eq!(rules.matches("masquerade").count(), 1, "{rules}");
+    }
+
+    #[test]
     fn live_guard_requires_every_per_interface_source_drop() {
         let mut missing = live_fixture(&[]);
         let items = missing["nftables"].as_array_mut().unwrap();
@@ -1170,6 +1520,150 @@ mod tests {
         let mut reordered = live_fixture(&[11434]);
         reordered["nftables"].as_array_mut().unwrap().reverse();
         assert!(parse_live_guard(&reordered.to_string(), &[11434]));
+    }
+
+    /// Remove a named set from a fixture, as a flushed or stale table would.
+    fn remove_set(fixture: &mut serde_json::Value, name: &str) {
+        fixture["nftables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|item| !item.get("set").is_some_and(|set| set["name"] == name));
+    }
+
+    #[test]
+    fn live_guard_requires_the_complete_control_sets() {
+        let mut missing_ifaces = live_fixture(&[]);
+        remove_set(&mut missing_ifaces, "hegn_control_ifaces");
+        assert!(
+            !parse_live_guard(&missing_ifaces.to_string(), &[]),
+            "a missing control interface set must be rejected"
+        );
+
+        let mut missing_hosts = live_fixture(&[]);
+        remove_set(&mut missing_hosts, "hegn_control_hosts");
+        assert!(
+            !parse_live_guard(&missing_hosts.to_string(), &[]),
+            "a missing control host set must be rejected"
+        );
+
+        let mut incomplete = live_fixture(&[]);
+        let set = incomplete["nftables"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|item| {
+                item.get("set")
+                    .is_some_and(|set| set["name"] == "hegn_control_hosts")
+            })
+            .expect("fixture must contain the control host set");
+        set["set"]["elem"].as_array_mut().unwrap().pop();
+        assert!(
+            !parse_live_guard(&incomplete.to_string(), &[]),
+            "an incomplete control host set must be rejected"
+        );
+    }
+
+    #[test]
+    fn live_guard_requires_every_control_source_drop() {
+        let mut missing = live_fixture(&[]);
+        let items = missing["nftables"].as_array_mut().unwrap();
+        let position = items
+            .iter()
+            .position(|item| {
+                item.get("rule").is_some_and(|rule| {
+                    rule["chain"] == "input"
+                        && rule["expr"]
+                            .to_string()
+                            .contains(&format!("\"{}\"", control_tap_name(7)))
+                })
+            })
+            .expect("fixture must contain the hegnc7 source drop");
+        items.remove(position);
+        assert!(
+            !parse_live_guard(&missing.to_string(), &[]),
+            "a missing control source drop must be rejected"
+        );
+    }
+
+    #[test]
+    fn live_guard_requires_the_control_accept_before_the_control_drop() {
+        let mut wrong_order = live_fixture(&[]);
+        for item in wrong_order["nftables"].as_array_mut().unwrap() {
+            let Some(rule) = item.get_mut("rule") else {
+                continue;
+            };
+            let text = rule["expr"].to_string();
+            if rule["chain"] == "input"
+                && text.contains("@hegn_control_ifaces")
+                && text.contains("drop")
+            {
+                // Move the catch-all drop in front of the established accept.
+                rule["handle"] = json!(0);
+            }
+        }
+        assert!(
+            !parse_live_guard(&wrong_order.to_string(), &[]),
+            "control accept must precede the control drop"
+        );
+    }
+
+    #[test]
+    fn live_guard_requires_the_control_forward_drop() {
+        let mut missing = live_fixture(&[]);
+        let items = missing["nftables"].as_array_mut().unwrap();
+        let position = items
+            .iter()
+            .position(|item| {
+                item.get("rule").is_some_and(|rule| {
+                    rule["chain"] == "forward"
+                        && rule["expr"].to_string().contains("@hegn_control_ifaces")
+                })
+            })
+            .expect("fixture must contain the control forward drop");
+        items.remove(position);
+        assert!(
+            !parse_live_guard(&missing.to_string(), &[]),
+            "a missing control forward drop must be rejected"
+        );
+    }
+
+    #[test]
+    fn live_guard_rejects_a_control_masquerade() {
+        let mut fixture = live_fixture(&[]);
+        fixture["nftables"].as_array_mut().unwrap().push(json!({
+            "rule": {
+                "family": "inet", "table": "hegn", "chain": "postrouting", "handle": 9000,
+                "expr": [
+                    {"match": {"op": "==",
+                     "left": {"payload": {"protocol": "ip", "field": "saddr"}},
+                     "right": {"prefix": {"addr": "10.214.0.0", "len": 24}}}},
+                    {"masquerade": null}
+                ]
+            }
+        }));
+        assert!(
+            !parse_live_guard(&fixture.to_string(), &[]),
+            "the control subnet must never be masqueraded"
+        );
+
+        // A set reference hides the subnet literal, so the verifier must also
+        // reject any masquerade that names a control set.
+        let mut via_set = live_fixture(&[]);
+        via_set["nftables"].as_array_mut().unwrap().push(json!({
+            "rule": {
+                "family": "inet", "table": "hegn", "chain": "postrouting", "handle": 9001,
+                "expr": [
+                    {"match": {"op": "==",
+                     "left": {"payload": {"protocol": "ip", "field": "saddr"}},
+                     "right": "@hegn_control_hosts"}},
+                    {"masquerade": null}
+                ]
+            }
+        }));
+        assert!(
+            !parse_live_guard(&via_set.to_string(), &[]),
+            "a control-set masquerade must be rejected"
+        );
     }
 
     #[test]
