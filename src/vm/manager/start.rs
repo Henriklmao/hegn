@@ -61,7 +61,19 @@ impl VmManager {
     /// Lifecycle errors are appended to `run/hegn.log` so a failed start can
     /// be diagnosed even when the guest never reached userspace.
     pub fn start(&self) -> Result<VmReport> {
-        let result = self.start_inner();
+        self.start_with_auto_resume(true)
+    }
+
+    /// Boot without considering an automatic checkpoint.
+    ///
+    /// `vm apply` uses this so a seed change takes effect through cloud-init
+    /// instead of restoring an older guest memory image.
+    pub(crate) fn start_cold(&self) -> Result<VmReport> {
+        self.start_with_auto_resume(false)
+    }
+
+    fn start_with_auto_resume(&self, auto_resume: bool) -> Result<VmReport> {
+        let result = self.start_inner(auto_resume);
         let paths = self.paths();
         // `start_inner` may fail before it creates the run directory.
         let _ = paths.ensure();
@@ -85,7 +97,7 @@ impl VmManager {
         result.map_err(|err| anyhow::anyhow!("{err:#} (VM log: {})", paths.event_log.display()))
     }
 
-    fn start_inner(&self) -> Result<VmReport> {
+    fn start_inner(&self, auto_resume: bool) -> Result<VmReport> {
         let paths = self.paths();
         // A missing VM is always a hard error: there is no host-process fallback.
         self.config.require_vm_assets()?;
@@ -190,7 +202,7 @@ impl VmManager {
         // restart into a resume instead of a full cold boot. A checkpoint whose
         // device tree no longer matches is skipped with a logged reason, never
         // deleted, and the VM cold boots.
-        if let Some(candidates) = auto_resume_candidates(&self.config, &self.vm) {
+        if auto_resume && let Some(candidates) = auto_resume_candidates(&self.config, &self.vm) {
             match candidates {
                 Ok(candidates) if !candidates.is_empty() => {
                     let current = super::snapshot::current_boot(
@@ -348,7 +360,8 @@ impl VmManager {
                 ssh_user,
                 ssh_public_key: &ssh_public_key,
             };
-            let instance_id = cloud_init::instance_id(
+            let seed_generation = super::seed_generation::read(&self.config, &self.vm)?;
+            let instance_id = cloud_init::instance_id_with_generation(
                 &mounts,
                 primary_guest,
                 &provision,
@@ -357,6 +370,7 @@ impl VmManager {
                 &self.config.local_endpoints,
                 self.config.guest_credential_hardening,
                 &identity,
+                seed_generation,
             );
             cloud_init::write_seed(
                 &paths.cloud_init,

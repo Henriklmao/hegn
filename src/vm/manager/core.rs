@@ -242,6 +242,12 @@ impl VmManager {
     /// `known_hosts` entry is dropped first. The client keypair is kept: the
     /// guest is re-provisioned with the existing public key on the next start.
     pub fn apply(&self) -> Result<super::session::VmReport> {
+        super::seed_generation::bump(&self.config, &self.vm).with_context(|| {
+            format!(
+                "failed to advance the cloud-init seed generation for VM '{}'",
+                self.vm.name
+            )
+        })?;
         crate::session::ssh::SshIdentity::new(&self.config.vms_dir, &self.vm.name)
             .remove_known_hosts()
             .with_context(|| {
@@ -253,7 +259,7 @@ impl VmManager {
         if self.is_running() {
             self.stop()?;
         }
-        self.start()
+        self.start_cold()
     }
 
     /// Attach the TUI/CLI terminal to the running guest serial console.
@@ -481,6 +487,11 @@ mod tests {
             std::fs::read(identity.key()).unwrap(),
             b"client-key",
             "the client key must survive apply"
+        );
+        assert_eq!(
+            crate::vm::manager::seed_generation::read(manager.config(), manager.vm()).unwrap(),
+            1,
+            "apply must advance the generation so cloud-init rotates host keys"
         );
     }
 

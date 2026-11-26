@@ -893,7 +893,8 @@ pub(super) async fn restore_snapshot_locked(
             ssh_user,
             ssh_public_key: &ssh_public_key,
         };
-        let instance_id = cloud_init::instance_id(
+        let seed_generation = super::seed_generation::read(config, vm)?;
+        let instance_id = cloud_init::instance_id_with_generation(
             &mounts,
             primary_guest,
             &provision,
@@ -902,6 +903,7 @@ pub(super) async fn restore_snapshot_locked(
             &config.local_endpoints,
             config.guest_credential_hardening,
             &identity,
+            seed_generation,
         );
         cloud_init::write_seed(
             &paths.cloud_init,

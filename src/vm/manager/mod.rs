@@ -46,6 +46,7 @@ mod membership;
 mod paths;
 mod plan;
 mod process;
+mod seed_generation;
 mod session;
 mod snapshot;
 mod start;

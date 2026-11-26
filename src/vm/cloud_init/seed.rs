@@ -255,11 +255,41 @@ pub fn instance_id(
     credential_hardening: bool,
     identity: &SeedIdentity<'_>,
 ) -> String {
+    instance_id_with_generation(
+        mounts,
+        primary_guest,
+        provision,
+        profile,
+        network,
+        endpoints,
+        credential_hardening,
+        identity,
+        0,
+    )
+}
+
+/// Like [`instance_id`], but binds the seed to a per-VM generation.
+///
+/// `hegn vm apply` increments the generation so cloud-init re-runs even when
+/// every other input is unchanged; that is what rotates the guest host keys.
+#[allow(clippy::too_many_arguments)]
+pub fn instance_id_with_generation(
+    mounts: &[MountSpec],
+    primary_guest: &str,
+    provision: &ProvisionPlan,
+    profile: Option<&ProfileShare>,
+    network: Option<&NetworkLease>,
+    endpoints: &[LocalEndpoint],
+    credential_hardening: bool,
+    identity: &SeedIdentity<'_>,
+    seed_generation: u64,
+) -> String {
     use sha2::{Digest, Sha256};
 
     debug_assert!(validate_identity(identity).is_ok());
     let mut hasher = Sha256::new();
     hasher.update(SEED_VERSION.to_le_bytes());
+    hasher.update(seed_generation.to_le_bytes());
     hasher.update([credential_hardening as u8]);
     hasher.update(identity.vm.as_bytes());
     hasher.update(identity.project.as_bytes());
@@ -1006,6 +1036,61 @@ mod tests {
             );
             assert!(!path.exists(), "no seed may be written for {bad:?}");
         }
+    }
+
+    #[test]
+    fn instance_id_tracks_the_seed_generation() {
+        let plan = ProvisionPlan::new(Harness::Opencode, &[]).unwrap();
+        let mounts = mounts();
+        let base = instance_id_with_generation(
+            &mounts,
+            "/projects/parser",
+            &plan,
+            None,
+            None,
+            &[],
+            false,
+            &identity(),
+            0,
+        );
+        let first = instance_id_with_generation(
+            &mounts,
+            "/projects/parser",
+            &plan,
+            None,
+            None,
+            &[],
+            false,
+            &identity(),
+            1,
+        );
+        let second = instance_id_with_generation(
+            &mounts,
+            "/projects/parser",
+            &plan,
+            None,
+            None,
+            &[],
+            false,
+            &identity(),
+            2,
+        );
+        assert_ne!(base, first);
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            instance_id_with_generation(
+                &mounts,
+                "/projects/parser",
+                &plan,
+                None,
+                None,
+                &[],
+                false,
+                &identity(),
+                1,
+            )
+        );
     }
 
     #[test]
