@@ -25,6 +25,16 @@ pub(super) enum ScanMessage {
         note: String,
         level: ToastLevel,
     },
+    /// A project was assigned to `vm`; its change needs `hegn vm apply`.
+    ProjectAssigned {
+        vm: String,
+        note: String,
+    },
+    /// `hegn vm apply` finished and `vm` is running the current config.
+    VmApplied {
+        vm: String,
+        note: String,
+    },
     Doctor {
         report: DoctorReport,
         note: Option<String>,
@@ -97,6 +107,14 @@ mod tests {
                 note: "VMs refreshed".into(),
                 level: ToastLevel::Warn,
             },
+            ScanMessage::ProjectAssigned {
+                vm: "rust".into(),
+                note: "assigned demo to VM rust".into(),
+            },
+            ScanMessage::VmApplied {
+                vm: "rust".into(),
+                note: "VM rust restarted with the current config".into(),
+            },
             ScanMessage::Error("unreadable state".into()),
             ScanMessage::Doctor {
                 report: DoctorReport {
@@ -117,7 +135,7 @@ mod tests {
             ScanMessage::ProvisionFailed("no network".into()),
             ScanMessage::Error("scan failed".into()),
         ];
-        assert_eq!(messages.len(), 11);
+        assert_eq!(messages.len(), 13);
 
         if let ScanMessage::Started {
             console,
@@ -140,13 +158,15 @@ mod tests {
             matches!(&messages[1], ScanMessage::Started { .. }),
             matches!(&messages[2], ScanMessage::StartFailed(_)),
             matches!(&messages[3], ScanMessage::VmsChanged { .. }),
-            matches!(&messages[4], ScanMessage::Error(_)),
-            matches!(&messages[5], ScanMessage::Doctor { .. }),
-            matches!(&messages[6], ScanMessage::DownloadProgress(_)),
-            matches!(&messages[7], ScanMessage::Provision(_)),
-            matches!(&messages[8], ScanMessage::ProvisionReady),
-            matches!(&messages[9], ScanMessage::ProvisionFailed(_)),
-            matches!(&messages[10], ScanMessage::Error(_)),
+            matches!(&messages[4], ScanMessage::ProjectAssigned { .. }),
+            matches!(&messages[5], ScanMessage::VmApplied { .. }),
+            matches!(&messages[6], ScanMessage::Error(_)),
+            matches!(&messages[7], ScanMessage::Doctor { .. }),
+            matches!(&messages[8], ScanMessage::DownloadProgress(_)),
+            matches!(&messages[9], ScanMessage::Provision(_)),
+            matches!(&messages[10], ScanMessage::ProvisionReady),
+            matches!(&messages[11], ScanMessage::ProvisionFailed(_)),
+            matches!(&messages[12], ScanMessage::Error(_)),
         ];
         assert!(variants.iter().all(|matched| *matched));
     }

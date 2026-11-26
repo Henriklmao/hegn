@@ -233,10 +233,14 @@ fn spawn_lifecycle(
                         Lifecycle::Stop => format!("VM {vm} stopped"),
                         Lifecycle::Apply => format!("VM {vm} restarted with the current config"),
                     };
-                    let _ = thread_tx.send(ScanMessage::VmsChanged {
-                        note,
-                        level: ToastLevel::Info,
-                    });
+                    let message = match operation {
+                        Lifecycle::Stop => ScanMessage::VmsChanged {
+                            note,
+                            level: ToastLevel::Info,
+                        },
+                        Lifecycle::Apply => ScanMessage::VmApplied { vm, note },
+                    };
+                    let _ = thread_tx.send(message);
                 }
                 Err(err) => {
                     let _ = thread_tx.send(ScanMessage::VmsChanged {
@@ -336,11 +340,20 @@ pub(super) fn spawn_assign_project(
                 assign_project(&config, &selector, &vm, read_only)?;
                 Ok(())
             })();
-            let (note, level) = match result {
-                Ok(()) => (format!("assigned {project} to VM {vm}"), ToastLevel::Info),
-                Err(err) => (format!("assign failed: {err:#}"), ToastLevel::Error),
-            };
-            let _ = thread_tx.send(ScanMessage::VmsChanged { note, level });
+            match result {
+                Ok(()) => {
+                    let _ = thread_tx.send(ScanMessage::ProjectAssigned {
+                        note: format!("assigned {project} to VM {vm}"),
+                        vm,
+                    });
+                }
+                Err(err) => {
+                    let _ = thread_tx.send(ScanMessage::VmsChanged {
+                        note: format!("assign failed: {err:#}"),
+                        level: ToastLevel::Error,
+                    });
+                }
+            }
         });
     if let Err(err) = spawned {
         let _ = tx.send(ScanMessage::VmsChanged {
@@ -713,12 +726,13 @@ mod tests {
             false,
             tx,
         );
-        let ScanMessage::VmsChanged { level, note } =
+        let ScanMessage::ProjectAssigned { vm, note } =
             rx.recv_timeout(Duration::from_secs(2)).unwrap()
         else {
-            panic!("expected VmsChanged");
+            panic!("expected ProjectAssigned");
         };
-        assert_eq!(level, ToastLevel::Info, "{note}");
+        assert_eq!(vm, "rust");
+        assert!(note.contains("demo"), "{note}");
         assert_eq!(
             ProjectRegistry::load(&config.state_dir)
                 .unwrap()

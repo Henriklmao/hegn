@@ -40,6 +40,13 @@ impl App {
         let confirmed = matches!(key.code, KeyCode::Char('y'));
         let cancelled = matches!(key.code, KeyCode::Char('n') | KeyCode::Esc);
         if cancelled {
+            if let ConfirmAction::ApplyVm(vm) = prompt.action {
+                self.pending_apply.insert(vm.clone());
+                self.toast(
+                    format!("VM {vm} needs apply; run hegn vm apply {vm}"),
+                    ToastLevel::Warn,
+                );
+            }
             return Vec::new();
         }
         if !confirmed {
@@ -59,6 +66,10 @@ impl App {
             }
             ConfirmAction::RestoreSnapshot(snapshot) => vec![Effect::RestoreSnapshot(*snapshot)],
             ConfirmAction::SetupEnvironment => vec![Effect::SetupEnvironment],
+            ConfirmAction::ApplyVm(vm) => {
+                self.pending_apply.insert(vm.clone());
+                vec![Effect::ApplyVm { vm }]
+            }
         }
     }
 
@@ -154,6 +165,52 @@ mod tests {
             Some(Modal::Help(help)) => help.scroll,
             other => panic!("expected the help modal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn apply_prompt_confirms_with_y_and_marks_the_vm_pending() {
+        let (_dir, mut app) = test_app();
+        app.prompt_apply("rust");
+        assert!(matches!(app.modal, Some(Modal::Confirm(_))));
+        assert!(!app.apply_pending("rust"));
+
+        let effects = app.handle_key(key(KeyCode::Char('y')));
+        assert!(
+            matches!(effects.as_slice(), [Effect::ApplyVm { vm }] if vm == "rust"),
+            "{effects:?}"
+        );
+        assert!(app.modal.is_none());
+        assert!(app.apply_pending("rust"));
+    }
+
+    #[test]
+    fn cancelling_the_apply_prompt_keeps_the_vm_pending() {
+        let (_dir, mut app) = test_app();
+        app.prompt_apply("rust");
+        let effects = app.handle_key(key(KeyCode::Char('n')));
+        assert!(effects.is_empty());
+        assert!(app.modal.is_none());
+        assert!(app.apply_pending("rust"));
+        let toast = app.toast.as_ref().expect("expected a toast");
+        assert_eq!(toast.level, ToastLevel::Warn);
+        assert!(toast.text.contains("hegn vm apply rust"), "{}", toast.text);
+
+        app.toast = None;
+        app.prompt_apply("rust");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.apply_pending("rust"));
+        assert!(app.toast.is_some(), "Esc cancels like n");
+    }
+
+    #[test]
+    fn apply_prompt_yields_to_an_open_modal() {
+        let (_dir, mut app) = test_app();
+        app.modal = Some(Modal::Help(HelpState::default()));
+        app.prompt_apply("rust");
+        assert!(matches!(app.modal, Some(Modal::Help(_))));
+        assert!(app.apply_pending("rust"));
+        let toast = app.toast.as_ref().expect("expected a toast");
+        assert!(toast.text.contains("hegn vm apply rust"), "{}", toast.text);
     }
 
     #[test]

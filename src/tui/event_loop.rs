@@ -129,6 +129,16 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 app.refresh_vms();
                 app.toast(note, level);
             }
+            Ok(ScanMessage::ProjectAssigned { vm, note }) => {
+                app.refresh_vms();
+                app.toast(note, ToastLevel::Info);
+                app.prompt_apply(&vm);
+            }
+            Ok(ScanMessage::VmApplied { vm, note }) => {
+                app.pending_apply.remove(&vm);
+                app.refresh_vms();
+                app.toast(note, ToastLevel::Info);
+            }
             Ok(ScanMessage::Error(err)) => {
                 if app.loading {
                     app.loading = false;
@@ -165,7 +175,7 @@ mod tests {
     use crate::config::Harness;
     use crate::project::{GitSummary, Project};
     use crate::session::console::TerminalConsole;
-    use crate::tui::app::{Modal, Screen, ToastLevel, VmUiState};
+    use crate::tui::app::{ConfirmAction, Modal, Screen, ToastLevel, VmUiState};
     use crate::vm::images::DownloadProgress;
     use std::path::{Path, PathBuf};
 
@@ -331,6 +341,53 @@ mod tests {
         assert_eq!(
             toast(&app),
             ("session branch hegn/session-1", ToastLevel::Info)
+        );
+    }
+
+    #[test]
+    fn drain_scan_prompts_to_apply_after_an_assignment() {
+        let (_dir, mut app) = test_app();
+        let (tx, rx) = mpsc::channel();
+
+        tx.send(ScanMessage::ProjectAssigned {
+            vm: "rust".into(),
+            note: "assigned demo to VM rust".into(),
+        })
+        .unwrap();
+        drain_scan(&mut app, &rx);
+
+        let Some(Modal::Confirm(prompt)) = &app.modal else {
+            panic!("expected the apply prompt, got {:?}", app.modal);
+        };
+        assert_eq!(prompt.title, "Restart VM?");
+        assert!(
+            matches!(&prompt.action, ConfirmAction::ApplyVm(vm) if vm == "rust"),
+            "{:?}",
+            prompt.action
+        );
+        assert_eq!(toast(&app), ("assigned demo to VM rust", ToastLevel::Info));
+    }
+
+    #[test]
+    fn drain_scan_clears_pending_apply_when_the_vm_is_applied() {
+        let (_dir, mut app) = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.pending_apply.insert("rust".into());
+
+        tx.send(ScanMessage::VmApplied {
+            vm: "rust".into(),
+            note: "VM rust restarted with the current config".into(),
+        })
+        .unwrap();
+        drain_scan(&mut app, &rx);
+
+        assert!(!app.apply_pending("rust"));
+        assert_eq!(
+            toast(&app),
+            (
+                "VM rust restarted with the current config",
+                ToastLevel::Info
+            )
         );
     }
 

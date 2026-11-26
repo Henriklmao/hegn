@@ -4,6 +4,7 @@
 //! [`crate::tui::app`] and the pure renderer in [`crate::tui::ui`]. They carry
 //! no behaviour beyond small pure helpers on the forms and health line.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -627,6 +628,8 @@ pub enum ConfirmAction {
     DeleteSnapshot(String),
     RestoreSnapshot(Box<SnapshotMeta>),
     SetupEnvironment,
+    /// Restart a VM so a changed config or membership takes effect.
+    ApplyVm(String),
 }
 
 #[derive(Debug, Clone)]
@@ -1018,6 +1021,10 @@ pub struct App {
     pub terminal_mode: TerminalMode,
     pub scroll: usize,
     pub toast: Option<Toast>,
+    /// VMs whose pending config/membership change has not been applied yet.
+    ///
+    /// This is a TUI-session hint only and is never persisted.
+    pub pending_apply: BTreeSet<String>,
     /// In-flight VM image download, rendered as a progress notification.
     pub download: Option<crate::vm::images::DownloadProgress>,
     /// First-boot harness provisioning, rendered above the download/toast.
