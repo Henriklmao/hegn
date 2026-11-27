@@ -38,6 +38,7 @@ pub use firewall::{HostFirewall, detect_host_firewall, live_guard_status, nft_ru
 pub(crate) use firewall::{SAFE_PATH, safe_command_path};
 pub use marker::{ReadyMarker, guard_ready, marker_path, ready_marker};
 pub use pool::{Lease, NetworkLease, TapLease, TapStatus, acquire, release, status, vm_is_running};
+pub(crate) use privilege::privilege_helpers;
 pub use privilege::{
     ensure_ready, invoking_user, is_privileged, reload, safe_user, setup, setup_with_privilege,
     teardown,

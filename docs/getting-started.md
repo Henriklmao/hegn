@@ -28,7 +28,7 @@ This single command does the setup work:
 - configures the control network for SSH and the guarded data network.
 
 When it needs root rights for the firewall or the network devices, it asks for
-`sudo` or `pkexec` and prints the exact command first.
+`pkexec` first (when installed) or `sudo`, and prints the exact command first.
 
 ---
 

@@ -25,7 +25,28 @@ pub fn invoking_user() -> Option<String> {
         .find(|user| safe_user(user))
 }
 
-/// Apply the guard, re-executing hegn through sudo/pkexec when the current
+/// Privileged helpers to try, most preferred first.
+///
+/// `pkexec` wins when it is installed: it authorizes through polkit and needs
+/// no sudoers entry. Both helpers are optional runtime dependencies, so a
+/// missing one is skipped and a direct root run never reaches this list. The
+/// `bool` marks helpers that take a leading `--` before the command.
+pub(crate) fn privilege_helpers() -> Vec<(&'static str, bool)> {
+    helpers_from(command_exists("pkexec"), command_exists("sudo"))
+}
+
+fn helpers_from(pkexec: bool, sudo: bool) -> Vec<(&'static str, bool)> {
+    let mut helpers = Vec::new();
+    if pkexec {
+        helpers.push(("pkexec", false));
+    }
+    if sudo {
+        helpers.push(("sudo", true));
+    }
+    helpers
+}
+
+/// Apply the guard, re-executing hegn through pkexec/sudo when the current
 /// process is not root. The caller is responsible for restoring any TUI
 /// terminal first so the privilege helper can prompt.
 pub fn setup_with_privilege(user: &str, endpoints: &[u16]) -> Result<()> {
@@ -36,46 +57,51 @@ pub fn setup_with_privilege(user: &str, endpoints: &[u16]) -> Result<()> {
         return setup(user, endpoints);
     }
     let exe = std::env::current_exe().context("failed to locate the hegn executable")?;
-    let (helper, prefix) = if command_exists("sudo") {
-        ("sudo", true)
-    } else if command_exists("pkexec") {
-        ("pkexec", false)
-    } else {
+    let helpers = privilege_helpers();
+    if helpers.is_empty() {
         bail!(
-            "guarded networking needs root, but neither sudo nor pkexec is installed; run `sudo \
+            "guarded networking needs root, but neither pkexec nor sudo is installed; run `sudo \
              hegn network setup --user {user}` manually"
         );
-    };
-    // Resolve the helper itself through the fixed path; the caller's PATH must
-    // not be able to substitute a different `sudo`/`pkexec`.
-    let helper_path = super::firewall::safe_command_path(helper)
-        .with_context(|| format!("failed to locate {helper} in the fixed root path {SAFE_PATH}"))?;
-    let mut args: Vec<OsString> = Vec::new();
-    if prefix {
-        args.push("--".into());
     }
-    args.push(exe.into_os_string());
-    args.push("network".into());
-    args.push("setup".into());
-    args.push("--user".into());
-    args.push(user.into());
-    // The password prompt happens inside sudo/pkexec. Echo the exact command
-    // first so the user can inspect what will run as root before typing it.
-    eprintln!(
-        "hegn: requesting root privileges; about to run:\n  {}",
-        render_command(helper, &args)
-    );
-    let status = Command::new(&helper_path)
-        .args(&args)
-        // The escalated process inherits this PATH; pin it rather than passing
-        // the caller's environment into a root command.
-        .env("PATH", SAFE_PATH)
-        .status()
-        .with_context(|| format!("failed to run {helper}"))?;
-    if !status.success() {
-        bail!("{helper} exited with {status}");
+    let mut failures = Vec::new();
+    for (helper, prefix) in helpers {
+        // Resolve the helper itself through the fixed path; the caller's PATH
+        // must not be able to substitute a different `pkexec`/`sudo`.
+        let helper_path = super::firewall::safe_command_path(helper).with_context(|| {
+            format!("failed to locate {helper} in the fixed root path {SAFE_PATH}")
+        })?;
+        let mut args: Vec<OsString> = Vec::new();
+        if prefix {
+            args.push("--".into());
+        }
+        args.push(exe.clone().into_os_string());
+        args.push("network".into());
+        args.push("setup".into());
+        args.push("--user".into());
+        args.push(user.into());
+        // The prompt happens inside the helper. Echo the exact command first
+        // so the user can inspect what will run as root before approving it.
+        eprintln!(
+            "hegn: requesting root privileges; about to run:\n  {}",
+            render_command(helper, &args)
+        );
+        match Command::new(&helper_path)
+            .args(&args)
+            // The escalated process inherits this PATH; pin it rather than
+            // passing the caller's environment into a root command.
+            .env("PATH", SAFE_PATH)
+            .status()
+        {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => failures.push(format!("{helper} exited with {status}")),
+            Err(err) => failures.push(format!("failed to run {helper}: {err}")),
+        }
     }
-    Ok(())
+    bail!(
+        "{}; run `sudo hegn network setup --user {user}` manually",
+        failures.join("; ")
+    )
 }
 
 /// Fail closed when the configured networking has not been applied.
@@ -282,6 +308,17 @@ pub fn teardown() -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::NetworkMode;
+
+    #[test]
+    fn pkexec_is_preferred_over_sudo() {
+        assert_eq!(
+            helpers_from(true, true),
+            vec![("pkexec", false), ("sudo", true)]
+        );
+        assert_eq!(helpers_from(true, false), vec![("pkexec", false)]);
+        assert_eq!(helpers_from(false, true), vec![("sudo", true)]);
+        assert!(helpers_from(false, false).is_empty());
+    }
 
     #[test]
     fn safe_user_accepts_normal_unix_account_names() {

@@ -564,10 +564,10 @@ cleared when the worker reports the finished doctor run. `s` asks for explicit
 confirmation and then runs
 `Effect::SetupEnvironment`: repair permission leftovers, create directories,
 write the default config, download/verify images, and call the
-control/guarded network setup through `sudo`/`pkexec` with the terminal
-temporarily restored for the password prompt. Permission repair widens a
-same-owner mode in place; root-owned (`uid 0`) trees are chowned to
-`SUDO_UID`/`SUDO_GID` with one `chown -R -h -P --preserve-root` and the same
+control/guarded network setup through `pkexec` (preferred when installed) or
+`sudo` with the terminal temporarily restored for the password prompt. Permission
+repair widens a same-owner mode in place; root-owned (`uid 0`) trees are chowned
+to `SUDO_UID`/`SUDO_GID` with one `chown -R -h -P --preserve-root` and the same
 fixed-path escalation, so planted symlinks cannot redirect the privileged write.
 Repairs refuse `/` and system trees (`/etc`, `/usr`, `/bin`, `/boot`, `/proc`,
 `/sys`, `/root`, `/var/lib`, `/var/cache`) even if a config path points there,

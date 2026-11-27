@@ -238,8 +238,8 @@ hegn doctor --fix
 hegn network status
 ```
 
-`--fix` performs only hegn-owned steps and prompts through `sudo`/`pkexec` for
-the network. The explicit equivalent remains:
+`--fix` performs only hegn-owned steps and prompts through `pkexec` (preferred
+when installed) or `sudo` for the network. The explicit equivalent remains:
 
 ```bash
 sudo hegn network setup --user "$USER"

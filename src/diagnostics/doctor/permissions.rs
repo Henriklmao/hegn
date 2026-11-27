@@ -452,56 +452,62 @@ fn widen_owner_access(path: &Path) -> io::Result<()> {
 }
 
 fn escalate_chown(paths: &[PathBuf], owner: Owner) -> Result<()> {
-    let (helper, prefix) = if crate::network::safe_command_path("sudo").is_some() {
-        ("sudo", true)
-    } else if crate::network::safe_command_path("pkexec").is_some() {
-        ("pkexec", false)
-    } else {
+    let helpers = crate::network::privilege_helpers();
+    if helpers.is_empty() {
         bail!(
-            "cannot repair ownership automatically: neither sudo nor pkexec is installed. Run {}",
+            "cannot repair ownership automatically: neither pkexec nor sudo is installed. Run {}",
             manual_command(paths, owner)
         );
-    };
-    let helper_path = crate::network::safe_command_path(helper)
-        .with_context(|| format!("failed to locate {helper}"))?;
+    }
+    // Resolve `chown` through the fixed path too: pkexec does not inherit the
+    // caller's PATH, so an absolute program removes any ambiguity.
+    let chown = crate::network::safe_command_path("chown")
+        .map_or_else(|| OsString::from("chown"), PathBuf::into_os_string);
     let spec = owner_spec(owner);
-    let mut args: Vec<OsString> = Vec::new();
-    if prefix {
+    let mut failures = Vec::new();
+    for (helper, prefix) in helpers {
+        let helper_path = crate::network::safe_command_path(helper)
+            .with_context(|| format!("failed to locate {helper}"))?;
+        let mut args: Vec<OsString> = Vec::new();
+        if prefix {
+            args.push("--".into());
+        }
+        args.push(chown.clone());
+        args.push("-R".into());
+        // Never let a planted symlink redirect a root chown outside the tree,
+        // and never operate on `/` even if a configured root collapses to it.
+        args.push("-h".into());
+        args.push("-P".into());
+        args.push("--preserve-root".into());
+        args.push(spec.clone().into());
         args.push("--".into());
-    }
-    args.push("chown".into());
-    args.push("-R".into());
-    // Never let a planted symlink redirect a root chown outside the tree, and
-    // never operate on `/` even if a configured root collapses to it.
-    args.push("-h".into());
-    args.push("-P".into());
-    args.push("--preserve-root".into());
-    args.push(spec.clone().into());
-    args.push("--".into());
-    for path in paths {
-        args.push(path.clone().into_os_string());
-    }
-    // Describe the change and echo the exact command before the password
-    // prompt so the user can inspect what will run as root.
-    eprintln!(
-        "hegn: handing {} root-owned hegn path(s) back to {} with a recursive chown that does \
-         not follow symlinks; requesting root privileges; about to run:\n  {}",
-        paths.len(),
-        spec,
-        render_command(helper, &args)
-    );
-    let status = Command::new(&helper_path)
-        .args(&args)
-        .env("PATH", crate::network::SAFE_PATH)
-        .status()
-        .with_context(|| format!("failed to run {helper}"))?;
-    if !status.success() {
-        bail!(
-            "{helper} exited with {status}; run {} manually",
-            manual_command(paths, owner)
+        for path in paths {
+            args.push(path.clone().into_os_string());
+        }
+        // Describe the change and echo the exact command before the password
+        // prompt so the user can inspect what will run as root.
+        eprintln!(
+            "hegn: handing {} root-owned hegn path(s) back to {} with a recursive chown that does \
+             not follow symlinks; requesting root privileges; about to run:\n  {}",
+            paths.len(),
+            spec,
+            render_command(helper, &args)
         );
+        match Command::new(&helper_path)
+            .args(&args)
+            .env("PATH", crate::network::SAFE_PATH)
+            .status()
+        {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => failures.push(format!("{helper} exited with {status}")),
+            Err(err) => failures.push(format!("failed to run {helper}: {err}")),
+        }
     }
-    Ok(())
+    bail!(
+        "{}; run {} manually",
+        failures.join("; "),
+        manual_command(paths, owner)
+    )
 }
 
 fn owner_spec(owner: Owner) -> String {

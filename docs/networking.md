@@ -103,8 +103,9 @@ rules.
 `network = "off"` needs this setup too, because every VM still gets a control
 TAP for SSH. A host without the marker cannot start any VM.
 
-`hegn doctor --fix` runs the setup for you and asks for `sudo` or `pkexec`. It
-prints the exact command before the password prompt, so you can read it first.
+`hegn doctor --fix` runs the setup for you and asks for `pkexec` when it is
+installed, otherwise `sudo`. It prints the exact command before the password
+prompt, so you can read it first.
 
 `hegn vm start` is fail-closed. It refuses to boot unless
 `/run/hegn/network.json` exists, was written by root and carries the current
