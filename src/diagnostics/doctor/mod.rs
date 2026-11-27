@@ -6,9 +6,11 @@ use crate::config::Config;
 use crate::vm::images::{self, AssetStatus};
 
 mod checks;
+mod permissions;
 mod setup;
 
 pub use checks::Check;
+pub use permissions::{RepairReport, repair as repair_permissions};
 pub use setup::{SetupActions, setup_actions};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -45,14 +47,19 @@ impl DoctorReport {
 /// belongs off the UI thread only when it becomes expensive; today it is a
 /// handful of version commands.
 pub fn run(config: &Config) -> DoctorReport {
-    let checks = checks::host_checks(config);
+    let permissions = permissions::audit(config);
+    let checks = checks::host_checks(config, &permissions);
 
     let ok = checks.iter().all(|check| !check.required || check.ok);
     DoctorReport {
         ok,
         checks,
         assets: images::status(config),
-        setup: setup_actions(config),
+        setup: setup::setup_actions_with(
+            config,
+            crate::network::guard_ready(config),
+            permissions.ok(),
+        ),
     }
 }
 
