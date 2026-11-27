@@ -19,6 +19,8 @@ pub struct SetupActions {
     /// Create the control and (for guarded mode) data TAP pools plus the
     /// nftables rules (needs root). Every mode needs this setup.
     pub configure_network: bool,
+    /// Hand root-owned or unreadable entries back to the invoking user.
+    pub repair_permissions: bool,
 }
 
 impl SetupActions {
@@ -28,15 +30,25 @@ impl SetupActions {
             || self.init_profiles
             || self.download_images
             || self.configure_network
+            || self.repair_permissions
     }
 }
 
 /// What a first launch or the doctor modal can fix automatically.
 pub fn setup_actions(config: &Config) -> SetupActions {
-    setup_actions_with(config, crate::network::guard_ready(config))
+    let permissions = super::permissions::audit(config);
+    setup_actions_with(
+        config,
+        crate::network::guard_ready(config),
+        permissions.ok(),
+    )
 }
 
-fn setup_actions_with(config: &Config, network_ready: bool) -> SetupActions {
+pub(super) fn setup_actions_with(
+    config: &Config,
+    network_ready: bool,
+    permissions_ok: bool,
+) -> SetupActions {
     SetupActions {
         create_dirs: !config.projects_root.is_dir()
             || !config.state_dir.is_dir()
@@ -51,6 +63,7 @@ fn setup_actions_with(config: &Config, network_ready: bool) -> SetupActions {
         // Every mode needs the one-time setup: `off` still gets control TAPs
         // for SSH, guarded additionally needs the data TAPs and egress rules.
         configure_network: !network_ready,
+        repair_permissions: !permissions_ok,
     }
 }
 
@@ -78,6 +91,38 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_state_is_a_permission_repair_action() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        if (unsafe { libc::geteuid() }) == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            state_dir: dir.path().join("state"),
+            projects_root: dir.path().join("projects"),
+            snapshots_dir: dir.path().join("snapshots"),
+            vms_dir: dir.path().join("vms"),
+            templates_dir: dir.path().join("templates"),
+            profiles_dir: dir.path().join("config/hegn/profiles"),
+            kernel_image: dir.path().join("images/kernel"),
+            rootfs_image: dir.path().join("images/rootfs"),
+            ..Config::default()
+        };
+        let logs = config.state_dir.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::set_permissions(&logs, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let actions = setup_actions(&config);
+        assert!(actions.repair_permissions, "{actions:?}");
+        assert!(actions.any());
+
+        // Let `TempDir` remove the tree again.
+        fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
     fn network_setup_is_required_for_off_and_guarded() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config {
@@ -94,11 +139,11 @@ mod tests {
         ] {
             config.network = mode;
             assert!(
-                setup_actions_with(&config, false).configure_network,
+                setup_actions_with(&config, false, true).configure_network,
                 "{mode:?} needs network setup"
             );
             assert!(
-                !setup_actions_with(&config, true).configure_network,
+                !setup_actions_with(&config, true, true).configure_network,
                 "{mode:?} is ready"
             );
         }

@@ -84,7 +84,7 @@ Run `hegn <command> --help` for the full options of each command.
           [--allow-unverified]
   images status | verify           Show or re-hash the configured images
   network status | setup [--user U] [--dry-run] | reload [--dry-run] | teardown
-  doctor [--fix]                   Check host prerequisites (exit 1 if required checks fail)
+  doctor [--fix]                   Check host prerequisites; repair missing setup and root-owned state (exit 1 if required checks fail)
   benchmark [PROJECT] [--clean]    Measure host cost; boots a VM on demand
 ```
 

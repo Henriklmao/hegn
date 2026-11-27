@@ -14,7 +14,7 @@ use super::{CONTROL_TAP_POOL, DNS, TAP_POOL};
 /// Fixed `PATH` for every privileged command. root must never resolve `sh`,
 /// `ip`, `nft`, `sysctl`, `ufw`, `firewall-cmd` or `iptables` through an
 /// inherited, user-controlled `PATH`.
-pub(super) const SAFE_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+pub(crate) const SAFE_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Host firewalls that filter the netfilter `forward` hook in their own base
 /// chain. Recorded in the marker for `doctor`/`status` output only; the setup
@@ -74,7 +74,7 @@ pub fn detect_host_firewall() -> HostFirewall {
 }
 
 /// Absolute path of `name` inside [`SAFE_PATH`], bypassing the caller's PATH.
-pub(super) fn safe_command_path(name: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn safe_command_path(name: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(SAFE_PATH)
         .map(|dir| dir.join(name))
         .find(|path| path.is_file())

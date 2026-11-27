@@ -21,13 +21,14 @@ hegn doctor --fix
 This single command does the setup work:
 
 - checks your host, including the OpenSSH client (`ssh`, `ssh-keygen`),
+- repairs root-owned or unreadable state left by an earlier `sudo` run,
 - creates the directories hegn needs,
 - writes the default config,
 - downloads and verifies the pinned VM images,
 - configures the control network for SSH and the guarded data network.
 
 When it needs root rights for the firewall or the network devices, it asks for
-`sudo` or `pkexec` and prints the exact command first.
+`pkexec` first (when installed) or `sudo`, and prints the exact command first.
 
 ---
 

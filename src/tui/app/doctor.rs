@@ -19,6 +19,11 @@ impl App {
             "hegn can prepare this machine automatically:".to_string(),
             String::new(),
         ];
+        if actions.repair_permissions {
+            lines.push(
+                "• repair root-owned or unreadable state left by a sudo run (asks for sudo)".into(),
+            );
+        }
         if actions.create_dirs {
             lines.push("• create missing state/project/template/log directories".into());
         }

@@ -16,6 +16,8 @@ use crate::vm::config::VmStore;
 use crate::vm::images;
 use crate::vm::manager::VmManager;
 
+use super::permissions::Audit;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Check {
     pub name: String,
@@ -56,7 +58,7 @@ impl Check {
 }
 
 /// Run every individual host check, in report order.
-pub(super) fn host_checks(config: &Config) -> Vec<Check> {
+pub(super) fn host_checks(config: &Config, permissions: &Audit) -> Vec<Check> {
     let mut checks = Vec::new();
     checks.push(match config.resolved_cloud_hypervisor() {
         Some(binary) => check_tool("cloud-hypervisor", &binary, &["--version"], true),
@@ -163,6 +165,12 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
         _ => (true, "VM filesystem not created yet".to_string()),
     };
     checks.push(Check::new("disk space", disk_ok, false, disk_detail));
+    checks.push(Check::new(
+        "permissions",
+        permissions.ok(),
+        true,
+        permissions.detail(),
+    ));
     let marker = crate::network::ready_marker();
     let control_taps = control_taps_present();
     let data_taps = data_taps_present();

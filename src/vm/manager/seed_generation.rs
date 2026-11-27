@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use crate::config::Config;
-use crate::shared::fs::{create_private_dir, write_private};
+use crate::shared::fs::{create_private_dir, is_permission_denied, write_private_replacing};
 use crate::vm::config::VmConfig;
 
 const SEED_GENERATION_FILE: &str = "seed-generation";
@@ -35,8 +35,25 @@ pub(super) fn read(config: &Config, vm: &VmConfig) -> Result<u64> {
     if !metadata.file_type().is_file() {
         anyhow::bail!("seed generation {} is not a regular file", path.display());
     }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read seed generation {}", path.display()))?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if is_permission_denied(&err) => {
+            // The true generation is unknown, so never rewind it to zero:
+            // cloud-init derives the instance id from it. The doctor can hand
+            // the file back without losing the value.
+            return Err(err).with_context(|| {
+                format!(
+                    "seed generation {} is unreadable (a root-run hegn may own it); run `hegn \
+                     doctor --fix`",
+                    path.display()
+                )
+            });
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read seed generation {}", path.display()));
+        }
+    };
     raw.trim().parse::<u64>().with_context(|| {
         format!(
             "seed generation {} is not an unsigned integer",
@@ -54,7 +71,7 @@ pub(super) fn bump(config: &Config, vm: &VmConfig) -> Result<u64> {
         .checked_add(1)
         .context("seed generation overflowed; move the VM aside and create a fresh one")?;
     let path = path(config, vm);
-    write_private(&path, format!("{next}\n"))
+    write_private_replacing(&path, format!("{next}\n"))
         .with_context(|| format!("failed to write seed generation {}", path.display()))?;
     Ok(next)
 }
@@ -104,6 +121,36 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn an_unreadable_generation_fails_closed_until_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            vms_dir: dir.path().join("vms"),
+            ..Config::default()
+        };
+        let vm = vm(&config);
+        let vm_dir = vm.dir(&config.vms_dir);
+        fs::create_dir_all(&vm_dir).unwrap();
+        let path = path(&config, &vm);
+        fs::write(&path, "5\n").unwrap();
+        // A root-run hegn leaves the file 0600; the owning user cannot read it.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = read(&config, &vm).expect_err("the true generation is unknown");
+        assert!(format!("{err:#}").contains("hegn doctor --fix"), "{err:#}");
+
+        // The doctor hands the file back without rewriting it.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read(&config, &vm).unwrap(), 5);
+        assert_eq!(bump(&config, &vm).unwrap(), 6);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

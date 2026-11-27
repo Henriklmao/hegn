@@ -260,9 +260,11 @@ are handled correctly, so every line the guest printed stays visible.
 The doctor opens on the first start when setup is available or a required check
 fails. It also opens after a VM start or attach failure.
 
-`s` is the one setup entry point. It creates missing directories and the config,
-downloads the pinned images, and applies the control/guarded network through
-`sudo` or `pkexec` when needed. The report also checks `ssh`/`ssh-keygen`, the
+`s` is the one setup entry point. It repairs root-owned or unreadable state from
+an earlier sudo run, creates missing directories and the config, downloads the
+pinned images, and applies the control/guarded network through `pkexec`
+(preferred when installed) or `sudo` when needed. The report also checks
+`ssh`/`ssh-keygen`, the
 network marker and the control TAPs. Every step can be repeated safely. Image downloads run in
 the background, and a notification in the bottom-right corner shows the progress.
 The same work is available from the command line as `hegn doctor --fix`.

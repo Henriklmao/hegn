@@ -28,6 +28,39 @@ pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> 
     Ok(())
 }
 
+/// Write `contents` to `path`, replacing a file the current user may not
+/// reopen.
+///
+/// A root-run hegn (or a tightened mode) can leave a `0600`/`0400` file that
+/// its owner can no longer truncate. The directory owner may still unlink and
+/// recreate it, so on `EACCES`/`EPERM` this removes a regular file and retries
+/// once. Symlinks and non-regular files are never removed: the original error
+/// is returned so callers keep their `O_NOFOLLOW` guarantee.
+pub fn write_private_replacing(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    let contents = contents.as_ref();
+    match write_private(path, contents) {
+        Ok(()) => Ok(()),
+        Err(error) if is_permission_denied(&error) => match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                fs::remove_file(path)?;
+                write_private(path, contents)
+            }
+            Ok(_) => Err(error),
+            Err(inspect) if inspect.kind() == io::ErrorKind::NotFound => {
+                write_private(path, contents)
+            }
+            Err(inspect) => Err(inspect),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `error` means the current user lacks permission.
+pub fn is_permission_denied(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM))
+        || error.kind() == io::ErrorKind::PermissionDenied
+}
+
 /// Create `path` recursively with mode `0700`, refusing a symlinked directory.
 ///
 /// Existing directories are tightened to `0700` as well, because all callers
@@ -105,6 +138,40 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(write_private(&link, b"replace").is_err());
         assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn write_private_replacing_replaces_a_file_the_user_cannot_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        fs::write(&path, b"old").unwrap();
+        // A root-run hegn left it 0400 for the owning user.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        write_private_replacing(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn write_private_replacing_never_removes_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"keep").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(write_private_replacing(&link, b"replace").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

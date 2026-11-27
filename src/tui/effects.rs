@@ -280,6 +280,18 @@ pub(super) fn handle_effects(
                 app.modal = Some(crate::tui::app::Modal::Doctor(modal));
                 app.toast("setting up hegn…", ToastLevel::Info);
 
+                if actions.repair_permissions {
+                    app.toast("repairing file permissions…", ToastLevel::Info);
+                    match with_suspended_terminal(terminal, || {
+                        crate::diagnostics::doctor::repair_permissions(&app.config)
+                    }) {
+                        Ok(report) => notes.push(format!("permissions: {}", report.summary())),
+                        Err(err) => {
+                            failed = true;
+                            notes.push(format!("permission repair failed: {err:#}"));
+                        }
+                    }
+                }
                 if actions.create_dirs {
                     match app.config.ensure_dirs() {
                         Ok(()) => notes.push("directories created".to_string()),

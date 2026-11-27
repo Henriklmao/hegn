@@ -65,6 +65,12 @@ pub(crate) fn doctor(config: Config, json: bool, fix: bool) -> Result<i32> {
             if !json {
                 eprintln!("hegn: preparing this host");
             }
+            if actions.repair_permissions {
+                let report = doctor::repair_permissions(&config)?;
+                if !json {
+                    eprintln!("hegn: {}", report.summary());
+                }
+            }
             if actions.create_dirs {
                 config.ensure_dirs()?;
             }
