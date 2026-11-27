@@ -110,7 +110,7 @@ pub(crate) fn render_doctor(
     if modal.report.can_setup() && !modal.downloading && !modal.setting_up {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            " Not ready yet? Press s to prepare directories, images and the guarded network.",
+            " Not ready yet? Press s to repair permissions, prepare directories, images and the guarded network.",
             Style::default().fg(CYAN),
         )));
     }
