@@ -382,24 +382,8 @@ fn adopt_owner(root: &Path, uid: u32, gid: Option<u32>) -> Result<()> {
 }
 
 pub(super) fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
-    match crate::shared::fs::write_private(path, contents) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            // A root-run hegn can leave a 0600 file that the current user may
-            // not reopen. The directory owner may still unlink and replace it,
-            // but never through a symlink and never over a directory.
-            let metadata = fs::symlink_metadata(path)
-                .with_context(|| format!("failed to inspect {}", path.display()))?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(error).with_context(|| format!("failed to write {}", path.display()));
-            }
-            fs::remove_file(path)
-                .with_context(|| format!("failed to remove {}", path.display()))?;
-            crate::shared::fs::write_private(path, contents)
-                .with_context(|| format!("failed to write {}", path.display()))
-        }
-        Err(error) => Err(error).with_context(|| format!("failed to write {}", path.display())),
-    }
+    crate::shared::fs::write_private_replacing(path, contents)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 pub(super) fn copy_file_private(source: &Path, dest: &Path, follow_symlinks: bool) -> Result<()> {
