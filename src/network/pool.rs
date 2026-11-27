@@ -16,7 +16,7 @@ use super::addressing::{
 use super::privilege::ensure_ready;
 use super::{DNS, NETWORK_DIR, TAP_POOL};
 use crate::config::{Config, NetworkMode};
-use crate::shared::fs::{write_private, write_private_replacing};
+use crate::shared::fs::write_private_replacing;
 use crate::vm::config::{VmConfig, VmStore};
 use crate::vm::manager::VmManager;
 
@@ -476,6 +476,7 @@ impl FileLock {
 mod tests {
     use super::*;
     use crate::config::NetworkMode;
+    use crate::shared::fs::write_private;
     use std::os::unix::fs::PermissionsExt;
 
     /// A config whose state and VM roots live in a throwaway directory, so
