@@ -7,5 +7,6 @@
 pub mod fs;
 pub mod math;
 pub mod paths;
+pub mod permissions;
 pub mod process;
 pub mod text;

@@ -7,7 +7,7 @@ use std::ffi::{CString, OsStr};
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -340,45 +340,8 @@ pub(super) fn repaired_warning(path: &Path) -> String {
 /// files in the user's private VM state, which later user runs cannot read or
 /// replace.
 pub(super) fn adopt_invoking_owner(root: &Path) -> Result<()> {
-    // Safety: geteuid has no preconditions and cannot fail.
-    if unsafe { libc::geteuid() } != 0 {
-        return Ok(());
-    }
-    let Some(uid) = std::env::var("SUDO_UID")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-    else {
-        return Ok(());
-    };
-    let gid = std::env::var("SUDO_GID")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok());
-    adopt_owner(root, uid, gid)
-}
-
-fn adopt_owner(root: &Path, uid: u32, gid: Option<u32>) -> Result<()> {
-    // The bundle is guest-writable, so walk it iteratively: a poisoned guest
-    // can nest directories deeply enough to overflow a recursive walk.
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to inspect {}", path.display()))?;
-        if metadata.file_type().is_symlink() {
-            continue;
-        }
-        if metadata.uid() != uid || gid.is_some_and(|gid| metadata.gid() != gid) {
-            std::os::unix::fs::chown(&path, Some(uid), gid)
-                .with_context(|| format!("failed to hand {} to user {uid}", path.display()))?;
-        }
-        if metadata.is_dir() {
-            for entry in
-                fs::read_dir(&path).with_context(|| format!("failed to read {}", path.display()))?
-            {
-                pending.push(entry?.path());
-            }
-        }
-    }
-    Ok(())
+    crate::shared::permissions::adopt_invoking_owner(root)
+        .with_context(|| format!("failed to hand {} to the invoking user", root.display()))
 }
 
 pub(super) fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
