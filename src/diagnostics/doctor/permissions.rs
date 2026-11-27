@@ -481,10 +481,13 @@ fn escalate_chown(paths: &[PathBuf], owner: Owner) -> Result<()> {
     for path in paths {
         args.push(path.clone().into_os_string());
     }
-    // Echo the exact command before the password prompt so the user can
-    // inspect what will run as root.
+    // Describe the change and echo the exact command before the password
+    // prompt so the user can inspect what will run as root.
     eprintln!(
-        "hegn: requesting root privileges; about to run:\n  {}",
+        "hegn: handing {} root-owned hegn path(s) back to {} with a recursive chown that does \
+         not follow symlinks; requesting root privileges; about to run:\n  {}",
+        paths.len(),
+        spec,
         render_command(helper, &args)
     );
     let status = Command::new(&helper_path)
