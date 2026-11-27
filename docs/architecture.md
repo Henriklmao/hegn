@@ -228,7 +228,7 @@ All state paths can be overridden in `config.toml` or by environment variables
 | `vm/config/` | `vm.toml` model and `VmStore` | Version 2; unknown keys rejected; name becomes a path component and is validated; `0600`, `O_NOFOLLOW`, atomic writes; one config per `<vms_dir>/<name>` |
 | `vm/manager/` | VM lifecycle, registry, lock, boot plan, membership manifest, session record, snapshots | One lifecycle lock per VM; registry validation and member preflight before spawn; one `--fs` per exported member; always a control lease, data only with guarded networking; every error path kills all daemons; duplicate cross-VM export refused; explicit rootfs images unique |
 | `session/snapshot/` | Snapshot metadata, v3 boot fingerprint, restore selection | Sanitized names; private dirs/files; atomic metadata writes; legacy snapshots visible but never restored, auto-selected or pruned; manual restore refuses a fingerprint mismatch |
-| `diagnostics/doctor/` | Shared host checks and automatic setup planning for CLI and TUI | Required vs optional checks; covers `ssh`/`ssh-keygen`, marker version 3, control TAPs, nft control rules and per-running-VM `guest_ip`/`ssh_user`/key; `SetupActions` covers directories, default config, profile templates, pinned images and the control/guarded network; `hegn doctor --fix` and the TUI `s` action are idempotent |
+| `diagnostics/doctor/` | Shared host checks and automatic setup planning for CLI and TUI | Required vs optional checks; covers `ssh`/`ssh-keygen`, marker version 3, control TAPs, nft control rules and per-running-VM `guest_ip`/`ssh_user`/key; `SetupActions` covers directories, default config, profile templates, pinned images, permission repair and the control/guarded network; `hegn doctor --fix` and the TUI `s` action are idempotent |
 | `diagnostics/benchmark/` | Measured host cost: process RSS, disk usage, snapshot estimate; boots a VM only when asked | Refuses to delete anything outside its own `hegn-benchmark-*` projects; sparse-aware accounting; JSON output |
 | `session/ssh/` | Per-VM OpenSSH identity, `known_hosts`, fixed client argv, readiness probe and terminal title | Key `0600` in a `0700` directory; `-F /dev/null` and explicit options; public-key only; no agent/TCP forwarding; hard error instead of serial fallback |
 | `session/console/` | Serial transport over the relay socket, tmux-style attach, status bar | Embedded TUI view and `--serial`; never pretends a VM exists; verifies VMM and relay; bar content sanitized; `--no-bar` for full-screen guests |
@@ -526,7 +526,12 @@ mismatch. `hegn images status` shows path, presence and size.
 `doctor::run(&config)` performs cheap blocking checks: Cloud Hypervisor,
 virtiofsd, `ssh`, `ssh-keygen`, git, lazygit (optional), `/dev/kvm`, Landlock
 (required when enabled), kernel image, rootfs image, projects root, logs dir
-(optional), backend, editor (optional), plus `images::status`. The network check
+(optional), backend, editor (optional), plus `images::status`. A required
+`permissions` check walks the configured private roots (`state`, `vms`,
+`snapshots`, `templates`, `profiles` and its config parent, kernel/rootfs) and
+flags entries that are foreign-owned while the user cannot use them, or whose
+owner bits deny the read/write/execute access hegn needs. Symlinks are never
+followed. The network check
 requires setup marker version 3, the control TAP family and the control nftables
 rules (sets, per-TAP source drops, established accept before the control drop,
 forward drop and no control masquerade). For every running VM it verifies
@@ -557,10 +562,20 @@ the scan channel (throttled to 256 KiB), which `App::set_download_progress`
 turns into a bottom-right notification with a progress bar; the notification is
 cleared when the worker reports the finished doctor run. `s` asks for explicit
 confirmation and then runs
-`Effect::SetupEnvironment`: create directories, write the default config,
-download/verify images, and call the control/guarded network setup through
-`sudo`/`pkexec` with the terminal temporarily restored for the password prompt.
-Every step is idempotent and only hegn-owned state is changed. The CLI exposes
+`Effect::SetupEnvironment`: repair permission leftovers, create directories,
+write the default config, download/verify images, and call the
+control/guarded network setup through `sudo`/`pkexec` with the terminal
+temporarily restored for the password prompt. Permission repair widens a
+same-owner mode in place; root-owned (`uid 0`) trees are chowned to
+`SUDO_UID`/`SUDO_GID` with one `chown -R -h -P --preserve-root` and the same
+fixed-path escalation, so planted symlinks cannot redirect the privileged write.
+Repairs refuse `/` and system trees (`/etc`, `/usr`, `/bin`, `/boot`, `/proc`,
+`/sys`, `/root`, `/var/lib`, `/var/cache`) even if a config path points there,
+and require every ancestor to belong to the invoking user or root (no
+world-writable, non-sticky parent).
+Entries owned by another non-root user, and unreadable kernel/rootfs images, are
+reported for manual action instead of being taken over. Every step is idempotent
+and only hegn-owned state is changed. The CLI exposes
 the same plan as `hegn doctor --fix`, with `--json` support.
 
 ---
@@ -909,7 +924,7 @@ matters when hegn runs inside tmux and `Ctrl-B` is consumed as the tmux prefix.
 | Launch in tmux/herdr | `F6` integration → `r` | `hegn launch --integration tmux\|herdr` |
 | Project settings | `F6` (`hegn.toml`) | edit `hegn.toml` |
 | Doctor | `F3` + automatic on first launch/failure | `hegn doctor` |
-| Automatic setup | doctor modal `s` (confirmed) | `hegn doctor --fix` |
+| Automatic setup | doctor modal `s` (confirmed) | `hegn doctor --fix` (also repairs root-owned state) |
 | Image download | doctor modal `d` | `hegn images download` |
 | Image verification | doctor report | `hegn images verify` |
 

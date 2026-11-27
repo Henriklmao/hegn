@@ -21,6 +21,7 @@ hegn doctor --fix
 This single command does the setup work:
 
 - checks your host, including the OpenSSH client (`ssh`, `ssh-keygen`),
+- repairs root-owned or unreadable state left by an earlier `sudo` run,
 - creates the directories hegn needs,
 - writes the default config,
 - downloads and verifies the pinned VM images,

@@ -4,6 +4,7 @@ Start with `hegn doctor`. It checks the host and tells you what is missing. Most
 problems are solved by `hegn doctor --fix`.
 
 - [A VM does not start](#a-vm-does-not-start)
+- [Permission denied after a sudo run](#permission-denied-after-a-sudo-run)
 - [A project is not mounted](#a-project-is-not-mounted)
 - [SSH cannot connect](#ssh-cannot-connect)
 - [Landlock is not active](#landlock-is-not-active)
@@ -42,9 +43,59 @@ Common membership errors:
 | `ssh`/`ssh-keygen` missing | Install the OpenSSH client |
 | `session metadata ... unreadable or from an older hegn version` | Run `hegn vm start <vm>`, `hegn vm stop <vm>` or restore again. hegn archives the stale run files under `run/stale-<timestamp>/` automatically and continues; no manual directory removal is needed. |
 | `failed to remove .../profile/bundle/files: Permission denied` | A root-run (for example `sudo hegn vm apply`) left a root-owned bundle directory. The next start replaces an empty leftover automatically; for a non-empty one the error prints the exact `sudo rm -rf` command. Root-run hegn hands the bundle back to `SUDO_UID`, and the next start rewrites root-owned `manifest`/`env.sh`/`local.json` in the user-owned directory. |
+| `Permission denied (os error 13)` with no further context | A sudo run left root-owned files in the user's state. `hegn doctor --fix` audits and repairs them; an unreadable `network/hegnN.owner` or `vms/<vm>/seed-generation` now fails with a hint instead of a bare error. See [Permission denied after a sudo run](#permission-denied-after-a-sudo-run). |
 
 If you changed membership while the VM was running, run `hegn vm apply <vm>`.
 That restarts the VM and kills running agents and SSH sessions.
+
+---
+
+## Permission denied after a sudo run
+
+`hegn` keeps its state in the user's XDG directories. A command that ran through
+`sudo` (for example `sudo hegn network setup` or `sudo hegn doctor --fix`) can
+still leave individual files owned by root. The next user run owns the parent
+directory, so it can unlink a leftover file, but cannot read it first — the
+result was often a bare `Permission denied (os error 13)`.
+
+`hegn doctor` now reports this as the `permissions` check. Press `s` in the
+doctor modal or run:
+
+```bash
+hegn doctor --fix
+```
+
+The repair widens a same-owner mode that is missing owner access. Root-owned
+trees are handed to `SUDO_UID`/`SUDO_GID`; from an unprivileged run this prints
+the exact `chown -R` command and asks for sudo/pkexec before running it.
+
+Two hot spots fail with a targeted hint instead of a bare error. Never delete
+these files: their content proves which slot or seed is current, and the doctor
+hands them back without losing it:
+
+| Leftover | Behaviour |
+| --- | --- |
+| `~/.local/state/hegn/network/hegnN.owner` | The start refuses with `unreadable owner file` and points at `hegn doctor --fix`. Deleting it could let two guests share one TAP, so hegn never unlinks it. |
+| `~/.local/share/hegn/vms/<vm>/seed-generation` | The start refuses with `unreadable seed generation`; resetting the counter to `0` could repeat a cloud-init instance id, so hegn keeps the value and asks for the doctor. |
+
+Everything else — snapshots, serial logs, the run directory, `vm.toml`,
+`rootfs.qcow2`, profiles and the TAP marker — is covered by the doctor audit.
+The audit never follows symlinks; foreign symlinks are left untouched. The
+repair escalates `chown -R -h -P --preserve-root`, so a symlink planted inside a
+guest-writable tree cannot redirect the root write.
+
+If you prefer to fix it by hand, the `permissions` check names the first affected
+paths. A broad repair that covers every hegn root is:
+
+```bash
+sudo chown -R -h -P --preserve-root "$(id -u):$(id -g)" -- \
+  ~/.local/state/hegn ~/.local/share/hegn ~/.config/hegn
+```
+
+Run hegn as your normal user afterwards; only `hegn network setup` and its
+`--fix` escalation need root. Check any custom `state_dir`, `vms_dir`,
+`snapshots_dir` or `profiles_dir` in `config.toml` first: the doctor only touches
+the roots configured there.
 
 ---
 

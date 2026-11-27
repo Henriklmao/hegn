@@ -254,15 +254,18 @@ the control rules. If the host already has a conflicting `10.213.0.0/24` or
 
 ```bash
 hegn doctor              # exit 1 if any required check fails
-hegn doctor --fix        # prepare directories, config, images and network
+hegn doctor --fix        # repair permissions, directories, config, images and network
 hegn doctor --json       # machine-readable, one object per check
 ```
 
 **Gate:** exit code `0`. `hegn doctor` must report all required checks as ok:
 `cloud-hypervisor`, `virtiofsd`, `ssh`, `ssh-keygen`, `git`, `kvm`, `landlock`,
-`kernel image`, `rootfs image`, `projects root`, `backend` and `network guard`
+`kernel image`, `rootfs image`, `projects root`, `permissions`, `backend` and
+`network guard`
 (the control TAPs and control rules are required in every network mode). This
 list is the common set, not every check; `serial logs` is optional. If
+`permissions` fails, `hegn doctor --fix` widens owner modes or chowns root-owned
+leftovers from an earlier sudo run. If
 `landlock` fails, the kernel is too old — do not disable the sandbox; report the
 kernel version.
 
