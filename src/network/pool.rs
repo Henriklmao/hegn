@@ -16,7 +16,7 @@ use super::addressing::{
 use super::privilege::ensure_ready;
 use super::{DNS, NETWORK_DIR, TAP_POOL};
 use crate::config::{Config, NetworkMode};
-use crate::shared::fs::write_private;
+use crate::shared::fs::{write_private, write_private_replacing};
 use crate::vm::config::{VmConfig, VmStore};
 use crate::vm::manager::VmManager;
 
@@ -309,19 +309,32 @@ fn try_claim(config: &Config, index: u8, vm: &str) -> Result<Option<TapLease>> {
     let lock = lock_path(config, index);
     let _guard = FileLock::acquire(&lock)?;
 
-    if let Some((owner, pid)) = read_owner(&path)
-        && !owner.is_empty()
-        && owner != vm
-    {
-        // A live hegn process may still be booting the owner VM, before its
-        // session record exists. A live VM is equally authoritative. The pid
-        // alone is not proof: it may have been recycled by an unrelated
-        // process, so require it to still execute the hegn binary.
-        if owner_process_alive(pid) || vm_is_running(config, &owner) {
-            return Ok(None);
+    match read_owner(&path) {
+        Some((owner, pid)) if !owner.is_empty() && owner != vm => {
+            // A live hegn process may still be booting the owner VM, before its
+            // session record exists. A live VM is equally authoritative. The pid
+            // alone is not proof: it may have been recycled by an unrelated
+            // process, so require it to still execute the hegn binary.
+            if owner_process_alive(pid) || vm_is_running(config, &owner) {
+                return Ok(None);
+            }
+            // A crashed hegn process and a stopped VM left the reservation behind.
+            let _ = fs::remove_file(&path);
         }
-        // A crashed hegn process and a stopped VM left the reservation behind.
-        let _ = fs::remove_file(&path);
+        Some(_) => {}
+        None => {
+            if fs::symlink_metadata(&path).is_ok() {
+                // An unreadable owner file cannot prove that the slot is free.
+                // Unlinking it could steal a live TAP from a root-run hegn and
+                // make two guests share one device, so fail closed and let the
+                // doctor repair it by chowning (which keeps the content).
+                bail!(
+                    "network slot {index} has an unreadable owner file {}; run `hegn doctor --fix` \
+                     to hand it back",
+                    path.display()
+                );
+            }
+        }
     }
 
     let lease = TapLease {
@@ -332,7 +345,7 @@ fn try_claim(config: &Config, index: u8, vm: &str) -> Result<Option<TapLease>> {
         host_ip: host_ip(index),
         guest_ip: guest_ip(index),
     };
-    write_private(&path, format!("{vm}\n{}\n", std::process::id()))?;
+    write_private_replacing(&path, format!("{vm}\n{}\n", std::process::id()))?;
     Ok(Some(lease))
 }
 
@@ -666,6 +679,29 @@ mod tests {
             owner_file(&config, 9),
             format!("demo\n{}\n", std::process::id())
         );
+    }
+
+    #[test]
+    fn try_claim_refuses_an_unreadable_owner_file() {
+        let (_dir, config) = test_config();
+        fs::create_dir_all(network_dir(&config)).unwrap();
+        let path = owner_path(&config, 8);
+        write_private(&path, "ghost\n4294967295\n").unwrap();
+        // A root-run hegn leaves the file 0600; the owning user cannot read it.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = try_claim(&config, 8, "demo")
+            .expect_err("an unreadable owner file must not be unlinked");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("unreadable owner file") && message.contains("hegn doctor --fix"),
+            "{message}"
+        );
+        // The content survives; the doctor repairs the mode instead of deleting
+        // a reservation it cannot authenticate.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(owner_file(&config, 8), "ghost\n4294967295\n");
+        assert!(try_claim(&config, 8, "demo").unwrap().is_some());
     }
 
     #[test]
