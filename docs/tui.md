@@ -34,7 +34,7 @@ it was opened and how to assign it.
 | Key | Action |
 | --- | --- |
 | `↑`/`↓`, `j`/`k` | Move the selection |
-| `Enter` / `o` | Open the project screen and attach its VM |
+| `Enter` / `o` | Open the project screen and attach its VM over SSH |
 | `/` | Fuzzy-filter projects |
 | `1` / `b` | Open the project screen on the VM section |
 | `2` / `3` / `4` | Open the project screen on snapshots / health / git |
@@ -75,14 +75,14 @@ The terminal is a single line until you open it.
 | `1` / `2` / `3` / `4` | VM / snapshots / health / git |
 | `Tab` | Cycle through the sections |
 | `↑`/`↓`, `j`/`k` | Move inside the focused section |
-| `Enter` (VM) | Attach the VM, starting it if needed |
+| `Enter` (VM) | Attach the VM over SSH, starting it if needed |
 | `Enter` (snapshots) | Restore the selected snapshot |
 | `v` | Open the VM screen (projects, snapshots, tools, health) |
 | `i` / `a` / `t` | Open or focus the terminal (starts the VM if needed) |
 | `L` | Launch the configured agent or command in its terminal integration |
 | `Esc` | Section view → split view; again back to the dashboard |
 | `←` | Back to the dashboard (the VM keeps running) |
-| `F2` | Leave the TUI and start the real `hegn attach` client |
+| `F2` | Leave the TUI and open an external SSH session via `hegn attach` |
 | `Ctrl-B` / `Ctrl-]` | Back to the dashboard from any mode |
 | `n` | New snapshot (snapshots section) |
 | `M` / `f` | Fork the project into a clone or worktree |
@@ -131,10 +131,10 @@ four numbered sections:
 | `1` / `2` / `3` / `4` | Projects / snapshots / tools / health |
 | `Tab` | Cycle through the sections |
 | `↑`/`↓`, `j`/`k` | Move inside the focused section |
-| `Enter` (projects) | Open the member project and attach the VM |
+| `Enter` (projects) | Open the member project and attach the VM over SSH |
 | `Enter` (snapshots) | Restore the selected snapshot |
 | `Enter` (tools) | Attach the VM |
-| `s` | Attach the VM, starting it if needed |
+| `s` | Attach the VM over SSH, starting it if needed |
 | `S` / `A` | Stop / apply (restart) the VM |
 | `p` | Make the selected project the primary (`/workspace`) |
 | `a` | Assign an unassigned project to this VM |
@@ -146,7 +146,7 @@ four numbered sections:
 | `n` | Create another VM |
 | `F5` / `e` | Edit this VM's `vm.toml` |
 | `F4` | Global settings editor |
-| `F2` | External attach |
+| `F2` | External SSH attach |
 | `r` | Refresh VMs, projects and snapshots |
 | `Esc` / `←` | Back to the dashboard |
 | `?` / `F1` | Help |
@@ -155,8 +155,13 @@ Creating a VM (`n` on the dashboard, or `n` outside the snapshots section here)
 opens a form for name, harness, vCPUs, memory and extra packages. Editing an
 existing VM uses `F5` or `e`, which opens `vm.toml` in the settings editor.
 
-Assigning a project opens a candidate list and a read-only toggle. Forking opens
-the fork modal: `Tab` toggles between the isolated clone default and the nested
+Assigning a project opens a candidate list and a read-only toggle. The first
+project assigned to an empty VM applies automatically without a prompt, so the
+VM boots and its harness setup starts immediately. Later assignments ask whether
+to restart the VM now with `hegn vm apply`. Answer `n`/`Esc` to apply later; the
+health section then shows `apply required · hegn vm apply <vm>` until an apply
+succeeds. Forking opens the
+fork modal: `Tab` toggles between the isolated clone default and the nested
 worktree, `Enter` creates it, and `Esc` cancels. Detaching asks for confirmation
 and never deletes project files.
 
@@ -194,6 +199,8 @@ or use `↑`/`↓`, `j`/`k` and `PgUp`/`PgDn`.
 The doctor and security modals scroll the same way. Mouse wheel and dragging
 work in every modal that overflows. All modals size themselves to the terminal
 and keep their buttons visible, wrapping them onto another row when needed.
+Long SSH attach failures open the same scrollable error modal instead of a
+one-line toast, so the full recovery hint stays readable.
 
 ---
 
@@ -211,10 +218,17 @@ More on snapshots in [Snapshots](snapshots.md).
 
 ## Terminal (guest serial console)
 
-The terminal is a pane inside the project screen. It opens in **normal** mode.
-In normal mode, keys are hegn shortcuts and nothing reaches the guest. Press `i`
-or `a` to enter **insert** mode and type commands. `Esc` returns to normal mode,
-and then to the section headers. The pane stays open.
+The embedded terminal is a pane inside the project screen and stays on the
+**serial console**. It opens in **normal** mode. In normal mode, keys are hegn
+shortcuts and nothing reaches the guest. Press `i` or `a` to enter **insert**
+mode and type commands. `Esc` returns to normal mode, and then to the section
+headers. The pane stays open.
+
+The TUI does not embed SSH, tabs or a VT emulator. `Enter`/`s`/`F2` open an
+external SSH session in the current terminal; each one gets its own guest PTY.
+The serial pane is still there for boot, provisioning, recovery and checked
+input. If a running VM has no `guest_ip`/`ssh_user` in its session record, the
+TUI reports it and points at `hegn attach <vm> --serial`.
 
 | Key | Action |
 | --- | --- |
@@ -224,7 +238,7 @@ and then to the section headers. The pane stays open.
 | `←` | Return to the dashboard (the VM keeps running) |
 | `M` / `f` | Fork the open project into a clone or worktree |
 | `Enter` | In insert mode: check the command with `tirith-core`, then send it |
-| `F2` | Leave the TUI and start the real `hegn attach` client |
+| `F2` | Leave the TUI and open an external SSH session via `hegn attach` |
 | `Ctrl-B` / `Ctrl-]` | Return to the dashboard from any mode |
 | `PgUp` / `PgDn` | Scroll the output |
 | `Ctrl-L` | Clear the scrollback |
@@ -247,8 +261,9 @@ The doctor opens on the first start when setup is available or a required check
 fails. It also opens after a VM start or attach failure.
 
 `s` is the one setup entry point. It creates missing directories and the config,
-downloads the pinned images, and applies the guarded network through `sudo` or
-`pkexec` when needed. Every step can be repeated safely. Image downloads run in
+downloads the pinned images, and applies the control/guarded network through
+`sudo` or `pkexec` when needed. The report also checks `ssh`/`ssh-keygen`, the
+network marker and the control TAPs. Every step can be repeated safely. Image downloads run in
 the background, and a notification in the bottom-right corner shows the progress.
 The same work is available from the command line as `hegn doctor --fix`.
 

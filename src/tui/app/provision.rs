@@ -31,6 +31,13 @@ impl App {
         );
     }
 
+    /// Drop stale provisioning UI after a stop or session exit.
+    pub fn clear_provision(&mut self) {
+        self.provision = None;
+        self.provision_running = false;
+        self.provision_ready_seen = false;
+    }
+
     /// Note that first-boot provisioning is running.
     pub fn provision_started(&mut self) {
         self.provision_running = true;

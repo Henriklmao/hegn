@@ -17,6 +17,15 @@ use super::import::expand_tilde;
 use super::meta::validate_project_name;
 use super::registry::{ProjectEntry, ProjectKind, ProjectRegistry};
 
+/// Result of an assignment, including whether it was the VM's first member.
+#[derive(Debug, Clone)]
+pub struct AssignOutcome {
+    pub entry: ProjectEntry,
+    pub vm: VmConfig,
+    /// True when the VM had no members before this assignment.
+    pub first: bool,
+}
+
 /// Assign `selector` to `vm_name`, setting `primary` when the VM has none.
 ///
 /// Any write is rolled back when registry validation fails, so a rejected
@@ -27,9 +36,22 @@ pub fn assign_project(
     vm_name: &str,
     read_only: bool,
 ) -> Result<(ProjectEntry, VmConfig)> {
+    let outcome = assign_project_detailed(config, selector, vm_name, read_only)?;
+    Ok((outcome.entry, outcome.vm))
+}
+
+/// Like [`assign_project`], but also reports whether this was the first
+/// project assigned to the VM.
+pub fn assign_project_detailed(
+    config: &Config,
+    selector: &str,
+    vm_name: &str,
+    read_only: bool,
+) -> Result<AssignOutcome> {
     let store = VmStore::new(config);
     let mut vm = store.load(vm_name)?;
     let mut registry = ProjectRegistry::load(&config.state_dir)?;
+    let first = registry.members(vm_name).is_empty();
     let (entry, created) = match registered_entry(config, selector)? {
         Some(entry) => (entry, false),
         None => (
@@ -62,7 +84,7 @@ pub fn assign_project(
         return Err(err);
     }
     let entry = registry.get(&entry.name).cloned().unwrap_or(previous);
-    Ok((entry, vm))
+    Ok(AssignOutcome { entry, vm, first })
 }
 
 /// Clear a project's VM. A departing primary hands `/workspace` to the next
@@ -267,6 +289,26 @@ mod tests {
                 .vm
                 .is_none()
         );
+    }
+
+    #[test]
+    fn the_first_member_is_reported_only_for_an_empty_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        save_vm(&config, "rust");
+        for name in ["parser", "cli"] {
+            let path = config.projects_root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            ProjectRegistry::load(&config.state_dir)
+                .unwrap()
+                .upsert(entry(name, &path))
+                .unwrap();
+        }
+
+        let first = assign_project_detailed(&config, "parser", "rust", false).unwrap();
+        assert!(first.first);
+        let second = assign_project_detailed(&config, "cli", "rust", false).unwrap();
+        assert!(!second.first, "the VM already has a member");
     }
 
     #[test]

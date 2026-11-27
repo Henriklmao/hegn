@@ -22,6 +22,7 @@ use crate::diagnostics::doctor::DoctorReport;
 use crate::tui::App;
 use crate::tui::app::{Effect, ToastLevel};
 use crate::tui::effects::handle_effects;
+use crate::tui::jobs::spawn_apply_vm;
 use crate::tui::messages::ScanMessage;
 use crate::tui::ui;
 
@@ -83,7 +84,13 @@ pub(super) fn run_loop(
             app.poll();
         }
 
-        drain_scan(app, scan_rx);
+        for vm in drain_scan(app, scan_rx) {
+            app.toast(
+                format!("applying VM {vm} for its first project…"),
+                ToastLevel::Info,
+            );
+            spawn_apply_vm(app.config.clone(), vm, scan_tx.clone());
+        }
         if let Some((spec, vm, project)) = app.take_due_launch() {
             handle_effects(
                 terminal,
@@ -100,7 +107,8 @@ pub(super) fn run_loop(
     }
 }
 
-fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
+fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) -> Vec<String> {
+    let mut auto_apply = Vec::new();
     loop {
         match scan_rx.try_recv() {
             Ok(ScanMessage::Projects(projects)) => app.set_projects(projects),
@@ -129,6 +137,30 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
                 app.refresh_vms();
                 app.toast(note, level);
             }
+            Ok(ScanMessage::ProjectAssigned { vm, note, first }) => {
+                app.refresh_vms();
+                app.toast(note, ToastLevel::Info);
+                if first {
+                    app.pending_apply.remove(&vm);
+                    auto_apply.push(vm);
+                } else {
+                    app.prompt_apply(&vm);
+                }
+            }
+            Ok(ScanMessage::VmApplied { vm, note }) => {
+                app.pending_apply.remove(&vm);
+                app.refresh_vms();
+                app.toast(note, ToastLevel::Info);
+            }
+            Ok(ScanMessage::VmStopped { vm, note }) => {
+                if app.attached_vm.as_deref() == Some(vm.as_str()) {
+                    app.detach_console();
+                    app.attached_vm = None;
+                }
+                app.clear_provision();
+                app.refresh_vms();
+                app.toast(note, ToastLevel::Info);
+            }
             Ok(ScanMessage::Error(err)) => {
                 if app.loading {
                     app.loading = false;
@@ -151,6 +183,7 @@ fn drain_scan(app: &mut App, scan_rx: &Receiver<ScanMessage>) {
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
         }
     }
+    auto_apply
 }
 
 /// Open the doctor on first launch when anything is broken or hegn can prepare
@@ -165,7 +198,7 @@ mod tests {
     use crate::config::Harness;
     use crate::project::{GitSummary, Project};
     use crate::session::console::TerminalConsole;
-    use crate::tui::app::{Modal, Screen, ToastLevel, VmUiState};
+    use crate::tui::app::{ConfirmAction, Modal, Screen, ToastLevel, VmUiState};
     use crate::vm::images::DownloadProgress;
     use std::path::{Path, PathBuf};
 
@@ -332,6 +365,91 @@ mod tests {
             toast(&app),
             ("session branch hegn/session-1", ToastLevel::Info)
         );
+    }
+
+    #[test]
+    fn drain_scan_prompts_to_apply_after_an_assignment() {
+        let (_dir, mut app) = test_app();
+        let (tx, rx) = mpsc::channel();
+
+        tx.send(ScanMessage::ProjectAssigned {
+            vm: "rust".into(),
+            note: "assigned demo to VM rust".into(),
+            first: false,
+        })
+        .unwrap();
+        drain_scan(&mut app, &rx);
+
+        let Some(Modal::Confirm(prompt)) = &app.modal else {
+            panic!("expected the apply prompt, got {:?}", app.modal);
+        };
+        assert_eq!(prompt.title, "Restart VM?");
+        assert!(
+            matches!(&prompt.action, ConfirmAction::ApplyVm(vm) if vm == "rust"),
+            "{:?}",
+            prompt.action
+        );
+        assert_eq!(toast(&app), ("assigned demo to VM rust", ToastLevel::Info));
+    }
+
+    #[test]
+    fn drain_scan_auto_applies_the_first_project_assignment() {
+        let (_dir, mut app) = test_app();
+        let (tx, rx) = mpsc::channel();
+
+        tx.send(ScanMessage::ProjectAssigned {
+            vm: "rust".into(),
+            note: "assigned demo to VM rust".into(),
+            first: true,
+        })
+        .unwrap();
+        let auto_apply = drain_scan(&mut app, &rx);
+
+        assert_eq!(auto_apply, vec!["rust".to_string()]);
+        assert!(app.modal.is_none(), "the first assignment must not prompt");
+        assert!(!app.pending_apply.contains("rust"));
+        assert_eq!(toast(&app), ("assigned demo to VM rust", ToastLevel::Info));
+    }
+
+    #[test]
+    fn drain_scan_clears_pending_apply_when_the_vm_is_applied() {
+        let (_dir, mut app) = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.pending_apply.insert("rust".into());
+
+        tx.send(ScanMessage::VmApplied {
+            vm: "rust".into(),
+            note: "VM rust restarted with the current config".into(),
+        })
+        .unwrap();
+        drain_scan(&mut app, &rx);
+
+        assert!(!app.apply_pending("rust"));
+        assert_eq!(
+            toast(&app),
+            (
+                "VM rust restarted with the current config",
+                ToastLevel::Info
+            )
+        );
+    }
+
+    #[test]
+    fn drain_scan_clears_provisioning_when_the_vm_stops() {
+        let (_dir, mut app) = test_app();
+        let (tx, rx) = mpsc::channel();
+        let plan = crate::agent::provision::ProvisionPlan::new(Harness::Shell, &[]).unwrap();
+        app.set_provision_progress(crate::agent::provision::ProvisionProgress::new(&plan));
+        assert!(app.provision.is_some());
+
+        tx.send(ScanMessage::VmStopped {
+            vm: "rust".into(),
+            note: "VM rust stopped".into(),
+        })
+        .unwrap();
+        drain_scan(&mut app, &rx);
+
+        assert!(app.provision.is_none());
     }
 
     #[test]

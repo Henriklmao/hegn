@@ -24,10 +24,13 @@ upgrade from an older version.
 | Kernel + rootfs images | A guest kernel and a qcow2 or raw root filesystem. Defaults live under `~/.local/share/hegn/images/`. See [VM images](vm-images.md). |
 | Free disk space | About 2.5 GiB for the pinned images and tools, plus about the size of guest RAM per snapshot and some log space. See [Resource usage](resources.md). |
 | `git` | Used for project status, session branches and checkpoints. |
+| OpenSSH client | `ssh` and `ssh-keygen` on `PATH`. Used for the default SSH attach, `--command` and the per-VM key. `hegn doctor` checks both. |
 | `lazygit`, `$EDITOR` | Optional. Used by the `g` and `e` shortcuts. |
 
-Run `hegn doctor` after installing. It checks all of the above and tells you
-what is missing.
+The pinned cloud image already ships OpenSSH server and `ssh-keygen`; hegn's
+cloud-init configures sshd and the per-VM key. A custom `rootfs_image` must
+provide both. Run `hegn doctor` after installing. It checks all of the above and
+tells you what is missing.
 
 hegn always needs a real Cloud Hypervisor VM. If the kernel, rootfs, Cloud
 Hypervisor binary, virtiofsd or KVM device is missing, hegn stops with an error
@@ -132,6 +135,25 @@ A v1 `config.toml` still starts: `instances_dir`, `sandboxes_dir`, `shared_tag` 
 `guest_mount` parse as deprecated aliases for `vms_dir`, `share_tag_prefix` and
 `guest_projects_base`. Rewrite the keys when convenient. The full mapping is in
 [Migrating to v2](migration-v2.md).
+
+### Upgrading to SSH attach
+
+The SSH/control-TAP release keeps the v2 config format but changes the network
+setup, seed and snapshots:
+
+1. Install the OpenSSH client (`ssh`, `ssh-keygen`) if it is missing.
+2. Run `sudo hegn network setup --user "$USER"` again for marker version 3 and
+   the control TAPs. This is required even with `network = "off"`.
+3. Run `hegn vm apply <vm>` (or start a stopped VM) so the next boot uses seed
+   version 13, configures sshd and rotates the guest host keys.
+4. Snapshots from the old fingerprint domain are not resumed; the next start
+   cold boots.
+5. A session record without `guest_ip`/`ssh_user` cannot use SSH attach yet; use
+   `hegn attach <vm> --serial` until `hegn vm apply` has refreshed it.
+
+The full order and troubleshooting are in
+[Migrating to v2](migration-v2.md#upgrading-an-existing-v2-installation) and
+[Troubleshooting](troubleshooting.md#ssh-cannot-connect).
 
 ---
 

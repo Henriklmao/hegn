@@ -67,6 +67,9 @@ mod tests {
         let mut config = Config::default();
         config.state_dir = dir.path().join("state");
         config.projects_root = dir.path().join("projects");
+        config.snapshots_dir = dir.path().join("snapshots");
+        config.vms_dir = dir.path().join("vms");
+        config.templates_dir = dir.path().join("templates");
         config.kernel_image = dir.path().join("missing-kernel");
         config.rootfs_image = dir.path().join("missing-rootfs");
         config.cloud_hypervisor_bin = dir.path().join("missing-cloud-hypervisor");

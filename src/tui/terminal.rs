@@ -12,7 +12,7 @@ use crossterm::cursor::Show;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -62,4 +62,16 @@ pub(super) fn with_suspended_terminal<T>(
     )?;
     terminal.clear().ok();
     result
+}
+
+/// Write the TUI's own window title back to the terminal.
+///
+/// The event loop skips `SetTitle` while the title is unchanged, so a
+/// temporarily overridden title (an SSH session) has to be restored here.
+pub(super) fn set_title(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    title: &str,
+) -> Result<()> {
+    execute!(terminal.backend_mut(), SetTitle(title.to_string()))?;
+    Ok(())
 }

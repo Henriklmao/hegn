@@ -56,6 +56,8 @@ pub enum ConfigField {
     ReadOnlyWorkspace,
     Network,
     Security,
+    /// Guest account that receives the per-VM SSH key.
+    SshUser,
     Backend,
     CloudHypervisorBin,
     VirtiofsdBin,
@@ -118,6 +120,7 @@ impl ConfigField {
             Self::ReadOnlyWorkspace => "Read-only workspace",
             Self::Network => "Network",
             Self::Security => "Security",
+            Self::SshUser => "SSH user",
             Self::Backend => "Backend",
             Self::CloudHypervisorBin => "Hypervisor bin",
             Self::VirtiofsdBin => "virtiofsd bin",
@@ -139,9 +142,12 @@ impl ConfigField {
 
     pub fn kind(self) -> FieldKind {
         match self {
-            Self::Harness | Self::RootfsFormat | Self::Network | Self::Security | Self::Backend => {
-                FieldKind::Choice
-            }
+            Self::Harness
+            | Self::RootfsFormat
+            | Self::Network
+            | Self::Security
+            | Self::SshUser
+            | Self::Backend => FieldKind::Choice,
             Self::Vcpus => FieldKind::Integer {
                 min: 1,
                 max: 32,
@@ -284,6 +290,7 @@ const VM_ROWS: &[ConfigRow] = &[
     ConfigRow::Field(ConfigField::Vcpus),
     ConfigRow::Field(ConfigField::Memory),
     ConfigRow::Field(ConfigField::Security),
+    ConfigRow::Field(ConfigField::SshUser),
     ConfigRow::Group("Guest sharing"),
     ConfigRow::Note("share tags come from the global share_tag_prefix"),
     ConfigRow::Note("membership is managed by `hegn project assign`"),

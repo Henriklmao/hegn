@@ -17,6 +17,7 @@ pub(crate) fn app() -> (tempfile::TempDir, App) {
     let mut config = Config::default();
     config.projects_root = dir.path().join("projects");
     config.state_dir = dir.path().join("state");
+    config.vms_dir = dir.path().join("vms");
     config.snapshots_dir = dir.path().join("snapshots");
     config.templates_dir = dir.path().join("templates");
     config.profiles_dir = dir.path().join("profiles");

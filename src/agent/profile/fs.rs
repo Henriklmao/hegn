@@ -7,7 +7,7 @@ use std::ffi::{CString, OsStr};
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -247,9 +247,159 @@ pub(super) fn remove_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether `error` means the current user may not read or delete a path.
+///
+/// hegn invoked through `sudo` (for example `sudo hegn vm apply`) writes the
+/// per-VM bundle as root. A later user run owns the parent directory but can
+/// neither read the root-owned directory nor rename it (`rename` must update
+/// the directory's own `..` entry).
+pub(super) fn owner_blocked(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|error| {
+            matches!(error.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM))
+                || error.kind() == std::io::ErrorKind::PermissionDenied
+        })
+}
+
+/// Recreate `path` as a private directory, repairing content a root-run hegn
+/// left behind. Returns whether a repair was needed.
+///
+/// A root-owned directory cannot be read or renamed by a later user run, but
+/// `rmdir` of an empty directory only needs write access to the parent, which
+/// the user owns. Non-empty leftovers are impossible to fix without root, so
+/// they fail with the exact command instead of a bare `Permission denied`.
+pub(super) fn reset_dir(path: &Path) -> Result<bool> {
+    match remove_path(path) {
+        Ok(()) => {
+            ensure_real_dir(path)?;
+            Ok(false)
+        }
+        Err(error) if owner_blocked(&error) => {
+            remove_empty_dir(path)?;
+            ensure_real_dir(path)?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Ensure `path` is a private directory the current user controls.
+///
+/// Unlike [`reset_dir`] this keeps usable content; only a directory the current
+/// user cannot access is replaced. Returns whether a repair was needed.
+pub(super) fn ensure_usable_dir(path: &Path) -> Result<bool> {
+    if let Err(error) = fs::read_dir(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+        && owner_blocked(&anyhow::Error::new(error))
+    {
+        remove_empty_dir(path)?;
+        ensure_real_dir(path)?;
+        return Ok(true);
+    }
+    match ensure_real_dir(path) {
+        Ok(()) => Ok(false),
+        Err(error) if owner_blocked(&error) => {
+            remove_empty_dir(path)?;
+            ensure_real_dir(path)?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_empty_dir(path: &Path) -> Result<()> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "cannot repair {} automatically; a root-run hegn left it root-owned and it is \
+                 not empty. Run `sudo rm -rf {}` and start again",
+                path.display(),
+                crate::shared::text::shell_quote_always(&path.to_string_lossy())
+            )
+        }),
+    }
+}
+
+/// Warning text for a directory that [`reset_dir`] or [`ensure_usable_dir`]
+/// replaced because a root-run hegn created it.
+pub(super) fn repaired_warning(path: &Path) -> String {
+    format!(
+        "replaced {} after a root-run hegn left it root-owned; its content was not readable \
+         by this user",
+        path.display()
+    )
+}
+
+/// Hand a bundle written while running as root back to the invoking user.
+///
+/// Without this, a root-run `hegn vm apply` leaves root-owned directories and
+/// files in the user's private VM state, which later user runs cannot read or
+/// replace.
+pub(super) fn adopt_invoking_owner(root: &Path) -> Result<()> {
+    // Safety: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let Some(uid) = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return Ok(());
+    };
+    let gid = std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    adopt_owner(root, uid, gid)
+}
+
+fn adopt_owner(root: &Path, uid: u32, gid: Option<u32>) -> Result<()> {
+    // The bundle is guest-writable, so walk it iteratively: a poisoned guest
+    // can nest directories deeply enough to overflow a recursive walk.
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.uid() != uid || gid.is_some_and(|gid| metadata.gid() != gid) {
+            std::os::unix::fs::chown(&path, Some(uid), gid)
+                .with_context(|| format!("failed to hand {} to user {uid}", path.display()))?;
+        }
+        if metadata.is_dir() {
+            for entry in
+                fs::read_dir(&path).with_context(|| format!("failed to read {}", path.display()))?
+            {
+                pending.push(entry?.path());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
-    crate::shared::fs::write_private(path, contents)
-        .with_context(|| format!("failed to write {}", path.display()))
+    match crate::shared::fs::write_private(path, contents) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            // A root-run hegn can leave a 0600 file that the current user may
+            // not reopen. The directory owner may still unlink and replace it,
+            // but never through a symlink and never over a directory.
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("failed to inspect {}", path.display()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(error).with_context(|| format!("failed to write {}", path.display()));
+            }
+            fs::remove_file(path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+            crate::shared::fs::write_private(path, contents)
+                .with_context(|| format!("failed to write {}", path.display()))
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to write {}", path.display())),
+    }
 }
 
 pub(super) fn copy_file_private(source: &Path, dest: &Path, follow_symlinks: bool) -> Result<()> {
@@ -403,5 +553,88 @@ mod tests {
         assert_eq!(metadata.uid(), fs::metadata(&source).unwrap().uid());
         assert_eq!(fs::read(&dest).unwrap(), b"payload");
         assert_eq!(metadata.permissions().mode() & 0o600, 0o600);
+    }
+
+    #[test]
+    fn reset_dir_repairs_an_empty_directory_the_user_cannot_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("files");
+        fs::create_dir(&path).unwrap();
+        // An empty directory that cannot be opened makes `remove_dir_all` fail
+        // with `EACCES`, while `rmdir` only needs write access to the parent.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o300)).unwrap();
+
+        assert!(reset_dir(&path).unwrap());
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn reset_dir_removes_a_writable_directory_without_a_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("files");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("previous"), b"copied").unwrap();
+
+        assert!(!reset_dir(&path).unwrap());
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn reset_dir_names_the_manual_command_for_a_non_empty_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("files");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("root-owned"), b"leftover").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let err = format!("{:#}", reset_dir(&path).unwrap_err());
+        assert!(err.contains("sudo rm -rf"), "{err}");
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn ensure_usable_dir_repairs_an_unreadable_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("skills");
+        fs::create_dir(&path).unwrap();
+        // A root-owned 0700 directory is unreadable for the user who owns the
+        // parent; write-only simulates that for the owning user.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o300)).unwrap();
+
+        assert!(ensure_usable_dir(&path).unwrap());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn ensure_usable_dir_keeps_readable_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("skills");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("guest"), b"keep").unwrap();
+
+        assert!(!ensure_usable_dir(&path).unwrap());
+        assert_eq!(fs::read(path.join("guest")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn write_private_replaces_a_file_the_user_cannot_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local.json");
+        fs::write(&path, b"old").unwrap();
+        // Owned by the user, but a root-run hegn left it 0400.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        write_private(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

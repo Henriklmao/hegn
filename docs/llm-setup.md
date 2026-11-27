@@ -15,9 +15,9 @@ missing VM is always a hard error.
 ## Ground rules
 
 1. **Linux only.** hegn needs KVM (`/dev/kvm`), a Landlock-capable kernel
-   (ABI v3, Linux 6.2+) and `cloud-hypervisor` plus `virtiofsd`. If the host
-   cannot provide them, stop and report the gap instead of substituting another
-   runtime.
+   (ABI v3, Linux 6.2+), `cloud-hypervisor`, `virtiofsd` and the OpenSSH client
+   (`ssh`, `ssh-keygen`). If the host cannot provide them, stop and report the
+   gap instead of substituting another runtime.
 2. **Never weaken the sandbox.** Do not set `security = "off"`,
    `virtiofs_sandbox = "chroot"` or edit the VMM argv to drop seccomp/Landlock to
    get past an error. Report the failure and let the user decide.
@@ -43,11 +43,13 @@ id -nG | tr ' ' '\n' | grep -qx kvm && echo "kvm group: ok" || echo "kvm group: 
 ldd --version | head -1                      # glibc host
 df -h ~                                      # need ~2.5 GiB free, plus snapshots
 command -v paru yay 2>/dev/null              # AUR helper (Arch family only)
+command -v ssh ssh-keygen                    # OpenSSH client
 ```
 
 | Check | Required | Fix |
 | --- | --- | --- |
 | Linux kernel 6.2+ | yes | Use a current distribution kernel. |
+| `ssh` and `ssh-keygen` | yes | Install the distribution's OpenSSH client package. |
 | `/dev/kvm` readable/writable by the user | yes | Enable VT-x/AMD-V (and nested virt inside a VM) in firmware/hypervisor, then add the user to `kvm`: `sudo usermod -aG kvm "$USER"` (needs a new login session). |
 | glibc | yes for the pre-built binaries | On musl (Alpine) install from source. |
 | Disk space | ~2.5 GiB free | 46 MiB kernel + 1.9 GiB rootfs + ~10 MiB tools, plus ~`memory_mib` per snapshot. |
@@ -185,7 +187,7 @@ cloud_init      = true
 guest_credential_hardening = false
 security        = "enforce"
 harness         = "shell"   # default for new VMs
-network         = "guarded" # "guarded" (web+DNS only) or "off" (no NIC)
+network         = "guarded" # "guarded" (web+DNS) or "off" (control-only SSH, no egress)
 ```
 
 The old keys `instances_dir`, `sandboxes_dir`, `shared_tag` and `guest_mount` still
@@ -219,13 +221,14 @@ custom, unhashed images.
 
 ---
 
-## Step 4b — Enable the guarded guest network
+## Step 4b — Enable the control and guarded guest network
 
 This is a host firewall change and needs root. Ask the user before running it.
-It creates a pool of TAP devices owned by the invoking user and installs an
-nftables table that allows only public HTTP(S) and public DNS. It also exempts
-the TAP pool from an active ufw/firewalld/iptables routed policy, which would
-otherwise drop the traffic hegn allows.
+It creates a pool of data TAPs and a pool of control TAPs owned by the invoking
+user, and installs an nftables table. The control TAPs carry only SSH and have
+no egress. The data TAPs allow only public HTTP(S) and public DNS and are
+exempted from an active ufw/firewalld/iptables routed policy, which would
+otherwise drop the traffic hegn allows. The setup marker is version 3.
 
 The normal path is the automatic doctor setup, which also creates directories,
 writes the default config and downloads the pinned images:
@@ -243,9 +246,9 @@ sudo hegn network setup --user "$USER"
 ```
 
 **Gate:** `hegn network status` reports `guard: ready` and lists `hegn0` as
-`up`. `hegn doctor` reports the `network guard` check as ok. If the host already
-has a conflicting `10.213.0.0/24` network, stop and report it; do not weaken the
-rules.
+`up`; a root-run `hegn doctor` verifies marker version 3, the control TAPs and
+the control rules. If the host already has a conflicting `10.213.0.0/24` or
+`10.214.0.0/24` network, stop and report it; do not weaken the rules.
 
 ## Step 5 — Host check
 
@@ -256,11 +259,12 @@ hegn doctor --json       # machine-readable, one object per check
 ```
 
 **Gate:** exit code `0`. `hegn doctor` must report all required checks as ok:
-`cloud-hypervisor`, `virtiofsd`, `git`, `kvm`, `landlock`, `kernel image`,
-`rootfs image`, `projects root`, `backend` (always) and `network guard` (when
-`network = "guarded"`). This list is the common set, not every check; `serial
-logs` is optional. If `landlock` fails, the kernel is too old — do not disable
-the sandbox; report the kernel version.
+`cloud-hypervisor`, `virtiofsd`, `ssh`, `ssh-keygen`, `git`, `kvm`, `landlock`,
+`kernel image`, `rootfs image`, `projects root`, `backend` and `network guard`
+(the control TAPs and control rules are required in every network mode). This
+list is the common set, not every check; `serial logs` is optional. If
+`landlock` fails, the kernel is too old — do not disable the sandbox; report the
+kernel version.
 
 The optional legacy checks are `legacy instance dirs`, `legacy snapshots`,
 `legacy project keys` and `deprecated config keys`. They use the `!` marker when

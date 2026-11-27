@@ -10,7 +10,9 @@ use crate::config::{Config, Harness};
 use crate::shared::text::shell_quote_always as shell_quote;
 use crate::vm::config::VmConfig;
 
-use super::fs::{ensure_real_dir, remove_path, secure_dir, write_private};
+use super::fs::{
+    adopt_invoking_owner, ensure_usable_dir, repaired_warning, reset_dir, secure_dir, write_private,
+};
 use super::model::Profile;
 use super::template::template;
 use super::{BUNDLE_DIR, ENV_FILE, FILES_DIR, LOCAL_STATE, MANIFEST, SKILLS_DIR};
@@ -125,10 +127,8 @@ impl ProfileLayout {
         self.bundle_dir.join(SKILLS_DIR)
     }
 
-    pub(super) fn reset_files(&self) -> Result<()> {
-        let files = self.files_dir();
-        remove_path(&files)?;
-        ensure_real_dir(&files)
+    pub(super) fn reset_files(&self) -> Result<bool> {
+        reset_dir(&self.files_dir())
     }
 
     fn state_path(&self) -> PathBuf {
@@ -140,16 +140,22 @@ impl ProfileLayout {
         serde_json::from_str(&raw).ok()
     }
 
-    pub(super) fn save(&self, state: &ProfileState, profile: &Profile) -> Result<()> {
-        ensure_real_dir(&self.files_dir())?;
-        ensure_real_dir(&self.skills_dir())?;
+    /// Write the bundle metadata and return warnings about repaired entries.
+    pub(super) fn save(&self, state: &ProfileState, profile: &Profile) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
+        for dir in [self.files_dir(), self.skills_dir()] {
+            if ensure_usable_dir(&dir)? {
+                warnings.push(repaired_warning(&dir));
+            }
+        }
         let manifest = self.manifest_contents(state)?;
         let env = self.env_contents(profile);
         write_private(&self.bundle_dir.join(MANIFEST), manifest.as_bytes())?;
         write_private(&self.bundle_dir.join(ENV_FILE), env.as_bytes())?;
         let raw = serde_json::to_vec_pretty(state)?;
         write_private(&self.state_path(), &raw)?;
-        Ok(())
+        adopt_invoking_owner(&self.bundle_dir)?;
+        Ok(warnings)
     }
 
     pub(super) fn manifest_contents(&self, state: &ProfileState) -> Result<String> {
@@ -271,6 +277,42 @@ mod tests {
             "{err}"
         );
         assert_eq!(fs::read(&target).unwrap(), b"version = 1\n");
+    }
+
+    #[test]
+    fn save_reports_a_repaired_bundle_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let vm = VmConfig {
+            name: "demo".into(),
+            ..VmConfig::default()
+        };
+        vm.validate().unwrap();
+        let layout = ProfileLayout::new(&config, &vm).unwrap();
+        let skills = layout.skills_dir();
+        fs::create_dir(&skills).unwrap();
+        // Simulate a root-owned 0700 directory for the user who owns the parent.
+        fs::set_permissions(&skills, fs::Permissions::from_mode(0o300)).unwrap();
+
+        let state = ProfileState {
+            version: crate::agent::profile::PROFILE_VERSION,
+            harness: vm.harness,
+            files: Vec::new(),
+            skills: Vec::new(),
+        };
+        let warnings = layout
+            .save(&state, &Profile::for_harness(vm.harness))
+            .unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("root-run"), "{warnings:?}");
+        assert_eq!(
+            fs::metadata(layout.skills_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 
     #[test]

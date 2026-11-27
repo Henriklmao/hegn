@@ -47,7 +47,9 @@ pub enum Commands {
         #[command(subcommand)]
         command: ProjectCommands,
     },
-    /// Boot or attach a project VM and open its serial console.
+    /// Boot or attach a project VM and open an SSH session.
+    ///
+    /// Pass `--serial` to use the serial console instead.
     Open {
         /// Project name (under projects_root) or path.
         project: String,
@@ -60,25 +62,32 @@ pub enum Commands {
         /// Skip creating a transient git session branch.
         #[arg(long)]
         no_branch: bool,
-        /// Do not reserve a status bar line (for full-screen guest programs).
+        /// Use the serial console instead of SSH.
+        #[arg(long)]
+        serial: bool,
+        /// Do not reserve a status bar line (serial path only).
         #[arg(long)]
         no_bar: bool,
-        /// Command to type into the guest after attaching (for example an agent).
+        /// Command to run in the guest (SSH exec) or type into the serial console.
         #[arg(long, value_name = "COMMAND")]
         command: Option<String>,
     },
-    /// Attach to the serial console of the already running VM (tmux-style).
+    /// Attach to the already running VM over SSH (tmux-style).
     ///
-    /// Never boots or restarts a VM. The bottom line shows the project name,
-    /// harness, VM pid and persistent serial log; Ctrl-B detaches.
+    /// Never boots or restarts a VM. With `--serial` hegn attaches the serial
+    /// console instead; the bottom line then shows the project name, harness,
+    /// VM pid and persistent serial log, and Ctrl-B detaches.
     #[command(visible_alias = "a")]
     Attach {
         /// VM name, or a project that names its VM.
         project: Option<String>,
-        /// Do not reserve a status bar line (for full-screen guest programs).
+        /// Use the serial console instead of SSH.
+        #[arg(long)]
+        serial: bool,
+        /// Do not reserve a status bar line (serial path only).
         #[arg(long)]
         no_bar: bool,
-        /// Command to type into the guest after attaching.
+        /// Command to run in the guest (SSH exec) or type into the serial console.
         #[arg(long, value_name = "COMMAND")]
         command: Option<String>,
     },
@@ -93,7 +102,10 @@ pub enum Commands {
         /// Override the terminal integration.
         #[arg(long, value_enum)]
         integration: Option<Integration>,
-        /// Do not reserve a status bar line.
+        /// Use the serial console instead of SSH.
+        #[arg(long)]
+        serial: bool,
+        /// Do not reserve a status bar line (serial path only).
         #[arg(long)]
         no_bar: bool,
     },
@@ -318,12 +330,15 @@ pub enum VmCommands {
     Primary { name: String, project: String },
     /// List a VM's project members and guest paths.
     Projects { name: String },
-    /// Attach the console and start a shell or harness in a project directory.
+    /// Start a shell or the harness in a project directory over SSH.
     Shell {
         name: String,
         /// Member project to start in (defaults to the VM primary).
         #[arg(long, value_name = "PROJECT")]
         project: Option<String>,
+        /// Use the serial console instead of SSH.
+        #[arg(long)]
+        serial: bool,
     },
     /// Delete a VM after unassigning its projects.
     Delete {
@@ -708,10 +723,12 @@ mod tests {
         match cli.command {
             Some(Commands::Attach {
                 project,
+                serial,
                 no_bar,
                 command,
             }) => {
                 assert_eq!(project.as_deref(), Some("demo"));
+                assert!(!serial);
                 assert!(!no_bar);
                 assert!(command.is_none());
             }
@@ -722,6 +739,42 @@ mod tests {
             Some(Commands::Attach { project, .. }) => assert!(project.is_none()),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn serial_flag_selects_the_serial_transport_for_every_entry_point() {
+        let cli = Cli::try_parse_from(["hegn", "attach", "demo", "--serial"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attach { serial: true, .. })
+        ));
+
+        let cli = Cli::try_parse_from(["hegn", "open", "demo", "--serial"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Open { serial: true, .. })
+        ));
+
+        let cli = Cli::try_parse_from(["hegn", "launch", "demo", "--serial"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Launch { serial: true, .. })
+        ));
+
+        let cli = Cli::try_parse_from(["hegn", "vm", "shell", "rust", "--serial"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Vm {
+                command: VmCommands::Shell { serial: true, .. }
+            })
+        ));
+
+        // SSH is the default: no flag means the SSH transport.
+        let cli = Cli::try_parse_from(["hegn", "attach", "demo"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attach { serial: false, .. })
+        ));
     }
 
     #[test]
@@ -741,11 +794,13 @@ mod tests {
                 selector,
                 command,
                 integration,
+                serial,
                 no_bar,
             }) => {
                 assert_eq!(selector.as_deref(), Some("demo"));
                 assert_eq!(command.as_deref(), Some("review"));
                 assert_eq!(integration, Some(Integration::Herdr));
+                assert!(!serial);
                 assert!(!no_bar);
             }
             other => panic!("unexpected {other:?}"),
@@ -1152,7 +1207,11 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Vm {
-                command: VmCommands::Shell { name, project: Some(project) }
+                command: VmCommands::Shell {
+                    name,
+                    project: Some(project),
+                    serial: false,
+                }
             }) if name == "rust" && project == "parser"
         ));
 

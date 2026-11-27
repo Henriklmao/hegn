@@ -1,7 +1,7 @@
 //! Dashboard and VM state: loading project lists, filters, selection and the
 //! periodic poll.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
 use crate::config::Config;
@@ -78,6 +78,7 @@ impl App {
             terminal_mode: TerminalMode::Normal,
             scroll: 0,
             toast: None,
+            pending_apply: BTreeSet::new(),
             download: None,
             provision: None,
             pending_launch: None,
@@ -623,6 +624,45 @@ impl App {
         self.toast = Some(Toast::new(text, level));
     }
 
+    /// Open a scrollable error modal so long diagnostics are never clipped.
+    pub fn show_error(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        self.modal = Some(Modal::Error {
+            title: title.into(),
+            message: message.into(),
+            scroll: 0,
+        });
+    }
+
+    /// Ask whether to restart `vm` so a new assignment takes effect.
+    ///
+    /// When another modal is already open the prompt would be lost, so the VM
+    /// is only marked pending and the user is told how to apply it later.
+    pub fn prompt_apply(&mut self, vm: &str) {
+        if self.modal.is_some() {
+            self.pending_apply.insert(vm.to_string());
+            self.toast(
+                format!("VM {vm} needs apply; run hegn vm apply {vm}"),
+                ToastLevel::Warn,
+            );
+            return;
+        }
+        self.modal = Some(Modal::Confirm(ConfirmPrompt {
+            title: "Restart VM?".into(),
+            message: format!(
+                "The project assignment changed. Applying restarts VM {vm} and ends its \
+                 running sessions."
+            ),
+            confirm_label: "Apply now".into(),
+            action: ConfirmAction::ApplyVm(vm.to_string()),
+            scroll: 0,
+        }));
+    }
+
+    /// True while `vm` still needs `hegn vm apply`.
+    pub fn apply_pending(&self, vm: &str) -> bool {
+        self.pending_apply.contains(vm)
+    }
+
     /// Record the latest image download progress shown in the notification.
     pub fn set_download_progress(&mut self, progress: crate::vm::images::DownloadProgress) {
         self.download = Some(progress);
@@ -658,6 +698,7 @@ impl App {
             self.session_closed_reported = true;
             self.vm.state = VmUiState::Stopped;
             self.vm.started_at = None;
+            self.clear_provision();
             self.toast("session exited", ToastLevel::Info);
         }
         if self

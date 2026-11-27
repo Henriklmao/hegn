@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::RootfsFormat;
+use crate::config::{NetworkMode, RootfsFormat};
 use crate::project::ProjectKind;
 use crate::shared::text::human_bytes as human_size;
 
@@ -28,7 +28,12 @@ pub const SNAPSHOT_VERSION: u32 = 2;
 const LEGACY_VERSION: u32 = 1;
 
 /// Domain separator mixed into [`compute_fingerprint`].
-const FINGERPRINT_DOMAIN: &str = "hegn-snapshot-boot-v2";
+///
+/// v3 hashes the cloud-init seed version and the network mode. Bumping the
+/// domain invalidates every checkpoint written before those inputs were part
+/// of the fingerprint, so an old snapshot cannot be resumed into a different
+/// seed or NIC layout.
+const FINGERPRINT_DOMAIN: &str = "hegn-snapshot-boot-v3";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotMeta {
@@ -59,9 +64,10 @@ pub struct SnapshotMeta {
     #[serde(default)]
     pub membership: Vec<SnapshotMember>,
     /// Boot inputs the fingerprint was computed from, kept structured so a
-    /// mismatch can name the changed fields.
+    /// mismatch can name the changed fields. Boxed to keep [`SnapshotMeta`]
+    /// (and every action that carries one) small; the JSON shape is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot: Option<SnapshotBoot>,
+    pub boot: Option<Box<SnapshotBoot>>,
 }
 
 fn legacy_meta_version() -> u32 {
@@ -176,6 +182,28 @@ pub struct SnapshotBoot {
     /// Guarded-network TAP slice, kept across restores.
     #[serde(default)]
     pub network_index: Option<u8>,
+    /// Cloud-init seed generation the guest was provisioned with. Missing in
+    /// v2 files, which deserialize as `0` and therefore never match.
+    #[serde(default)]
+    pub seed_version: u32,
+    /// Per-VM cloud-init generation recorded for this boot. `hegn vm apply`
+    /// increments it, so an older checkpoint can never hide the new seed.
+    #[serde(default)]
+    pub seed_generation: u64,
+    /// Network mode of the recorded boot. Missing in v2 files, which
+    /// deserialize as [`NetworkMode::Guarded`] and are invalidated by the
+    /// fingerprint domain bump.
+    #[serde(default)]
+    pub network_mode: NetworkMode,
+    /// Guest SSH account the seed was rendered with. Missing in older files,
+    /// which deserialize as `None` and never match a boot that knows its user.
+    #[serde(default)]
+    pub ssh_user: Option<String>,
+    /// SHA-256 (lowercase hex) of the client public key the guest authorized.
+    /// Missing in older files; a changed key would otherwise pair an old guest
+    /// memory image with a new SSH identity.
+    #[serde(default)]
+    pub ssh_public_key_hash: Option<String>,
     /// Whether the profile/skill share was part of the device tree.
     #[serde(default)]
     pub profile_share: bool,
@@ -192,6 +220,11 @@ impl Default for SnapshotBoot {
             rootfs_path: PathBuf::new(),
             rootfs_format: RootfsFormat::default(),
             network_index: None,
+            seed_version: 0,
+            seed_generation: 0,
+            network_mode: NetworkMode::default(),
+            ssh_user: None,
+            ssh_public_key_hash: None,
             profile_share: false,
             primary: None,
         }
@@ -218,6 +251,25 @@ pub fn compute_fingerprint(membership: &[SnapshotMember], boot: &SnapshotBoot) -
         &mut hasher,
         "network_index",
         &optional_u8(boot.network_index),
+    );
+    hash_field(&mut hasher, "seed_version", &boot.seed_version.to_string());
+    hash_field(
+        &mut hasher,
+        "seed_generation",
+        &boot.seed_generation.to_string(),
+    );
+    hash_field(&mut hasher, "network_mode", boot.network_mode.label());
+    // The seed authorizes one account with one public key. Binding both to the
+    // fingerprint stops a memory image from being paired with a new identity.
+    hash_field(
+        &mut hasher,
+        "ssh_user",
+        boot.ssh_user.as_deref().unwrap_or("none"),
+    );
+    hash_field(
+        &mut hasher,
+        "ssh_public_key_hash",
+        boot.ssh_public_key_hash.as_deref().unwrap_or("none"),
     );
     hash_field(
         &mut hasher,
@@ -308,6 +360,39 @@ pub fn describe_boot_changes(
             "network index {} -> {}",
             optional_u8(recorded.network_index),
             optional_u8(current.network_index)
+        ));
+    }
+    if recorded.seed_version != current.seed_version {
+        changes.push(format!(
+            "seed version {} -> {}",
+            recorded.seed_version, current.seed_version
+        ));
+    }
+    if recorded.seed_generation != current.seed_generation {
+        changes.push(format!(
+            "seed generation {} -> {}",
+            recorded.seed_generation, current.seed_generation
+        ));
+    }
+    if recorded.network_mode != current.network_mode {
+        changes.push(format!(
+            "network mode {} -> {}",
+            recorded.network_mode.label(),
+            current.network_mode.label()
+        ));
+    }
+    if recorded.ssh_user != current.ssh_user {
+        changes.push(format!(
+            "ssh user {} -> {}",
+            recorded.ssh_user.as_deref().unwrap_or("none"),
+            current.ssh_user.as_deref().unwrap_or("none")
+        ));
+    }
+    if recorded.ssh_public_key_hash != current.ssh_public_key_hash {
+        changes.push(format!(
+            "ssh public key {} -> {}",
+            recorded.ssh_public_key_hash.as_deref().unwrap_or("none"),
+            current.ssh_public_key_hash.as_deref().unwrap_or("none")
         ));
     }
     if recorded.profile_share != current.profile_share {
@@ -424,6 +509,9 @@ pub fn sanitize_name(name: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// Stand-in for a SHA-256 hex digest of a client public key.
+    const SSH_KEY_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     fn member(name: &str, path: &str, tag: &str, guest: &str) -> SnapshotMember {
         SnapshotMember {
             name: name.into(),
@@ -454,6 +542,11 @@ mod tests {
             rootfs_path: PathBuf::from("/vms/rust/rootfs.qcow2"),
             rootfs_format: RootfsFormat::Qcow2,
             network_index: Some(3),
+            seed_version: 13,
+            seed_generation: 0,
+            network_mode: NetworkMode::Guarded,
+            ssh_user: Some("hegn".into()),
+            ssh_public_key_hash: Some(SSH_KEY_HASH.into()),
             profile_share: true,
             primary: Some("parser".into()),
         }
@@ -465,7 +558,7 @@ mod tests {
             vm: Some("rust".into()),
             boot_fingerprint: Some(compute_fingerprint(&membership(), &boot())),
             membership: membership(),
-            boot: Some(boot()),
+            boot: Some(Box::new(boot())),
             ..SnapshotMeta::default()
         }
     }
@@ -488,7 +581,7 @@ mod tests {
             dir: dir.path().join("missing"),
             vm: Some("rust".into()),
             boot_fingerprint: Some("0".repeat(64)),
-            boot: Some(boot()),
+            boot: Some(Box::new(boot())),
             ..SnapshotMeta::default()
         };
         assert!(!meta.is_restorable());
@@ -533,6 +626,31 @@ mod tests {
             },
             SnapshotBoot {
                 network_index: None,
+                ..boot()
+            },
+            SnapshotBoot {
+                seed_version: 12,
+                ..boot()
+            },
+            SnapshotBoot {
+                seed_generation: 1,
+                ..boot()
+            },
+            SnapshotBoot {
+                network_mode: NetworkMode::Off,
+                ..boot()
+            },
+            SnapshotBoot {
+                ssh_user: Some("root".into()),
+                ..boot()
+            },
+            SnapshotBoot {
+                ssh_public_key_hash: Some("9".repeat(64)),
+                ..boot()
+            },
+            SnapshotBoot {
+                ssh_user: None,
+                ssh_public_key_hash: None,
                 ..boot()
             },
             SnapshotBoot {
@@ -604,6 +722,11 @@ mod tests {
             rootfs_path: PathBuf::from("/vms/rust/other.qcow2"),
             rootfs_format: RootfsFormat::Raw,
             network_index: Some(5),
+            seed_version: 12,
+            seed_generation: 7,
+            network_mode: NetworkMode::Off,
+            ssh_user: Some("root".into()),
+            ssh_public_key_hash: Some("9".repeat(64)),
             profile_share: false,
             primary: Some("cli".into()),
         };
@@ -626,6 +749,11 @@ mod tests {
             "rootfs /vms/rust/rootfs.qcow2 -> /vms/rust/other.qcow2",
             "rootfs format qcow2 -> raw",
             "network index 3 -> 5",
+            "seed version 13 -> 12",
+            "seed generation 0 -> 7",
+            "network mode guarded -> off",
+            "ssh user hegn -> root",
+            &format!("ssh public key {SSH_KEY_HASH} -> {}", "9".repeat(64)),
             "profile share present -> absent",
             "member 'parser' tag hegn-prj-0 -> hegn-prj-9",
             "member 'cli' read-only false -> true",
@@ -679,6 +807,14 @@ mod tests {
         assert!(raw.contains("\"version\": 2"), "{raw}");
         assert!(raw.contains("\"boot_fingerprint\""), "{raw}");
         assert!(raw.contains("\"membership\""), "{raw}");
+        assert!(raw.contains("\"seed_version\": 13"), "{raw}");
+        assert!(raw.contains("\"seed_generation\": 0"), "{raw}");
+        assert!(raw.contains("\"network_mode\": \"guarded\""), "{raw}");
+        assert!(raw.contains("\"ssh_user\": \"hegn\""), "{raw}");
+        assert!(
+            raw.contains(&format!("\"ssh_public_key_hash\": \"{SSH_KEY_HASH}\"")),
+            "{raw}"
+        );
         let loaded: SnapshotMeta = serde_json::from_str(&raw).unwrap();
         assert_eq!(loaded, meta);
 
@@ -689,11 +825,73 @@ mod tests {
     }
 
     #[test]
+    fn v2_metadata_without_the_new_boot_fields_is_incompatible() {
+        let mut raw = serde_json::to_value(meta()).unwrap();
+        let boot_fields = raw["boot"].as_object_mut().unwrap();
+        boot_fields.remove("seed_version");
+        boot_fields.remove("seed_generation");
+        boot_fields.remove("network_mode");
+
+        let loaded: SnapshotMeta = serde_json::from_value(raw).unwrap();
+        let recorded = loaded.boot.as_ref().unwrap();
+        // Old v2 files still load: serde falls back to zero/guarded, but the
+        // v3 fingerprint domain and the seed version make them incompatible.
+        assert_eq!(recorded.seed_version, 0);
+        assert_eq!(recorded.network_mode, NetworkMode::Guarded);
+        assert!(!loaded.is_legacy(), "the v2 structure is still intact");
+        assert!(!loaded.fingerprint_matches(&compute_fingerprint(&loaded.membership, recorded)));
+
+        let changes = describe_boot_changes(recorded, &loaded.membership, &boot(), &membership());
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "seed version 0 -> 13"),
+            "{changes:?}"
+        );
+    }
+
+    #[test]
+    fn v3_metadata_without_the_ssh_identity_is_incompatible() {
+        let mut raw = serde_json::to_value(meta()).unwrap();
+        let boot_fields = raw["boot"].as_object_mut().unwrap();
+        boot_fields.remove("ssh_user");
+        boot_fields.remove("ssh_public_key_hash");
+
+        let loaded: SnapshotMeta = serde_json::from_value(raw).unwrap();
+        let recorded = loaded.boot.as_ref().unwrap();
+        // Older v3 files still load: serde defaults the new inputs to `None`,
+        // but the recorded fingerprint was computed with them, so the file can
+        // never resume a boot that knows its SSH identity.
+        assert_eq!(recorded.ssh_user, None);
+        assert_eq!(recorded.ssh_public_key_hash, None);
+        assert!(!loaded.is_legacy(), "the v3 structure is still intact");
+        assert!(!loaded.fingerprint_matches(&compute_fingerprint(&loaded.membership, recorded)));
+        assert!(
+            loaded.fingerprint_matches(&compute_fingerprint(&loaded.membership, &boot())),
+            "the recorded identity must still match the unmodified boot inputs"
+        );
+
+        let changes = describe_boot_changes(recorded, &loaded.membership, &boot(), &membership());
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "ssh user none -> hegn"),
+            "{changes:?}"
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == &format!("ssh public key none -> {SSH_KEY_HASH}")),
+            "{changes:?}"
+        );
+    }
+
+    #[test]
     fn a_v2_file_missing_its_inputs_is_treated_as_legacy() {
         let mut meta = meta();
         meta.boot = None;
         assert!(meta.is_legacy());
-        meta.boot = Some(boot());
+        meta.boot = Some(Box::new(boot()));
         meta.boot_fingerprint = None;
         assert!(meta.is_legacy());
     }

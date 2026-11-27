@@ -4,7 +4,7 @@
 **Supersedes:** the one-project-per-VM model described in
 [Projects, VMs and workspaces](../projects-and-vms.md) and
 [Architecture §2–§6](../architecture.md).
-**ADRs:** [ADR-006 … ADR-010](../architecture.md#13-decisions-and-trade-offs).
+**ADRs:** [ADR-006 … ADR-011](../architecture.md#13-decisions-and-trade-offs).
 
 ---
 
@@ -21,7 +21,7 @@ The new model separates three things that are currently fused:
 | Concept | Role | Cardinality |
 | --- | --- | --- |
 | **Project** | A directory the user works in; the primary navigation object | many |
-| **VM** | A named tool profile and runtime: harness, packages, CPU/RAM, rootfs, network, snapshots, console | many |
+| **VM** | A named tool profile and runtime: harness, packages, CPU/RAM, rootfs, network, snapshots, SSH access | many |
 | **Workspace** | A concrete checkout exported to a VM: the project itself, a clone, or a git worktree | one per project membership |
 
 A **project belongs to at most one VM**. A **VM hosts many projects**. The
@@ -71,13 +71,16 @@ are shared by both projects.
 6. Fail closed. Missing project, duplicate membership, or a mismatched snapshot
    is an error, never a partial boot.
 7. Be explicit that VM membership is a **trust decision**. Projects in one VM
-   share a guest user, a toolchain, a console and each other's mounted files.
+   share a guest user, a toolchain, an SSH account and each other's mounted
+   files.
+8. Give every interactive session its own guest PTY and resize. SSH over a
+   control TAP is the transport; the serial relay remains boot/recovery. No
+   vsock broker (ADR-011).
 
 ### Non-goals (v1 of this model)
 
-- Multiple interactive terminals into one VM. One serial console remains the
-  transport; guest-side `tmux` is the supported workaround. A vsock session
-  broker is future work.
+- TUI tabs, an embedded VT emulator or a hegn-side session multiplexer. SSH
+  sessions are external; the embedded TUI terminal stays on the serial relay.
 - Live adding/removing of shares on a running VM. Membership changes require a
   restart (`hegn vm apply`).
 - Automatic migration of v1 instances. See §11.
@@ -95,6 +98,7 @@ are shared by both projects.
 | 3 | Parallel workspaces: self-contained clones by default, nested worktrees opt-in | [ADR-008](../architecture.md#adr-008-clones-by-default-worktrees-opt-in) |
 | 4 | Hard cut to config/state v2; v1 instances are not migrated | [ADR-009](../architecture.md#adr-009-hard-cut-to-v2) |
 | 5 | Snapshot boot fingerprint; membership or resource changes invalidate resume | [ADR-010](../architecture.md#adr-010-snapshot-boot-fingerprint) |
+| 6 | SSH over a per-VM control TAP; serial stays the recovery channel; no vsock broker | [ADR-011](../architecture.md#adr-011-ssh-over-the-control-tap-instead-of-a-vsock-broker) |
 
 ---
 
@@ -166,7 +170,8 @@ periodic_snapshots = true
 snapshot_interval_secs = 300
 snapshot_keep = 2
 auto_resume = true
-network_index = 3                # assigned once, kept across restores
+network_index = 3                # TAP slot; set in every mode, kept across restores
+ssh_user = "root"                # root | hegn | ubuntu; default from hardening
 created_at = "2026-11-24T10:00:00Z"
 ```
 
@@ -208,6 +213,10 @@ See §8 for the clone/worktree rules.
 8. `max_projects_per_vm` (global config) defaults to 16 and is validated
    (hard ceiling 32), because each member is one virtio-fs device and one
    `virtiofsd` process.
+9. Interactive access uses SSH over the VM's control TAP. The control TAP has
+   no egress; the guarded data TAP remains the only route to the public web. A
+   missing `ssh_user`/`guest_ip` is a hard attach error, never a serial
+   fallback.
 
 ---
 
@@ -274,37 +283,48 @@ is the default working directory. Other projects are reached with
    spawning anything.
 5. Try auto-resume only when the newest autosave's boot fingerprint matches
    (`§7`).
-6. Reserve the network TAP, materialize the VM profile.
-7. Write the NoCloud seed with all mounts and the `/workspace` symlink.
+6. Ensure the per-VM SSH key, reserve the slot's control TAP and, with guarded
+   networking, its data TAP; materialize the VM profile.
+7. Write the NoCloud seed with all mounts, the `/workspace` symlink, the
+   control netplan, sshd configuration and the authorized public key.
 8. Spawn one sandboxed `virtiofsd` per member on its indexed socket, plus the
    optional profile daemon.
-9. Spawn Cloud Hypervisor with one `--fs` per member, then the profile device.
+9. Spawn Cloud Hypervisor with one `--fs` per member, then the profile device,
+   and `--net` for the control TAP (data first when guarded); add one Landlock
+   sysfs rule per TAP.
 10. Start the relay, wait for a running seccomp-confined VMM, write
-    `run/membership.json` and `session.json`, start the autosave worker.
+    `run/membership.json` and `session.json` (with `guest_ip`/`ssh_user`), start
+    the autosave worker.
 
 Any failure kills **all** daemons started so far and removes run files; the
 serial log is kept, exactly as today.
 
 ### 5.4 Attach and start semantics
 
-- Starting any member starts the whole VM. Attaching another member attaches
-  the same console.
+- Starting any member starts the whole VM. `hegn attach` opens SSH to the
+  guest's control address; every invocation gets its own PTY, so several
+  sessions (terminals, tmux panes, full-screen TUIs) can run in parallel.
+  `--serial` attaches the single serial console instead.
 - The VM writes `run/membership.json` at boot. `hegn open` compares it with the
   registry. If they differ (a project was assigned while the VM ran), attach
   succeeds with a warning; changing mounts requires
   `hegn vm apply <vm>` (restart). hegn never kills a running agent
   automatically.
-- `hegn attach <vm>` is raw. `hegn open <project>` attaches and shows the
-  project's guest path. `hegn vm shell <vm> --project <name>` uses the existing
-  typed-launch mechanism to `cd` and start the shell/harness.
-- One interactive foreground process per VM. Multiple agents in one VM use
-  guest `tmux`; this is documented rather than emulated (see §13).
+- `hegn attach <vm>` is raw and unguarded, like the serial path. `hegn open
+  <project>` waits for provisioning/SSH readiness, attaches and shows the
+  project's guest path. `--command` is executed through SSH in that guest
+  directory. `hegn vm shell <vm> --project <name>` starts the shell/harness
+  over SSH.
+- The embedded TUI terminal remains the serial console; `F2` and the external
+  attach path open an SSH session. There are no TUI tabs and no VT emulator
+  (see §13).
 
 ### 5.5 Stop
 
-Stop terminates the VMM, relay, every member `virtiofsd` (from
-`membership.json`), the profile daemon and the autosave worker, then releases
-the TAP. It never deletes a workspace.
+Stop terminates every SSH session, the VMM, relay, every member `virtiofsd`
+(from `membership.json`), the profile daemon and the autosave worker, then
+releases the slot lease for the control TAP and, when present, the data TAP.
+The pool TAP devices themselves stay in place. It never deletes a workspace.
 
 ---
 
@@ -345,19 +365,27 @@ so adding one does not invalidate a snapshot.
 
 - ordered membership (tag, canonical path, mount slug, read-only, kind),
 - `vcpus`, `memory_mib`, rootfs path and format,
-- `network_index`, profile-share presence.
+- `network_index`, profile-share presence,
+- `seed_version`, `network_mode` (control-only vs control+data) and the
+  per-VM `seed_generation` advanced by `hegn vm apply`,
+- `ssh_user` and the SHA-256 hash of the client public key the guest
+  authorized, so a changed identity invalidates the checkpoint.
+
+The fingerprint domain is `hegn-snapshot-boot-v3`.
 
 Semantics:
 
-- **Automatic resume:** skip a checkpoint whose fingerprint differs, log why,
-  and cold boot. Never restore a VM whose embedded mounts no longer exist.
+- **Automatic resume:** skip a checkpoint whose fingerprint or domain differs,
+  log why, and cold boot. Never restore a VM whose embedded mounts no longer
+  exist or whose device tree predates the control NIC.
 - **Manual restore:** refuse a fingerprint mismatch with a message naming the
-  changed fields and suggesting `hegn vm apply`. There is no `--force` in v1;
-  a restored VM cannot be reconciled with added or removed shares after the
-  fact.
-- **Restore flow:** re-spawn one `virtiofsd` per recorded member on the same
-  indexed sockets, regenerate the seed from the recorded membership, restore
-  the VMM, and rewrite the session record.
+  changed fields and suggesting `hegn vm apply`. There is no `--force`; a
+  restored VM cannot be reconciled with added or removed shares or a changed
+  network mode after the fact.
+- **Restore flow:** reserve the control TAP and, when recorded, the data TAP;
+  re-spawn one `virtiofsd` per recorded member on the same indexed sockets;
+  regenerate the seed from the recorded membership and network mode; restore the
+  VMM with the Landlock rules for both TAPs; and rewrite the session record.
 - Snapshots are listed and restored from the VM, not from a project. The
   project screen shows its VM's snapshots.
 - v1 snapshot directories have no fingerprint and are listed as legacy,
@@ -454,6 +482,12 @@ The existing invariants stay; the following are new or strengthened.
    created inside the guest. It cannot point at the host or outside
    `/projects`.
 9. **Explicit rootfs images are unique per VM** and checked before boot.
+10. **SSH is a management channel.** Each VM's client key and `known_hosts`
+    live in its private `ssh/` directory. SSH terminates on the control TAP,
+    which has no route, DNS, forwarding or masquerade; the guarded data TAP is
+    still the only egress path. sshd is public-key only for `ssh_user`, and
+    agent/TCP forwarding are disabled. A missing key or stale session record is
+    a hard error; hegn never falls back to serial.
 
 ---
 
@@ -473,7 +507,7 @@ hegn vm apply <name>              # restart when membership/config changed
 hegn vm rebuild <name>            # new private rootfs from the base image
 hegn vm primary <name> <project>
 hegn vm projects <name>
-hegn vm shell <name> [--project <project>]
+hegn vm shell <name> [--project <project>] [--serial]
 hegn vm delete <name> [--keep-workspaces|--delete-workspaces] [--yes]
 
 hegn project create <name> [--vm <name>] ...
@@ -484,9 +518,9 @@ hegn project fork <project> [--mode clone|worktree] [--name <name>] [--vm <name>
 hegn project delete <project> [--keep-files|--delete-files]
 hegn projects [query]             # now shows the VM column
 
-hegn open <project> [--vm <name>]
-hegn attach <vm|project> [--project <name>] [--no-bar]
-hegn launch <project> [--command C] [--integration I]
+hegn open <project> [--serial] [--command C]
+hegn attach <vm|project> [--serial] [--no-bar] [--command C]
+hegn launch <project> [--command C] [--integration I] [--serial] [--no-bar]
 hegn snapshot create|restore|list|delete --vm <name> ...
 hegn logs ...                     # per VM, filterable by project
 ```
@@ -512,8 +546,11 @@ The project picker stays the home screen.
   `1 Projects` (assign/detach/set primary), `2 Snapshots`, `3 Tools`
   (harness, packages, resources, provisioning state), `4 Health`.
   Start/stop/apply/shell live here.
-- **Attach:** `Enter` on a project attaches its VM; the terminal title and
-  header show `project · vm`. `F2` attaches externally to the VM.
+- **Attach:** `Enter` on a project attaches its VM. External attachments
+  (`F2`, external/tmux/herdr integrations) open an SSH session in the current
+  terminal; the host title is `hegn: <vm> · <project>`. The embedded terminal
+  remains the serial relay, with no tabs or VT emulator. Missing
+  `guest_ip`/`ssh_user` produces a TUI error that points at `--serial`.
 - **Settings:** `F4` global, `F5` VM (`vm.toml`), `F6` project presentation
   preferences. The project settings modal no longer contains `harness`.
 - **Modals:** create VM, edit VM, assign project to VM, fork workspace
@@ -541,6 +578,20 @@ No automatic migration.
   `guest_projects_base` (default `/projects`).
 - Legacy snapshots and instances are never selected for restore.
 
+The SSH attach release upgrades an existing v2 installation in place:
+
+1. Run `sudo hegn network setup --user "$USER"` again; the marker moves to
+   version 3 and the control TAP family is created.
+2. Install the host OpenSSH client (`ssh`, `ssh-keygen`); `hegn doctor` checks
+   both.
+3. `hegn vm apply <vm>` regenerates the seed (version 13) and restarts the VM,
+   which re-runs cloud-init, configures sshd/control netplan and rotates the
+   guest host keys.
+4. Snapshots from before seed version 13 or the v3 fingerprint domain are not
+   resumed; the next start cold boots.
+5. A VM whose `session.json` predates `guest_ip`/`ssh_user` refuses SSH attach;
+   use `hegn attach <vm> --serial` until `hegn vm apply` has refreshed it.
+
 v1 projects are obviously importable via:
 
 ```bash
@@ -566,6 +617,9 @@ although I'm the only user...
 | Auto-resume fingerprint mismatch | Skip checkpoint, cold boot, log reason |
 | Manual restore fingerprint mismatch | Refuse and name the changed fields |
 | Legacy v1 instance/snapshot | Ignored, reported by doctor, never deleted |
+| Snapshot without the control NIC | Rejected; cold boot instead of resume |
+| SSH refused or authentication fails | Hard error naming `--serial`/`hegn vm apply`; VM keeps running |
+| Session record lacks `guest_ip`/`ssh_user` | SSH attach refused with a `--serial` hint |
 | Shared explicit rootfs | Boot fails for the second VM |
 | Read-only project | virtiofsd `--readonly` plus guest `ro` mount |
 
@@ -573,9 +627,11 @@ although I'm the only user...
 
 ## 13. Known limitations
 
-- **One console per VM.** The serial relay remains the only transport. Running
-  several agents in one VM requires guest `tmux` (or separate VMs). A vsock
-  guest session broker with per-project PTYs is the natural follow-up.
+- **External SSH sessions only.** Every `hegn attach` gets its own guest PTY,
+  so several agents can run in parallel without sharing the serial line. There
+  is no hegn-side multiplexer, TUI tab bar, VT emulator or SSH status bar, and
+  no vsock broker (ADR-011). The embedded TUI terminal still shows the serial
+  console. Guest `tmux` remains the way to survive a disconnect.
 - **Membership changes need a restart.** There is no live hot-plug of
   virtio-fs devices; `vm apply` is explicit because it kills running agents.
 - **Tool changes are not reconciled.** The provisioner installs the baseline
@@ -585,7 +641,7 @@ although I'm the only user...
 - **N daemons cost N processes.** Shared-tool VMs reduce rootfs and provision
   cost but increase per-VM process count. `max_projects_per_vm` bounds it.
 - **No per-project snapshots.** A snapshot belongs to the VM and covers every
-  member; that is the price of a shared rootfs and console.
+  member; that is the price of a shared rootfs and runtime.
 - **No inter-project isolation inside a VM.** Every member is visible at
   `/projects/<slug>`. Group only projects that may read each other's files and
   secrets; use separate VMs for a hard boundary.
@@ -607,7 +663,9 @@ although I'm the only user...
 - Lifecycle: every member preflighted before spawn; one failed `virtiofsd`
   cleans all; stop kills every daemon from the manifest.
 - Snapshots: mismatch skips auto-resume; manual restore refuses; restore
-  re-spawns the recorded daemons.
+  re-spawns the recorded daemons and reserves control (+ optional data) TAPs.
+- SSH: exact argv, key permissions, missing guest IP/user, readiness probe,
+  host-key rotation and `--serial` selection.
 - Security: destructive commands in any `/projects/*` root; membership file is
   not agent-writable; duplicate/nested export refused.
 - TUI: `TestBackend` coverage for the VM badge, VM screen, assign/fork modals,
@@ -642,10 +700,11 @@ its own commit and review.
 1. **Repo-local presentation config.** Keep `launch`/`integration`/`auto_start`
    in the project's `hegn.toml`, or move everything private? This design keeps
    the presentation plane in the repo and the control plane private.
-2. **Guest multiplexing.** Is guest `tmux` enough for parallel agents in one
-   shared VM, or is a vsock session broker required earlier?
-3. **Cwd injection.** Should `hegn open <project>` type `cd` into a plain
-   shell, or only into the configured launch command? This design only types
-   through the existing launch path.
+2. **Guest multiplexing (resolved).** Parallel sessions use SSH over the
+   control TAP, one guest PTY per attach; no vsock broker (ADR-011). Guest
+   `tmux` is optional persistence, not the transport.
+3. **Cwd injection (resolved).** The SSH login shell starts in `/workspace`;
+   `--command` runs through SSH exec with the selected project's guest CWD. hegn
+   does not type `cd` into a shared serial shell.
 4. **Tool reconciliation.** When should package changes be applied: manual in
    the guest, an explicit `vm rebuild`, or a guest-side manifest reconciler?

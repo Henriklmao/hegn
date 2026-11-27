@@ -82,20 +82,25 @@ fn dispatch(command: Commands, config: Config, json: bool) -> Result<i32> {
             editor,
             lazygit,
             no_branch,
+            serial,
             no_bar,
             command,
-        } => open(project, editor, lazygit, no_branch, no_bar, command, config),
+        } => open(
+            project, editor, lazygit, no_branch, serial, no_bar, command, config,
+        ),
         Commands::Attach {
             project,
+            serial,
             no_bar,
             command,
-        } => attach(project, no_bar, command, config),
+        } => attach(project, serial, no_bar, command, config),
         Commands::Launch {
             selector,
             command,
             integration,
+            serial,
             no_bar,
-        } => launch_command(selector, command, integration, no_bar, config),
+        } => launch_command(selector, command, integration, serial, no_bar, config),
         Commands::Logs { command } => logs_command(
             command.unwrap_or(LogCommands::List { vm: None }),
             config,

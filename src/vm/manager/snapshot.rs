@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 
 use crate::agent::profile::{self, PROFILE_SHARE_TAG, ProfilePlan};
 use crate::agent::provision::ProvisionPlan;
@@ -34,6 +35,7 @@ use crate::session::snapshot::{
     SNAPSHOT_VERSION, SnapshotBoot, SnapshotMember, SnapshotMeta, SnapshotStore,
     compute_fingerprint, describe_boot_changes,
 };
+use crate::session::ssh::SshIdentity;
 use crate::vm::cloud_init;
 use crate::vm::config::VmConfig;
 use crate::vm::hypervisor::{CloudHypervisorClient, SnapshotConfig};
@@ -50,11 +52,24 @@ use super::process::{
     ensure_socket, hegn_binary, read_pid, terminate, terminate_autosave, terminate_relay,
 };
 use super::session::SessionRecord;
-use super::start::effective_rootfs;
+use super::start::{effective_rootfs, prepare_guest_ssh};
 use super::util::{append_event_log, dir_size, secure_snapshot_dir, write_private};
 
-/// TAP names embedded in a Cloud Hypervisor snapshot config.
-fn snapshot_network_taps(dir: &Path) -> Result<Vec<String>> {
+/// One NIC embedded in a Cloud Hypervisor snapshot config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotNic {
+    tap: String,
+    mac: String,
+}
+
+impl SnapshotNic {
+    fn label(&self) -> String {
+        format!("{} ({})", self.tap, self.mac)
+    }
+}
+
+/// TAP names and MACs embedded in a Cloud Hypervisor snapshot config.
+fn snapshot_network_taps(dir: &Path) -> Result<Vec<SnapshotNic>> {
     let path = dir.join("config.json");
     let raw =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -66,11 +81,84 @@ fn snapshot_network_taps(dir: &Path) -> Result<Vec<String>> {
         .map(|devices| {
             devices
                 .iter()
-                .filter_map(|device| device.get("tap").and_then(serde_json::Value::as_str))
-                .map(str::to_string)
+                .filter_map(|device| {
+                    let tap = device.get("tap")?.as_str()?.to_string();
+                    let mac = device
+                        .get("mac")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    Some(SnapshotNic { tap, mac })
+                })
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// Check that a snapshot's recorded NICs match the current network lease.
+///
+/// A snapshot owns its device tree, so the expected set is exact: the control
+/// NIC always, plus the data NIC only in guarded mode. Both the TAP name and
+/// the MAC must match, because the guest configures its interfaces by MAC.
+/// Extra, missing or foreign NICs would either attach an interface the guest
+/// never configured or boot a guest with no control link at all.
+fn validate_snapshot_taps(
+    snapshot_name: &str,
+    vm_name: &str,
+    lease: &network::NetworkLease,
+    snapshot_nics: &[SnapshotNic],
+) -> Result<()> {
+    let control = &lease.control;
+    let control_present = snapshot_nics
+        .iter()
+        .any(|nic| nic.tap == control.tap && nic.mac == control.mac);
+    if !control_present {
+        // Old snapshots predate the always-present control NIC; a data-only
+        // device tree cannot carry SSH or hegn's guest metadata. The slot
+        // reservation stays with the VM: a running VM may still own it and the
+        // next start reuses it.
+        bail!(
+            "snapshot '{snapshot_name}' has no control NIC ({} / {}); cold boot required",
+            control.tap,
+            control.mac
+        );
+    }
+    let mut expected: Vec<&network::TapLease> = Vec::with_capacity(2);
+    if let Some(data) = &lease.data {
+        expected.push(data);
+    }
+    expected.push(control);
+    let mut expected_nics: Vec<(&str, &str)> = expected
+        .iter()
+        .map(|nic| (nic.tap.as_str(), nic.mac.as_str()))
+        .collect();
+    expected_nics.sort();
+    let mut found_nics: Vec<(&str, &str)> = snapshot_nics
+        .iter()
+        .map(|nic| (nic.tap.as_str(), nic.mac.as_str()))
+        .collect();
+    found_nics.sort();
+    if found_nics != expected_nics {
+        // Leave the VM's reservation intact: an old VM may still be running on
+        // that TAP, and the next start will reuse it.
+        bail!(
+            "snapshot '{}' expects NICs [{}], but VM '{}' owns [{}]; restore it in the VM that \
+             created it",
+            snapshot_name,
+            expected
+                .iter()
+                .map(|nic| format!("{} ({})", nic.tap, nic.mac))
+                .collect::<Vec<_>>()
+                .join(", "),
+            vm_name,
+            snapshot_nics
+                .iter()
+                .map(SnapshotNic::label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// virtio-fs tags embedded in a Cloud Hypervisor snapshot config.
@@ -127,7 +215,14 @@ pub(super) fn current_boot(
     plan: &BootPlan,
     profile_share: bool,
 ) -> SnapshotBoot {
-    boot_inputs(config, vm, plan.primary.clone(), profile_share)
+    let seed_generation = super::seed_generation::read(config, vm).unwrap_or(0);
+    boot_inputs(
+        config,
+        vm,
+        plan.primary.clone(),
+        profile_share,
+        seed_generation,
+    )
 }
 
 fn boot_inputs(
@@ -135,6 +230,7 @@ fn boot_inputs(
     vm: &VmConfig,
     primary: String,
     profile_share: bool,
+    seed_generation: u64,
 ) -> SnapshotBoot {
     SnapshotBoot {
         vcpus: vm.vcpus,
@@ -142,9 +238,32 @@ fn boot_inputs(
         rootfs_path: effective_rootfs(config, vm),
         rootfs_format: config.rootfs_format,
         network_index: vm.network_index,
+        seed_version: cloud_init::SEED_VERSION,
+        seed_generation,
+        network_mode: config.network,
+        ssh_user: vm
+            .effective_ssh_user(config.guest_credential_hardening)
+            .ok()
+            .map(|user| user.as_str().to_string()),
+        ssh_public_key_hash: public_key_hash(config, vm),
         profile_share,
         primary: Some(primary),
     }
+}
+
+/// SHA-256 (lowercase hex) of the VM's trimmed client public key.
+///
+/// A missing, unreadable or invalid identity yields `None`: an old VM must
+/// still be able to snapshot, and the resulting fingerprint simply cannot
+/// match a boot that later has a usable key. The hash never leaves the host;
+/// only the public half is ever read.
+fn public_key_hash(config: &Config, vm: &VmConfig) -> Option<String> {
+    let key = SshIdentity::new(&config.vms_dir, &vm.name)
+        .public_key()
+        .ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(key.trim().as_bytes());
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// A checkpoint chosen for auto-resume, or the reasons no checkpoint matched.
@@ -172,6 +291,16 @@ pub(super) fn select_auto_resume(
             ));
             continue;
         };
+        // v2 files predate the seed-version field and deserialize it as zero.
+        // Never resume one: the guest may have been provisioned from an older
+        // seed generation that no longer matches the current devices.
+        if recorded.seed_version == 0 {
+            reasons.push(format!(
+                "skipping autosave {}: snapshot has no recorded seed version; cold boot required",
+                snapshot.name
+            ));
+            continue;
+        }
         if snapshot.fingerprint_matches(&fingerprint) {
             return AutoResume::Resume(Box::new(snapshot));
         }
@@ -543,7 +672,14 @@ impl VmManager {
                 membership_path.display()
             ),
         };
-        let boot = boot_inputs(&self.config, &self.vm, primary, profile_share);
+        let seed_generation = super::seed_generation::read(&self.config, &self.vm)?;
+        let boot = boot_inputs(
+            &self.config,
+            &self.vm,
+            primary,
+            profile_share,
+            seed_generation,
+        );
         let fingerprint = compute_fingerprint(&membership, &boot);
         let project = boot
             .primary
@@ -562,7 +698,7 @@ impl VmManager {
             version: SNAPSHOT_VERSION,
             boot_fingerprint: Some(fingerprint),
             membership,
-            boot: Some(boot),
+            boot: Some(Box::new(boot)),
         })
     }
 
@@ -619,6 +755,12 @@ pub(super) async fn restore_snapshot_locked(
     }
     // Validate the recorded membership before stopping anything.
     let plan = recorded_plan(manager, snapshot)?;
+    let primary_path = plan
+        .members
+        .iter()
+        .find(|member| member.name == plan.primary)
+        .map(|member| member.path.clone())
+        .context("the recorded membership lost its primary project")?;
     paths.ensure()?;
     config.ensure_dirs()?;
     SnapshotStore::new(&config.snapshots_dir).ensure_staging()?;
@@ -653,11 +795,15 @@ pub(super) async fn restore_snapshot_locked(
         );
     }
     let hegn = hegn_binary()?;
-    if manager.unreadable_session() {
-        bail!(
-            "session metadata in {} is unreadable or from an older hegn version; \
-             stop the old VM manually and remove that directory before restoring",
-            paths.run_dir.display()
+    // Prepare the keypair and resolve the guest account before the current VM
+    // is stopped; an invalid ssh_user must not cost a running session.
+    let (ssh_user, ssh_public_key) = prepare_guest_ssh(config, vm)?;
+    if manager.unreadable_session()
+        && let Some(archive) = super::repair::repair_unreadable_session_locked(config, vm, &paths)?
+    {
+        append_event_log(
+            &paths.event_log,
+            &format!("archived unreadable session state to {}", archive.display()),
         );
     }
     // The snapshot embeds its device tree. Check the profile before stopping
@@ -685,56 +831,24 @@ pub(super) async fn restore_snapshot_locked(
             vm.harness.label()
         );
     }
-    let network_lease = match config.network {
-        crate::config::NetworkMode::Guarded => Some(network::acquire(config, vm)?),
-        crate::config::NetworkMode::Off => None,
-    };
-    if let Some(lease) = &network_lease
-        && let Err(err) = manager.persist_network_index(lease.index)
-    {
+    // The control TAP is reserved in every mode; guarded mode adds the data
+    // TAP. Off mode still gets a control link for SSH and metadata.
+    let network_lease = network::acquire(config, vm)?;
+    if let Err(err) = manager.persist_network_index(network_lease.slot) {
         network::release(config, &vm.name);
         return Err(err);
     }
     // The snapshot embeds its device tree. Never silently restore a NIC that
     // contradicts the current policy, and never attach a snapshot to a
     // different VM TAP than the one it was created with.
-    let snapshot_taps = match snapshot_network_taps(&snapshot.dir) {
-        Ok(taps) => taps,
+    let snapshot_nics = match snapshot_network_taps(&snapshot.dir) {
+        Ok(nics) => nics,
         Err(err) => {
             network::release(config, &vm.name);
             return Err(err);
         }
     };
-    match (&network_lease, snapshot_taps.as_slice()) {
-        (None, []) => {}
-        (None, [_, ..]) => {
-            bail!(
-                "snapshot '{}' contains a network device but `network = \"off\"`; enable \
-                 guarded networking or restore an air-gapped snapshot",
-                snapshot.name
-            );
-        }
-        (Some(lease), []) => append_event_log(
-            &paths.event_log,
-            &format!(
-                "warning: snapshot {} has no network device; restoring it without the reserved {}",
-                snapshot.name, lease.tap
-            ),
-        ),
-        (Some(lease), taps) if taps.iter().any(|tap| tap != &lease.tap) => {
-            // Leave the VM's reservation intact: an old VM may still be running
-            // on that TAP, and the next start will reuse it.
-            bail!(
-                "snapshot '{}' expects TAP {}, but VM '{}' owns {}; restore it in the VM that \
-                 created it",
-                snapshot.name,
-                taps.join(", "),
-                vm.name,
-                lease.tap
-            );
-        }
-        (Some(_), [_, ..]) => {}
-    }
+    validate_snapshot_taps(&snapshot.name, &vm.name, &network_lease, &snapshot_nics)?;
 
     // Stop the old VM, relay and every member filesystem daemon. The sockets
     // are freed and recreated below with the same paths the snapshot expects.
@@ -810,15 +924,25 @@ pub(super) async fn restore_snapshot_locked(
             .primary_guest_path()
             .context("the recorded membership lost the primary guest path")?;
         let mounts = plan.mount_specs();
-        let instance_id = cloud_init::instance_id(
-            &vm.name,
+        let workspace = primary_path.to_string_lossy().into_owned();
+        let identity = cloud_init::SeedIdentity {
+            vm: &vm.name,
+            project: &plan.primary,
+            workspace: &workspace,
+            ssh_user,
+            ssh_public_key: &ssh_public_key,
+        };
+        let seed_generation = super::seed_generation::read(config, vm)?;
+        let instance_id = cloud_init::instance_id_with_generation(
             &mounts,
             primary_guest,
             &provision,
             profile_plan.share.as_ref(),
-            network_lease.as_ref(),
+            Some(&network_lease),
             &config.local_endpoints,
             config.guest_credential_hardening,
+            &identity,
+            seed_generation,
         );
         cloud_init::write_seed(
             &paths.cloud_init,
@@ -827,9 +951,10 @@ pub(super) async fn restore_snapshot_locked(
             &instance_id,
             &provision,
             profile_plan.share.as_ref(),
-            network_lease.as_ref(),
+            Some(&network_lease),
             &config.local_endpoints,
             config.guest_credential_hardening,
+            &identity,
         )?;
     }
 
@@ -841,15 +966,9 @@ pub(super) async fn restore_snapshot_locked(
             &format!("warning: could not prune old serial logs: {err:#}"),
         );
     }
-    let primary_path = plan
-        .members
-        .iter()
-        .find(|member| member.name == plan.primary)
-        .map(|member| member.path.clone())
-        .context("the recorded membership lost its primary project")?;
     let serial_log = logs.create_session(&primary_path, started_at, std::process::id())?;
 
-    let vm_child = spawn_restore(config, &paths, snapshot, &vm_binary, network_lease.as_ref())?;
+    let vm_child = spawn_restore(config, &paths, snapshot, &vm_binary, Some(&network_lease))?;
     let vm_pid = vm_child.id();
     rollback.vm = Some(vm_child);
     let relay_pid = {
@@ -901,6 +1020,8 @@ pub(super) async fn restore_snapshot_locked(
         boot_args: super::args::boot_args(&config.root_device),
         serial_log: Some(serial_log),
         membership: membership.members.clone(),
+        guest_ip: Some(network_lease.control_guest_ip()),
+        ssh_user: Some(ssh_user.as_str().to_string()),
     };
     let recorded = (|| -> Result<()> {
         membership.save(&paths.membership)?;
@@ -985,6 +1106,111 @@ mod tests {
     use crate::vm::manager::SharedMember;
     use crate::vm::manager::test_support::{config_with_assets, manager, manager_for, plan_for};
 
+    fn network_lease(slot: u8, with_data: bool) -> crate::network::NetworkLease {
+        let control = crate::network::Lease {
+            index: slot,
+            vm: "demo".into(),
+            tap: crate::network::control_tap_name(slot),
+            mac: crate::network::control_mac(slot),
+            host_ip: crate::network::control_host_ip(slot),
+            guest_ip: crate::network::control_guest_ip(slot),
+        };
+        let data = with_data.then(|| crate::network::Lease {
+            index: slot,
+            vm: "demo".into(),
+            tap: crate::network::tap_name(slot),
+            mac: crate::network::mac(slot),
+            host_ip: crate::network::host_ip(slot),
+            guest_ip: crate::network::guest_ip(slot),
+        });
+        crate::network::NetworkLease {
+            slot,
+            vm: "demo".into(),
+            data,
+            control,
+        }
+    }
+
+    fn nic(tap: &str, mac: String) -> SnapshotNic {
+        SnapshotNic {
+            tap: tap.to_string(),
+            mac,
+        }
+    }
+
+    fn control_nic(lease: &crate::network::NetworkLease) -> SnapshotNic {
+        nic(&lease.control.tap, lease.control.mac.clone())
+    }
+
+    fn data_nic(lease: &crate::network::NetworkLease) -> SnapshotNic {
+        let data = lease.data.as_ref().expect("lease has no data NIC");
+        nic(&data.tap, data.mac.clone())
+    }
+
+    #[test]
+    fn snapshot_nics_must_match_the_guarded_lease_exactly() {
+        let lease = network_lease(3, true);
+        let control = control_nic(&lease);
+        let data = data_nic(&lease);
+        assert!(
+            validate_snapshot_taps("snap", "demo", &lease, &[data.clone(), control.clone()])
+                .is_ok()
+        );
+        // A data-only snapshot predates the control NIC and must cold boot.
+        let err = validate_snapshot_taps("snap", "demo", &lease, std::slice::from_ref(&data))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no control NIC"), "{err}");
+        assert!(err.contains("hegnc3"), "{err}");
+        assert!(err.contains("cold boot required"), "{err}");
+        // A foreign or extra NIC is refused too.
+        let extra = nic("hegn9", crate::network::mac(9));
+        let err = validate_snapshot_taps(
+            "snap",
+            "demo",
+            &lease,
+            &[data.clone(), control.clone(), extra],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("hegn9"), "{err}");
+        // The MAC belongs to the fingerprint: a mismatching data MAC is refused
+        // even when the TAP name matches.
+        let wrong_data = nic(&data.tap, crate::network::mac(4));
+        let err = validate_snapshot_taps("snap", "demo", &lease, &[wrong_data, control])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expects NICs"), "{err}");
+    }
+
+    #[test]
+    fn snapshot_nics_accept_off_mode_with_only_the_control_nic() {
+        let lease = network_lease(3, false);
+        let control = control_nic(&lease);
+        assert!(
+            validate_snapshot_taps("snap", "demo", &lease, std::slice::from_ref(&control)).is_ok()
+        );
+        // Off mode never has a data TAP; a snapshot that contains one is
+        // contradictory and must be refused.
+        let data = nic("hegn3", crate::network::mac(3));
+        let err = validate_snapshot_taps("snap", "demo", &lease, &[data, control])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expects NICs [hegnc3"), "{err}");
+        assert!(err.contains("owns [hegn3"), "{err}");
+    }
+
+    #[test]
+    fn snapshots_without_any_nic_require_a_cold_boot() {
+        let lease = network_lease(3, true);
+        let err = validate_snapshot_taps("snap", "demo", &lease, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no control NIC"), "{err}");
+        assert!(err.contains("hegnc3"), "{err}");
+        assert!(err.contains("cold boot required"), "{err}");
+    }
+
     fn snapshot(dir: &Path, owner: &str) -> SnapshotMeta {
         SnapshotMeta {
             name: "demo".into(),
@@ -1016,7 +1242,7 @@ mod tests {
             version: SNAPSHOT_VERSION,
             boot_fingerprint: Some(compute_fingerprint(&members, &boot)),
             membership: members,
-            boot: Some(boot),
+            boot: Some(Box::new(boot)),
         }
     }
 
@@ -1115,7 +1341,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_refuses_an_unreadable_session() {
+    fn restore_repairs_an_unreadable_session() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
         config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
@@ -1127,14 +1353,16 @@ mod tests {
         let snap_dir = dir.path().join("snap");
         write_snapshot_files(&snap_dir);
         let snapshot = matching_snapshot(&manager, &snap_dir);
-        let err = runtime()
-            .block_on(manager.restore_snapshot(&snapshot))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unreadable"), "{err}");
-        assert!(
-            paths.session.exists(),
-            "unreadable metadata must be preserved"
+        let _ = runtime().block_on(manager.restore_snapshot(&snapshot));
+        assert!(!paths.session.exists());
+        let archive = std::fs::read_dir(&paths.run_dir)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("stale-"))
+            .expect("archive directory");
+        assert_eq!(
+            std::fs::read(archive.path().join("session.json")).unwrap(),
+            b"{not json"
         );
     }
 
@@ -1163,15 +1391,20 @@ mod tests {
         let snap_dir = dir.path().join("snap");
         write_snapshot_files(&snap_dir);
         let mut snapshot = matching_snapshot(&manager, &snap_dir);
-        snapshot.boot = Some(SnapshotBoot {
+        snapshot.boot = Some(Box::new(SnapshotBoot {
             vcpus: 8,
             memory_mib: 8192,
             rootfs_path: std::path::PathBuf::from("/vms/rust/old-rootfs.qcow2"),
             rootfs_format: crate::config::RootfsFormat::Raw,
             network_index: Some(9),
+            seed_version: 11,
+            seed_generation: 3,
+            network_mode: crate::config::NetworkMode::Off,
+            ssh_user: Some("someone".into()),
+            ssh_public_key_hash: Some("0".repeat(64)),
             profile_share: true,
             primary: Some("demo".into()),
-        });
+        }));
         snapshot.membership[0].read_only = true;
         snapshot.boot_fingerprint = Some("0".repeat(64));
 
@@ -1185,6 +1418,10 @@ mod tests {
             "rootfs /vms/rust/old-rootfs.qcow2 ->",
             "rootfs format raw -> qcow2",
             "network index 9 -> none",
+            "seed version 11 -> 13",
+            "network mode off -> guarded",
+            "ssh user someone -> ",
+            &format!("ssh public key {} -> ", "0".repeat(64)),
             "profile share present -> absent",
             "member 'demo' read-only true -> false",
             "There is no --force",
@@ -1496,10 +1733,10 @@ mod tests {
         let mut old = matching_snapshot(&manager, &dir.path().join("snap"));
         old.name = "autosave-old".into();
         old.note = Some(AUTOSAVE_NOTE.into());
-        old.boot = Some(SnapshotBoot {
+        old.boot = Some(Box::new(SnapshotBoot {
             vcpus: 4,
             ..current.clone()
-        });
+        }));
         old.boot_fingerprint = Some(compute_fingerprint(
             &old.membership,
             old.boot.as_ref().unwrap(),
@@ -1558,6 +1795,37 @@ mod tests {
     }
 
     #[test]
+    fn auto_resume_skips_a_v2_snapshot_without_a_seed_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(config_with_assets(dir.path()), dir.path());
+        let plan = plan_for(&manager);
+        let members = current_membership(&plan);
+        let current = current_boot(manager.config(), manager.vm(), &plan, false);
+
+        let mut old = matching_snapshot(&manager, &dir.path().join("snap"));
+        old.name = "autosave-v2".into();
+        old.note = Some(AUTOSAVE_NOTE.into());
+        // v2 metadata has no `seed_version` key, so serde defaults it to zero.
+        old.boot.as_mut().unwrap().seed_version = 0;
+        old.boot_fingerprint = Some(compute_fingerprint(
+            &old.membership,
+            old.boot.as_ref().unwrap(),
+        ));
+
+        match select_auto_resume(vec![old], &current, &members) {
+            AutoResume::ColdBoot(reasons) => {
+                assert_eq!(reasons.len(), 1);
+                assert!(
+                    reasons[0].contains("has no recorded seed version"),
+                    "{reasons:?}"
+                );
+                assert!(reasons[0].contains("cold boot required"), "{reasons:?}");
+            }
+            AutoResume::Resume(_) => panic!("a v2 checkpoint must never be resumed"),
+        }
+    }
+
+    #[test]
     fn snapshot_metadata_records_the_manifest_membership_in_boot_order() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
@@ -1592,10 +1860,38 @@ mod tests {
         assert_eq!(meta.membership[1].kind, ProjectKind::Clone);
         assert!(!meta.boot.as_ref().unwrap().profile_share);
         assert_eq!(
+            meta.boot.as_ref().unwrap().seed_version,
+            cloud_init::SEED_VERSION
+        );
+        assert_eq!(
+            meta.boot.as_ref().unwrap().network_mode,
+            manager.config().network
+        );
+        assert_eq!(
             meta.boot_fingerprint.as_deref().unwrap(),
             compute_fingerprint(&meta.membership, meta.boot.as_ref().unwrap())
         );
         assert_eq!(meta.note.as_deref(), Some(AUTOSAVE_NOTE));
+    }
+
+    #[test]
+    fn public_key_hash_reads_trims_and_hashes_the_client_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let manager = manager(config.clone(), dir.path());
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample hegn:demo";
+
+        // A missing identity must not block a snapshot: it hashes to `None`.
+        assert_eq!(public_key_hash(&config, manager.vm()), None);
+
+        let ssh_dir = config.vms_dir.join(&manager.vm().name).join("ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        std::fs::write(ssh_dir.join("id_ed25519.pub"), format!("{key}\n")).unwrap();
+        let expected = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(key.as_bytes()))
+        };
+        assert_eq!(public_key_hash(&config, manager.vm()), Some(expected));
     }
 
     #[test]
@@ -1627,14 +1923,20 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_tap_names_are_read_from_the_device_tree() {
+    fn snapshot_nics_are_read_from_the_device_tree() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.json"),
-            r#"{"net":[{"tap":"hegn3","mac":"52:54:00:00:00:04"}]}"#,
+            r#"{"net":[{"tap":"hegn3","mac":"52:54:00:00:00:04"},{"tap":"hegnc3","mac":"52:54:00:00:01:04"}]}"#,
         )
         .unwrap();
-        assert_eq!(snapshot_network_taps(dir.path()).unwrap(), vec!["hegn3"]);
+        assert_eq!(
+            snapshot_network_taps(dir.path()).unwrap(),
+            vec![
+                nic("hegn3", "52:54:00:00:00:04".into()),
+                nic("hegnc3", "52:54:00:00:01:04".into()),
+            ]
+        );
         std::fs::write(dir.path().join("config.json"), r#"{"net":[]}"#).unwrap();
         assert!(snapshot_network_taps(dir.path()).unwrap().is_empty());
     }

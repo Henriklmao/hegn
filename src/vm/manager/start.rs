@@ -17,8 +17,9 @@ use crate::network;
 use crate::project::ProjectRegistry;
 use crate::session::logs::{DEFAULT_KEEP, LogStore};
 use crate::session::snapshot::{SnapshotMeta, SnapshotStore};
+use crate::session::ssh::SshIdentity;
 use crate::vm::cloud_init;
-use crate::vm::config::{VmConfig, VmStore};
+use crate::vm::config::{SshUser, VmConfig, VmStore};
 use crate::vm::manager::autosave;
 use crate::vm::rootfs::prepare_rootfs;
 use crate::vm::virtiofs::VirtiofsProcess;
@@ -36,13 +37,43 @@ use super::process::{hegn_binary, terminate_relay};
 use super::session::{SessionRecord, VmReport};
 use super::util::{append_event_log, endpoint_urls, write_private};
 
+/// Resolve the guest SSH account and materialize the per-VM keypair.
+///
+/// The key is created once per VM under `<vms_dir>/<vm>/ssh/` and never leaves
+/// the host; only the public half goes into the cloud-init seed. A corrupt
+/// identity is repaired here because this runs on the boot path, before any
+/// guest exists.
+pub(super) fn prepare_guest_ssh(config: &Config, vm: &VmConfig) -> Result<(SshUser, String)> {
+    let user = vm.effective_ssh_user(config.guest_credential_hardening)?;
+    let identity = SshIdentity::new(&config.vms_dir, &vm.name);
+    identity
+        .ensure()
+        .with_context(|| format!("failed to prepare the SSH identity for VM '{}'", vm.name))?;
+    let public_key = identity
+        .public_key()
+        .with_context(|| format!("failed to read the SSH public key for VM '{}'", vm.name))?;
+    Ok((user, public_key))
+}
+
 impl VmManager {
     /// Boot every exported project, Cloud Hypervisor and the console relay.
     ///
     /// Lifecycle errors are appended to `run/hegn.log` so a failed start can
     /// be diagnosed even when the guest never reached userspace.
     pub fn start(&self) -> Result<VmReport> {
-        let result = self.start_inner();
+        self.start_with_auto_resume(true)
+    }
+
+    /// Boot without considering an automatic checkpoint.
+    ///
+    /// `vm apply` uses this so a seed change takes effect through cloud-init
+    /// instead of restoring an older guest memory image.
+    pub(crate) fn start_cold(&self) -> Result<VmReport> {
+        self.start_with_auto_resume(false)
+    }
+
+    fn start_with_auto_resume(&self, auto_resume: bool) -> Result<VmReport> {
+        let result = self.start_inner(auto_resume);
         let paths = self.paths();
         // `start_inner` may fail before it creates the run directory.
         let _ = paths.ensure();
@@ -66,7 +97,7 @@ impl VmManager {
         result.map_err(|err| anyhow::anyhow!("{err:#} (VM log: {})", paths.event_log.display()))
     }
 
-    fn start_inner(&self) -> Result<VmReport> {
+    fn start_inner(&self, auto_resume: bool) -> Result<VmReport> {
         let paths = self.paths();
         // A missing VM is always a hard error: there is no host-process fallback.
         self.config.require_vm_assets()?;
@@ -107,11 +138,14 @@ impl VmManager {
         let _hegn = hegn_binary()?;
         let _lock = self.lock(&paths)?;
         if self.unreadable_session() {
-            bail!(
-                "session metadata in {} is unreadable or from an older hegn version; \
-                 stop the old VM manually and remove that directory before starting",
-                paths.run_dir.display()
-            );
+            let archive =
+                super::repair::repair_unreadable_session_locked(&self.config, &self.vm, &paths)?;
+            if let Some(archive) = archive {
+                append_event_log(
+                    &paths.event_log,
+                    &format!("archived unreadable session state to {}", archive.display()),
+                );
+            }
         }
         if self.is_running() {
             bail!(
@@ -120,6 +154,10 @@ impl VmManager {
                 self.vm.name
             );
         }
+        // Fail fast on an invalid ssh_user/hardening combination and create or
+        // repair the per-VM key before any child process is spawned. This runs
+        // under the lifecycle lock, so two starts cannot race on the keypair.
+        let (ssh_user, ssh_public_key) = prepare_guest_ssh(&self.config, &self.vm)?;
         // Save the primary the first time an empty VM gets a member. `/workspace`
         // is a boot-time symlink, so this is the only place it is chosen.
         if plan.primary_changed {
@@ -167,7 +205,7 @@ impl VmManager {
         // restart into a resume instead of a full cold boot. A checkpoint whose
         // device tree no longer matches is skipped with a logged reason, never
         // deleted, and the VM cold boots.
-        if let Some(candidates) = auto_resume_candidates(&self.config, &self.vm) {
+        if auto_resume && let Some(candidates) = auto_resume_candidates(&self.config, &self.vm) {
             match candidates {
                 Ok(candidates) if !candidates.is_empty() => {
                     let current = super::snapshot::current_boot(
@@ -226,16 +264,12 @@ impl VmManager {
         let mut packages = self.vm.extra_packages.clone();
         packages.extend(profile_plan.packages.iter().cloned());
         let provision = ProvisionPlan::new(self.vm.harness, &packages)?;
-        // Reserve the guarded-network slice before any process is spawned.
-        // `acquire` also verifies that the host firewall marker is present, so
-        // an unconfigured guard fails before virtiofsd or the VMM can start.
-        let network_lease = match self.config.network {
-            crate::config::NetworkMode::Guarded => Some(network::acquire(&self.config, &self.vm)?),
-            crate::config::NetworkMode::Off => None,
-        };
-        if let Some(lease) = &network_lease
-            && let Err(err) = self.persist_network_index(lease.index)
-        {
+        // Reserve the network slot before any process is spawned. `acquire`
+        // also verifies that the host firewall marker is present in guarded
+        // mode, so an unconfigured guard fails before virtiofsd or the VMM can
+        // start. The control TAP is reserved in every mode.
+        let network_lease = network::acquire(&self.config, &self.vm)?;
+        if let Err(err) = self.persist_network_index(network_lease.slot) {
             network::release(&self.config, &self.vm.name);
             return Err(err);
         }
@@ -321,15 +355,25 @@ impl VmManager {
                 .primary_guest_path()
                 .context("the boot plan lost the primary guest path")?;
             let mounts = plan.mount_specs();
-            let instance_id = cloud_init::instance_id(
-                &self.vm.name,
+            let workspace = primary_path.to_string_lossy().into_owned();
+            let identity = cloud_init::SeedIdentity {
+                vm: &self.vm.name,
+                project: &plan.primary,
+                workspace: &workspace,
+                ssh_user,
+                ssh_public_key: &ssh_public_key,
+            };
+            let seed_generation = super::seed_generation::read(&self.config, &self.vm)?;
+            let instance_id = cloud_init::instance_id_with_generation(
                 &mounts,
                 primary_guest,
                 &provision,
                 profile_plan.share.as_ref(),
-                network_lease.as_ref(),
+                Some(&network_lease),
                 &self.config.local_endpoints,
                 self.config.guest_credential_hardening,
+                &identity,
+                seed_generation,
             );
             cloud_init::write_seed(
                 &paths.cloud_init,
@@ -338,9 +382,10 @@ impl VmManager {
                 &instance_id,
                 &provision,
                 profile_plan.share.as_ref(),
-                network_lease.as_ref(),
+                Some(&network_lease),
                 &self.config.local_endpoints,
                 self.config.guest_credential_hardening,
+                &identity,
             )?;
         }
 
@@ -352,7 +397,7 @@ impl VmManager {
             &paths,
             &rootfs,
             &vm_binary,
-            network_lease.as_ref(),
+            Some(&network_lease),
             profile_plan
                 .share
                 .as_ref()
@@ -395,6 +440,8 @@ impl VmManager {
             boot_args: boot_args(&self.config.root_device),
             serial_log: Some(serial_log.clone()),
             membership: membership.members.clone(),
+            guest_ip: Some(network_lease.control_guest_ip()),
+            ssh_user: Some(ssh_user.as_str().to_string()),
         };
         let recorded = (|| -> Result<()> {
             membership.save(&paths.membership)?;
@@ -433,7 +480,7 @@ impl VmManager {
             started_at: Some(record.started_at),
             serial_log: Some(serial_log),
             local_endpoints: network_lease
-                .as_ref()
+                .data_lease()
                 .map(|lease| endpoint_urls(&self.config, lease.host_ip))
                 .unwrap_or_default(),
             note: Some(format!(
@@ -705,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn start_refuses_an_unreadable_session() {
+    fn start_repairs_an_unreadable_session() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_assets(dir.path());
         config.cloud_hypervisor_bin = std::env::current_exe().unwrap();
@@ -719,9 +766,19 @@ mod tests {
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
 
-        let err = manager.start().unwrap_err().to_string();
-        assert!(err.contains("unreadable"), "{err}");
-        assert_eq!(std::fs::read(&paths.session).unwrap(), b"{not json");
+        // The boot may still fail on the fake assets, but the stale metadata
+        // must be archived instead of blocking the start forever.
+        let _ = manager.start();
+        assert!(!paths.session.exists());
+        let archive = std::fs::read_dir(&paths.run_dir)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("stale-"))
+            .expect("archive directory");
+        assert_eq!(
+            std::fs::read(archive.path().join("session.json")).unwrap(),
+            b"{not json"
+        );
     }
 
     #[test]
@@ -769,6 +826,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: None,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         };
         let raw = serde_json::to_string(&record).unwrap();
         fs::write(&paths.session, &raw).unwrap();
@@ -861,6 +920,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: None,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         };
         fs::write(&one_paths.session, serde_json::to_string(&record).unwrap()).unwrap();
 
@@ -940,6 +1001,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: None,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         };
         fs::write(&one_paths.session, serde_json::to_string(&record).unwrap()).unwrap();
         MembershipManifest {

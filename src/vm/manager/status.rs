@@ -92,8 +92,8 @@ impl VmManager {
         if self.unreadable_session() {
             state = "failed".into();
             note = Some(
-                "session metadata is unreadable or from an older hegn version; stop the old VM \
-                 and remove the run directory"
+                "session metadata is unreadable or from an older hegn version; \
+                 the stale run state is archived automatically on the next start or stop"
                     .into(),
             );
         }
@@ -154,11 +154,15 @@ impl VmManager {
             relay_pid: session.as_ref().map(|s| s.relay_pid),
             started_at: session.as_ref().map(|s| s.started_at),
             serial_log: session.as_ref().and_then(|s| s.serial_log.clone()),
-            local_endpoints: self
-                .vm
-                .network_index
-                .map(|index| endpoint_urls(&self.config, network::host_ip(index)))
-                .unwrap_or_default(),
+            local_endpoints: if self.config.network == crate::config::NetworkMode::Off {
+                // Off mode has no data TAP, so no host endpoint is reachable.
+                Vec::new()
+            } else {
+                self.vm
+                    .network_index
+                    .map(|index| endpoint_urls(&self.config, network::host_ip(index)))
+                    .unwrap_or_default()
+            },
             note,
         })
     }
@@ -210,6 +214,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: None,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         };
         std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
     }
@@ -345,5 +351,25 @@ mod tests {
         );
         assert!(manager.status().unwrap().local_endpoints.is_empty());
         let _ = VmConfig::default();
+    }
+
+    #[test]
+    fn status_hides_local_endpoints_in_off_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_assets(dir.path());
+        config.network = crate::config::NetworkMode::Off;
+        config.local_endpoints = vec![crate::config::LocalEndpoint {
+            name: "ollama".into(),
+            port: 11434,
+        }];
+        let manager = manager(config.clone(), dir.path());
+        let mut vm = manager.vm().clone();
+        vm.network_index = Some(2);
+        let manager = crate::vm::manager::VmManager::new(config, vm).unwrap();
+
+        assert!(
+            manager.status().unwrap().local_endpoints.is_empty(),
+            "off mode has no data TAP to expose endpoints on"
+        );
     }
 }

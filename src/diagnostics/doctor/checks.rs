@@ -2,14 +2,19 @@
 
 use std::fs;
 use std::io;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Serialize;
 
-use crate::config::{Config, VIRTIOFSD_FALLBACKS};
+use crate::config::{Config, NetworkMode, VIRTIOFSD_FALLBACKS};
+use crate::network::{CONTROL_TAP_POOL, HostFirewall, TAP_POOL, control_tap_name, tap_name};
 use crate::session::snapshot::SnapshotStore;
+use crate::session::ssh::SshIdentity;
+use crate::vm::config::VmStore;
 use crate::vm::images;
+use crate::vm::manager::VmManager;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Check {
@@ -80,6 +85,8 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
         ),
     });
     checks.push(check_tool("git", Path::new("git"), &["--version"], true));
+    checks.push(ssh_client_check(Path::new("ssh")));
+    checks.push(ssh_keygen_check(Path::new("ssh-keygen")));
     checks.push(check_tool(
         "lazygit",
         Path::new("lazygit"),
@@ -156,64 +163,20 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
         _ => (true, "VM filesystem not created yet".to_string()),
     };
     checks.push(Check::new("disk space", disk_ok, false, disk_detail));
-    let guarded = config.network == crate::config::NetworkMode::Guarded;
     let marker = crate::network::ready_marker();
+    let control_taps = control_taps_present();
+    let data_taps = data_taps_present();
     let live = crate::network::live_guard_status(&config.endpoint_ports());
     let guard_ready = crate::network::guard_ready(config);
-    checks.push(Check::new(
-        "network guard",
-        guard_ready || !guarded,
-        guarded,
-        if !guarded {
-            "disabled in config (air-gapped guest)".to_string()
-        } else if guard_ready {
-            let endpoints = config.local_endpoints.len();
-            let mut detail = if endpoints == 0 {
-                format!(
-                    "guarded egress: public HTTP(S)+DNS only, {} TAP slices",
-                    crate::network::TAP_POOL
-                )
-            } else {
-                format!(
-                    "guarded egress + {endpoints} local endpoint(s), {} TAP slices",
-                    crate::network::TAP_POOL
-                )
-            };
-            if let Some(firewall) = marker
-                .as_ref()
-                .map(|marker| marker.host_firewall)
-                .filter(|firewall| *firewall != crate::network::HostFirewall::None)
-            {
-                // Without the carve-out a host firewall's routed policy drops
-                // everything hegn accepted, which looks like the guest being
-                // offline. Naming it here turns that into a one-line answer.
-                detail.push_str(&format!("; routed through {}", firewall.label()));
-            }
-            match live {
-                Some(true) => detail.push_str("; rules verified live"),
-                None => detail.push_str("; marker only (run as root to verify rules)"),
-                Some(false) => {}
-            }
-            detail
-        } else if marker
-            .as_ref()
-            .is_some_and(|marker| marker.endpoints != config.endpoint_ports())
-        {
-            "local endpoints changed; re-run `sudo hegn network setup --user $USER`".to_string()
-        } else if live == Some(false) {
-            "nftables guard is missing or incomplete; re-run `sudo hegn network setup --user \
-             $USER`"
-                .to_string()
-        } else if marker.is_some() {
-            "TAP pool incomplete (deleted or renamed); re-run `sudo hegn network setup --user \
-             $USER`"
-                .to_string()
-        } else {
-            "not configured (or written by an older hegn); run `sudo hegn network setup --user \
-             $USER`"
-                .to_string()
-        },
+    checks.push(network_check(
+        config,
+        marker.as_ref(),
+        control_taps,
+        data_taps,
+        live,
+        guard_ready,
     ));
+    checks.extend(running_vm_checks(config));
     checks.push(Check::new(
         "serial logs",
         config.logs_dir().is_dir(),
@@ -234,6 +197,7 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
             None => "no hegn-health line yet (boot a VM)".to_string(),
         },
     ));
+    checks.push(snapshot_control_check(config));
     checks.push(Check::new(
         "backend",
         config.vm_assets_ready(),
@@ -259,6 +223,383 @@ pub(super) fn host_checks(config: &Config) -> Vec<Check> {
         &Config::config_path(),
     ));
     checks
+}
+
+/// The OpenSSH client is mandatory for every attach and `open`.
+///
+/// `ssh -V` prints its version on stderr and exits successfully. A missing
+/// binary is a required failure with an install hint, not just a raw `ENOENT`.
+fn ssh_client_check(binary: &Path) -> Check {
+    match Command::new(binary).arg("-V").output() {
+        Ok(output) if output.status.success() => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let version = stderr
+                .lines()
+                .chain(stdout.lines())
+                .next()
+                .unwrap_or("")
+                .trim();
+            let detail = if version.is_empty() {
+                format!("{} available", binary.display())
+            } else {
+                format!("{version} ({})", binary.display())
+            };
+            Check::new("ssh", true, true, detail)
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = if stderr.trim().is_empty() {
+                output.status.to_string()
+            } else {
+                stderr.trim().to_string()
+            };
+            Check::new(
+                "ssh",
+                false,
+                true,
+                format!("`{} -V` failed: {detail}", binary.display()),
+            )
+        }
+        Err(err) => Check::new(
+            "ssh",
+            false,
+            true,
+            format!(
+                "{}: {err}; install openssh-client (Debian/Ubuntu) or openssh (Fedora/Arch) and \
+                 make sure `ssh` is on PATH",
+                binary.display()
+            ),
+        ),
+    }
+}
+
+/// `ssh-keygen` creates and validates every per-VM client key.
+///
+/// The tool has no `--version` flag. A known-hosts lookup against `/dev/null`
+/// is side-effect free: exit 0 means "found", exit 1 means "not found"; both
+/// prove the binary ran. Any other status is a broken install.
+fn ssh_keygen_check(binary: &Path) -> Check {
+    let output = Command::new(binary)
+        .args(["-F", "hegn-doctor-probe", "-f", "/dev/null"])
+        .output();
+    match output {
+        Ok(output) if matches!(output.status.code(), Some(0 | 1)) => Check::new(
+            "ssh-keygen",
+            true,
+            true,
+            format!("sshd key generator available ({})", binary.display()),
+        ),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = if stderr.trim().is_empty() {
+                output.status.to_string()
+            } else {
+                stderr.trim().to_string()
+            };
+            Check::new(
+                "ssh-keygen",
+                false,
+                true,
+                format!("`{}` failed: {detail}", binary.display()),
+            )
+        }
+        Err(err) => Check::new(
+            "ssh-keygen",
+            false,
+            true,
+            format!(
+                "{}: {err}; install openssh (it ships the `ssh-keygen` key generator)",
+                binary.display()
+            ),
+        ),
+    }
+}
+
+/// Every VM needs a control TAP for SSH, regardless of its data-network mode.
+///
+/// A version 3 marker records the control pool, but only the kernel knows
+/// whether the devices still exist. A missing marker is also the version gate:
+/// markers written before v3 do not vouch for `hegnc*` at all.
+fn network_check(
+    config: &Config,
+    marker: Option<&crate::network::ReadyMarker>,
+    control_taps: bool,
+    data_taps: bool,
+    live: Option<bool>,
+    ready: bool,
+) -> Check {
+    let guarded = config.network == NetworkMode::Guarded;
+    if ready {
+        let mut detail = if guarded {
+            let endpoints = config.local_endpoints.len();
+            if endpoints == 0 {
+                format!(
+                    "guarded egress: public HTTP(S)+DNS only, {CONTROL_TAP_POOL} control TAPs + \
+                     {TAP_POOL} data TAP slices"
+                )
+            } else {
+                format!(
+                    "guarded egress + {endpoints} local endpoint(s), {CONTROL_TAP_POOL} control \
+                     TAPs + {TAP_POOL} data TAP slices"
+                )
+            }
+        } else {
+            format!(
+                "control TAP pool ready for SSH ({CONTROL_TAP_POOL} control TAPs); egress \
+                 disabled (network = off)"
+            )
+        };
+        if let Some(marker) = marker {
+            detail.push_str(&format!("; marker v{}", marker.version));
+            // Without the carve-out a host firewall's routed policy drops
+            // everything hegn accepted, which looks like the guest being
+            // offline. Naming it here turns that into a one-line answer.
+            if guarded && marker.host_firewall != HostFirewall::None {
+                detail.push_str(&format!(
+                    "; routed through {}",
+                    marker.host_firewall.label()
+                ));
+            }
+        }
+        match live {
+            Some(true) => detail.push_str("; rules verified live"),
+            None => detail.push_str("; marker only (run as root to verify rules)"),
+            Some(false) => {}
+        }
+        return Check::new("network guard", true, true, detail);
+    }
+
+    let mut problems = Vec::new();
+    if marker.is_none() {
+        problems.push(
+            "network marker v3 missing (not configured, or written by an older hegn without the \
+             control TAP pool)"
+                .to_string(),
+        );
+    }
+    if marker.is_some_and(|marker| marker.endpoints != config.endpoint_ports()) {
+        problems.push("local endpoints changed since setup".to_string());
+    }
+    if !control_taps {
+        problems.push(format!(
+            "control TAP pool {}..{} incomplete",
+            control_tap_name(0),
+            control_tap_name(CONTROL_TAP_POOL - 1)
+        ));
+    }
+    if guarded && !data_taps {
+        problems.push(format!(
+            "data TAP pool {}..{} incomplete",
+            tap_name(0),
+            tap_name(TAP_POOL - 1)
+        ));
+    }
+    match live {
+        Some(false) => problems.push("nftables guard or control rules missing/incomplete".into()),
+        None if crate::network::is_privileged() => {
+            problems.push("cannot verify nftables rules (is `nft` installed?)".into());
+        }
+        _ => {}
+    }
+    if problems.is_empty() {
+        problems.push("host network setup is not ready".to_string());
+    }
+    Check::new(
+        "network guard",
+        false,
+        true,
+        format!(
+            "{}; run `sudo hegn network setup --user $USER`",
+            problems.join("; ")
+        ),
+    )
+}
+
+/// Whether every TAP of one family exists below `root`.
+fn tap_family_present_at(root: &Path, pool: u8, name: impl Fn(u8) -> String) -> bool {
+    (0..pool).all(|index| root.join(name(index)).exists())
+}
+
+fn control_taps_present() -> bool {
+    tap_family_present_at(
+        Path::new("/sys/class/net"),
+        CONTROL_TAP_POOL,
+        control_tap_name,
+    )
+}
+
+fn data_taps_present() -> bool {
+    tap_family_present_at(Path::new("/sys/class/net"), TAP_POOL, tap_name)
+}
+
+/// The SSH-relevant fields of a running VM's session record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunningVm {
+    name: String,
+    guest_ip: Option<Ipv4Addr>,
+    ssh_user: Option<String>,
+}
+
+/// Every VM whose recorded Cloud Hypervisor process is still alive.
+///
+/// A stale `session.json` is not a running VM. `VmManager::is_running` verifies
+/// the process identity, so a recycled PID never turns into a doctor finding.
+fn running_vms(config: &Config) -> Vec<RunningVm> {
+    let store = VmStore::new(config);
+    let Ok(vms) = store.list() else {
+        return Vec::new();
+    };
+    let mut running = Vec::new();
+    for vm in vms {
+        let Ok(manager) = VmManager::new(config.clone(), vm) else {
+            continue;
+        };
+        if !manager.is_running() {
+            continue;
+        }
+        let Some(session) = manager.session() else {
+            continue;
+        };
+        running.push(RunningVm {
+            name: manager.vm().name.clone(),
+            guest_ip: session.guest_ip,
+            ssh_user: session.ssh_user.filter(|user| !user.is_empty()),
+        });
+    }
+    running.sort_by(|left, right| left.name.cmp(&right.name));
+    running
+}
+
+fn running_vm_checks(config: &Config) -> Vec<Check> {
+    running_vms(config)
+        .iter()
+        .map(|vm| running_vm_check(config, vm))
+        .collect()
+}
+
+/// SSH readiness of one running VM.
+///
+/// A record written before SSH support is a warning: the serial console still
+/// works, so an old VM must not turn an otherwise healthy host red. A current
+/// record with a missing client key is a hard failure: that VM cannot be
+/// attached over SSH until it is re-provisioned.
+fn running_vm_check(config: &Config, vm: &RunningVm) -> Check {
+    let name = format!("ssh {}", vm.name);
+    let key = SshIdentity::new(&config.vms_dir, &vm.name)
+        .key()
+        .to_path_buf();
+    let has_key = is_regular_file(&key);
+    let has_record = vm.guest_ip.is_some() && vm.ssh_user.is_some();
+    if has_record && has_key {
+        let user = vm.ssh_user.as_deref().unwrap_or("?");
+        let host = vm.guest_ip.map(|ip| ip.to_string()).unwrap_or_default();
+        return Check::new(
+            name,
+            true,
+            true,
+            format!("{user}@{host} ready (key {})", key.display()),
+        );
+    }
+
+    let mut problems = Vec::new();
+    let mut missing = Vec::new();
+    if vm.guest_ip.is_none() {
+        missing.push("guest_ip");
+    }
+    if vm.ssh_user.is_none() {
+        missing.push("ssh_user");
+    }
+    if !missing.is_empty() {
+        problems.push(format!(
+            "session.json lacks {} (VM started before SSH support)",
+            missing.join(" and ")
+        ));
+    }
+    if !has_key {
+        problems.push(format!("SSH client key {} is missing", key.display()));
+    }
+    Check::new(
+        name,
+        false,
+        has_record,
+        format!(
+            "{}; run `hegn vm apply {}` and restart the VM, or use `hegn attach {} --serial`",
+            problems.join("; "),
+            vm.name,
+            vm.name
+        ),
+    )
+}
+
+/// Snapshots whose embedded device tree has no control NIC predate SSH support.
+///
+/// Restoring one would boot a guest that is unreachable over the control TAP,
+/// so the restore path already rejects it. The doctor only reports the hint:
+/// snapshots are never changed or deleted here, and this is not a hard failure.
+fn snapshot_control_check(config: &Config) -> Check {
+    let store = SnapshotStore::new(&config.snapshots_dir);
+    let snapshots = match store.list() {
+        Ok(snapshots) => snapshots,
+        Err(err) => {
+            return Check::new(
+                "snapshot control NIC",
+                false,
+                false,
+                format!(
+                    "could not list snapshots in {}: {err}",
+                    config.snapshots_dir.display()
+                ),
+            );
+        }
+    };
+    let mut outdated = Vec::new();
+    for snapshot in snapshots.iter().filter(|snapshot| !snapshot.is_legacy()) {
+        let path = snapshot.dir.join("config.json");
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let has_control = value
+            .get("net")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|devices| {
+                devices.iter().any(|device| {
+                    device
+                        .get("tap")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|tap| tap.starts_with("hegnc"))
+                })
+            });
+        if !has_control {
+            outdated.push(snapshot.name.clone());
+        }
+    }
+    if outdated.is_empty() {
+        return Check::new(
+            "snapshot control NIC",
+            true,
+            false,
+            format!(
+                "none found in {} (restorable snapshots include the control NIC)",
+                config.snapshots_dir.display()
+            ),
+        );
+    }
+    outdated.sort();
+    Check::new(
+        "snapshot control NIC",
+        false,
+        false,
+        format!(
+            "{} snapshot(s) predate the control NIC and need a cold boot: {}; restart the VM and \
+             take a fresh snapshot",
+            outdated.len(),
+            outdated.join(", ")
+        ),
+    )
 }
 
 /// Legacy v1 findings. Every check is informational: v2 ignores this state and
@@ -1028,7 +1369,7 @@ mod tests {
                 dir,
                 version: SNAPSHOT_VERSION,
                 boot_fingerprint: Some("a".repeat(64)),
-                boot: Some(SnapshotBoot::default()),
+                boot: Some(Box::new(SnapshotBoot::default())),
                 ..SnapshotMeta::default()
             })
             .unwrap();
@@ -1138,7 +1479,8 @@ mod tests {
 
         let absent = deprecated_project_keys_check(&Config {
             projects_root: dir.path().join("empty-projects"),
-            ..Config::default()
+            state_dir: dir.path().join("empty-state"),
+            ..isolated_config(dir.path())
         });
         assert!(absent.ok);
         assert!(absent.detail.contains("none found"), "{}", absent.detail);
@@ -1338,5 +1680,278 @@ mod tests {
                 .line()
                 .starts_with("! ")
         );
+    }
+
+    #[test]
+    fn missing_ssh_tools_are_required_failures_with_install_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = ssh_client_check(&dir.path().join("missing-ssh"));
+        assert_eq!(ssh.name, "ssh");
+        assert!(!ssh.ok);
+        assert!(ssh.required);
+        assert!(ssh.detail.contains("openssh"), "{}", ssh.detail);
+
+        let keygen = ssh_keygen_check(&dir.path().join("missing-ssh-keygen"));
+        assert_eq!(keygen.name, "ssh-keygen");
+        assert!(!keygen.ok);
+        assert!(keygen.required);
+        assert!(keygen.detail.contains("openssh"), "{}", keygen.detail);
+    }
+
+    #[test]
+    fn ssh_tool_checks_accept_a_working_binary() {
+        // `/bin/true` is stable; it is only used to prove the success path.
+        let ssh = ssh_client_check(Path::new("/bin/true"));
+        assert!(ssh.ok, "{ssh:?}");
+        assert!(ssh.required);
+        let keygen = ssh_keygen_check(Path::new("/bin/true"));
+        assert!(keygen.ok, "{keygen:?}");
+        assert!(keygen.required);
+    }
+
+    fn network_marker(endpoints: Vec<u16>) -> crate::network::ReadyMarker {
+        crate::network::ReadyMarker {
+            version: 3,
+            pool: crate::network::TAP_POOL,
+            subnet: crate::network::SUBNET.to_string(),
+            control_pool: CONTROL_TAP_POOL,
+            control_subnet: crate::network::CONTROL_SUBNET.to_string(),
+            dns: crate::network::DNS
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            endpoints,
+            host_firewall: crate::network::HostFirewall::None,
+            applied_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn network_check_requires_marker_v3_and_control_taps_for_off() {
+        let config = Config {
+            network: NetworkMode::Off,
+            ..Config::default()
+        };
+        let marker = network_marker(Vec::new());
+        // `off` needs control TAPs for SSH, but no data TAPs.
+        let ready = network_check(&config, Some(&marker), true, false, Some(true), true);
+        assert!(ready.ok, "{}", ready.detail);
+        assert!(ready.required);
+        assert!(ready.detail.contains("marker v3"), "{}", ready.detail);
+        assert!(ready.detail.contains("control TAP"), "{}", ready.detail);
+        assert!(ready.detail.contains("network = off"), "{}", ready.detail);
+
+        let missing_control =
+            network_check(&config, Some(&marker), false, false, Some(true), false);
+        assert!(!missing_control.ok);
+        assert!(missing_control.required);
+        assert!(
+            missing_control.detail.contains("hegnc0..hegnc15"),
+            "{}",
+            missing_control.detail
+        );
+        assert!(
+            missing_control.detail.contains("sudo hegn network setup"),
+            "{}",
+            missing_control.detail
+        );
+
+        let no_marker = network_check(&config, None, true, false, Some(true), false);
+        assert!(!no_marker.ok);
+        assert!(no_marker.required);
+        assert!(
+            no_marker.detail.contains("marker v3"),
+            "{}",
+            no_marker.detail
+        );
+        assert!(
+            no_marker.detail.contains("older hegn"),
+            "{}",
+            no_marker.detail
+        );
+    }
+
+    #[test]
+    fn network_check_covers_data_taps_and_live_control_rules() {
+        let marker = network_marker(Vec::new());
+        let guarded = Config {
+            network: NetworkMode::Guarded,
+            ..Config::default()
+        };
+        let missing_data = network_check(&guarded, Some(&marker), true, false, Some(true), false);
+        assert!(!missing_data.ok);
+        assert!(missing_data.required);
+        assert!(
+            missing_data.detail.contains("data TAP pool hegn0..hegn15"),
+            "{}",
+            missing_data.detail
+        );
+
+        let off = Config {
+            network: NetworkMode::Off,
+            ..Config::default()
+        };
+        let bad_rules = network_check(&off, Some(&marker), true, false, Some(false), false);
+        assert!(!bad_rules.ok);
+        assert!(bad_rules.required);
+        assert!(
+            bad_rules.detail.contains("nftables guard or control rules"),
+            "{}",
+            bad_rules.detail
+        );
+
+        // The live parser verifies control sets, source drops, the established
+        // accept before the drop, the forward drop and the masquerade absence.
+        let verified = network_check(&off, Some(&marker), true, false, Some(true), true);
+        assert!(verified.ok, "{}", verified.detail);
+        assert!(
+            verified.detail.contains("rules verified live"),
+            "{}",
+            verified.detail
+        );
+    }
+
+    #[test]
+    fn tap_family_presence_checks_every_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..CONTROL_TAP_POOL {
+            fs::write(dir.path().join(control_tap_name(index)), b"").unwrap();
+        }
+        assert!(tap_family_present_at(
+            dir.path(),
+            CONTROL_TAP_POOL,
+            control_tap_name
+        ));
+
+        fs::remove_file(dir.path().join(control_tap_name(7))).unwrap();
+        assert!(!tap_family_present_at(
+            dir.path(),
+            CONTROL_TAP_POOL,
+            control_tap_name
+        ));
+    }
+
+    fn test_config_with_vms(dir: &Path) -> Config {
+        Config {
+            vms_dir: dir.join("vms"),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn running_vm_without_ssh_metadata_is_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_with_vms(dir.path());
+        let check = running_vm_check(
+            &config,
+            &RunningVm {
+                name: "old".into(),
+                guest_ip: None,
+                ssh_user: None,
+            },
+        );
+        assert!(!check.ok);
+        assert!(!check.required, "old VMs must not make the doctor red");
+        for needle in [
+            "guest_ip and ssh_user",
+            "before SSH support",
+            "hegn vm apply old",
+            "hegn attach old --serial",
+        ] {
+            assert!(
+                check.detail.contains(needle),
+                "missing {needle:?}: {}",
+                check.detail
+            );
+        }
+        assert!(check.line().starts_with("! "), "{}", check.line());
+    }
+
+    #[test]
+    fn running_vm_with_a_current_record_and_missing_key_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_with_vms(dir.path());
+        let key = SshIdentity::new(&config.vms_dir, "demo")
+            .key()
+            .to_path_buf();
+        let check = running_vm_check(
+            &config,
+            &RunningVm {
+                name: "demo".into(),
+                guest_ip: Some(Ipv4Addr::new(10, 214, 0, 2)),
+                ssh_user: Some("root".into()),
+            },
+        );
+        assert!(!check.ok);
+        assert!(check.required);
+        assert!(
+            check.detail.contains(&key.display().to_string()),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("hegn vm apply demo"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("hegn attach demo --serial"),
+            "{}",
+            check.detail
+        );
+        assert!(check.line().starts_with("✗ "), "{}", check.line());
+    }
+
+    #[test]
+    fn running_vm_with_ip_user_and_key_is_green() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_with_vms(dir.path());
+        let identity = SshIdentity::new(&config.vms_dir, "demo");
+        fs::create_dir_all(identity.dir()).unwrap();
+        fs::write(identity.key(), b"placeholder").unwrap();
+        let check = running_vm_check(
+            &config,
+            &RunningVm {
+                name: "demo".into(),
+                guest_ip: Some(Ipv4Addr::new(10, 214, 0, 2)),
+                ssh_user: Some("root".into()),
+            },
+        );
+        assert!(check.ok, "{}", check.detail);
+        assert!(check.required);
+        assert!(check.detail.contains("root@10.214.0.2"), "{}", check.detail);
+        assert!(check.line().starts_with("✓ "), "{}", check.line());
+    }
+
+    #[test]
+    fn snapshots_without_a_control_nic_are_reported_as_a_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        fs::create_dir_all(&config.snapshots_dir).unwrap();
+        write_current_snapshot(&config.snapshots_dir, "old-ssh");
+        fs::write(
+            config.snapshots_dir.join("old-ssh/config.json"),
+            r#"{"net":[{"tap":"hegn3"}]}"#,
+        )
+        .unwrap();
+        write_current_snapshot(&config.snapshots_dir, "ready-ssh");
+        fs::write(
+            config.snapshots_dir.join("ready-ssh/config.json"),
+            r#"{"net":[{"tap":"hegn3"},{"tap":"hegnc3"}]}"#,
+        )
+        .unwrap();
+
+        let check = snapshot_control_check(&config);
+        assert!(!check.ok);
+        assert!(!check.required, "old snapshots are a hint, not a failure");
+        assert!(check.detail.contains("old-ssh"), "{}", check.detail);
+        assert!(!check.detail.contains("ready-ssh"), "{}", check.detail);
+        assert!(check.detail.contains("cold boot"), "{}", check.detail);
+        assert!(check.line().starts_with("! "), "{}", check.line());
+
+        fs::remove_dir_all(config.snapshots_dir.join("old-ssh")).unwrap();
+        let ready = snapshot_control_check(&config);
+        assert!(ready.ok, "{}", ready.detail);
+        assert!(!ready.required);
     }
 }

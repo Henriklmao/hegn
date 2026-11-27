@@ -43,6 +43,13 @@ pub struct SessionRecord {
     /// Membership summary captured at boot.
     #[serde(default)]
     pub membership: Vec<MembershipMember>,
+    /// Guest address of the always-present control NIC.
+    #[serde(default)]
+    pub guest_ip: Option<std::net::Ipv4Addr>,
+    /// SSH user configured for the control NIC. Filled by a later hegn
+    /// version; records written before it stay valid with `None`.
+    #[serde(default)]
+    pub ssh_user: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,6 +113,8 @@ mod tests {
                 read_only: false,
                 kind: ProjectKind::External,
             }],
+            guest_ip: Some(std::net::Ipv4Addr::new(10, 214, 0, 2)),
+            ssh_user: Some("hegn".into()),
         }
     }
 
@@ -119,8 +128,14 @@ mod tests {
         assert_eq!(loaded.relay_pid, 5678);
         assert_eq!(loaded.virtiofs_pids, vec![11, 12]);
         assert_eq!(loaded.membership.len(), 1);
+        assert_eq!(
+            loaded.guest_ip,
+            Some(std::net::Ipv4Addr::new(10, 214, 0, 2))
+        );
+        assert_eq!(loaded.ssh_user.as_deref(), Some("hegn"));
         assert!(json.contains("\"vm\": \"rust\""), "{json}");
         assert!(!json.contains("\"instance\""), "{json}");
+        assert!(json.contains("\"guest_ip\": \"10.214.0.2\""), "{json}");
     }
 
     #[test]
@@ -140,5 +155,19 @@ mod tests {
         assert!(record.workspace.as_os_str().is_empty());
         assert!(record.virtiofs_pids.is_empty());
         assert_eq!(record.vm_pid, 123);
+        assert_eq!(record.guest_ip, None, "legacy records have no control IP");
+        assert_eq!(record.ssh_user, None);
+    }
+
+    #[test]
+    fn a_record_without_control_fields_deserializes_with_none() {
+        let mut value = serde_json::to_value(record()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("guest_ip");
+        object.remove("ssh_user");
+
+        let loaded: SessionRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.guest_ip, None);
+        assert_eq!(loaded.ssh_user, None);
     }
 }

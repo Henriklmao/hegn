@@ -287,7 +287,7 @@ impl SnapshotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RootfsFormat;
+    use crate::config::{NetworkMode, RootfsFormat};
     use crate::project::ProjectKind;
     use crate::session::snapshot::{
         SNAPSHOT_VERSION, SnapshotBoot, SnapshotMember, compute_fingerprint,
@@ -311,6 +311,11 @@ mod tests {
             rootfs_path: PathBuf::from("/vms/demo/rootfs.qcow2"),
             rootfs_format: RootfsFormat::Qcow2,
             network_index: None,
+            seed_version: 13,
+            seed_generation: 0,
+            network_mode: NetworkMode::Guarded,
+            ssh_user: Some("hegn".into()),
+            ssh_public_key_hash: Some("0".repeat(64)),
             profile_share: false,
             primary: Some("demo".into()),
         }
@@ -331,7 +336,7 @@ mod tests {
             version: SNAPSHOT_VERSION,
             boot_fingerprint: Some(compute_fingerprint(&membership, &boot)),
             membership,
-            boot: Some(boot),
+            boot: Some(Box::new(boot)),
         }
     }
 

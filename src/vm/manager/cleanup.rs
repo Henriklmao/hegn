@@ -119,6 +119,7 @@ mod tests {
 
     use super::*;
     use crate::config::Harness;
+    use crate::session::ssh::SshIdentity;
     use crate::vm::manager::SessionRecord;
     use crate::vm::manager::test_support::{config_with_assets, manager};
 
@@ -137,6 +138,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: None,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         }
     }
 
@@ -151,6 +154,10 @@ mod tests {
         std::fs::create_dir_all(&vm_dir).unwrap();
         let rootfs = vm_dir.join("rootfs.qcow2");
         std::fs::write(&rootfs, b"rootfs").unwrap();
+        let identity = SshIdentity::new(&config.vms_dir, "demo");
+        std::fs::create_dir_all(identity.dir()).unwrap();
+        std::fs::write(identity.key(), b"client-key").unwrap();
+        std::fs::write(identity.known_hosts(), b"host-key\n").unwrap();
 
         let manager = manager(config, dir.path());
         let paths = manager.paths();
@@ -207,6 +214,9 @@ mod tests {
         }
         assert!(project.join("README.md").is_file());
         assert_eq!(std::fs::read(&rootfs).unwrap(), b"rootfs");
+        // Runtime cleanup never touches the SSH identity.
+        assert_eq!(std::fs::read(identity.key()).unwrap(), b"client-key");
+        assert!(identity.known_hosts().is_file());
         // Diagnostics are intentionally kept for post-mortems.
         assert!(paths.event_log.parent().unwrap().is_dir());
         drop(listeners);

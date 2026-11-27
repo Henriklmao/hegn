@@ -84,8 +84,11 @@ to trust them with your whole machine. hegn gives every project a boundary:
   workspace root.
 - **Terminal UI and CLI.** Everything in the TUI also works as a command, with
   `--json` output for scripts.
-- **Detachable sessions.** Detach from a running agent and attach again later, like
-  `tmux`. One serial console per VM; use guest `tmux` for several agents in one VM.
+- **SSH sessions and a recovery console.** Every VM has a private control TAP for
+  SSH. Each attach gets its own guest PTY, so several terminals, tmux panes or
+  full-screen TUIs run in parallel. The serial console stays available with
+  `hegn attach <vm> --serial` for boot and recovery; the control link has no
+  egress.
 - **Private logs** of every session, with terminal control sequences removed when
   you read them.
 
@@ -129,10 +132,12 @@ From the command line, the same steps look like this:
 
 ```bash
 hegn vm start dev
-hegn attach dev
+hegn attach dev            # SSH session
+hegn attach dev --serial   # serial console (boot/recovery)
 ```
 
-Press `Ctrl-B` to detach. The VM keeps running. The full walkthrough is in
+`exit` or `Ctrl-D` ends an SSH session; `Ctrl-B` detaches from the serial
+console. The VM keeps running in both cases. The full walkthrough is in
 [Getting started](docs/getting-started.md).
 
 ---
@@ -145,11 +150,11 @@ Press `Ctrl-B` to detach. The VM keeps running. The full walkthrough is in
 | [Getting started](docs/getting-started.md) | First VM, first project, harness presets |
 | [Projects, VMs and workspaces](docs/projects-and-vms.md) | Membership, imports, forks, read-only exports |
 | [Harnesses and profiles](docs/harnesses.md) | API keys, skills, launch commands and terminal integrations |
-| [Sessions, attach and logs](docs/sessions-and-logs.md) | Attaching, the status bar, session logs |
+| [Sessions, attach and logs](docs/sessions-and-logs.md) | SSH sessions, the serial console, session logs |
 | [Configuration](docs/configuration.md) | `config.toml`, `vm.toml`, project settings, the settings editor |
 | [TUI guide](docs/tui.md) | All keyboard shortcuts and screens |
 | [Snapshots](docs/snapshots.md) | Manual snapshots, fingerprints and automatic resume |
-| [Networking](docs/networking.md) | The guarded network, local LLM servers, firewalls |
+| [Networking](docs/networking.md) | The SSH control TAP, guarded network, local LLM servers, firewalls |
 | [VM images](docs/vm-images.md) | Kernel and rootfs, checksums, guest login |
 | [Security](docs/security.md) | How isolation works and what it does not cover |
 | [Troubleshooting](docs/troubleshooting.md) | Common problems and where the logs are |
@@ -166,6 +171,7 @@ Press `Ctrl-B` to detach. The VM keeps running. The full walkthrough is in
 - Linux with KVM (`/dev/kvm`)
 - Cloud Hypervisor and virtiofsd
 - A kernel with Landlock (Linux 6.2 or newer)
+- OpenSSH client (`ssh`, `ssh-keygen`)
 - git
 
 `hegn doctor` checks all of these. The complete list is in
@@ -175,9 +181,9 @@ Press `Ctrl-B` to detach. The VM keeps running. The full walkthrough is in
 
 ## Status
 
-hegn is early (`0.1.0`). The CLI, the security engine, snapshots, the serial
-console and the TUI work today. Expect changes to the configuration format until
-the first stable release.
+hegn is early (`0.1.0`). The CLI, the security engine, snapshots, SSH attach, the
+serial console and the TUI work today. Expect changes to the configuration
+format until the first stable release.
 
 ---
 

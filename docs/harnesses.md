@@ -135,27 +135,29 @@ configured agent in a real terminal. Press `L` to launch it again later.
 - `"shell"` only opens the maintenance shell.
 - Any other value refers to an entry in `[[launch.commands]]`.
 
-Commands are typed into the guest shell. They never run on the host.
+Commands run inside the guest: over SSH for external integrations, or in the
+TUI's embedded serial terminal. They never run on the host.
 
 Launch commands are trusted, user-owned configuration. They are sent straight to
 the guest shell, like input from `hegn attach`. The line-based `tirith-core`
 check applies only to commands typed in insert mode. Use `hegn check` first for
 anything you do not trust.
 
-### Where the console is shown
+### Where the session is shown
 
-The `integration` setting decides where the serial console appears:
+The `integration` setting decides where the command's terminal appears:
 
 | Value | Behaviour |
 | --- | --- |
 | `auto` | Use `herdr` when running inside herdr, then `tmux` when inside tmux, otherwise the current terminal. |
-| `embedded` | Keep the command in the TUI's embedded terminal. |
-| `external` | Leave the TUI and attach the current terminal through `hegn attach`. |
-| `tmux` | Open a new tmux window that runs `hegn attach`. Requires hegn to run inside tmux. |
-| `herdr` | Split a herdr pane and run `hegn attach` in it. Requires `HERDR_ENV=1`. |
+| `embedded` | Keep the command in the TUI's embedded terminal, which stays on the serial console. |
+| `external` | Leave the TUI and open an SSH session in the current terminal through `hegn attach`. |
+| `tmux` | Open a new tmux window that runs `hegn attach`, which opens SSH. Requires hegn to run inside tmux. |
+| `herdr` | Split a herdr pane and run `hegn attach`, which opens SSH. Requires `HERDR_ENV=1`. |
 
-The integration only chooses where the console is shown. The command always runs
-inside the VM.
+The integration only chooses where the session is shown. The command always runs
+inside the VM. External, tmux and herdr integrations get a real guest PTY, so
+several launches can run in parallel. The embedded terminal remains serial.
 
 ### Configuration
 
@@ -170,7 +172,7 @@ auto_start      = true
 name            = "review"
 command         = "opencode"
 integration     = "tmux"
-bar             = false      # full-screen commands should own every row
+bar             = false      # serial integrations only; SSH uses a real PTY
 ```
 
 Per-project overrides go into the project's `hegn.toml`:
@@ -189,16 +191,17 @@ package choices belong to the VM and are edited with `F5` or
 `hegn vm config <vm> --edit`.
 
 TUI auto-launch waits for the first-boot provisioner. The agent is installed
-before the command is typed.
+before the command runs.
 
 ### Non-interactive launch
 
 ```bash
 hegn launch my-app                         # configured default
 hegn launch my-app --command review        # named command
-hegn launch my-app --integration tmux      # override the integration
-hegn open my-app --command opencode        # attach and type one command
-hegn attach my-app --command opencode --no-bar
+hegn launch my-app --integration tmux      # override the integration (SSH)
+hegn open my-app --command opencode        # boot/attach, run one SSH command
+hegn attach my-app --command 'git status'  # SSH exec in the guest project dir
+hegn attach my-app --serial                # serial console, no SSH
 ```
 
 `auto_start = false` in a project's `hegn.toml` turns off the automatic launch

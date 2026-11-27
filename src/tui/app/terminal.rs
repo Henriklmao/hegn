@@ -50,6 +50,10 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Suspend the TUI and open the VM in an external SSH session.
+    ///
+    /// The embedded console stays on the serial relay; the external session is
+    /// a separate SSH connection over the control TAP.
     pub(super) fn attach_console_external(&mut self) -> Vec<Effect> {
         let vm = self
             .active_vm_name()
@@ -92,8 +96,7 @@ impl App {
         self.session = None;
         self.attached_vm = None;
         self.pending_launch = None;
-        self.provision_running = false;
-        self.provision_ready_seen = false;
+        self.clear_provision();
         self.terminal.clear();
         self.scroll = 0;
         self.input.clear();
@@ -215,8 +218,7 @@ impl App {
         self.session = None;
         self.attached_vm = None;
         self.pending_launch = None;
-        self.provision_running = false;
-        self.provision_ready_seen = false;
+        self.clear_provision();
         self.terminal.clear();
         self.scroll = 0;
         self.input.clear();
@@ -293,8 +295,7 @@ impl App {
         self.session = None;
         self.attached_vm = None;
         self.pending_launch = None;
-        self.provision_running = false;
-        self.provision_ready_seen = false;
+        self.clear_provision();
         self.vm.state = VmUiState::Failed;
         self.vm.started_at = None;
         self.vm.note = Some(error.clone());

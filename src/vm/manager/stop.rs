@@ -18,6 +18,10 @@ use super::process::{hegn_binary, read_pid, terminate, terminate_autosave, termi
 impl VmManager {
     /// Stop Cloud Hypervisor, the console relay, every member virtiofsd, the
     /// profile daemon and the autosave worker.
+    ///
+    /// Running SSH sessions end with the guest: the control TAP and its guest
+    /// sshd disappear when the VMM exits. The per-VM keypair and `known_hosts`
+    /// are intentionally kept so a later start can reuse the identity.
     pub fn stop(&self) -> Result<()> {
         let paths = self.paths();
         if !paths.run_dir.is_dir() {
@@ -26,11 +30,8 @@ impl VmManager {
         let _lock = self.lock(&paths)?;
         let hegn = hegn_binary()?;
         if self.unreadable_session() {
-            bail!(
-                "session metadata in {} is unreadable or from an older hegn version; \
-                 find and stop the recorded VMM manually, then remove that directory",
-                paths.run_dir.display()
-            );
+            super::repair::repair_unreadable_session_locked(&self.config, &self.vm, &paths)?;
+            return Ok(());
         }
         let session = self.session();
         let vm_pid = session
@@ -100,18 +101,23 @@ mod tests {
     use crate::vm::manager::test_support::{config_with_assets, manager};
 
     #[test]
-    fn stop_refuses_an_unreadable_session() {
+    fn stop_archives_an_unreadable_session() {
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(config_with_assets(dir.path()), dir.path());
         let paths = manager.paths();
         paths.ensure().unwrap();
         std::fs::write(&paths.session, b"{not json").unwrap();
 
-        let err = manager.stop().unwrap_err().to_string();
-        assert!(err.contains("unreadable"), "{err}");
-        assert!(
-            paths.session.exists(),
-            "unreadable metadata must be preserved"
+        manager.stop().unwrap();
+        assert!(!paths.session.exists());
+        let archive = std::fs::read_dir(&paths.run_dir)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("stale-"))
+            .expect("archive directory");
+        assert_eq!(
+            std::fs::read(archive.path().join("session.json")).unwrap(),
+            b"{not json"
         );
     }
 
@@ -164,6 +170,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: None,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         };
         std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
         std::fs::write(&paths.vm_pid, b"0").unwrap();

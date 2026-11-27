@@ -9,16 +9,24 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::addressing::{control_tap_name, tap_name};
 use super::firewall::HostFirewall;
-use super::pool::status;
-use super::{MARKER, MARKER_VERSION, SUBNET, TAP_POOL};
-use crate::config::Config;
+use super::{CONTROL_SUBNET, CONTROL_TAP_POOL, MARKER, MARKER_VERSION, SUBNET, TAP_POOL};
+use crate::config::{Config, NetworkMode};
+
+/// Where the kernel exposes network interfaces.
+const SYSFS_NET: &str = "/sys/class/net";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadyMarker {
     pub version: u32,
     pub pool: u8,
     pub subnet: String,
+    /// Number of control TAP slots. Every VM needs one for SSH, independent of
+    /// its data-network mode.
+    pub control_pool: u8,
+    /// Root of the host-only control network (`10.214.0.0`).
+    pub control_subnet: String,
     pub dns: Vec<String>,
     /// TCP ports DNATed to the host loopback for the guest.
     #[serde(default)]
@@ -37,7 +45,14 @@ pub fn marker_path() -> &'static Path {
 
 /// Read and validate the host firewall marker.
 pub fn ready_marker() -> Option<ReadyMarker> {
-    let path = marker_path();
+    ready_marker_at(marker_path())
+}
+
+/// Read and validate a marker from `path`.
+///
+/// Kept separate from [`marker_path`] so tests can exercise the file-level
+/// safety checks (symlinks, ownership) without touching `/run`.
+fn ready_marker_at(path: &Path) -> Option<ReadyMarker> {
     let meta = fs::symlink_metadata(path).ok()?;
     if !meta.file_type().is_file() {
         return None;
@@ -52,32 +67,86 @@ pub fn ready_marker() -> Option<ReadyMarker> {
         }
     }
     let raw = fs::read_to_string(path).ok()?;
-    let marker: ReadyMarker = serde_json::from_str(&raw).ok()?;
+    parse_marker(&raw)
+}
+
+/// Parse and validate the marker payload.
+///
+/// The version gate is what makes an old marker unusable for new rules. The
+/// control fields are required (not serde defaults), so a version 2 marker
+/// cannot be reinterpreted as a version 3 receipt even if someone edits its
+/// version number.
+fn parse_marker(raw: &str) -> Option<ReadyMarker> {
+    let marker: ReadyMarker = serde_json::from_str(raw).ok()?;
     (marker.version == MARKER_VERSION
         && marker.pool == TAP_POOL
-        && marker.subnet == SUBNET.to_string())
+        && marker.subnet == SUBNET.to_string()
+        && marker.control_pool == CONTROL_TAP_POOL
+        && marker.control_subnet == CONTROL_SUBNET.to_string())
     .then_some(marker)
 }
 
-/// Marker present, every TAP in the pool exists and — when the caller can
-/// inspect the kernel — the live nftables table still matches the marker.
+/// All slots of a TAP family exist under `root`.
+fn taps_present(root: &Path, pool: u8, name: impl Fn(u8) -> String) -> bool {
+    (0..pool).all(|index| root.join(name(index)).exists())
+}
+
+/// Whether every control TAP (`hegnc0..hegnc15`) currently exists.
+pub(super) fn control_taps_present() -> bool {
+    taps_present(Path::new(SYSFS_NET), CONTROL_TAP_POOL, control_tap_name)
+}
+
+/// Whether every guarded data TAP (`hegn0..hegn15`) currently exists.
+pub(super) fn data_taps_present() -> bool {
+    taps_present(Path::new(SYSFS_NET), TAP_POOL, tap_name)
+}
+
+/// Marker present, the control TAP pool exists and — when the caller can
+/// inspect the kernel — the live nftables rules still match the marker.
+///
+/// Air-gapped (`off`) guests still need their control TAPs for SSH, so there is
+/// no mode that skips host preparation. Guarded guests additionally need the
+/// data TAP pool.
 ///
 /// Unprivileged callers (TUI, `hegn network status`) cannot read nftables, so
 /// they fall back to the root-owned marker and TAP presence.
 pub fn guard_ready(config: &Config) -> bool {
     let endpoints = config.endpoint_ports();
-    if !(ready_marker().is_some_and(|marker| marker.endpoints == endpoints)
-        && status(config).iter().all(|tap| tap.exists))
-    {
+    guard_ready_with(
+        config.network,
+        &endpoints,
+        ready_marker().as_ref(),
+        control_taps_present(),
+        data_taps_present(),
+        super::firewall::live_guard_status(&endpoints),
+        super::privilege::is_privileged(),
+    )
+}
+
+/// Pure readiness decision, so every mode/TAP/live combination is testable
+/// without a real `/run` marker or `/sys/class/net`.
+fn guard_ready_with(
+    mode: NetworkMode,
+    endpoints: &[u16],
+    marker: Option<&ReadyMarker>,
+    control_taps: bool,
+    data_taps: bool,
+    live: Option<bool>,
+    privileged: bool,
+) -> bool {
+    let Some(marker) = marker else {
+        return false;
+    };
+    if marker.endpoints != endpoints || !control_taps {
+        return false;
+    }
+    if mode == NetworkMode::Guarded && !data_taps {
         return false;
     }
     // A privileged caller can always inspect nftables, so an unverifiable
     // guard must fail closed. Unprivileged callers keep the root-owned marker
     // as their only gate.
-    super::firewall::guard_ready_from_status(
-        super::firewall::live_guard_status(&endpoints),
-        super::privilege::is_privileged(),
-    )
+    super::firewall::guard_ready_from_status(live, privileged)
 }
 
 /// The marker is deliberately world-readable: the unprivileged TUI reads it to
@@ -111,21 +180,27 @@ mod tests {
     use super::*;
     use crate::network::DNS;
 
+    fn marker(endpoints: Vec<u16>, host_firewall: HostFirewall) -> ReadyMarker {
+        ReadyMarker {
+            version: MARKER_VERSION,
+            pool: TAP_POOL,
+            subnet: SUBNET.to_string(),
+            control_pool: CONTROL_TAP_POOL,
+            control_subnet: CONTROL_SUBNET.to_string(),
+            dns: DNS.iter().map(ToString::to_string).collect(),
+            endpoints,
+            host_firewall,
+            applied_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn ready_marker_is_readable_by_the_unprivileged_doctor() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("network.json");
-        let marker = ReadyMarker {
-            version: MARKER_VERSION,
-            pool: TAP_POOL,
-            subnet: SUBNET.to_string(),
-            dns: DNS.iter().map(ToString::to_string).collect(),
-            endpoints: Vec::new(),
-            host_firewall: HostFirewall::Ufw,
-            applied_at: Utc::now(),
-        };
+        let marker = marker(Vec::new(), HostFirewall::Ufw);
         write_marker(&path, &marker).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -138,20 +213,8 @@ mod tests {
         assert!(raw.contains("\"host_firewall\": \"ufw\""), "{raw}");
     }
 
-    fn marker(endpoints: Vec<u16>, host_firewall: HostFirewall) -> ReadyMarker {
-        ReadyMarker {
-            version: MARKER_VERSION,
-            pool: TAP_POOL,
-            subnet: SUBNET.to_string(),
-            dns: DNS.iter().map(ToString::to_string).collect(),
-            endpoints,
-            host_firewall,
-            applied_at: Utc::now(),
-        }
-    }
-
     #[test]
-    fn marker_roundtrip_preserves_endpoints_and_firewall() {
+    fn marker_roundtrip_preserves_endpoints_control_fields_and_firewall() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("network.json");
         let expected = marker(vec![1234, 11434], HostFirewall::Firewalld);
@@ -161,9 +224,78 @@ mod tests {
         let raw = fs::read_to_string(&path).unwrap();
         let parsed: ReadyMarker = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed, expected);
+        assert_eq!(parsed.version, 3);
+        assert_eq!(parsed.control_pool, CONTROL_TAP_POOL);
+        assert_eq!(parsed.control_subnet, "10.214.0.0");
+        assert!(raw.contains("\"control_pool\": 16"), "{raw}");
+        assert!(raw.contains("\"control_subnet\": \"10.214.0.0\""), "{raw}");
         assert!(raw.contains("\"endpoints\": [\n"), "{raw}");
         assert!(raw.contains("11434"), "{raw}");
         assert!(raw.contains("\"host_firewall\": \"firewalld\""), "{raw}");
+        assert_eq!(parse_marker(&raw), Some(expected));
+    }
+
+    #[test]
+    fn version_two_markers_never_vouch_for_version_three_rules() {
+        // A plain v2 marker has no control fields and must not deserialize.
+        let legacy = r#"{
+            "version": 2,
+            "pool": 16,
+            "subnet": "10.213.0.0",
+            "dns": ["1.1.1.1", "9.9.9.9"],
+            "endpoints": [],
+            "host_firewall": "none",
+            "applied_at": "2024-01-01T00:00:00Z"
+        }"#;
+        assert!(serde_json::from_str::<ReadyMarker>(legacy).is_err());
+        assert_eq!(parse_marker(legacy), None);
+
+        // Even a v2 marker that carries the new fields is rejected by version.
+        let upgraded = r#"{
+            "version": 2,
+            "pool": 16,
+            "subnet": "10.213.0.0",
+            "control_pool": 16,
+            "control_subnet": "10.214.0.0",
+            "dns": ["1.1.1.1", "9.9.9.9"],
+            "endpoints": [],
+            "host_firewall": "none",
+            "applied_at": "2024-01-01T00:00:00Z"
+        }"#;
+        assert_eq!(parse_marker(upgraded), None);
+    }
+
+    #[test]
+    fn markers_without_control_fields_are_rejected() {
+        let raw = r#"{
+            "version": 3,
+            "pool": 16,
+            "subnet": "10.213.0.0",
+            "dns": ["1.1.1.1", "9.9.9.9"],
+            "endpoints": [],
+            "host_firewall": "none",
+            "applied_at": "2024-01-01T00:00:00Z"
+        }"#;
+        assert!(
+            serde_json::from_str::<ReadyMarker>(raw).is_err(),
+            "control fields must be required, not defaulted"
+        );
+        assert_eq!(parse_marker(raw), None);
+    }
+
+    #[test]
+    fn marker_with_wrong_control_pool_or_subnet_is_rejected() {
+        for (pool, subnet) in [
+            (CONTROL_TAP_POOL - 1, "10.214.0.0"),
+            (CONTROL_TAP_POOL, "10.215.0.0"),
+            (CONTROL_TAP_POOL, "10.213.0.0"),
+        ] {
+            let mut marker = marker(Vec::new(), HostFirewall::None);
+            marker.control_pool = pool;
+            marker.control_subnet = subnet.to_string();
+            let raw = serde_json::to_string(&marker).unwrap();
+            assert_eq!(parse_marker(&raw), None, "{pool}/{subnet} must be rejected");
+        }
     }
 
     #[test]
@@ -182,41 +314,17 @@ mod tests {
     }
 
     #[test]
-    fn legacy_marker_without_optional_fields_still_deserializes() {
-        // A marker written before local endpoints existed has neither
-        // `endpoints` nor `host_firewall`; both default rather than failing.
-        let legacy = r#"{
-            "version": 1,
-            "pool": 16,
-            "subnet": "10.213.0.0",
-            "dns": ["1.1.1.1", "9.9.9.9"],
-            "applied_at": "2024-01-01T00:00:00Z"
-        }"#;
-        let parsed: ReadyMarker = serde_json::from_str(legacy).unwrap();
-        assert_eq!(parsed.version, 1);
-        assert!(parsed.endpoints.is_empty());
-        assert_eq!(parsed.host_firewall, HostFirewall::None);
-        // The version gate is what makes a v1 marker unusable for v2 rules.
-        assert_ne!(
-            parsed.version, MARKER_VERSION,
-            "an old marker must never vouch for the current rules"
-        );
-    }
+    fn a_marker_owned_by_a_non_root_user_is_rejected() {
+        use std::os::unix::fs::MetadataExt;
 
-    #[test]
-    fn malformed_or_incomplete_markers_are_rejected() {
-        for raw in [
-            "",
-            "not json",
-            "{}",
-            r#"{"version": 2}"#,
-            r#"{"version": "2", "pool": 16, "subnet": "10.213.0.0", "dns": [], "applied_at": "2024-01-01T00:00:00Z"}"#,
-            r#"{"version": 2, "pool": 16, "subnet": "10.213.0.0", "dns": [], "applied_at": "yesterday"}"#,
-        ] {
-            assert!(
-                serde_json::from_str::<ReadyMarker>(raw).is_err(),
-                "malformed marker must be rejected: {raw:?}"
-            );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("network.json");
+        write_marker(&path, &marker(Vec::new(), HostFirewall::None)).unwrap();
+
+        // The test process normally runs unprivileged; under root this check
+        // cannot be exercised without changing file ownership.
+        if fs::metadata(&path).unwrap().uid() != 0 {
+            assert_eq!(ready_marker_at(&path), None);
         }
     }
 
@@ -230,7 +338,9 @@ mod tests {
     fn writing_a_marker_truncates_the_previous_one() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("network.json");
-        let long = marker(vec![1234, 4321, 9999], HostFirewall::Iptables);
+        let mut long = marker(vec![1234, 4321, 9999], HostFirewall::Iptables);
+        // A non-numeric token cannot collide with digits in the timestamp.
+        long.dns = vec!["192.0.2.123".to_string()];
         write_marker(&path, &long).unwrap();
 
         let short = marker(Vec::new(), HostFirewall::None);
@@ -239,7 +349,10 @@ mod tests {
         let raw = fs::read_to_string(&path).unwrap();
         let parsed: ReadyMarker = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed, short);
-        assert!(!raw.contains("9999"), "old contents must be gone: {raw}");
+        assert!(
+            !raw.contains("192.0.2.123"),
+            "old contents must be gone: {raw}"
+        );
     }
 
     #[test]
@@ -258,32 +371,191 @@ mod tests {
     }
 
     #[test]
+    fn reading_a_symlinked_marker_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        write_marker(&target, &marker(Vec::new(), HostFirewall::None)).unwrap();
+        let link = dir.path().join("network.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            ready_marker_at(&link),
+            None,
+            "a symlink must never be accepted as the readiness marker"
+        );
+    }
+
+    #[test]
     fn marker_lives_on_the_volatile_run_filesystem() {
         assert_eq!(marker_path(), Path::new("/run/hegn/network.json"));
         assert!(marker_path().is_absolute());
     }
 
     #[test]
-    fn guard_ready_requires_a_valid_marker_matching_endpoints_and_all_taps() {
-        // Read-only: never writes to /run. On an unguarded host there is no
-        // marker and readiness must be false; on a guarded host readiness is
-        // exactly "endpoints match && every pool TAP exists".
-        let config = Config::default();
-        let marker = ready_marker();
-        let all_taps_exist = status(&config).iter().all(|tap| tap.exists);
-        let endpoints_match = marker
-            .as_ref()
-            .is_some_and(|marker| marker.endpoints == config.endpoint_ports());
+    fn tap_presence_requires_every_slot_of_the_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
 
-        let expected = endpoints_match
-            && all_taps_exist
-            && super::super::firewall::guard_ready_from_status(
-                super::super::firewall::live_guard_status(&config.endpoint_ports()),
-                super::super::privilege::is_privileged(),
+        assert!(!taps_present(root, CONTROL_TAP_POOL, control_tap_name));
+        assert!(!taps_present(root, TAP_POOL, tap_name));
+
+        for index in 0..TAP_POOL {
+            fs::write(root.join(control_tap_name(index)), "").unwrap();
+            fs::write(root.join(tap_name(index)), "").unwrap();
+        }
+        assert!(taps_present(root, CONTROL_TAP_POOL, control_tap_name));
+        assert!(taps_present(root, TAP_POOL, tap_name));
+
+        fs::remove_file(root.join(control_tap_name(15))).unwrap();
+        fs::remove_file(root.join(tap_name(0))).unwrap();
+        assert!(!taps_present(root, CONTROL_TAP_POOL, control_tap_name));
+        assert!(!taps_present(root, TAP_POOL, tap_name));
+    }
+
+    #[test]
+    fn guard_ready_requires_control_taps_in_every_mode() {
+        let marker = marker(Vec::new(), HostFirewall::None);
+        for mode in NetworkMode::ALL {
+            assert!(
+                !guard_ready_with(mode, &[], Some(&marker), false, true, Some(true), true),
+                "{mode:?} must not be ready without the control pool"
             );
-        assert_eq!(guard_ready(&config), expected);
-        if marker.is_none() {
-            assert!(!guard_ready(&config), "no marker means not ready");
+        }
+    }
+
+    #[test]
+    fn guarded_guard_ready_requires_the_data_pool_too() {
+        let marker = marker(Vec::new(), HostFirewall::None);
+        assert!(!guard_ready_with(
+            NetworkMode::Guarded,
+            &[],
+            Some(&marker),
+            true,
+            false,
+            Some(true),
+            true
+        ));
+        assert!(guard_ready_with(
+            NetworkMode::Guarded,
+            &[],
+            Some(&marker),
+            true,
+            true,
+            Some(true),
+            true
+        ));
+    }
+
+    #[test]
+    fn off_guard_ready_needs_a_marker_and_control_taps_but_no_data_pool() {
+        let marker = marker(Vec::new(), HostFirewall::None);
+        assert!(guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            Some(&marker),
+            true,
+            false,
+            Some(true),
+            true
+        ));
+        assert!(!guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            None,
+            true,
+            false,
+            Some(true),
+            true
+        ));
+        assert!(!guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            Some(&marker),
+            false,
+            true,
+            Some(true),
+            true
+        ));
+    }
+
+    #[test]
+    fn guard_ready_rejects_changed_endpoints() {
+        let marker = marker(vec![11434], HostFirewall::None);
+        assert!(!guard_ready_with(
+            NetworkMode::Off,
+            &[4321],
+            Some(&marker),
+            true,
+            false,
+            Some(true),
+            true
+        ));
+        assert!(guard_ready_with(
+            NetworkMode::Off,
+            &[11434],
+            Some(&marker),
+            true,
+            false,
+            Some(true),
+            true
+        ));
+    }
+
+    #[test]
+    fn privileged_guard_ready_fails_closed_when_the_live_guard_is_unverifiable() {
+        let marker = marker(Vec::new(), HostFirewall::None);
+        assert!(!guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            Some(&marker),
+            true,
+            false,
+            None,
+            true
+        ));
+        assert!(!guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            Some(&marker),
+            true,
+            false,
+            Some(false),
+            true
+        ));
+        // Unprivileged callers cannot run nft, so the root-owned marker stays
+        // their gate.
+        assert!(guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            Some(&marker),
+            true,
+            false,
+            None,
+            false
+        ));
+        assert!(!guard_ready_with(
+            NetworkMode::Off,
+            &[],
+            Some(&marker),
+            true,
+            false,
+            Some(false),
+            false
+        ));
+    }
+
+    #[test]
+    fn guard_ready_never_vouches_from_the_host_state_without_a_marker() {
+        // Read-only: never writes to /run. On a host without a v3 marker both
+        // modes must report "not ready".
+        for mode in NetworkMode::ALL {
+            let config = Config {
+                network: mode,
+                ..Config::default()
+            };
+            if ready_marker().is_none() {
+                assert!(!guard_ready(&config), "{mode:?} without a marker");
+            }
         }
     }
 

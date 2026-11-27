@@ -11,17 +11,20 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
 use crate::config::{Config, SecurityMode};
 use crate::project::ProjectRegistry;
+use crate::session::logs::tail_bytes;
+use crate::session::ssh::{SshError, SshIdentity, SshTarget};
 use crate::vm::config::{VmConfig, VmStore};
 
 use super::membership::MembershipManifest;
 use super::paths::VmPaths;
 use super::process::process_matches;
-use super::session::SessionRecord;
+use super::session::{SessionRecord, VmReport};
 
 #[derive(Debug, Clone)]
 pub struct VmManager {
@@ -237,11 +240,158 @@ impl VmManager {
     ///
     /// This is deliberately explicit: applying membership kills running
     /// agents. hegn never restarts a VM on its own.
+    ///
+    /// The guest may present a new host key after the reboot, so the cached
+    /// `known_hosts` entry is dropped first. The client keypair is kept: the
+    /// guest is re-provisioned with the existing public key on the next start.
     pub fn apply(&self) -> Result<super::session::VmReport> {
+        super::seed_generation::bump(&self.config, &self.vm).with_context(|| {
+            format!(
+                "failed to advance the cloud-init seed generation for VM '{}'",
+                self.vm.name
+            )
+        })?;
+        crate::session::ssh::SshIdentity::new(&self.config.vms_dir, &self.vm.name)
+            .remove_known_hosts()
+            .with_context(|| {
+                format!(
+                    "failed to clear the SSH host key cache for VM '{}'",
+                    self.vm.name
+                )
+            })?;
         if self.is_running() {
             self.stop()?;
         }
-        self.start()
+        let report = self.start_cold()?;
+        self.wait_for_guest_ssh(&report)?;
+        Ok(report)
+    }
+
+    /// Wait until cloud-init finished and SSH accepts the new host key.
+    ///
+    /// A boot with cloud-init rotates the guest host keys in its final stage.
+    /// Returning immediately after the VMM starts would let a later attach
+    /// cache the image host key and then fail once cloud-init rotates it. The
+    /// host-key cache is cleared before every probe and once more at the end,
+    /// so the next attach accepts the host key that is current at that time.
+    fn wait_for_guest_ssh(&self, report: &VmReport) -> Result<()> {
+        if !self.config.cloud_init {
+            return Ok(());
+        }
+        let Some(index) = self.vm.network_index else {
+            return Ok(());
+        };
+        let user = self
+            .vm
+            .effective_ssh_user(self.config.guest_credential_hardening)?;
+        let identity = SshIdentity::new(&self.config.vms_dir, &self.vm.name);
+        identity.load().with_context(|| {
+            format!("failed to load the SSH identity for VM '{}'", self.vm.name)
+        })?;
+        let target = SshTarget::new(
+            self.vm.name.clone(),
+            crate::network::control_guest_ip(index),
+            user.as_str(),
+            identity.key().to_path_buf(),
+            identity.known_hosts().to_path_buf(),
+        )?;
+
+        // Cloud-init rotates the guest host keys near the end of its run. Wait
+        // for that marker before probing SSH; a missing or unreadable log is
+        // not fatal, the SSH timeout below still applies.
+        if let Some(log) = &report.serial_log {
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while Instant::now() < deadline {
+                if cloud_init_finished(log) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+
+        identity.remove_known_hosts().with_context(|| {
+            format!(
+                "failed to clear the SSH host key cache for VM '{}'",
+                self.vm.name
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut last: Option<String> = None;
+        while Instant::now() < deadline {
+            // `accept-new` cannot replace an existing entry. Clearing the
+            // cache before each probe also covers a host-key rotation that
+            // happens between two probes.
+            identity.remove_known_hosts().with_context(|| {
+                format!(
+                    "failed to clear the SSH host key cache for VM '{}'",
+                    self.vm.name
+                )
+            })?;
+            match target.wait_ready(Duration::from_secs(5)) {
+                Ok(()) => {
+                    identity.remove_known_hosts().with_context(|| {
+                        format!(
+                            "failed to clear the SSH host key cache for VM '{}'",
+                            self.vm.name
+                        )
+                    })?;
+                    if let Some(log) = &report.serial_log {
+                        self.wait_for_provision(log)?;
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    if matches!(
+                        error,
+                        SshError::MissingClient
+                            | SshError::InvalidUser { .. }
+                            | SshError::MissingIdentity { .. }
+                    ) {
+                        return Err(error.into());
+                    }
+                    last = Some(error.to_string());
+                }
+            }
+        }
+        identity.remove_known_hosts().ok();
+        bail!(
+            "VM '{}' restarted, but SSH did not become ready: {}. Use 'hegn attach {} --serial' \
+             if the guest did not boot.",
+            self.vm.name,
+            last.as_deref().unwrap_or("no probe completed"),
+            self.vm.name
+        );
+    }
+
+    /// Wait until the first-boot provisioner installed the harness preset.
+    ///
+    /// `wait_for_guest_ssh` returns as soon as sshd accepts connections, but
+    /// cloud-init may still be installing the harness in the background. A
+    /// user who stops the VM right after `apply` would otherwise interrupt the
+    /// installation and only see it finish on the next boot.
+    fn wait_for_provision(&self, log: &Path) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(15 * 60);
+        loop {
+            match provision_state(log) {
+                ProvisionState::Ready => return Ok(()),
+                ProvisionState::Failed(reason) => bail!(
+                    "VM '{}' is running, but the harness setup failed: {reason}. \
+                     Attach with 'hegn attach {} --serial' to inspect the guest.",
+                    self.vm.name,
+                    self.vm.name
+                ),
+                ProvisionState::Pending => {}
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "VM '{}' is running, but the harness setup did not finish within 15 minutes. \
+                     Attach with 'hegn attach {} --serial' to follow the provisioning log.",
+                    self.vm.name,
+                    self.vm.name
+                );
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 
     /// Attach the TUI/CLI terminal to the running guest serial console.
@@ -258,6 +408,42 @@ impl VmManager {
     }
 }
 
+/// True when the serial log shows cloud-init's final stage.
+fn cloud_init_finished(path: &Path) -> bool {
+    let Ok(bytes) = tail_bytes(path, 2000) else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    text.lines()
+        .any(|line| line.contains("Cloud-init") && line.contains("finished at"))
+}
+
+enum ProvisionState {
+    Pending,
+    Ready,
+    Failed(String),
+}
+
+/// Read the harness provisioner state from the end of the serial log.
+fn provision_state(path: &Path) -> ProvisionState {
+    let Ok(bytes) = tail_bytes(path, 2000) else {
+        return ProvisionState::Pending;
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    if text.lines().any(|line| {
+        line.contains("hegn: preset ready") || line.contains("hegn: preset already provisioned")
+    }) {
+        return ProvisionState::Ready;
+    }
+    if let Some(line) = text
+        .lines()
+        .find(|line| line.contains("hegn-progress:") && line.contains("\"stage\":\"failed\""))
+    {
+        return ProvisionState::Failed(line.trim().to_string());
+    }
+    ProvisionState::Pending
+}
+
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
@@ -267,6 +453,7 @@ mod tests {
 
     use super::*;
     use crate::config::Harness;
+    use crate::session::ssh::SshIdentity;
     use crate::vm::config::VmConfig;
     use crate::vm::manager::test_support::{config_with_assets, manager};
 
@@ -309,6 +496,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: None,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         };
         std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
         assert!(
@@ -433,6 +622,38 @@ mod tests {
     }
 
     #[test]
+    fn cloud_init_finished_detects_the_final_serial_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("serial.log");
+        std::fs::write(
+            &log,
+            "Cloud-init v. 24.4 running 'modules:config' at Thu, 26 Nov 2026\n",
+        )
+        .unwrap();
+        assert!(!cloud_init_finished(&log));
+        std::fs::write(
+            &log,
+            "Cloud-init v. 24.4 finished at Thu, 26 Nov 2026 16:35:00 +0000\n",
+        )
+        .unwrap();
+        assert!(cloud_init_finished(&log));
+    }
+
+    #[test]
+    fn provision_state_detects_ready_already_and_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("serial.log");
+        std::fs::write(&log, "booting\n").unwrap();
+        assert!(matches!(provision_state(&log), ProvisionState::Pending));
+        std::fs::write(&log, "hegn: preset already provisioned\n").unwrap();
+        assert!(matches!(provision_state(&log), ProvisionState::Ready));
+        std::fs::write(&log, "hegn: preset ready\n").unwrap();
+        assert!(matches!(provision_state(&log), ProvisionState::Ready));
+        std::fs::write(&log, "hegn-progress: {\"stage\":\"failed\",\"code\":2}\n").unwrap();
+        assert!(matches!(provision_state(&log), ProvisionState::Failed(_)));
+    }
+
+    #[test]
     fn apply_on_a_stopped_vm_starts_it() {
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(config_with_assets(dir.path()), dir.path());
@@ -442,6 +663,35 @@ mod tests {
         assert!(
             err.contains("VM log:") || err.contains("cloud-hypervisor"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn apply_forgets_the_guest_host_key_but_keeps_the_client_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(config_with_assets(dir.path()), dir.path());
+        let identity = SshIdentity::new(&manager.config().vms_dir, manager.vm().name.as_str());
+        std::fs::create_dir_all(identity.dir()).unwrap();
+        std::fs::write(identity.key(), b"client-key").unwrap();
+        std::fs::write(identity.known_hosts(), b"demo ssh-ed25519 AAAA\n").unwrap();
+
+        // The fixture has no VM binaries, so start fails after `apply` cleared
+        // the host-key cache and before anything else could touch it.
+        assert!(manager.apply().is_err());
+
+        assert!(
+            !identity.known_hosts().exists(),
+            "a reboot may change the guest host key"
+        );
+        assert_eq!(
+            std::fs::read(identity.key()).unwrap(),
+            b"client-key",
+            "the client key must survive apply"
+        );
+        assert_eq!(
+            crate::vm::manager::seed_generation::read(manager.config(), manager.vm()).unwrap(),
+            1,
+            "apply must advance the generation so cloud-init rotates host keys"
         );
     }
 

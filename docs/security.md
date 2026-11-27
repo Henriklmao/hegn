@@ -24,26 +24,40 @@ it protects against, and what it does not protect against.
    Multiplicity never comes from exporting a parent directory.
 2. **VMM hardening.** Cloud Hypervisor runs with seccomp filters and Landlock
    file-system sandboxing. The VMM can access only the kernel, the disks, the
-   serial socket and the virtio-fs sockets, plus a staging directory for
-   snapshots. `virtiofsd` runs with `--sandbox=namespace` (or `chroot`) and
-   `--cache=never`. All control and console sockets are in a `0700` directory. The
-   relay socket is `0600`. A finished snapshot is moved out of the VMM's staging
-   directory and its files are set to `0600`. The VMM can therefore not write to
-   completed checkpoints.
+   serial socket, the virtio-fs sockets and the sysfs directories of the TAPs
+   passed to it, plus a staging directory for snapshots. `virtiofsd` runs with
+   `--sandbox=namespace` (or `chroot`) and `--cache=never`. All control and
+   console sockets are in a `0700` directory. The relay socket is `0600`. A
+   finished snapshot is moved out of the VMM's staging directory and its files
+   are set to `0600`. The VMM can therefore not write to completed checkpoints.
 3. **Private membership.** `<state_dir>/projects.toml` decides which host
    directories are exported and whether they are writable. It lives outside every
    exported directory, is `0600`, is written atomically under a lock, and does
    not follow symlinks. A repo-local `hegn.toml` cannot change membership,
    read-only status, resources or the tool profile.
-4. **Console access.** The official cloud image is started with a private NoCloud
-   seed. It enables automatic root login on the serial console. Set
-   `guest_credential_hardening = true` for a non-root console. The serial and
-   relay sockets are reachable only by the user who owns them.
-5. **Network guard.** With `network = "guarded"`, each VM gets its own TAP
-   device. Host nftables rules allow only outgoing TCP 80 and 443 and DNS to
-   `1.1.1.1` and `9.9.9.9`. Private, CGNAT, link-local and multicast ranges, forged
-   sources and all IPv6 are dropped. Guest-to-host traffic is dropped too. Details
-   in [Networking](networking.md).
+4. **SSH and console access.** Interactive sessions attach over SSH to the
+   guest's **control TAP**. Each VM has its own Ed25519 client key under
+   `<vms_dir>/<vm>/ssh/` (`0600` in a `0700` directory) and its own
+   `known_hosts`. sshd accepts public keys only, for the configured `ssh_user`
+   only, and disables password, keyboard-interactive, agent and TCP forwarding.
+   The host key is regenerated on each cloud-init run (for example `hegn vm
+   apply` or `hegn vm rebuild`), so `known_hosts` is per VM and rotated with
+   the VM. The
+   official cloud image is started with a private NoCloud seed; it keeps serial
+   autologin as the boot/recovery path. Set `guest_credential_hardening = true`
+   for a non-root serial console and a non-root SSH default; hardening plus
+   `ssh_user = "root"` is rejected. The serial and relay sockets are reachable
+   only by the user who owns them.
+5. **Network guard.** Every VM gets a control TAP (`hegnc<i>`) on
+   `10.214.0.0/30` for SSH. It has no default route, DNS, forwarding or
+   masquerade, so the guest cannot originate connections to other host
+   services, the local network or the internet; only SSH replies to the host
+   are accepted.
+   With `network = "guarded"`, each VM also gets a data TAP for egress. Host
+   nftables rules allow only outgoing TCP 80 and 443 and DNS to `1.1.1.1` and
+   `9.9.9.9` on that data path. Private, CGNAT, link-local and multicast
+   ranges, forged sources and all IPv6 are dropped. Guest-to-host traffic is
+   dropped too. Details in [Networking](networking.md).
 6. **Command interception.** In the project terminal, input is collected into a
    command line. Before any bytes reach the guest serial port, the line is checked
    by `tirith-core` and by hegn's own workspace guardrails. Every `/projects/*`
@@ -94,9 +108,11 @@ needs to write the parent's git state.
 
 ## Projects in one VM are mutually visible
 
-A VM shares one guest user, one console and one toolchain across its projects.
-Every member is mounted at `/projects/<slug>`, and the guest can read every
-member. Unless a member is read-only, the guest can also write it.
+A VM shares one guest user, one SSH account and one toolchain across its
+projects. Several SSH sessions can run at the same time, but they all log in as
+the same `ssh_user`. Every member is mounted at `/projects/<slug>`, and the
+guest can read every member. Unless a member is read-only, the guest can also
+write it.
 
 Consequences:
 
@@ -107,7 +123,11 @@ Consequences:
   other's files and secrets. Put unrelated or untrusted projects in separate
   VMs.
 - **The VM is the boundary.** There is no per-project user, network or process
-  isolation inside the guest.
+  isolation inside the guest. Multiple SSH sessions do not change that: they
+  are separate PTYs, not separate users or containers.
+- **The control TAP is management-only.** SSH traffic stays on the isolated
+  `10.214.0.0/24` control link. It has no route, DNS or masquerade off the
+  host; only the guarded data TAP can reach the public internet.
 - **Project deletion never deletes a VM.** Removing a project removes its
   registry entry and unassigns it; its VM and sibling projects stay. A VM is
   deleted only by `hegn vm delete`, with its own confirmation.
@@ -148,10 +168,12 @@ The exit code tells you the verdict, so `hegn check` works in scripts and CI:
 
 ## Input that bypasses the guardrails
 
-The `F2` key and `hegn attach` hand the terminal directly to the guest. Their
-input is **not** checked by `tirith-core`. The attach bar shows this with the
-`INPUT DIRECT` label. Use the TUI terminal for checked input, or `hegn check` in
-scripts. See [Sessions, attach and logs](sessions-and-logs.md).
+The `F2` key and `hegn attach` hand the terminal directly to the guest. This is
+true for the default SSH session and for `--serial`: both bypass `tirith-core`,
+because the bytes go straight to a guest shell. The serial attach bar shows the
+`INPUT DIRECT` label; SSH sessions are labelled by the terminal title and by
+this page. Use the TUI terminal for checked input, or `hegn check` in scripts.
+See [Sessions, attach and logs](sessions-and-logs.md).
 
 Launch commands from your configuration are trusted. They are sent straight to the
 guest shell. Run `hegn check` on anything you do not trust.
@@ -167,6 +189,18 @@ can contain terminal escape sequences that alter your screen. Logs are stored in
 private directory and are opened without following symlinks. `hegn logs show`
 removes control and bidi sequences by default. `--raw` is for debugging and should
 only be used with logs you trust.
+
+**SSH identity.** Each VM owns a private key and `known_hosts` in
+`<vms_dir>/<vm>/ssh/`. The directory is `0700`, the key is `0600`, and neither
+is ever exported to the guest. `known_hosts` uses OpenSSH's TOFU
+(`StrictHostKeyChecking=accept-new`), but only for that VM's control address.
+The guest host keys are regenerated by cloud-init on `hegn vm apply` and
+`hegn vm rebuild`; `apply` also clears the VM's `known_hosts`, so a rebooted VM
+is re-pinned instead of silently accepted. `hegn vm rebuild` deletes the VM's
+`ssh/` directory as well, so the next start creates a fresh client key and
+`known_hosts`; `apply` keeps the client key. `hegn vm delete --delete-files`
+removes the whole `ssh/` directory; a delete that keeps files leaves it in the
+renamed VM directory. The private key never leaves the host.
 
 **The guest root filesystem** is writable and is reused between sessions and by
 every project in that VM. Changes you make inside the guest stay. Only the
@@ -208,6 +242,11 @@ HTTPS-to-HTTP redirects, and only install data after the checksum matches.
 `--allow-unverified`. It never replaces an existing image without `--force`. See
 [VM images](vm-images.md).
 
+The official cloud image ships OpenSSH server and `ssh-keygen`; cloud-init adds
+the hegn sshd drop-in, generates fresh host keys and authorizes the per-VM
+public key. A custom rootfs must provide the same. The host needs the OpenSSH
+client (`ssh`, `ssh-keygen`), which `hegn doctor` checks.
+
 Project import only creates a symlink. It refuses targets that would expose `/`,
 `$HOME`, an ancestor of `projects_root` or hegn's state to the guest.
 
@@ -220,9 +259,14 @@ Project import only creates a symlink. It refuses targets that would expose `/`,
 - Automatic checkpoints restore the VM's memory, not the disk. They are not backups.
 - Every project in a VM is readable by every other project in that VM. Read-only
   prevents writes, not reads.
-- One VM has one serial console. Several agents in one VM share it and need guest
-  `tmux`; there is no vsock session broker yet.
-- Membership changes need a restart (`hegn vm apply`), which kills running agents.
+- Several SSH sessions per VM are supported and each gets its own guest PTY, but
+  they share one `ssh_user`, one guest rootfs and one network identity. There is
+  no per-session user, PTY proxy, SSH status bar or TUI VT emulator, and no vsock
+  session broker. SSH agent and TCP forwarding are disabled.
+- The embedded TUI terminal stays on the serial console; only `F2`,
+  `hegn attach`/`hegn open` and `vm shell` open SSH sessions.
+- Membership changes need a restart (`hegn vm apply`), which kills running agents
+  and SSH sessions.
 
 For the technical details, the threat notes and the invariants that the code must
 keep, see [Architecture](architecture.md#6-security-model-and-invariants).

@@ -63,7 +63,7 @@ backend         = "auto"      # "auto" or "cloud-hypervisor"; both need a VM
 cloud_init      = true        # NoCloud seed for the official cloud image
 guest_credential_hardening = false # opt-in: non-root console, passworded sudo
 harness         = "shell"     # default for new VMs
-network         = "guarded"   # "guarded" (web+DNS only) or "off" (no NIC)
+network         = "guarded"   # "guarded" (web+DNS) or "off" (control-only, no egress)
 extra_packages  = []          # seeded into new VMs
 auto_branch     = true
 # Rolling checkpoints let a restart resume instead of cold booting.
@@ -79,7 +79,7 @@ default         = "harness"  # "harness", "shell", or a name from commands
 integration     = "auto"     # auto | embedded | external | tmux | herdr
 auto_start      = true
 
-# Optional extra commands. They are typed into the guest shell.
+# Optional extra commands. They run in the guest shell (SSH or embedded serial).
 [[launch.commands]]
 name            = "review"
 command         = "opencode"
@@ -98,6 +98,14 @@ bar             = false      # full-screen commands should own every row
 `vms_dir` holds one directory per VM with `vm.toml`, runtime files, the private
 rootfs and managed clone workspaces. `state_dir` holds `projects.toml` and the
 logs. Neither is ever exported to a guest.
+
+`network = "off"` does not mean "no network card": every VM keeps a control TAP
+for SSH, but has no data NIC, default route or DNS. The guarded data network
+remains the only egress path. Both modes require the root-owned setup marker
+(version 3).
+
+SSH attach and `--command` use the host's OpenSSH client. `ssh` and
+`ssh-keygen` must be on `PATH`; `hegn doctor` checks both.
 
 ### Deprecated keys
 
@@ -165,20 +173,46 @@ periodic_snapshots = true
 snapshot_interval_secs = 300
 snapshot_keep = 2
 auto_resume = true
-network_index = 3              # assigned once, kept across restores
+network_index = 3              # TAP slot; set in every mode, including "off"
+ssh_user = "root"              # root | hegn | ubuntu (effective default below)
 created_at = "2026-11-24T10:00:00Z"
 ```
 
 These are VM settings: `security` and the snapshot policy fields are stored per
 VM in `vm.toml` and copied from the global defaults when the VM is created.
-They are effective at runtime: changing them in `vm.toml` takes effect on the
-next start, and `hegn vm apply <vm>` restarts a running VM to apply them.
-`vm.toml` deliberately does **not** list projects. Boot resolves the VM name to
-members by scanning the private registry, so membership has one source of truth.
+`ssh_user` is VM-only; its effective default is computed from
+`guest_credential_hardening` when the key is absent. All of them are effective
+at runtime: changing them in `vm.toml` takes effect on the next start, and
+`hegn vm apply <vm>` restarts a running VM to apply them. `apply` waits for
+cloud-init to finish and SSH to become ready; a changed seed identity also
+re-runs the harness provisioner. `vm.toml` deliberately does **not** list projects. Boot resolves the VM
+name to members by scanning the private registry, so membership has one source
+of truth.
 
 `primary` must name a current exported member. Changing it requires a restart
 (`hegn vm apply`) because `/workspace` is a boot-time symlink. When the first
 project is assigned to an empty VM, it becomes primary automatically.
+
+`network_index` is the **TAP slot**, not a data-only index. It is assigned once
+and kept across restarts and snapshot restores. Slot `3` means control TAP
+`hegnc3` in every network mode and data TAP `hegn3` only with
+`network = "guarded"`. The value is set for `network = "off"` as well, because
+the control TAP still exists.
+
+`ssh_user` chooses the guest account for SSH. It accepts `root`, `hegn` or
+`ubuntu`:
+
+- unset: `root`, or `hegn` when `guest_credential_hardening = true`,
+- `root`: key-only root login (`PermitRootLogin prohibit-password`); invalid
+  together with `guest_credential_hardening = true`,
+- `hegn`: the unprivileged hegn account (the default under hardening),
+- `ubuntu`: the image's default cloud user.
+
+Only the selected user receives the per-VM public key. sshd is public-key only
+and allows no password, keyboard-interactive, agent or TCP forwarding. A
+`root` choice combined with hardening is a hard validation error, not a silent
+fallback. Like every other key, `ssh_user` is schema-validated; unknown keys are
+still rejected.
 
 An explicit `rootfs_image` must be absolute, must not contain a comma, and must
 be unique across VMs. Two VMs may not boot from the same writable disk.
@@ -250,8 +284,13 @@ the file by hand.
 
 Rows are grouped by runtime, storage, sharing, network and security, tools,
 directories and packages. The VM editor also shows read-only rows for its
-resources, rootfs and TAP slot. The project editor only edits `launch`,
-`integration` and `auto_start`.
+resources, rootfs and TAP slot (`network_index`, valid in every network mode)
+and an `ssh_user` choice row (`root`/`hegn`/`ubuntu`). The project editor only
+edits `launch`, `integration` and `auto_start`.
+
+`ssh_user = "root"` together with `guest_credential_hardening = true` is
+rejected when you save. Change the VM's `ssh_user` or clear the global hardening
+setting first.
 
 Seccomp and Landlock have no configuration keys. hegn never weakens the Cloud
 Hypervisor sandbox.

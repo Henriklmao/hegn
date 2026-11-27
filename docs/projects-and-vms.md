@@ -5,7 +5,7 @@ hegn separates three things:
 | Concept | Role | Cardinality |
 | --- | --- | --- |
 | **Project** | A host directory you work in; the primary navigation object | many |
-| **VM** | A named tool profile and runtime: harness, packages, CPU/RAM, rootfs, network, snapshots, console | many |
+| **VM** | A named tool profile and runtime: harness, packages, CPU/RAM, rootfs, network, snapshots, SSH access | many |
 | **Workspace** | A concrete checkout exported to a VM: the project itself, a clone, or a git worktree | one per project membership |
 
 A project belongs to **at most one VM**. A VM hosts **zero or more projects**.
@@ -13,8 +13,8 @@ Every exported project gets its own sandboxed `virtiofsd` and its own guest
 mount, so tools are paid for once per VM while projects stay separate exports.
 
 The VM is the trust boundary. Projects in the same VM share a guest user, a
-toolchain, a console and each other's mounted files. Read-only prevents writes,
-not reads. See [Security](security.md#projects-in-one-vm-are-mutually-visible).
+toolchain, an SSH account and each other's mounted files. Read-only prevents
+writes, not reads. See [Security](security.md#projects-in-one-vm-are-mutually-visible).
 
 - [Projects](#projects)
 - [VMs](#vms)
@@ -120,7 +120,9 @@ hegn project unassign ~/code/cli
 
 - A project can be assigned to one VM at a time. Assigning it elsewhere moves
   it.
-- The first project assigned to an empty VM becomes `primary` automatically.
+- The first project assigned to an empty VM becomes `primary` automatically. In
+  the TUI that first assignment also applies the VM immediately, so it boots and
+  starts harness provisioning; later assignments ask before applying.
 - `hegn vm primary dev parser` chooses which project `/workspace` points at.
   The change takes effect on the next start; a running VM warns until
   `hegn vm apply`.
@@ -199,9 +201,12 @@ export and cannot point outside the configured project base (default
 primary project below it. `/workspace` and paths under it are reserved and
 cannot be the project base. The login shell starts there when it exists.
 
-One VM has one serial console. Starting any member starts the whole VM;
-attaching another member attaches the same console. For several agents in one
-VM, use guest `tmux` or separate VMs.
+Starting any member starts the whole VM. `hegn attach` opens SSH over the VM's
+control TAP by default; every session gets its own guest PTY, so several agents
+can run in parallel. The serial console remains the boot and recovery channel
+(`hegn attach <vm> --serial`) and is shared. Multiple SSH sessions still share
+one guest user and can read each other's projects; use separate VMs for a hard
+boundary.
 
 ---
 

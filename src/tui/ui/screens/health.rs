@@ -82,6 +82,17 @@ pub(crate) fn render_health(frame: &mut Frame, app: &App, area: Rect, number: us
         Span::styled(" apt       ", Style::default().fg(MUTED)),
         Span::styled(apt, Style::default().fg(TEXT)),
     ]));
+    if let Some(vm) = vm
+        && app.apply_pending(&vm.name)
+    {
+        lines.push(Line::from(vec![
+            Span::styled(" apply     ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("required · hegn vm apply {}", vm.name),
+                Style::default().fg(YELLOW),
+            ),
+        ]));
+    }
     if app.screen == crate::tui::app::Screen::Project {
         let template = app
             .project_meta
@@ -94,4 +105,49 @@ pub(crate) fn render_health(frame: &mut Frame, app: &App, area: Rect, number: us
         ]));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tui::app::{App, VmSection};
+    use crate::tui::ui::test_support::*;
+
+    fn app_with_vm(name: &str) -> (tempfile::TempDir, App) {
+        let (dir, mut app) = app();
+        let path = app.config.projects_root.join("demo");
+        std::fs::create_dir_all(&path).unwrap();
+        app.vms = vec![crate::vm::registry::VmSummary {
+            name: name.into(),
+            harness: crate::config::Harness::Shell,
+            primary: Some("demo".into()),
+            members: 1,
+            project: path.clone(),
+            workspace: path,
+            created_at: chrono::Utc::now(),
+            state: "running".into(),
+            vm_pid: None,
+            serial_log: None,
+            config_path: app.config.vms_dir.join(name).join("vm.toml"),
+            vcpus: 2,
+            memory_mib: 2048,
+            error: None,
+        }];
+        app.open_vm_screen(name.into());
+        assert_eq!(app.vm_section(), VmSection::Projects);
+        (dir, app)
+    }
+
+    #[test]
+    fn health_shows_a_pending_apply_only_until_the_vm_is_applied() {
+        let (_dir, mut app) = app_with_vm("rust");
+        app.pending_apply.insert("rust".into());
+
+        let (text, _) = render(&app);
+        assert!(text.contains("apply"), "{text}");
+        assert!(text.contains("required · hegn vm apply rust"), "{text}");
+
+        app.pending_apply.clear();
+        let (text, _) = render(&app);
+        assert!(!text.contains("hegn vm apply rust"), "{text}");
+    }
 }

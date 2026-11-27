@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use crate::config::{Config, Harness};
 use crate::network;
 use crate::project::{ProjectEntry, ProjectKind, ProjectRegistry};
+use crate::session::ssh::SshIdentity;
 use crate::vm::config::{VmConfig, VmStore};
 use crate::vm::manager::VmManager;
 
@@ -59,6 +60,10 @@ pub struct DeleteOutcome {
 /// `rootfs_image` is shared state and is always refused. The file must be a
 /// regular, non-symlinked `rootfs.<format>` directly inside the VM directory;
 /// workspaces and every other VM file are left untouched.
+///
+/// The private SSH identity is reset together with the rootfs: the rebuilt
+/// guest no longer knows the old client key, so the next start generates a
+/// fresh keypair and an empty `known_hosts`. Missing identity files are fine.
 pub fn remove_private_rootfs(config: &Config, vm: &VmConfig) -> Result<Option<PathBuf>> {
     if let Some(image) = &vm.rootfs_image {
         bail!(
@@ -111,6 +116,11 @@ pub fn remove_private_rootfs(config: &Config, vm: &VmConfig) -> Result<Option<Pa
             return Err(err).with_context(|| format!("failed to inspect {}", dest.display()));
         }
     }
+    // Reset the identity before the rootfs so a failure leaves both intact and
+    // a later rebuild can retry instead of keeping a stale key.
+    SshIdentity::new(&config.vms_dir, &vm.name)
+        .remove_all()
+        .with_context(|| format!("failed to delete the SSH identity of VM '{}'", vm.name))?;
     fs::remove_file(&dest)
         .with_context(|| format!("failed to delete rootfs {}", dest.display()))?;
     Ok(Some(dest))
@@ -599,6 +609,8 @@ mod tests {
             boot_args: String::new(),
             serial_log: None,
             membership: Vec::new(),
+            guest_ip: None,
+            ssh_user: None,
         };
         std::fs::write(&paths.session, serde_json::to_string(&record).unwrap()).unwrap();
 
@@ -635,6 +647,51 @@ mod tests {
     }
 
     #[test]
+    fn delete_with_files_removes_the_ssh_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let registry = VmRegistry::new(config.clone());
+        registry
+            .ensure_for_project(&project(dir.path(), "demo"), Harness::Shell)
+            .unwrap();
+        let identity = SshIdentity::new(&config.vms_dir, "demo");
+        std::fs::create_dir_all(identity.dir()).unwrap();
+        std::fs::write(identity.key(), b"client-key").unwrap();
+        std::fs::write(identity.known_hosts(), b"host-key").unwrap();
+
+        registry.delete("demo", true).unwrap();
+
+        assert!(!config.vms_dir.join("demo").exists());
+        assert!(!identity.key().exists());
+        assert!(!identity.known_hosts().exists());
+    }
+
+    #[test]
+    fn delete_without_files_keeps_the_ssh_identity_in_the_renamed_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let registry = VmRegistry::new(config.clone());
+        registry
+            .ensure_for_project(&project(dir.path(), "demo"), Harness::Shell)
+            .unwrap();
+        let identity = SshIdentity::new(&config.vms_dir, "demo");
+        std::fs::create_dir_all(identity.dir()).unwrap();
+        std::fs::write(identity.key(), b"client-key").unwrap();
+        std::fs::write(identity.known_hosts(), b"host-key").unwrap();
+        std::fs::create_dir_all(config.vms_dir.join("demo/workspaces")).unwrap();
+
+        let outcome = registry.delete("demo", false).unwrap();
+
+        assert!(!config.vms_dir.join("demo/ssh").exists());
+        let kept = outcome
+            .kept_workspace
+            .expect("the kept directory holds the workspaces");
+        let kept_dir = kept.parent().unwrap();
+        assert!(kept_dir.join("ssh/id_ed25519").is_file());
+        assert!(kept_dir.join("ssh/known_hosts").is_file());
+    }
+
+    #[test]
     fn unique_name_never_reuses_an_existing_vm() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_assets(dir.path());
@@ -661,6 +718,30 @@ mod tests {
         assert_eq!(removed.as_deref(), Some(rootfs.as_path()));
         assert!(!rootfs.exists());
         assert!(config.vms_dir.join("demo/keep.txt").is_file());
+        assert_eq!(remove_private_rootfs(&config, &vm).unwrap(), None);
+    }
+
+    #[test]
+    fn remove_private_rootfs_resets_the_ssh_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_assets(dir.path());
+        let store = VmStore::new(&config);
+        let vm = VmConfig::from_config(&config, "demo", Some(Harness::Shell));
+        store.save(&vm).unwrap();
+        let rootfs = vm.rootfs_path(&config);
+        std::fs::create_dir_all(rootfs.parent().unwrap()).unwrap();
+        std::fs::write(&rootfs, b"disk").unwrap();
+        let identity = SshIdentity::new(&config.vms_dir, "demo");
+        std::fs::create_dir_all(identity.dir()).unwrap();
+        std::fs::write(identity.key(), b"client-key").unwrap();
+        std::fs::write(identity.known_hosts(), b"stale-host-key").unwrap();
+
+        let removed = remove_private_rootfs(&config, &vm).unwrap();
+
+        assert_eq!(removed.as_deref(), Some(rootfs.as_path()));
+        assert!(!rootfs.exists());
+        assert!(!identity.dir().exists(), "rebuild resets the SSH identity");
+        // A second rebuild has nothing left to delete and stays quiet.
         assert_eq!(remove_private_rootfs(&config, &vm).unwrap(), None);
     }
 
