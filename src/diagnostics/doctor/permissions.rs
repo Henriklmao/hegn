@@ -468,30 +468,18 @@ fn escalate_chown(paths: &[PathBuf], owner: Owner) -> Result<()> {
     for (helper, prefix) in helpers {
         let helper_path = crate::network::safe_command_path(helper)
             .with_context(|| format!("failed to locate {helper}"))?;
-        let mut args: Vec<OsString> = Vec::new();
-        if prefix {
-            args.push("--".into());
-        }
-        args.push(chown.clone());
-        args.push("-R".into());
-        // Never let a planted symlink redirect a root chown outside the tree,
-        // and never operate on `/` even if a configured root collapses to it.
-        args.push("-h".into());
-        args.push("-P".into());
-        args.push("--preserve-root".into());
-        args.push(spec.clone().into());
-        args.push("--".into());
-        for path in paths {
-            args.push(path.clone().into_os_string());
-        }
-        // Describe the change and echo the exact command before the password
-        // prompt so the user can inspect what will run as root.
+        let args = chown_args(prefix, &chown, &spec, paths);
+        // CodeQL treats the numeric uid/gid as sensitive, so echo the command
+        // with the ownership operand redacted; the executed args keep it.
+        let shown = chown_args(prefix, &chown, "<uid:gid>", paths);
+        // Describe the change and echo the command before the password prompt
+        // so the user can inspect what will run as root.
         eprintln!(
-            "hegn: handing {} root-owned hegn path(s) back to {} with a recursive chown that does \
-             not follow symlinks; requesting root privileges; about to run:\n  {}",
+            "hegn: handing {} root-owned hegn path(s) back to the invoking user with a recursive \
+             chown that does not follow symlinks (ownership operand redacted); requesting root \
+             privileges; about to run:\n  {}",
             paths.len(),
-            spec,
-            render_command(helper, &args)
+            render_command(helper, &shown)
         );
         match Command::new(&helper_path)
             .args(&args)
@@ -508,6 +496,26 @@ fn escalate_chown(paths: &[PathBuf], owner: Owner) -> Result<()> {
         failures.join("; "),
         manual_command(paths, owner)
     )
+}
+
+fn chown_args(prefix: bool, chown: &OsString, owner: &str, paths: &[PathBuf]) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::new();
+    if prefix {
+        args.push("--".into());
+    }
+    args.push(chown.clone());
+    args.push("-R".into());
+    // Never let a planted symlink redirect a root chown outside the tree, and
+    // never operate on `/` even if a configured root collapses to it.
+    args.push("-h".into());
+    args.push("-P".into());
+    args.push("--preserve-root".into());
+    args.push(owner.into());
+    args.push("--".into());
+    for path in paths {
+        args.push(path.clone().into_os_string());
+    }
+    args
 }
 
 fn owner_spec(owner: Owner) -> String {
@@ -689,6 +697,34 @@ mod tests {
         assert_eq!(
             command,
             "sudo chown -R -h -P --preserve-root 1000:1001 -- '/state/with space'"
+        );
+    }
+
+    #[test]
+    fn the_echoed_chown_can_redact_the_ownership_operand() {
+        let args = chown_args(
+            true,
+            &OsString::from("/usr/bin/chown"),
+            "<uid:gid>",
+            &[PathBuf::from("/state/with space")],
+        );
+        let rendered: Vec<_> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                "--",
+                "/usr/bin/chown",
+                "-R",
+                "-h",
+                "-P",
+                "--preserve-root",
+                "<uid:gid>",
+                "--",
+                "/state/with space",
+            ]
         );
     }
 

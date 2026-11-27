@@ -67,7 +67,8 @@ hegn doctor --fix
 
 The repair widens a same-owner mode that is missing owner access. Root-owned
 trees are handed to `SUDO_UID`/`SUDO_GID`; from an unprivileged run this prints
-a short description and the exact `chown -R` command, then asks pkexec (preferred
+a short description and the `chown -R` command with the ownership operand
+redacted, then asks pkexec (preferred
 when installed) or sudo before running it.
 
 Two hot spots fail with a targeted hint instead of a bare error. Never delete
